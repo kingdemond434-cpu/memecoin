@@ -696,12 +696,17 @@ class SocialIntelligenceEngine:
                 else:
                     mention.causality_score = 0.1
 
-    def get_token_social_signal(self, token: str) -> Dict[str, Any]:
+    def get_token_social_signal(self, token: str, *, as_of: Optional[float] = None) -> Dict[str, Any]:
+        """Return a point-in-time signal without admitting future mentions."""
+        cutoff = float(as_of if as_of is not None else time.time())
         mentions = self.token_mentions.get(token, [])
         if not mentions:
             return {"signal": 0, "confidence": 0, "reason": "no_mentions"}
         
-        recent = [m for m in mentions if time.time() - m.timestamp < 1800]
+        recent = sorted(
+            [m for m in mentions if cutoff - 1800 < m.timestamp <= cutoff],
+            key=lambda mention: mention.timestamp,
+        )
         if not recent:
             return {"signal": 0, "confidence": 0, "reason": "stale_mentions"}
         
@@ -731,7 +736,7 @@ class SocialIntelligenceEngine:
             "avg_credibility": avg_cred,
             "chain_before_pct": chain_before / len(recent) if recent else 0,
             "platforms": list(set(m.platform.value for m in recent)),
-            "first_mention_delay": time.time() - first_mention_time,
+            "first_mention_delay": cutoff - first_mention_time,
             "cross_platform": len(set(m.platform for m in recent)) > 1
         }
 

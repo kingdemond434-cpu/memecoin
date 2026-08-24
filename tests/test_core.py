@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from solders.hash import Hash
 from solders.keypair import Keypair
@@ -16,7 +17,7 @@ from solders.transaction import VersionedTransaction
 from src.chains.rpc_manager import ChainConfig, ChainType, RPCEndpointConfig, RPCManager
 from src.chains.yellowstone_grpc import (
     PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
-    create_combined_subscription,
+    create_combined_subscription, enrich_trade_balances,
 )
 from src.detection.rug_detector import TOKEN_2022_PROGRAM, TOKEN_PROGRAM, RugDetector
 from src.execution.jupiter_jito import (
@@ -24,13 +25,13 @@ from src.execution.jupiter_jito import (
 )
 from src.main import MemecoinQuantDesk
 from src.strategies.information_graph import CounterfactualExecutionLab
-from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPrediction, MultiHeadPredictor
+from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPrediction, MultiHeadPredictor, PredictionFeatures
 from src.strategies.public_coordination import PublicCoordinationMiner
 from src.strategies.wallet_intelligence import WalletIntelligenceEngine
 from src.research.dataset_builder import LaunchEpisode, PointInTimeDatasetBuilder, SnapshotTimepoint
-from src.research.shadow_trainer import train_shadow
+from src.research.shadow_trainer import chronological_episode_split, train_shadow
 from src.research.global_research_miner import GlobalResearchMiner, ResearchLead
-from src.strategies.champion_challenger import ChampionChallengerFramework
+from src.strategies.champion_challenger import ChampionChallengerFramework, HypothesisSpec, TrialResult
 from src.strategies.rug_hazard import ContinuousRugHazardModel
 
 
@@ -54,6 +55,7 @@ class DummyYellowstone:
 class TestSolanaParsing(unittest.IsolatedAsyncioTestCase):
     async def test_real_historical_pump_sell_inner_instruction(self):
         fixture = json.loads((Path(__file__).parent / "fixtures" / "pump_sell_441417557.json").read_text())
+        fixture["blockTime"] = 1_700_000_000
         events = []
         monitor = PumpFunMonitor(DummyYellowstone(), events.append)
         await monitor._on_transaction(fixture)
@@ -63,6 +65,9 @@ class TestSolanaParsing(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0]["wallet"], "V4SyF9Vv3EgzPyUEQQckN8b5eWSRndu9j2584WpnkCg")
         self.assertEqual(events[0]["slot"], 441417557)
         self.assertEqual(events[0]["signature"], fixture["signature"])
+        self.assertEqual(events[0]["timestamp"], 1_700_000_000)
+        self.assertEqual(events[0]["block_time"], 1_700_000_000)
+        self.assertLessEqual(events[0]["received_ns"], events[0]["decoded_ns"])
 
     async def test_raydium_v4_initialize2_layout(self):
         keys = [f"key{i}" for i in range(18)]
@@ -105,6 +110,22 @@ class TestSolanaParsing(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["pool"], "key9")
         self.assertEqual(event["wallet"], "key5")
 
+    def test_trade_event_uses_observed_balance_deltas_not_instruction_limit(self):
+        event = {"type": "token_trade", "side": "buy", "token": "mint", "wallet": "wallet",
+                 "quote_limit_amount": 999_999_999}
+        tx = {"meta": {
+            "fee": 5_000,
+            "preBalances": [2_000_000_000], "postBalances": [1_499_995_000],
+            "preTokenBalances": [{"mint": "mint", "owner": "wallet",
+                                   "uiTokenAmount": {"amount": "0", "decimals": 2}}],
+            "postTokenBalances": [{"mint": "mint", "owner": "wallet",
+                                    "uiTokenAmount": {"amount": "2500", "decimals": 2}}],
+        }}
+        enrich_trade_balances(event, tx, ["wallet"])
+        self.assertEqual(event["fill_data_status"], "OBSERVED_WALLET_BALANCE_DELTA")
+        self.assertEqual(event["actual_token_amount_ui"], 25)
+        self.assertEqual(event["notional_sol"], 0.5)
+
 
 class TestNativeMintChecks(unittest.TestCase):
     @staticmethod
@@ -138,13 +159,15 @@ class TestNativeMintChecks(unittest.TestCase):
 class TestProbabilityAndAccounting(unittest.TestCase):
     def test_nested_probabilities_become_disjoint_distribution_with_p50(self):
         prediction = MultiHeadPrediction("mint", "solana", 0, p_2x=0.4, p_5x=0.7,
-                                         p_10x=0.2, p_50x=0.05, p_rug_5m=0.1)
+                                         p_10x=0.2, p_50x=0.05, p_rug_5m=0.1,
+                                         expected_feasible_multiple=3.0)
         bins = ElogwEngine.probability_bins(prediction)
         self.assertAlmostEqual(sum(probability for _, probability, _ in bins), 1.0)
         self.assertLessEqual(prediction.p_5x, prediction.p_2x)
         self.assertLessEqual(prediction.p_10x, prediction.p_5x)
         self.assertLessEqual(prediction.p_50x, prediction.p_10x)
         self.assertAlmostEqual(dict((name, probability) for name, probability, _ in bins)["50x_plus"], 0.045)
+        self.assertLessEqual(max(outcome for _, _, outcome in bins), 2.0)
 
     def test_risk_constrained_elogw_and_partial_cost_basis(self):
         predictor = MultiHeadPredictor()
@@ -182,6 +205,20 @@ class TestProbabilityAndAccounting(unittest.TestCase):
 
 
 class TestShadowTrainer(unittest.TestCase):
+    def test_chronological_split_keeps_launch_episodes_disjoint(self):
+        samples = []
+        for token_index in range(5):
+            for offset in (0, 60):
+                samples.append((
+                    PredictionFeatures(f"token-{token_index}", "solana", token_index * 100 + offset),
+                    {}, {},
+                ))
+        train, oos = chronological_episode_split(samples)
+        train_tokens = {item[0].token for item in train}
+        oos_tokens = {item[0].token for item in oos}
+        self.assertFalse(train_tokens & oos_tokens)
+        self.assertEqual(train_tokens | oos_tokens, {f"token-{index}" for index in range(5)})
+
     def test_insufficient_history_remains_explicitly_data_blocked(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -191,7 +228,49 @@ class TestShadowTrainer(unittest.TestCase):
             self.assertEqual(persisted["status"], "DATA_BLOCKED")
 
 
+class TestApplicationStartup(unittest.IsolatedAsyncioTestCase):
+    async def test_offline_dry_run_initializes_without_provider_credentials(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            "os.environ", {"CHAMPION_STATE_PATH": str(Path(directory) / "champion.json")}
+        ):
+            desk = MemecoinQuantDesk(dry_run_override=True, offline=True)
+            try:
+                await desk.initialize()
+                self.assertTrue(desk.dry_run)
+                self.assertEqual(desk.readiness()["mode"], "DRY_RUN")
+            finally:
+                await desk.stop()
+
+
 class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
+    async def test_promotion_evidence_survives_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = str(Path(directory) / "champion_state.json")
+            hypothesis = HypothesisSpec(
+                hypothesis_id="model-v1", mechanism="test", target="net_elogw",
+                features=["flow"], feature_hash="schema-1", model_type="test",
+                model_params={}, training_window="point-in-time", threshold=0.0,
+                sizing_rule={}, exit_rule={}, execution_policy={}, fakeability={},
+                cost_model={}, falsifier="negative oos", kill_thesis="decay",
+                source_provenance="fixture", trial_family="test", created_at=1.0,
+            )
+            first = ChampionChallengerFramework(
+                min_oos_samples=1, min_portfolio_impact=0.0, state_path=state_path,
+            )
+            first.submit_hypothesis(hypothesis)
+            first.record_trial_result(TrialResult(
+                hypothesis_id="model-v1", stage="CHRONOLOGICAL_OOS", samples=10,
+                metrics={}, oos_metrics={"elogw": 0.01}, portfolio_impact=0.01,
+                passed=True, timestamp=2.0,
+            ))
+            await first._evaluate_challengers()
+            await first.stop()
+
+            second = ChampionChallengerFramework(state_path=state_path)
+            self.assertIn("model-v1", second.shadow_models)
+            self.assertEqual(len(second.trial_results), 1)
+            self.assertEqual(second.hypotheses["model-v1"].feature_hash, "schema-1")
+
     async def test_hourly_leads_survive_restart_and_restore_challengers(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = Path(directory) / "leads.jsonl"
@@ -247,6 +326,8 @@ class TestExecution(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.filled)
         self.assertEqual(result.status, TransactionStatus.SIMULATED)
         self.assertEqual(result.output_amount, 12345)
+        self.assertEqual(result.actual_input_amount, 1000)
+        self.assertEqual(result.native_balance_delta_lamports, 0)
         self.assertFalse(jupiter.swap_build_called)
 
     async def test_live_path_needs_second_acknowledgement(self):
@@ -264,6 +345,19 @@ class TestExecution(unittest.IsolatedAsyncioTestCase):
         encoded = SolanaTransactionBuilder(FakeRpc(), keypair).sign_versioned_transaction(bytes(unsigned))
         signed = VersionedTransaction.from_bytes(base64.b64decode(encoded))
         self.assertTrue(signed.verify_with_results()[0])
+
+    def test_landed_wallet_deltas_drive_accounting(self):
+        owner = "wallet"
+        tx = {
+            "transaction": {"message": {"accountKeys": [{"pubkey": owner}, {"pubkey": "other"}]}},
+            "meta": {"preBalances": [1_000, 2_000], "postBalances": [725, 2_000]},
+        }
+        self.assertEqual(ExecutionEngine._native_balance_delta(tx, owner), -275)
+        meta = {
+            "preTokenBalances": [{"mint": "token", "owner": owner, "uiTokenAmount": {"amount": "500"}}],
+            "postTokenBalances": [{"mint": "token", "owner": owner, "uiTokenAmount": {"amount": "125"}}],
+        }
+        self.assertEqual(ExecutionEngine._token_balance_decrease(meta, "token", owner), 375)
 
 
 class FakeGenealogy:
@@ -347,6 +441,20 @@ class TestRpcFallback(unittest.IsolatedAsyncioTestCase):
 
 
 class TestShadowMarketObservation(unittest.IsolatedAsyncioTestCase):
+    async def test_candidate_pipeline_rechecks_first_seconds_without_duplicates(self):
+        desk = MemecoinQuantDesk()
+        desk.global_config = {"candidate_recheck_delays_seconds": [0, 0.001, 0.003]}
+        desk._candidate_semaphore = asyncio.Semaphore(1)
+        desk.elogw_engine = SimpleNamespace(open_positions={})
+        observed = []
+
+        async def evaluate(candidate):
+            observed.append(candidate.address)
+
+        desk._evaluate_candidate = evaluate
+        await desk._candidate_pipeline(SimpleNamespace(address="token"))
+        self.assertEqual(observed, ["token", "token", "token"])
+
     async def test_blocked_prediction_still_collects_price_path(self):
         class Jupiter:
             def __init__(self):
@@ -421,6 +529,35 @@ class TestPointInTimeResearch(unittest.IsolatedAsyncioTestCase):
         snapshot = builder.active_episodes["token"].snapshots[SnapshotTimepoint.PRELAUNCH]
         self.assertEqual(builder.active_episodes["token"].prelaunch_status, "DATA_BLOCKED")
         self.assertEqual(snapshot.social_features["status"], "DATA_BLOCKED")
+
+    async def test_flow_snapshot_excludes_observations_after_cutoff(self):
+        builder = self.builder()
+        episode = LaunchEpisode("token", "solana", 100, "dev", "pump", "curve", "wsol")
+        episode.market_observations.extend([
+            {"type": "trade", "side": "buy", "wallet": "a", "slot": 1, "timestamp": 101},
+            {"type": "trade", "side": "buy", "wallet": "b", "slot": 2, "timestamp": 109},
+            {"type": "trade", "side": "buy", "wallet": "future", "slot": 2, "timestamp": 111},
+        ])
+        features = await builder._capture_flow_features(episode, as_of=110)
+        self.assertEqual(features["status"], "OK")
+        self.assertEqual(features["observed_trade_count"], 2)
+        self.assertEqual(features["buy_velocity"], 0.2)
+
+    async def test_active_episode_checkpoint_survives_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = self.builder()
+            first.storage_path = directory
+            first.start_episode("token", "dev", "pump", "curve", "wsol", detected_at=100)
+            first.record_market_observation("token", {"type": "trade", "timestamp": 101, "side": "buy"})
+            await first._flush_active()
+
+            second = self.builder()
+            second.storage_path = directory
+            second._load_active_checkpoints()
+            self.assertIn("token", second.active_episodes)
+            restored = second.active_episodes["token"]
+            self.assertEqual(restored.created_at, 100)
+            self.assertEqual(restored.market_observations[0]["timestamp"], 101)
 
 
 class TestCounterfactuals(unittest.TestCase):

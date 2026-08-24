@@ -25,6 +25,7 @@ class PredictionTarget(Enum):
     P_RUG_5M = "p_rug_5m"
     EXPECTED_SLIPPAGE = "expected_slippage"
     EXPECTED_HOLD_TIME = "expected_hold_time"
+    EXPECTED_FEASIBLE_MULTIPLE = "expected_feasible_multiple"
 
 
 CLASSIFICATION_TARGETS = {
@@ -81,6 +82,7 @@ class PredictionFeatures:
     wallet_history_available: bool = False
     social_available: bool = False
     coordination_available: bool = False
+    flow_available: bool = False
     
     def to_array(self) -> np.ndarray:
         return np.array([
@@ -118,6 +120,7 @@ class PredictionFeatures:
             float(self.wallet_history_available),
             float(self.social_available),
             float(self.coordination_available),
+            float(self.flow_available),
         ], dtype=np.float32)
 
 
@@ -136,6 +139,7 @@ class MultiHeadPrediction:
     p_rug_5m: float = 0
     expected_slippage: float = 0
     expected_hold_time: float = 0
+    expected_feasible_multiple: float = 0
     
     model_version: str = ""
     feature_hash: str = ""
@@ -143,6 +147,8 @@ class MultiHeadPrediction:
 
 
 class MultiHeadPredictor:
+    ARTIFACT_VERSION = 3
+
     def __init__(self, model_dir: str = "models"):
         self.model_dir = model_dir
         self.models: Dict[PredictionTarget, Any] = {}
@@ -157,7 +163,7 @@ class MultiHeadPredictor:
             "social_credibility", "chain_before_social", "cross_platform",
             "narrative_novelty", "narrative_momentum", "holder_concentration",
             "top_10_pct", "deployer_pct", "data_coverage", "wallet_history_available",
-            "social_available", "coordination_available"
+            "social_available", "coordination_available", "flow_available"
         ]
         self.model_version = "1.0"
         self._training_data: Dict[PredictionTarget, List[Tuple[np.ndarray, float, float]]] = defaultdict(list)
@@ -261,6 +267,8 @@ class MultiHeadPredictor:
                         val = np.clip(val, 0, 1)
                     elif target == PredictionTarget.EXPECTED_HOLD_TIME:
                         val = max(0, val)
+                    elif target == PredictionTarget.EXPECTED_FEASIBLE_MULTIPLE:
+                        val = np.clip(val, 0.02, 50)
                     setattr(pred, target.value, float(val))
             except Exception as e:
                 logger.error(f"Prediction failed for {target.value}: {e}")
@@ -300,6 +308,8 @@ class MultiHeadPredictor:
                             val = np.clip(val, 0, 1)
                         elif target == PredictionTarget.EXPECTED_HOLD_TIME:
                             val = max(0, val)
+                        elif target == PredictionTarget.EXPECTED_FEASIBLE_MULTIPLE:
+                            val = np.clip(val, 0.02, 50)
                         setattr(pred, target.value, float(val))
                 except Exception as e:
                     logger.error(f"Batch prediction failed for {target.value}: {e}")
@@ -321,7 +331,7 @@ class MultiHeadPredictor:
         if not validation_report or validation_report.get("status") != "PASSED":
             raise RuntimeError("refusing to save a model without passed chronological validation")
         data = {
-            "artifact_version": 2,
+            "artifact_version": self.ARTIFACT_VERSION,
             "models": self.models,
             "calibrators": self.calibrators,
             "model_version": self.model_version,
@@ -336,7 +346,7 @@ class MultiHeadPredictor:
     def load(self, path: str):
         import joblib
         data = joblib.load(path)
-        if data.get("artifact_version") != 2:
+        if data.get("artifact_version") != self.ARTIFACT_VERSION:
             raise ValueError("unsupported or unvalidated model artifact")
         expected_hash = hashlib.sha256("\n".join(self.feature_names).encode()).hexdigest()
         if data.get("feature_schema_hash") != expected_hash or data.get("feature_names") != self.feature_names:
@@ -444,6 +454,12 @@ class ElogwEngine:
             ("10x_to_50x", max(0.0, p10 - p50), 9.0),
             ("50x_plus", max(0.0, p50), 49.0),
         ]
+        if prediction.expected_feasible_multiple > 0:
+            feasible_return = float(np.clip(prediction.expected_feasible_multiple - 1, -0.98, 49))
+            survival = [
+                (name, probability, min(outcome, feasible_return) if outcome > 0 else outcome)
+                for name, probability, outcome in survival
+            ]
         p_rug = float(np.clip(max(prediction.p_rug_30s, prediction.p_rug_5m), 0, 1))
         bins = [(name, probability * (1 - p_rug), outcome) for name, probability, outcome in survival]
         bins.append(("rug", p_rug, -0.98))

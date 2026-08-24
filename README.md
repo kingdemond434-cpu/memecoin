@@ -15,18 +15,25 @@ or safe operating assumption.
 - Native SPL and Token-2022 mint-authority, freeze-authority, extension,
   concentration, and Jupiter sell-route checks.
 - Point-in-time launch episodes, immutable snapshot timestamps, observed price
-  paths, route-feasible outcomes, P50X labels, and persistent outcome indices.
+  paths, route-feasible outcomes, P50X labels, crash-safe active checkpoints,
+  and persistent outcome indices.
+- Bounded per-token candidate pipelines re-evaluate at 0/1/3/5/10 seconds;
+  quote observation runs separately so research I/O does not stall discovery.
 - Budgeted Jupiter round-trip market marks collect price paths even while the
   prediction model is blocked; hourly research leads persist in a JSONL ledger.
 - FIFO wallet round-trip scoring, public-chain coordination inference, public
   social/research discovery, creator genealogy, and continuous rug hazard.
-- Nested probability correction, disjoint outcome bins, net expected-log-wealth,
-  risk-constrained Kelly sizing, live equity/SOL-USD inputs, and hard exposure
-  limits.
+- Nested probability correction, disjoint outcome bins, a route-feasible return
+  head, net expected-log-wealth, risk-constrained Kelly sizing, live
+  equity/SOL-USD inputs, and hard exposure limits.
 - Champion/challenger registration, shadow-only research hypotheses, execution
-  counterfactuals, partial-exit cost basis, profit ratchets, and adaptive exits.
+  counterfactuals, persistent schema-bound promotion evidence, partial-exit cost
+  basis, profit ratchets, and adaptive exits.
 - Correct Solana `VersionedTransaction` signing plus distinct simulated,
-  submitted, landed, and filled execution states.
+  submitted, landed, and filled execution states. Landed wallet deltas—not
+  instruction limits—drive token amounts and cost/PnL accounting.
+- Block/receipt/decode timestamps and measured balance deltas are retained for
+  latency, flow, and transaction-economics research.
 
 Missing data is reported as `DATA_BLOCKED`; it is not replaced with a zero or a
 made-up value. Discovery never grants execution authority. A model must first
@@ -138,7 +145,8 @@ The suite covers dry-run non-submission, the independent live lock,
 VersionedTransaction signatures, native mint checks, nested P2/P5/P10/P50 math,
 risk-constrained sizing, partial cost basis, chain-aware RPC health, PumpSwap and
 Raydium layouts, FIFO wallet scoring, point-in-time leakage, counterfactuals,
-public coordination, and rug hazard. A reduced fixture from Solana mainnet slot
+public coordination, rug hazard, active-episode recovery, promotion-state
+recovery, and landed wallet-delta accounting. A reduced fixture from Solana mainnet slot
 `441417557` exercises the same Pump.fun inner-instruction decoder used live.
 
 On a Dockerless VPS, `memecoin-shadow-user.service` runs the collector as an

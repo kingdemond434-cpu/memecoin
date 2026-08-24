@@ -8,6 +8,7 @@ both an explicit ``--live`` launch and the execution engine's independent
 import argparse
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -111,7 +112,10 @@ class MemecoinQuantDesk:
         self._running = False
         self._main_task: Optional[asyncio.Task] = None
         self._health_task: Optional[asyncio.Task] = None
+        self._market_task: Optional[asyncio.Task] = None
         self._background_tasks: set[asyncio.Task] = set()
+        self._candidate_pipelines: Dict[str, asyncio.Task] = {}
+        self._candidate_semaphore: Optional[asyncio.Semaphore] = None
         self._web_runner: Optional[web.AppRunner] = None
         self.start_time = time.time()
         self.last_intelligence_update = 0.0
@@ -130,6 +134,9 @@ class MemecoinQuantDesk:
         with open(self.config_path, encoding="utf-8") as handle:
             self.config = yaml.safe_load(handle)
         self.global_config = self.config.get("global", {})
+        self._candidate_semaphore = asyncio.Semaphore(
+            int(self.global_config.get("max_candidate_concurrency", 8))
+        )
         configured_dry_run = bool(self.global_config.get("dry_run", True))
         self.dry_run = configured_dry_run if self.dry_run_override is None else bool(self.dry_run_override)
         await self._setup_keys()
@@ -251,12 +258,18 @@ class MemecoinQuantDesk:
             max_daily_loss_usd=float(self.global_config.get("max_daily_loss_usd", 1_000)),
             max_liquidity_fraction=float(self.global_config.get("max_liquidity_fraction", 0.01)),
         )
-        self.champion_challenger = ChampionChallengerFramework()
+        self.champion_challenger = ChampionChallengerFramework(
+            state_path=os.getenv("CHAMPION_STATE_PATH", "data/research/champion_state.json")
+        )
         if not self.offline:
             await self.champion_challenger.start()
+        feature_hash = hashlib.sha256(json.dumps({
+            "artifact_version": self.predictor.ARTIFACT_VERSION,
+            "features": list(self.predictor.feature_names),
+        }, sort_keys=True).encode()).hexdigest()
         hypothesis = HypothesisSpec(
             hypothesis_id=MODEL_HYPOTHESIS_ID, mechanism="calibrated multi-head tail and rug probabilities",
-            target="net_elogw", features=list(self.predictor.feature_names), feature_hash="runtime-model-schema-v1",
+            target="net_elogw", features=list(self.predictor.feature_names), feature_hash=feature_hash,
             model_type="gradient_boosting_calibrated", model_params={}, training_window="expanding_point_in_time",
             threshold=0.0, sizing_rule={"objective": "max_net_elogw", "hard_limits": True},
             exit_rule={"profit_ratchet": True, "rug_hazard": True}, execution_policy={"jupiter": True, "jito": True},
@@ -327,6 +340,7 @@ class MemecoinQuantDesk:
         await self._setup_health_server()
         self._main_task = asyncio.create_task(self._main_loop())
         self._health_task = asyncio.create_task(self._health_loop())
+        self._market_task = asyncio.create_task(self._market_observer_loop())
 
     async def stop(self):
         self._running = False
@@ -334,7 +348,7 @@ class MemecoinQuantDesk:
             task.cancel()
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
-        for task in (self._main_task, self._health_task):
+        for task in (self._main_task, self._health_task, self._market_task):
             if task:
                 task.cancel()
                 try:
@@ -363,23 +377,66 @@ class MemecoinQuantDesk:
             try:
                 await self._process_new_tokens()
                 await self._manage_positions()
-                await self._observe_active_markets()
                 await self._update_intelligence()
             except Exception as exc:
                 logger.exception("Main loop error: %s", exc)
             await asyncio.sleep(0.5)
+
+    async def _market_observer_loop(self):
+        """Keep research quotes off the latency-sensitive decision loop."""
+        while self._running:
+            try:
+                await self._observe_active_markets()
+            except Exception as exc:
+                logger.exception("Market observer error: %s", exc)
+            await asyncio.sleep(float(self.global_config.get("market_observer_sleep_seconds", 0.25)))
 
     async def _process_new_tokens(self):
         try:
             candidate = await asyncio.wait_for(self.detection_engine.get_candidate(), timeout=0.05)
         except asyncio.TimeoutError:
             return
-        await self._evaluate_candidate(candidate)
+        token = candidate.address
+        if not token or token in self._candidate_pipelines:
+            return
+        if len(self._candidate_pipelines) >= int(self.global_config.get("max_candidate_pipelines", 100)):
+            logger.warning("Candidate pipeline saturated; preserving DATA_BLOCKED decision for %s", token)
+            self._record_blocked_decision(token, "DATA_BLOCKED_candidate_pipeline_saturated", {})
+            return
+        task = asyncio.create_task(self._candidate_pipeline(candidate))
+        self._candidate_pipelines[token] = task
+        self._background_tasks.add(task)
+
+        def completed(done: asyncio.Task):
+            self._candidate_pipelines.pop(token, None)
+            self._background_tasks.discard(done)
+            if not done.cancelled():
+                exc = done.exception()
+                if exc:
+                    logger.error(
+                        "Candidate pipeline failed for %s", token,
+                        exc_info=(type(exc), exc, exc.__traceback__),
+                    )
+
+        task.add_done_callback(completed)
+
+    async def _candidate_pipeline(self, candidate: TokenCandidate):
+        delays = self.global_config.get("candidate_recheck_delays_seconds", [0, 1, 3, 5, 10])
+        checkpoints = sorted({max(0.0, float(delay)) for delay in delays})
+        started = time.monotonic()
+        for delay in checkpoints:
+            await asyncio.sleep(max(0.0, started + delay - time.monotonic()))
+            if candidate.address in self.elogw_engine.open_positions:
+                return
+            async with self._candidate_semaphore:
+                await self._evaluate_candidate(candidate)
 
     async def _evaluate_candidate(self, candidate: TokenCandidate):
         if candidate.chain != "solana" or not candidate.address:
             return
         token = candidate.address
+        if token in self.elogw_engine.open_positions:
+            return
         self.dataset_builder.start_episode(
             token, candidate.deployer or "", candidate.factory or "", candidate.pair or "",
             candidate.base_token or WSOL_MINT, detected_at=candidate.timestamp,
@@ -432,10 +489,24 @@ class MemecoinQuantDesk:
         self.dataset_builder.record_execution_attempt(token, _jsonable(result))
         if not result.success:
             return
+        intended_cost = float(trade_info["position_value_usd"])
+        if result.simulated:
+            acquisition_cost = intended_cost
+        else:
+            native_spent = max(0, -int(result.native_balance_delta_lamports)) / 1e9 * self.sol_price_usd
+            token_input = int(result.actual_input_amount) / 1e9 * self.sol_price_usd
+            acquisition_cost = native_spent or token_input
+            if acquisition_cost <= 0:
+                self.dataset_builder.record_execution_attempt(token, {
+                    "status": "DATA_BLOCKED_ACCOUNTING",
+                    "reason": "landed buy lacks verifiable wallet input delta",
+                    "execution": _jsonable(result),
+                })
+                return
         position = {
             "token": token, "size_tokens": int(result.output_amount), "initial_size_tokens": int(result.output_amount),
-            "remaining_cost_usd": float(trade_info["position_value_usd"]),
-            "initial_cost_usd": float(trade_info["position_value_usd"]),
+            "remaining_cost_usd": acquisition_cost,
+            "initial_cost_usd": acquisition_cost,
             "risk_contribution": float(trade_info["risk_contribution"]),
             "initial_risk_contribution": float(trade_info["risk_contribution"]),
             "entry_time": time.time(), "entry_sol": float(trade_info["position_size_sol"]),
@@ -499,6 +570,14 @@ class MemecoinQuantDesk:
         features.smart_buyers = sum(score is not None and score.overall_score >= 0.7 for score in buyer_scores)
         features.wallet_history_available = any(score is not None for score in buyer_scores)
         features.sol_volume = sum(float(item.get("amount", 0) or 0) * float(item.get("price", 0) or 0) for item in buys)
+        episode = self.dataset_builder.active_episodes.get(candidate.address)
+        if episode:
+            flow = await self.dataset_builder._capture_flow_features(episode, features.timestamp)
+            if flow.get("status") == "OK":
+                features.flow_available = True
+                features.buy_velocity = float(flow.get("buy_velocity", 0) or 0)
+                features.buyer_acceleration = float(flow.get("buy_acceleration", 0) or 0)
+                features.sol_volume = float(flow.get("buy_notional_sol_10s", features.sol_volume) or 0)
         coordination = self.public_coordination.get_features(candidate.address)
         if coordination.get("status") == "OK":
             features.bundle_concentration = float(coordination["coordinated_buyer_fraction"])
@@ -521,6 +600,7 @@ class MemecoinQuantDesk:
         coverage_checks = [
             deployer is not None, risk.data_status == "OK", liquidity > 0,
             features.wallet_history_available, features.coordination_available, features.social_available,
+            features.flow_available,
         ]
         features.data_coverage = sum(coverage_checks) / len(coverage_checks)
         return features
@@ -591,6 +671,7 @@ class MemecoinQuantDesk:
         budget = min(int(self.global_config.get("market_observation_budget", 5)), len(tokens))
         now = time.time()
         inspected = 0
+        due = []
         while inspected < len(tokens) and budget > 0:
             token = tokens[self._market_cursor % len(tokens)]
             self._market_cursor = (self._market_cursor + 1) % max(len(tokens), 1)
@@ -604,7 +685,19 @@ class MemecoinQuantDesk:
                 continue
             self._market_observed_at[token] = now
             budget -= 1
-            await self._observe_token_market(token, now)
+            due.append(token)
+        active = set(tokens)
+        for stale in set(self._market_observed_at) - active:
+            self._market_observed_at.pop(stale, None)
+            self._market_entry_price.pop(stale, None)
+        if due:
+            results = await asyncio.gather(
+                *(self._observe_token_market(token, now) for token in due),
+                return_exceptions=True,
+            )
+            for token, result in zip(due, results):
+                if isinstance(result, Exception):
+                    logger.warning("Market observation failed for %s: %s", token, result)
 
     async def _observe_token_market(self, token: str, observed_at: float):
         probe_lamports = int(self.global_config.get("market_probe_lamports", 10_000_000))
@@ -649,13 +742,15 @@ class MemecoinQuantDesk:
             self.dataset_builder.record_execution_attempt(token, attempt)
             return
         proceeds = result.output_amount / 1_000_000
+        native_delta_usd = int(result.native_balance_delta_lamports) / 1e9 * self.sol_price_usd
         allocated_cost = float(position["remaining_cost_usd"]) * sold_tokens / max(current_tokens, 1)
-        pnl = proceeds - allocated_cost
+        pnl = proceeds + native_delta_usd - allocated_cost
         self.total_pnl += pnl
         self.successful_exits += int(pnl > 0)
         self.elogw_engine.update_pnl(pnl)
         self.elogw_engine.reduce_position(token, sold_tokens, allocated_cost)
-        attempt.update({"proceeds_usd": proceeds, "allocated_cost_usd": allocated_cost,
+        attempt.update({"proceeds_usd": proceeds, "native_balance_delta_usd": native_delta_usd,
+                        "allocated_cost_usd": allocated_cost,
                         "realized_pnl_usd": pnl})
         self.dataset_builder.record_execution_attempt(token, attempt)
         resolved = self.counterfactual_lab.resolve_decision(position.get("decision_id", ""), pnl)
@@ -725,7 +820,13 @@ class MemecoinQuantDesk:
             ))
         elif event.get("type") == "token_trade":
             observation = {"type": "trade", "side": event.get("side"), "wallet": event.get("wallet"),
-                           "amount": event.get("token_amount", 0), "quote_limit_amount": event.get("quote_limit_amount", 0),
+                           "amount": event.get("actual_token_amount_ui"),
+                           "amount_raw": event.get("actual_token_delta_raw"),
+                           "notional_sol": event.get("notional_sol"),
+                           "price": event.get("price_sol_per_token"),
+                           "fill_data_status": event.get("fill_data_status", "DATA_BLOCKED"),
+                           "instruction_token_amount": event.get("token_amount", 0),
+                           "quote_limit_amount": event.get("quote_limit_amount", 0),
                            "timestamp": event.get("timestamp", time.time()), "slot": event.get("slot"),
                            "signature": event.get("signature"), "program": event.get("program")}
             self.rug_hazard.record_observation(token, observation)

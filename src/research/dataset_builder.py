@@ -141,6 +141,7 @@ class PointInTimeDatasetBuilder:
         import os
         os.makedirs(self.storage_path, exist_ok=True)
         self._load_outcome_index()
+        self._load_active_checkpoints()
         self._running = True
         self._snapshot_task = asyncio.create_task(self._snapshot_loop())
         self._flush_task = asyncio.create_task(self._flush_loop())
@@ -154,6 +155,7 @@ class PointInTimeDatasetBuilder:
             task.cancel()
         if self._capture_tasks:
             await asyncio.gather(*self._capture_tasks, return_exceptions=True)
+        await self._flush_active()
         await self._flush_all()
 
     def start_episode(
@@ -216,7 +218,13 @@ class PointInTimeDatasetBuilder:
                             self._capture_tasks.add(task)
                             task.add_done_callback(self._capture_tasks.discard)
                     
-                    if elapsed > 3600:
+                    if elapsed >= self.snapshot_times[SnapshotTimepoint.T1H]:
+                        final_key = (token, SnapshotTimepoint.T1H)
+                        if SnapshotTimepoint.T1H not in episode.snapshots:
+                            if final_key not in self._snapshot_inflight:
+                                self._snapshot_inflight.add(final_key)
+                                await self._capture_snapshot(token, SnapshotTimepoint.T1H)
+                            continue
                         await self._finalize_episode(token)
             except Exception as e:
                 logger.error(f"Snapshot loop error: {e}")
@@ -232,21 +240,22 @@ class PointInTimeDatasetBuilder:
         
         key = (token, snapshot_time)
         try:
+            as_of = time.time()
             snapshot = LaunchSnapshot(
                 token=token,
                 chain=self.chain_config.name,
                 snapshot_time=snapshot_time,
-                timestamp=time.time()
+                timestamp=as_of,
             )
             
-            snapshot.deployer_features = await self._capture_deployer_features(episode)
-            snapshot.wallet_features = await self._capture_wallet_features(episode)
-            snapshot.flow_features = await self._capture_flow_features(episode)
-            snapshot.liquidity_features = await self._capture_liquidity_features(episode)
-            snapshot.social_features = await self._capture_social_features(episode)
-            snapshot.token_features = await self._capture_token_features(episode)
-            snapshot.market_features = await self._capture_market_features(episode)
-            snapshot.entity_graph_features = await self._capture_entity_graph_features(episode)
+            snapshot.deployer_features = await self._capture_deployer_features(episode, as_of)
+            snapshot.wallet_features = await self._capture_wallet_features(episode, as_of)
+            snapshot.flow_features = await self._capture_flow_features(episode, as_of)
+            snapshot.liquidity_features = await self._capture_liquidity_features(episode, as_of)
+            snapshot.social_features = await self._capture_social_features(episode, as_of)
+            snapshot.token_features = await self._capture_token_features(episode, as_of)
+            snapshot.market_features = await self._capture_market_features(episode, as_of)
+            snapshot.entity_graph_features = await self._capture_entity_graph_features(episode, as_of)
             
             episode.snapshots[snapshot_time] = snapshot
             
@@ -255,7 +264,7 @@ class PointInTimeDatasetBuilder:
         finally:
             self._snapshot_inflight.discard(key)
 
-    async def _capture_deployer_features(self, episode: LaunchEpisode) -> Dict[str, Any]:
+    async def _capture_deployer_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
         dp = self.genealogy.get_deployer_profile(episode.deployer)
         if not dp:
             return {"has_profile": False}
@@ -272,7 +281,7 @@ class PointInTimeDatasetBuilder:
             "liquidity_locked_rate": dp.liquidity_locked_rate
         }
 
-    async def _capture_wallet_features(self, episode: LaunchEpisode) -> Dict[str, Any]:
+    async def _capture_wallet_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
         smart_wallets = self.wallet_intel.get_top_wallets(limit=50)
         
         initial_buyers = []
@@ -281,7 +290,8 @@ class PointInTimeDatasetBuilder:
         total_sol_volume = 0
         
         for buy in self.wallet_intel._recent_buys:
-            if buy["token"] == episode.token:
+            observed_at = float(buy.get("timestamp", 0) or 0)
+            if buy["token"] == episode.token and episode.created_at <= observed_at <= as_of:
                 initial_buyers.append(buy)
                 total_sol_volume += buy["amount"] * buy["price"]
                 
@@ -299,15 +309,31 @@ class PointInTimeDatasetBuilder:
             "buyer_diversity": len(set(b["wallet"] for b in initial_buyers)) / max(len(initial_buyers), 1)
         }
 
-    async def _capture_flow_features(self, episode: LaunchEpisode) -> Dict[str, Any]:
-        observations = [item for item in episode.market_observations if item.get("type") == "trade"]
+    async def _capture_flow_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
+        observations = [
+            item for item in episode.market_observations
+            if item.get("type") == "trade" and float(item.get("timestamp", 0) or 0) <= as_of
+        ]
         if not observations:
             return {"status": "DATA_BLOCKED", "reason": "no_trade_observations"}
         observations.sort(key=lambda item: item.get("timestamp", 0))
-        now = observations[-1].get("timestamp", time.time())
+        now = as_of
         buys_10s = [item for item in observations if item.get("side") == "buy" and now - item.get("timestamp", 0) <= 10]
         buys_prev = [item for item in observations if item.get("side") == "buy" and 10 < now - item.get("timestamp", 0) <= 20]
         wallets = [item.get("wallet") for item in buys_10s if item.get("wallet")]
+        sell_10s = [item for item in observations if item.get("side") == "sell" and now - item.get("timestamp", 0) <= 10]
+        buy_notionals = [float(item.get("notional_sol", 0) or 0) for item in buys_10s
+                         if item.get("notional_sol") is not None]
+        sell_notionals = [float(item.get("notional_sol", 0) or 0) for item in sell_10s
+                          if item.get("notional_sol") is not None]
+        total_notional = sum(buy_notionals) + sum(sell_notionals)
+        positive_sizes = np.array([value for value in buy_notionals if value > 0], dtype=float)
+        if positive_sizes.size:
+            weights = positive_sizes / positive_sizes.sum()
+            order_flow_entropy = float(-np.sum(weights * np.log(np.clip(weights, 1e-12, 1))))
+            order_flow_entropy /= max(float(np.log(len(weights))), 1.0)
+        else:
+            order_flow_entropy = None
         slots = [item.get("slot") for item in buys_10s if item.get("slot")]
         largest_slot = max((slots.count(slot) for slot in set(slots)), default=0)
         return {
@@ -316,11 +342,22 @@ class PointInTimeDatasetBuilder:
             "buy_acceleration": (len(buys_10s) - len(buys_prev)) / 10,
             "organic_ratio": len(set(wallets)) / max(len(wallets), 1),
             "bundle_concentration": largest_slot / max(len(buys_10s), 1),
+            "unique_buyers_10s": len(set(wallets)),
+            "repeated_buy_ratio": 1 - len(set(wallets)) / max(len(wallets), 1),
+            "buy_notional_sol_10s": sum(buy_notionals) if buy_notionals else None,
+            "sell_notional_sol_10s": sum(sell_notionals) if sell_notionals else None,
+            "buy_sell_notional_imbalance": ((sum(buy_notionals) - sum(sell_notionals)) / total_notional
+                                             if total_notional else None),
+            "order_flow_entropy": order_flow_entropy,
+            "economics_status": "OK" if total_notional else "DATA_BLOCKED",
             "observed_trade_count": len(observations),
         }
 
-    async def _capture_liquidity_features(self, episode: LaunchEpisode) -> Dict[str, Any]:
-        observed = [item for item in episode.market_observations if item.get("liquidity_usd") is not None]
+    async def _capture_liquidity_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
+        observed = [
+            item for item in episode.market_observations
+            if item.get("liquidity_usd") is not None and float(item.get("timestamp", 0) or 0) <= as_of
+        ]
         if not observed:
             return {"status": "DATA_BLOCKED", "reason": "liquidity_not_observed"}
         latest = max(observed, key=lambda item: item.get("timestamp", 0))
@@ -333,11 +370,11 @@ class PointInTimeDatasetBuilder:
             "price_impact_pct": latest.get("price_impact_pct"),
         }
 
-    async def _capture_social_features(self, episode: LaunchEpisode) -> Dict[str, Any]:
-        social_signal = self.social_intel.get_token_social_signal(episode.token)
+    async def _capture_social_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
+        social_signal = self.social_intel.get_token_social_signal(episode.token, as_of=as_of)
         return social_signal
 
-    async def _capture_token_features(self, episode: LaunchEpisode) -> Dict[str, Any]:
+    async def _capture_token_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
         if not episode.risk_report:
             return {"status": "DATA_BLOCKED", "reason": "risk_report_not_recorded"}
         return {
@@ -350,22 +387,28 @@ class PointInTimeDatasetBuilder:
             "sell_route_feasible": episode.risk_report.get("sell_route_feasible"),
         }
 
-    async def _capture_market_features(self, episode: LaunchEpisode) -> Dict[str, Any]:
-        observed = [item for item in episode.market_observations if item.get("sol_price_usd")]
-        recent_launches = [ep for ep in self.active_episodes.values() if time.time() - ep.created_at <= 3600]
+    async def _capture_market_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
+        observed = [
+            item for item in episode.market_observations
+            if item.get("sol_price_usd") and float(item.get("timestamp", 0) or 0) <= as_of
+        ]
+        recent_launches = [ep for ep in self.active_episodes.values() if 0 <= as_of - ep.created_at <= 3600]
         if not observed:
             return {"status": "DATA_BLOCKED", "meme_launch_rate_1h": len(recent_launches)}
         latest = max(observed, key=lambda item: item.get("timestamp", 0))
+        eligible_launches = [ep for ep in self.active_episodes.values() if ep.created_at <= as_of]
         return {
             "status": "OK",
             "sol_price_usd": latest.get("sol_price_usd"),
             "meme_launch_rate_1h": len(recent_launches),
             "graduation_rate_observed": sum(
-                any(item.get("migrated") for item in ep.market_observations) for ep in self.active_episodes.values()
-            ) / max(len(self.active_episodes), 1),
+                any(item.get("migrated") and float(item.get("timestamp", 0) or 0) <= as_of
+                    for item in ep.market_observations)
+                for ep in eligible_launches
+            ) / max(len(eligible_launches), 1),
         }
 
-    async def _capture_entity_graph_features(self, episode: LaunchEpisode) -> Dict[str, Any]:
+    async def _capture_entity_graph_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
         dp = self.genealogy.get_deployer_profile(episode.deployer)
         cluster_risk = 0
         
@@ -415,6 +458,7 @@ class PointInTimeDatasetBuilder:
             snapshot.realized_pnl = labels.get("realized_pnl")
         
         self.completed_episodes[token] = episode
+        self._active_checkpoint_path(token).unlink(missing_ok=True)
         if episode.final_outcome.get("status") == "OK":
             await self.genealogy.update_token_outcome(token, {**episode.final_outcome, "deployer": episode.deployer})
             if hasattr(self.social_intel, "record_token_outcome"):
@@ -506,6 +550,22 @@ class PointInTimeDatasetBuilder:
         temporary.write_text(json.dumps(self.outcome_index, separators=(",", ":")), encoding="utf-8")
         temporary.replace(path)
 
+    def _active_checkpoint_path(self, token: str) -> Path:
+        return Path(self.storage_path) / "active" / f"{token}.json.gz"
+
+    def _load_active_checkpoints(self):
+        active_dir = Path(self.storage_path) / "active"
+        if not active_dir.exists():
+            return
+        for path in active_dir.glob("*.json.gz"):
+            try:
+                with gzip.open(path, "rt", encoding="utf-8") as handle:
+                    episode = self._episode_from_dict(json.load(handle))
+                if episode.token and episode.token not in self.outcome_index:
+                    self.active_episodes[episode.token] = episode
+            except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+                logger.error("Active PIT checkpoint is unreadable; preserving %s: %s", path, exc)
+
     def record_execution_attempt(self, token: str, attempt: Dict):
         if token in self.active_episodes:
             self.active_episodes[token].execution_attempts.append(attempt)
@@ -521,10 +581,20 @@ class PointInTimeDatasetBuilder:
     async def _flush_loop(self):
         while self._running:
             try:
+                await self._flush_active()
                 await self._flush_completed()
             except Exception as e:
                 logger.error(f"Flush error: {e}")
-            await asyncio.sleep(300)
+            await asyncio.sleep(60)
+
+    async def _flush_active(self):
+        for episode in list(self.active_episodes.values()):
+            path = self._active_checkpoint_path(episode.token)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            with gzip.open(temporary, "wt", encoding="utf-8") as handle:
+                json.dump(self._episode_to_dict(episode), handle, separators=(",", ":"))
+            temporary.replace(path)
 
     async def _flush_completed(self):
         if not self.completed_episodes:
@@ -546,7 +616,16 @@ class PointInTimeDatasetBuilder:
         filename = f"{self.storage_path}/{date_str}/{episode.token}.json.gz"
         os.makedirs(os.path.dirname(filename), exist_ok=True)
         
-        data = {
+        data = self._episode_to_dict(episode)
+
+        temporary = f"{filename}.tmp"
+        with gzip.open(temporary, "wt", encoding="utf-8") as handle:
+            json.dump(data, handle, separators=(",", ":"))
+        Path(temporary).replace(filename)
+
+    @staticmethod
+    def _episode_to_dict(episode: LaunchEpisode) -> Dict[str, Any]:
+        return {
             "token": episode.token,
             "chain": episode.chain,
             "created_at": episode.created_at,
@@ -592,9 +671,47 @@ class PointInTimeDatasetBuilder:
             "risk_report": episode.risk_report,
             "prelaunch_status": episode.prelaunch_status,
         }
-        
-        with gzip.open(filename, 'wt') as f:
-            json.dump(data, f)
+
+    @staticmethod
+    def _episode_from_dict(data: Dict[str, Any]) -> LaunchEpisode:
+        episode = LaunchEpisode(
+            token=str(data["token"]), chain=str(data.get("chain", "solana")),
+            created_at=float(data["created_at"]), deployer=str(data.get("deployer", "")),
+            factory=str(data.get("factory", "")), pair=str(data.get("pair", "")),
+            base_token=str(data.get("base_token", "")),
+        )
+        for key, raw in (data.get("snapshots") or {}).items():
+            try:
+                timepoint = SnapshotTimepoint(key)
+            except ValueError:
+                continue
+            labels = raw.get("labels") or {}
+            episode.snapshots[timepoint] = LaunchSnapshot(
+                token=str(raw.get("token", episode.token)), chain=str(raw.get("chain", episode.chain)),
+                snapshot_time=timepoint, timestamp=float(raw.get("timestamp", episode.created_at)),
+                deployer_features=dict(raw.get("deployer_features") or {}),
+                wallet_features=dict(raw.get("wallet_features") or {}),
+                flow_features=dict(raw.get("flow_features") or {}),
+                liquidity_features=dict(raw.get("liquidity_features") or {}),
+                social_features=dict(raw.get("social_features") or {}),
+                token_features=dict(raw.get("token_features") or {}),
+                market_features=dict(raw.get("market_features") or {}),
+                entity_graph_features=dict(raw.get("entity_graph_features") or {}),
+                label_2x=labels.get("label_2x"), label_5x=labels.get("label_5x"),
+                label_10x=labels.get("label_10x"), label_50x=labels.get("label_50x"),
+                label_migration=labels.get("label_migration"), label_rug=labels.get("label_rug"),
+                label_rug_time=labels.get("label_rug_time"), max_multiple=labels.get("max_multiple"),
+                time_to_peak=labels.get("time_to_peak"), max_drawdown=labels.get("max_drawdown"),
+                feasible_exit_multiple=labels.get("feasible_exit_multiple"),
+                realized_pnl=labels.get("realized_pnl"),
+            )
+        episode.final_outcome = dict(data.get("final_outcome") or {})
+        episode.execution_attempts = list(data.get("execution_attempts") or [])
+        episode.counterfactuals = list(data.get("counterfactuals") or [])
+        episode.market_observations = list(data.get("market_observations") or [])
+        episode.risk_report = dict(data.get("risk_report") or {})
+        episode.prelaunch_status = str(data.get("prelaunch_status", "DATA_BLOCKED"))
+        return episode
 
     def get_training_data(self, target_label: str, timepoints: List[SnapshotTimepoint] = None) -> Tuple[np.ndarray, np.ndarray]:
         if timepoints is None:

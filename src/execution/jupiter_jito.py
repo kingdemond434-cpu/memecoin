@@ -87,8 +87,10 @@ class ExecutionResult:
     signature: Optional[str] = None
     bundle_id: Optional[str] = None
     input_amount: int = 0
+    actual_input_amount: int = 0
     quoted_output_amount: int = 0
     filled_output_amount: int = 0
+    native_balance_delta_lamports: int = 0
     slippage_bps: int = 0
     fees_paid: int = 0
     priority_fee: int = 0
@@ -349,6 +351,7 @@ class ExecutionEngine:
                 success=True,
                 status=TransactionStatus.SIMULATED,
                 input_amount=amount,
+                actual_input_amount=amount,
                 quoted_output_amount=quote.output_amount,
                 slippage_bps=slippage_bps,
                 latency_ms=int((time.time() - started) * 1000),
@@ -398,7 +401,7 @@ class ExecutionEngine:
                 error="submitted but no landed transaction was confirmed",
             )
 
-        fill = await self._wait_for_fill(signature, output_mint)
+        fill = await self._wait_for_fill(signature, input_mint, output_mint)
         status = (
             TransactionStatus.FILLED if fill.get("filled")
             else TransactionStatus.LANDED if fill.get("landed")
@@ -410,8 +413,10 @@ class ExecutionEngine:
             signature=signature,
             bundle_id=bundle_id,
             input_amount=amount,
+            actual_input_amount=int(fill.get("input_amount", 0)),
             quoted_output_amount=quote.output_amount,
             filled_output_amount=int(fill.get("output_amount", 0)),
+            native_balance_delta_lamports=int(fill.get("native_balance_delta_lamports", 0)),
             slippage_bps=slippage_bps,
             fees_paid=int(fill.get("fee", 0)),
             priority_fee=0 if use_jito else priority_fee,
@@ -453,7 +458,7 @@ class ExecutionEngine:
             await asyncio.sleep(0.5)
         return None
 
-    async def _wait_for_fill(self, signature: str, output_mint: str) -> Dict[str, Any]:
+    async def _wait_for_fill(self, signature: str, input_mint: str, output_mint: str) -> Dict[str, Any]:
         deadline = time.monotonic() + self.confirmation_timeout
         while time.monotonic() < deadline:
             try:
@@ -466,10 +471,14 @@ class ExecutionEngine:
                     if meta.get("err") is not None:
                         return {"landed": True, "filled": False, "slot": tx.get("slot"), "fee": meta.get("fee", 0)}
                     output = self._token_balance_delta(meta, output_mint, self.tx_builder.public_key)
+                    input_used = self._token_balance_decrease(meta, input_mint, self.tx_builder.public_key)
+                    native_delta = self._native_balance_delta(tx, self.tx_builder.public_key)
                     return {
                         "landed": True,
                         "filled": output > 0,
                         "output_amount": output,
+                        "input_amount": input_used,
+                        "native_balance_delta_lamports": native_delta,
                         "slot": tx.get("slot"),
                         "fee": meta.get("fee", 0),
                     }
@@ -487,6 +496,31 @@ class ExecutionEngine:
                     value += int(item.get("uiTokenAmount", {}).get("amount", 0) or 0)
             return value
         return max(0, total(meta.get("postTokenBalances", [])) - total(meta.get("preTokenBalances", [])))
+
+    @staticmethod
+    def _token_balance_decrease(meta: Dict[str, Any], mint: str, owner: str) -> int:
+        def total(entries: List[Dict[str, Any]]) -> int:
+            return sum(
+                int(item.get("uiTokenAmount", {}).get("amount", 0) or 0)
+                for item in entries or [] if item.get("mint") == mint and item.get("owner") == owner
+            )
+        return max(0, total(meta.get("preTokenBalances", [])) - total(meta.get("postTokenBalances", [])))
+
+    @staticmethod
+    def _native_balance_delta(tx: Dict[str, Any], owner: str) -> int:
+        message = (((tx.get("transaction") or {}).get("message")) or {})
+        keys = message.get("accountKeys") or []
+        normalized = [item.get("pubkey") if isinstance(item, dict) else item for item in keys]
+        try:
+            index = normalized.index(owner)
+        except ValueError:
+            return 0
+        meta = tx.get("meta") or {}
+        before = meta.get("preBalances") or []
+        after = meta.get("postBalances") or []
+        if index >= len(before) or index >= len(after):
+            return 0
+        return int(after[index]) - int(before[index])
 
     def _record(self, result: ExecutionResult, decision_id: Optional[str]):
         result_data = result.__dict__.copy()

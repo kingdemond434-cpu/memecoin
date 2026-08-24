@@ -343,6 +343,92 @@ def transaction_parts(tx_data: Any) -> Tuple[List[str], List[Any], str, int]:
     return _json_transaction_parts(tx_data) if isinstance(tx_data, dict) else _proto_transaction_parts(tx_data)
 
 
+def transaction_block_time(tx_data: Any) -> Optional[float]:
+    if not isinstance(tx_data, dict):
+        return None
+    result = tx_data.get("result", tx_data)
+    value = result.get("blockTime", result.get("block_time"))
+    return float(value) if value is not None else None
+
+
+def apply_event_timing(event: Dict[str, Any], tx_data: Any, received_ns: int) -> Dict[str, Any]:
+    block_time = transaction_block_time(tx_data)
+    event["block_time"] = block_time
+    event["received_ns"] = received_ns
+    event["decoded_ns"] = time.time_ns()
+    event["timestamp"] = block_time if block_time is not None else received_ns / 1_000_000_000
+    return event
+
+
+def enrich_trade_balances(event: Dict[str, Any], tx_data: Any, keys: List[str]) -> Dict[str, Any]:
+    """Attach observed wallet/token balance deltas; never treat instruction limits as fills."""
+    if event.get("type") != "token_trade":
+        return event
+    if isinstance(tx_data, dict):
+        result = tx_data.get("result", tx_data)
+        meta = result.get("meta") or {}
+    else:
+        info = getattr(tx_data, "transaction", tx_data)
+        meta = getattr(info, "meta", None)
+    if not meta:
+        event["fill_data_status"] = "DATA_BLOCKED: transaction metadata missing"
+        return event
+
+    def field(container: Any, camel: str, snake: str, default: Any = None) -> Any:
+        if isinstance(container, dict):
+            return container.get(camel, container.get(snake, default))
+        return getattr(container, snake, default)
+
+    def token_totals(name_camel: str, name_snake: str) -> Tuple[int, int]:
+        total = 0
+        decimals = 0
+        for item in field(meta, name_camel, name_snake, []) or []:
+            if field(item, "mint", "mint", "") != event.get("token"):
+                continue
+            if field(item, "owner", "owner", "") != event.get("wallet"):
+                continue
+            ui = field(item, "uiTokenAmount", "ui_token_amount", {}) or {}
+            total += int(field(ui, "amount", "amount", 0) or 0)
+            decimals = int(field(ui, "decimals", "decimals", decimals) or decimals)
+        return total, decimals
+
+    pre_token, pre_decimals = token_totals("preTokenBalances", "pre_token_balances")
+    post_token, post_decimals = token_totals("postTokenBalances", "post_token_balances")
+    token_delta = post_token - pre_token
+    decimals = post_decimals or pre_decimals
+
+    wallet = event.get("wallet")
+    native_delta: Optional[int] = None
+    if wallet in keys:
+        index = keys.index(wallet)
+        pre_native = field(meta, "preBalances", "pre_balances", []) or []
+        post_native = field(meta, "postBalances", "post_balances", []) or []
+        if index < len(pre_native) and index < len(post_native):
+            native_delta = int(post_native[index]) - int(pre_native[index])
+    fee = int(field(meta, "fee", "fee", 0) or 0)
+    side = event.get("side")
+    if native_delta is None or token_delta == 0:
+        event["fill_data_status"] = "DATA_BLOCKED: owner balance deltas unavailable"
+        return event
+    notional_lamports = (
+        max(0, -native_delta - fee) if side == "buy"
+        else max(0, native_delta + fee) if side == "sell"
+        else 0
+    )
+    token_amount_ui = abs(token_delta) / (10 ** decimals) if decimals >= 0 else 0
+    event.update({
+        "fill_data_status": "OBSERVED_WALLET_BALANCE_DELTA",
+        "actual_token_delta_raw": token_delta,
+        "actual_token_amount_ui": token_amount_ui,
+        "token_decimals": decimals,
+        "wallet_native_delta_lamports": native_delta,
+        "network_fee_lamports": fee,
+        "notional_sol": notional_lamports / 1_000_000_000,
+        "price_sol_per_token": (notional_lamports / 1_000_000_000 / token_amount_ui) if token_amount_ui else None,
+    })
+    return event
+
+
 def instruction_fields(instruction: Any) -> Tuple[int, List[int], bytes]:
     if isinstance(instruction, dict):
         data = instruction.get("data", "")
@@ -365,6 +451,7 @@ class PumpFunMonitor:
         yellowstone.on("transaction", self._on_transaction)
 
     async def _on_transaction(self, tx_data: Any):
+        received_ns = time.time_ns()
         keys, instructions, signature, slot = transaction_parts(tx_data)
         for instruction_index, instruction in enumerate(instructions):
             try:
@@ -383,6 +470,8 @@ class PumpFunMonitor:
                     self._seen = set(list(self._seen)[-50_000:])
                 event = self._decode_instruction(name, keys, accounts, data[8:], signature, slot)
                 if event:
+                    apply_event_timing(event, tx_data, received_ns)
+                    enrich_trade_balances(event, tx_data, keys)
                     result = self.callback(event)
                     if asyncio.iscoroutine(result):
                         await result
@@ -476,6 +565,7 @@ class PumpSwapMonitor:
         yellowstone.on("transaction", self._on_transaction)
 
     async def _on_transaction(self, tx_data: Any):
+        received_ns = time.time_ns()
         keys, instructions, signature, slot = transaction_parts(tx_data)
         for instruction_index, instruction in enumerate(instructions):
             try:
@@ -495,6 +585,8 @@ class PumpSwapMonitor:
                     self._seen = set(list(self._seen)[-50_000:])
                 event = self._decode_instruction(name, keys, accounts, data[8:], signature, slot)
                 if event:
+                    apply_event_timing(event, tx_data, received_ns)
+                    enrich_trade_balances(event, tx_data, keys)
                     result = self.callback(event)
                     if asyncio.iscoroutine(result):
                         await result
@@ -564,8 +656,9 @@ class RaydiumMonitor:
         yellowstone.on("transaction", self._on_transaction)
 
     async def _on_transaction(self, tx_data: Any):
+        received_ns = time.time_ns()
         keys, instructions, signature, slot = transaction_parts(tx_data)
-        for instruction in instructions:
+        for instruction_index, instruction in enumerate(instructions):
             try:
                 program_index, accounts, data = instruction_fields(instruction)
                 if program_index < 0 or program_index >= len(keys) or not data:
@@ -574,12 +667,13 @@ class RaydiumMonitor:
                 if program != self.RAYDIUM_AMM_V4:
                     continue  # CPMM/CLMM layouts are intentionally not guessed.
                 tag = data[0]
-                dedupe = (signature, tag)
+                dedupe = (signature, instruction_index)
                 if dedupe in self._seen:
                     continue
                 self._seen.add(dedupe)
                 event = self._decode_v4(tag, keys, accounts, data[1:], signature, slot)
                 if event:
+                    apply_event_timing(event, tx_data, received_ns)
                     result = self.callback(event)
                     if asyncio.iscoroutine(result):
                         await result

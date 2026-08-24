@@ -66,7 +66,9 @@ def snapshot_to_features(episode: Dict[str, Any], snapshot: Dict[str, Any]) -> P
         data_coverage=sum(statuses) / len(statuses),
         wallet_history_available=bool(wallet.get("smart_buyer_count") is not None),
         social_available=bool(social.get("mention_count")),
-        coordination_available=flow.get("status") == "OK",
+        coordination_available=(flow.get("status") == "OK"
+                                and int(flow.get("observed_trade_count", 0) or 0) >= 3),
+        flow_available=flow.get("status") == "OK",
         time_since_launch=max(0.0, _number(snapshot, "timestamp") - _number(episode, "created_at")),
     )
 
@@ -76,7 +78,7 @@ def snapshot_labels(snapshot: Dict[str, Any]) -> Dict[PredictionTarget, float]:
     rug_time = labels.get("label_rug_time")
     rugged = bool(labels.get("label_rug"))
     slippage = _number(snapshot.get("liquidity_features") or {}, "price_impact_pct")
-    return {
+    result = {
         PredictionTarget.P_2X: float(bool(labels.get("label_2x"))),
         PredictionTarget.P_5X: float(bool(labels.get("label_5x"))),
         PredictionTarget.P_10X: float(bool(labels.get("label_10x"))),
@@ -87,6 +89,10 @@ def snapshot_labels(snapshot: Dict[str, Any]) -> Dict[PredictionTarget, float]:
         PredictionTarget.EXPECTED_SLIPPAGE: float(np.clip(slippage, 0, 1)),
         PredictionTarget.EXPECTED_HOLD_TIME: max(0.0, _number(labels, "time_to_peak")),
     }
+    feasible = labels.get("feasible_exit_multiple")
+    if isinstance(feasible, (int, float)) and np.isfinite(feasible) and feasible > 0:
+        result[PredictionTarget.EXPECTED_FEASIBLE_MULTIPLE] = float(np.clip(feasible, 0.02, 50))
+    return result
 
 
 def load_samples(storage: Path) -> List[Tuple[PredictionFeatures, Dict[PredictionTarget, float], Dict[str, Any]]]:
@@ -156,16 +162,54 @@ def validate_oos(
     mean_brier_skill = float(np.mean([
         baseline[key] - brier[key] for key in brier
     ]))
+    feasible_pairs = [
+        (float(outcome["feasible_exit_multiple"]), float(prediction.expected_feasible_multiple))
+        for prediction, (_, _, outcome) in zip(predictions, oos_samples)
+        if outcome.get("feasible_exit_multiple") is not None
+    ]
+    train_feasible = [float(item[2]["feasible_exit_multiple"]) for item in train_samples
+                      if item[2].get("feasible_exit_multiple") is not None]
+    feasible_mae = (float(np.mean([abs(actual - predicted) for actual, predicted in feasible_pairs]))
+                    if feasible_pairs else float("inf"))
+    feasible_baseline = float(np.median(train_feasible)) if train_feasible else 0.0
+    feasible_baseline_mae = (float(np.mean([abs(actual - feasible_baseline) for actual, _ in feasible_pairs]))
+                             if feasible_pairs and train_feasible else float("inf"))
     net_elogw = float(np.mean(realized_logs)) if realized_logs else -float("inf")
-    passed = len(oos_samples) >= 50 and trade_count >= 10 and mean_brier_skill > 0 and net_elogw > 0
+    passed = (
+        len(oos_samples) >= 50 and trade_count >= 10 and mean_brier_skill > 0 and net_elogw > 0
+        and len(feasible_pairs) >= 10 and feasible_mae < feasible_baseline_mae
+    )
     return {
         "status": "PASSED" if passed else "REJECTED",
         "oos_samples": len(oos_samples), "shadow_policy_trades": trade_count,
         "mean_brier_skill": mean_brier_skill, "net_elogw_proxy": net_elogw,
+        "feasible_return_samples": len(feasible_pairs), "feasible_return_mae": feasible_mae,
+        "feasible_return_baseline_mae": feasible_baseline_mae,
         "brier": brier, "baseline_brier": baseline,
         "split": "strict_chronological_80_20",
         "warning": "net_elogw_proxy uses route-feasible observed outcomes; forward shadow remains mandatory",
     }
+
+
+def chronological_episode_split(
+    samples: List[Tuple[PredictionFeatures, Dict[PredictionTarget, float], Dict[str, Any]]],
+    train_fraction: float = 0.8,
+) -> Tuple[
+    List[Tuple[PredictionFeatures, Dict[PredictionTarget, float], Dict[str, Any]]],
+    List[Tuple[PredictionFeatures, Dict[PredictionTarget, float], Dict[str, Any]]],
+]:
+    """Split entire launch episodes, preventing one token from leaking across folds."""
+    first_seen: Dict[str, float] = {}
+    for features, _, _ in samples:
+        first_seen[features.token] = min(first_seen.get(features.token, features.timestamp), features.timestamp)
+    ordered_tokens = sorted(first_seen, key=lambda token: (first_seen[token], token))
+    if len(ordered_tokens) < 2:
+        return [], []
+    split_at = max(1, min(len(ordered_tokens) - 1, int(len(ordered_tokens) * train_fraction)))
+    train_tokens = set(ordered_tokens[:split_at])
+    train = [sample for sample in samples if sample[0].token in train_tokens]
+    oos = [sample for sample in samples if sample[0].token not in train_tokens]
+    return train, oos
 
 
 def train_shadow(storage: Path, model_dir: Path, min_samples: int = 250) -> Dict[str, Any]:
@@ -174,8 +218,19 @@ def train_shadow(storage: Path, model_dir: Path, min_samples: int = 250) -> Dict
     if len(samples) < min_samples:
         report.update({"status": "DATA_BLOCKED", "reason": f"need_at_least_{min_samples}_labeled_snapshots"})
     else:
-        split = int(len(samples) * 0.8)
-        train_samples, oos_samples = samples[:split], samples[split:]
+        train_samples, oos_samples = chronological_episode_split(samples)
+        report.update({
+            "train_samples": len(train_samples), "oos_samples": len(oos_samples),
+            "train_episodes": len({item[0].token for item in train_samples}),
+            "oos_episodes": len({item[0].token for item in oos_samples}),
+        })
+        if not train_samples or not oos_samples:
+            report.update({"status": "DATA_BLOCKED", "reason": "need_at_least_two_distinct_launch_episodes"})
+            model_dir.mkdir(parents=True, exist_ok=True)
+            (model_dir / "last_training_report.json").write_text(
+                json.dumps(report, indent=2, sort_keys=True), encoding="utf-8"
+            )
+            return report
         predictor = MultiHeadPredictor(str(model_dir))
         predictor.initialize_models()
         for features, labels, _ in train_samples:

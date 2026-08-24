@@ -1,5 +1,7 @@
 import asyncio
+import dataclasses
 import logging
+import os
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -7,6 +9,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import json
 import hashlib
+from pathlib import Path
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -59,9 +62,17 @@ class HypothesisSpec:
                 "mechanism": self.mechanism,
                 "target": self.target,
                 "features": self.features,
+                "feature_hash": self.feature_hash,
                 "model_type": self.model_type,
                 "model_params": self.model_params,
-                "threshold": self.threshold
+                "training_window": self.training_window,
+                "threshold": self.threshold,
+                "sizing_rule": self.sizing_rule,
+                "exit_rule": self.exit_rule,
+                "execution_policy": self.execution_policy,
+                "cost_model": self.cost_model,
+                "falsifier": self.falsifier,
+                "kill_thesis": self.kill_thesis,
             }, sort_keys=True)
             self.hash = hashlib.sha256(content.encode()).hexdigest()[:16]
 
@@ -97,7 +108,8 @@ class ChampionChallengerFramework:
         shadow_duration_hours: int = 168,
         canary_duration_hours: int = 72,
         decay_window: int = 500,
-        decay_threshold: float = -0.001
+        decay_threshold: float = -0.001,
+        state_path: Optional[str] = None,
     ):
         self.min_oos_samples = min_oos_samples
         self.min_portfolio_impact = min_portfolio_impact
@@ -105,6 +117,7 @@ class ChampionChallengerFramework:
         self.canary_duration = canary_duration_hours * 3600
         self.decay_window = decay_window
         self.decay_threshold = decay_threshold
+        self.state_path = Path(state_path) if state_path else None
         
         self.hypotheses: Dict[str, HypothesisSpec] = {}
         self.trial_results: List[TrialResult] = []
@@ -115,6 +128,7 @@ class ChampionChallengerFramework:
         
         self._running = False
         self._evaluation_task: Optional[asyncio.Task] = None
+        self._load_state()
 
     async def start(self):
         self._running = True
@@ -124,10 +138,26 @@ class ChampionChallengerFramework:
         self._running = False
         if self._evaluation_task:
             self._evaluation_task.cancel()
+            try:
+                await self._evaluation_task
+            except asyncio.CancelledError:
+                pass
+        self._save_state()
 
     def submit_hypothesis(self, hypothesis: HypothesisSpec) -> str:
         if hypothesis.hypothesis_id in self.hypotheses:
-            return "duplicate"
+            existing = self.hypotheses[hypothesis.hypothesis_id]
+            if existing.hash == hypothesis.hash and existing.feature_hash == hypothesis.feature_hash:
+                return "duplicate"
+            # Never inherit promotion evidence across a feature/model schema change.
+            self.challengers.pop(hypothesis.hypothesis_id, None)
+            self.shadow_models.pop(hypothesis.hypothesis_id, None)
+            self.canary_models.pop(hypothesis.hypothesis_id, None)
+            self.champions.pop(hypothesis.hypothesis_id, None)
+            self.trial_results = [
+                result for result in self.trial_results
+                if result.hypothesis_id != hypothesis.hypothesis_id
+            ]
         
         self.hypotheses[hypothesis.hypothesis_id] = hypothesis
         self.challengers[hypothesis.hypothesis_id] = {
@@ -135,14 +165,21 @@ class ChampionChallengerFramework:
             "submitted_at": time.time(),
             "status": ModelStatus.DISCOVERED.value,
         }
+        self._save_state()
         return "accepted"
 
     def mark_data_blocked(self, hypothesis_id: str, reason: str):
         if hypothesis_id not in self.hypotheses:
             return
+        champion = self.champions.get(hypothesis_id)
+        if champion:
+            champion.status = "HIBERNATED"
+        self.shadow_models.pop(hypothesis_id, None)
+        self.canary_models.pop(hypothesis_id, None)
         challenger = self.challengers.setdefault(hypothesis_id, {"hypothesis": self.hypotheses[hypothesis_id]})
         challenger["status"] = ModelStatus.DATA_BLOCKED.value
         challenger["reason"] = reason
+        self._save_state()
 
     def is_live(self, hypothesis_id: str) -> bool:
         champion = self.champions.get(hypothesis_id)
@@ -154,12 +191,14 @@ class ChampionChallengerFramework:
         
         hyp = self.hypotheses[hypothesis_id]
         hyp.frozen_at = time.time()
+        self._save_state()
         return True
 
     def record_trial_result(self, result: TrialResult):
         self.trial_results.append(result)
         if len(self.trial_results) > 10000:
             self.trial_results = self.trial_results[-5000:]
+        self._save_state()
 
     async def _evaluation_loop(self):
         while self._running:
@@ -168,6 +207,7 @@ class ChampionChallengerFramework:
                 await self._evaluate_shadow_models()
                 await self._evaluate_canary_models()
                 await self._monitor_champion_decay()
+                self._save_state()
             except Exception as e:
                 logger.error(f"Champion/challenger evaluation error: {e}")
             await asyncio.sleep(300)
@@ -278,6 +318,102 @@ class ChampionChallengerFramework:
             if "pnl" in result:
                 canary["position_count"] += 1
                 canary["total_pnl"] += result["pnl"]
+        self._save_state()
+
+    @staticmethod
+    def _json_value(value: Any) -> Any:
+        if dataclasses.is_dataclass(value):
+            return ChampionChallengerFramework._json_value(dataclasses.asdict(value))
+        if isinstance(value, deque):
+            return [ChampionChallengerFramework._json_value(item) for item in value]
+        if isinstance(value, dict):
+            return {str(key): ChampionChallengerFramework._json_value(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [ChampionChallengerFramework._json_value(item) for item in value]
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
+
+    def _bucket_state(self, bucket: Dict[str, Dict]) -> Dict[str, Dict]:
+        packed = {}
+        for hyp_id, entry in bucket.items():
+            packed[hyp_id] = {
+                key: self._json_value(value)
+                for key, value in entry.items()
+                if key != "hypothesis"
+            }
+        return packed
+
+    def _save_state(self):
+        if not self.state_path:
+            return
+        state = {
+            "schema_version": 1,
+            "hypotheses": {key: self._json_value(value) for key, value in self.hypotheses.items()},
+            "trial_results": self._json_value(self.trial_results),
+            "challengers": self._bucket_state(self.challengers),
+            "shadow_models": self._bucket_state(self.shadow_models),
+            "canary_models": self._bucket_state(self.canary_models),
+            "champions": {
+                key: {
+                    "promoted_at": value.promoted_at,
+                    "forward_performance": self._json_value(value.forward_performance),
+                    "decay_score": value.decay_score,
+                    "last_updated": value.last_updated,
+                    "status": value.status,
+                }
+                for key, value in self.champions.items()
+            },
+        }
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+        temporary.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+        os.replace(temporary, self.state_path)
+
+    def _load_state(self):
+        if not self.state_path or not self.state_path.exists():
+            return
+        try:
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+            if state.get("schema_version") != 1:
+                raise ValueError("unsupported champion state schema")
+            self.hypotheses = {
+                key: HypothesisSpec(**value) for key, value in state.get("hypotheses", {}).items()
+            }
+            self.trial_results = [TrialResult(**value) for value in state.get("trial_results", [])]
+            self.challengers = self._restore_bucket(state.get("challengers", {}))
+            self.shadow_models = self._restore_bucket(state.get("shadow_models", {}), forward=True)
+            self.canary_models = self._restore_bucket(state.get("canary_models", {}), forward=True)
+            self.champions = {}
+            for hyp_id, value in state.get("champions", {}).items():
+                hypothesis = self.hypotheses.get(hyp_id)
+                if not hypothesis:
+                    continue
+                self.champions[hyp_id] = ChampionModel(
+                    hypothesis=hypothesis,
+                    promoted_at=float(value["promoted_at"]),
+                    forward_performance=deque(value.get("forward_performance", []), maxlen=1000),
+                    decay_score=float(value.get("decay_score", 0.0)),
+                    last_updated=float(value.get("last_updated", time.time())),
+                    status=str(value.get("status", "LIVE")),
+                )
+        except Exception as exc:
+            logger.error("Ignoring unreadable champion/challenger state %s: %s", self.state_path, exc)
+
+    def _restore_bucket(self, raw: Dict[str, Dict], *, forward: bool = False) -> Dict[str, Dict]:
+        restored = {}
+        for hyp_id, value in raw.items():
+            hypothesis = self.hypotheses.get(hyp_id)
+            if not hypothesis:
+                continue
+            entry = dict(value)
+            entry["hypothesis"] = hypothesis
+            if forward:
+                entry["forward_results"] = deque(entry.get("forward_results", []), maxlen=1000)
+            restored[hyp_id] = entry
+        return restored
 
     def get_live_champions(self) -> List[ChampionModel]:
         return [c for c in self.champions.values() if c.status == "LIVE"]

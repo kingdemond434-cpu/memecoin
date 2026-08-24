@@ -158,3 +158,9 @@ global:
   max_liquidity_fraction: 0.01
   min_liquidity_usd: 5000
   reject_data_blocked_safety_checks: true
+  max_candidate_concurrency: 8
+  max_candidate_pipelines: 100
+  candidate_recheck_delays_seconds: [0, 1, 3, 5, 10]
+  market_observation_budget: 5
+  market_observer_sleep_seconds: 0.25
+  market_probe_lamports: 10000000
