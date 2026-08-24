@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import struct
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,11 +22,15 @@ from src.detection.rug_detector import TOKEN_2022_PROGRAM, TOKEN_PROGRAM, RugDet
 from src.execution.jupiter_jito import (
     ExecutionEngine, RouteType, SolanaTransactionBuilder, SwapQuote, TransactionStatus,
 )
+from src.main import MemecoinQuantDesk
 from src.strategies.information_graph import CounterfactualExecutionLab
 from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPrediction, MultiHeadPredictor
 from src.strategies.public_coordination import PublicCoordinationMiner
 from src.strategies.wallet_intelligence import WalletIntelligenceEngine
 from src.research.dataset_builder import LaunchEpisode, PointInTimeDatasetBuilder, SnapshotTimepoint
+from src.research.shadow_trainer import train_shadow
+from src.research.global_research_miner import GlobalResearchMiner, ResearchLead
+from src.strategies.champion_challenger import ChampionChallengerFramework
 from src.strategies.rug_hazard import ContinuousRugHazardModel
 
 
@@ -161,6 +166,47 @@ class TestProbabilityAndAccounting(unittest.TestCase):
         self.assertEqual(position["size_tokens"], 500)
         self.assertEqual(position["remaining_cost_usd"], 50)
         self.assertAlmostEqual(position["risk_contribution"], 0.01)
+
+    def test_feature_schema_includes_missingness_indicators(self):
+        from src.strategies.multihead_predictor import PredictionFeatures
+        predictor = MultiHeadPredictor()
+        features = PredictionFeatures("token", "solana", 1)
+        self.assertEqual(len(features.to_array()), len(predictor.feature_names))
+
+    def test_model_artifact_requires_passed_chronological_validation(self):
+        predictor = MultiHeadPredictor()
+        predictor._is_trained = True
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(RuntimeError):
+                predictor.save(str(Path(directory) / "unsafe.joblib"), {"status": "REJECTED"})
+
+
+class TestShadowTrainer(unittest.TestCase):
+    def test_insufficient_history_remains_explicitly_data_blocked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = train_shadow(root / "episodes", root / "models", min_samples=10)
+            self.assertEqual(report["status"], "DATA_BLOCKED")
+            persisted = json.loads((root / "models" / "last_training_report.json").read_text())
+            self.assertEqual(persisted["status"], "DATA_BLOCKED")
+
+
+class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
+    async def test_hourly_leads_survive_restart_and_restore_challengers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "leads.jsonl"
+            first_framework = ChampionChallengerFramework()
+            first = GlobalResearchMiner(first_framework, ledger_path=str(ledger))
+            await first._register_lead(ResearchLead(
+                source_type="github", title="wallet copy policy", url="https://example.test/repo",
+                summary="smart wallet copy research", language="en", license_spdx="Apache-2.0",
+            ))
+            self.assertTrue(ledger.exists())
+            second_framework = ChampionChallengerFramework()
+            second = GlobalResearchMiner(second_framework, ledger_path=str(ledger))
+            await second._load_ledger()
+            self.assertEqual(len(second.leads), 1)
+            self.assertEqual(len(second_framework.hypotheses), 1)
 
 
 class FakeJupiter:
@@ -298,6 +344,44 @@ class TestRpcFallback(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events, [])
         await stream.poll_once()
         self.assertEqual(events, [{"signature": "new"}])
+
+
+class TestShadowMarketObservation(unittest.IsolatedAsyncioTestCase):
+    async def test_blocked_prediction_still_collects_price_path(self):
+        class Jupiter:
+            def __init__(self):
+                self.quotes = [SimpleNamespace(output_amount=1_000_000, price_impact_pct=0.01),
+                               SimpleNamespace(output_amount=2_000_000, price_impact_pct=0.02)]
+
+            async def get_quote(self, *args, **kwargs):
+                return self.quotes.pop(0)
+
+        class Recorder:
+            def __init__(self):
+                self.items = []
+
+            def record_market_observation(self, token, observation):
+                self.items.append((token, observation))
+
+        class Hazard:
+            def __init__(self):
+                self.items = []
+
+            def record_observation(self, token, observation):
+                self.items.append((token, observation))
+
+        desk = MemecoinQuantDesk()
+        desk.jupiter = Jupiter()
+        desk.dataset_builder = Recorder()
+        desk.rug_hazard = Hazard()
+        desk.counterfactual_lab = CounterfactualExecutionLab()
+        desk.sol_price_usd = 100
+        await desk._observe_token_market("token", 123)
+        observation = desk.dataset_builder.items[0][1]
+        self.assertEqual(observation["data_status"], "OK")
+        self.assertEqual(observation["price_multiple"], 1)
+        self.assertTrue(observation["route_feasible"])
+        self.assertEqual(desk.rug_hazard.items[0][1]["type"], "route")
 
 
 class TestPointInTimeResearch(unittest.IsolatedAsyncioTestCase):

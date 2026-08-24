@@ -7,11 +7,13 @@ provide evidence. Source popularity never grants trading authority.
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 import aiohttp
@@ -72,7 +74,8 @@ class GlobalResearchMiner:
         "public_coordination": (["same slot", "shared funder", "bundle detector"], ["same_slot_buyers", "shared_funder_fraction", "buy_size_similarity"]),
     }
 
-    def __init__(self, framework: ChampionChallengerFramework, interval_seconds: int = 3600):
+    def __init__(self, framework: ChampionChallengerFramework, interval_seconds: int = 3600,
+                 ledger_path: str = "data/research/public_leads.jsonl"):
         self.framework = framework
         self.interval_seconds = interval_seconds
         self.leads: List[ResearchLead] = []
@@ -81,8 +84,10 @@ class GlobalResearchMiner:
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self.data_status: Dict[str, str] = {}
+        self.ledger_path = Path(ledger_path)
 
     async def start(self):
+        await self._load_ledger()
         github_token = os.getenv("GITHUB_TOKEN", "").strip()
         headers = {"User-Agent": "memecoin-quant-public-research/1.0"}
         if github_token:
@@ -171,7 +176,18 @@ class GlobalResearchMiner:
         except Exception as exc:
             self.data_status["arxiv"] = f"DATA_BLOCKED: {exc}"
 
-    async def _register_lead(self, lead: ResearchLead):
+    async def _load_ledger(self):
+        if not self.ledger_path.exists():
+            return
+        try:
+            for line in self.ledger_path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    await self._register_lead(ResearchLead(**json.loads(line)), persist=False)
+            self.data_status["research_ledger"] = "OK"
+        except (OSError, json.JSONDecodeError, TypeError) as exc:
+            self.data_status["research_ledger"] = f"DATA_BLOCKED: {exc}"
+
+    async def _register_lead(self, lead: ResearchLead, *, persist: bool = True):
         if not lead.url or lead.url in self._seen_urls:
             return
         self._seen_urls.add(lead.url)
@@ -186,9 +202,11 @@ class GlobalResearchMiner:
             self.leads = self.leads[-5_000:]
         if not lead.mechanism:
             lead.status = "DATA_BLOCKED"
+            self._persist_lead(lead, persist)
             return
         if lead.source_type == "github" and not lead.license_spdx:
             lead.status = "DATA_BLOCKED_LICENSE"
+            self._persist_lead(lead, persist)
             return
         hypothesis_id = hashlib.sha256(f"{lead.url}:{lead.mechanism}".encode()).hexdigest()[:20]
         hypothesis = HypothesisSpec(
@@ -216,6 +234,14 @@ class GlobalResearchMiner:
         if result == "accepted":
             self.framework.mark_data_blocked(hypothesis_id, "awaiting PIT feature coverage and chronological OOS evidence")
         lead.status = "DATA_BLOCKED"
+        self._persist_lead(lead, persist)
+
+    def _persist_lead(self, lead: ResearchLead, persist: bool):
+        if not persist:
+            return
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.ledger_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(asdict(lead), separators=(",", ":")) + "\n")
 
     def get_stats(self) -> Dict[str, Any]:
         return {

@@ -1,0 +1,17 @@
+[Unit]
+Description=Memecoin chronological shadow challenger training
+After=memecoin-shadow.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/opt/memecoin-shadow
+Environment=PYTHONUNBUFFERED=1
+Environment=SOLANA_PRIVATE_KEY=
+Environment=ALLOW_LIVE_TRADING=
+ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.research.shadow_trainer
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+MemoryMax=1536M
+CPUQuota=100%
+Nice=10

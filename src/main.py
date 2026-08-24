@@ -37,7 +37,7 @@ from src.execution.jupiter_jito import (
 )
 from src.research.dataset_builder import PointInTimeDatasetBuilder
 from src.research.global_research_miner import GlobalResearchMiner
-from src.strategies.champion_challenger import ChampionChallengerFramework, HypothesisSpec
+from src.strategies.champion_challenger import ChampionChallengerFramework, HypothesisSpec, TrialResult
 from src.strategies.genealogy_graph import GenealogyGraph
 from src.strategies.information_graph import (
     AdversarialAdaptationDetector,
@@ -121,6 +121,10 @@ class MemecoinQuantDesk:
         self.trade_count = 0
         self.successful_exits = 0
         self.total_pnl = 0.0
+        self._market_observed_at: Dict[str, float] = {}
+        self._market_entry_price: Dict[str, float] = {}
+        self._market_cursor = 0
+        self._model_artifact_mtime = 0.0
 
     async def initialize(self):
         with open(self.config_path, encoding="utf-8") as handle:
@@ -264,6 +268,28 @@ class MemecoinQuantDesk:
         self.champion_challenger.freeze_hypothesis(MODEL_HYPOTHESIS_ID)
         if not model_loaded:
             self.champion_challenger.mark_data_blocked(MODEL_HYPOTHESIS_ID, "no validated persisted multi-head model bundle")
+        else:
+            self._register_model_validation(self.predictor.validation_report)
+            self._model_artifact_mtime = self._latest_model_mtime()
+
+    def _register_model_validation(self, report: Dict[str, Any]):
+        if not report or report.get("status") != "PASSED":
+            return
+        net_elogw = float(report.get("net_elogw_proxy", 0) or 0)
+        self.champion_challenger.record_trial_result(TrialResult(
+            hypothesis_id=MODEL_HYPOTHESIS_ID, stage="CHRONOLOGICAL_OOS",
+            samples=int(report.get("oos_samples", 0) or 0), metrics={"brier_skill": float(report.get("mean_brier_skill", 0) or 0)},
+            oos_metrics={"elogw": net_elogw}, portfolio_impact=net_elogw,
+            passed=net_elogw > 0, timestamp=float(report.get("created_at", time.time()) or time.time()),
+            notes="route-feasible OOS proxy; forward shadow remains mandatory",
+        ))
+
+    @staticmethod
+    def _latest_model_mtime() -> float:
+        if not os.path.isdir("models"):
+            return 0.0
+        return max((os.path.getmtime(os.path.join("models", name)) for name in os.listdir("models")
+                    if name.endswith((".joblib", ".pkl"))), default=0.0)
 
     async def _setup_execution(self):
         self.jupiter = JupiterClient()
@@ -337,6 +363,7 @@ class MemecoinQuantDesk:
             try:
                 await self._process_new_tokens()
                 await self._manage_positions()
+                await self._observe_active_markets()
                 await self._update_intelligence()
             except Exception as exc:
                 logger.exception("Main loop error: %s", exc)
@@ -468,17 +495,16 @@ class MemecoinQuantDesk:
         features.deployer_cluster_risk = graph_risk.get("risk_score", 0)
         buys = [item for item in self.wallet_intel._recent_buys if item.get("token") == candidate.address]
         features.initial_buyers = len({item.get("wallet") for item in buys if item.get("wallet")})
-        features.smart_buyers = sum(
-            1 for item in buys
-            if (self.wallet_intel.get_wallet_score(item.get("wallet", "")) is not None
-                and self.wallet_intel.get_wallet_score(item.get("wallet", "")).overall_score >= 0.7)
-        )
+        buyer_scores = [self.wallet_intel.get_wallet_score(item.get("wallet", "")) for item in buys]
+        features.smart_buyers = sum(score is not None and score.overall_score >= 0.7 for score in buyer_scores)
+        features.wallet_history_available = any(score is not None for score in buyer_scores)
         features.sol_volume = sum(float(item.get("amount", 0) or 0) * float(item.get("price", 0) or 0) for item in buys)
         coordination = self.public_coordination.get_features(candidate.address)
         if coordination.get("status") == "OK":
             features.bundle_concentration = float(coordination["coordinated_buyer_fraction"])
             features.organic_ratio = float(coordination["organic_ratio"])
             features.insider_buyers = len(coordination["coordinated_wallets"])
+            features.coordination_available = True
         features.liquidity_usd = liquidity
         features.liquidity_locked = bool(risk.liquidity_locked)
         features.can_mint = bool(risk.can_mint)
@@ -491,6 +517,12 @@ class MemecoinQuantDesk:
         features.social_credibility = float(social.get("avg_credibility", 0) or 0)
         features.chain_before_social = float(social.get("chain_before_pct", 0) or 0)
         features.cross_platform = bool(social.get("cross_platform", False))
+        features.social_available = bool(social.get("mention_count", 0))
+        coverage_checks = [
+            deployer is not None, risk.data_status == "OK", liquidity > 0,
+            features.wallet_history_available, features.coordination_available, features.social_available,
+        ]
+        features.data_coverage = sum(coverage_checks) / len(coverage_checks)
         return features
 
     async def _manage_positions(self):
@@ -545,6 +577,67 @@ class MemecoinQuantDesk:
         self.dataset_builder.record_market_observation(token, observation)
         self.counterfactual_lab.record_market_observation(token, multiple, observation["timestamp"])
         return multiple, current_value
+
+    async def _observe_active_markets(self):
+        """Collect outcome paths independently of prediction/trade authority.
+
+        A blocked model must not prevent the research lake from learning. The
+        loop is intentionally budgeted and age-adaptive so thousands of active
+        episodes cannot create an unbounded quote storm.
+        """
+        if not self.jupiter or not self.jupiter._session or not self.dataset_builder.active_episodes:
+            return
+        tokens = list(self.dataset_builder.active_episodes)
+        budget = min(int(self.global_config.get("market_observation_budget", 5)), len(tokens))
+        now = time.time()
+        inspected = 0
+        while inspected < len(tokens) and budget > 0:
+            token = tokens[self._market_cursor % len(tokens)]
+            self._market_cursor = (self._market_cursor + 1) % max(len(tokens), 1)
+            inspected += 1
+            episode = self.dataset_builder.active_episodes.get(token)
+            if not episode:
+                continue
+            age = max(0.0, now - episode.created_at)
+            interval = 2.0 if age < 60 else 10.0 if age < 300 else 60.0
+            if now - self._market_observed_at.get(token, 0) < interval:
+                continue
+            self._market_observed_at[token] = now
+            budget -= 1
+            await self._observe_token_market(token, now)
+
+    async def _observe_token_market(self, token: str, observed_at: float):
+        probe_lamports = int(self.global_config.get("market_probe_lamports", 10_000_000))
+        buy_quote = await self.jupiter.get_quote(WSOL_MINT, token, probe_lamports, slippage_bps=300)
+        if not buy_quote or buy_quote.output_amount <= 0:
+            observation = {"type": "route", "feasible": False, "timestamp": observed_at,
+                           "data_status": "DATA_BLOCKED", "reason": "buy_quote_unavailable"}
+            self.dataset_builder.record_market_observation(token, observation)
+            self.rug_hazard.record_observation(token, observation)
+            return
+        sell_quote = await self.jupiter.get_quote(token, USDC_MINT, buy_quote.output_amount, slippage_bps=500)
+        if not sell_quote or sell_quote.output_amount <= 0:
+            observation = {"type": "route", "feasible": False, "timestamp": observed_at,
+                           "data_status": "DATA_BLOCKED", "reason": "sell_quote_unavailable"}
+            self.dataset_builder.record_market_observation(token, observation)
+            self.rug_hazard.record_observation(token, observation)
+            return
+        value_usd = sell_quote.output_amount / 1_000_000
+        unit_price = value_usd / buy_quote.output_amount
+        entry_price = self._market_entry_price.setdefault(token, unit_price)
+        multiple = unit_price / max(entry_price, 1e-18)
+        impact = max(float(buy_quote.price_impact_pct), float(sell_quote.price_impact_pct))
+        liquidity_estimate = (probe_lamports / 1e9 * self.sol_price_usd) / max(impact, 0.001)
+        observation = {
+            "type": "market_mark", "timestamp": observed_at, "data_status": "OK",
+            "price_usd": unit_price, "price_multiple": multiple, "value_usd": value_usd,
+            "route_feasible": True, "feasible": True, "price_impact_pct": impact,
+            "liquidity_usd": liquidity_estimate, "sol_price_usd": self.sol_price_usd,
+            "measurement": "jupiter_round_trip_probe",
+        }
+        self.dataset_builder.record_market_observation(token, observation)
+        self.rug_hazard.record_observation(token, {**observation, "type": "route"})
+        self.counterfactual_lab.record_market_observation(token, multiple, observed_at)
 
     async def _execute_exit(self, token: str, position: Dict[str, Any], exit_pct: float, reason: str):
         current_tokens = int(position["size_tokens"])
@@ -601,6 +694,17 @@ class MemecoinQuantDesk:
         self.last_intelligence_update = time.time()
         await self._refresh_portfolio_state()
         await self.genealogy.build_clusters()
+        if self.dry_run:
+            latest_mtime = self._latest_model_mtime()
+            if latest_mtime > self._model_artifact_mtime:
+                candidate = MultiHeadPredictor()
+                candidate.initialize_models()
+                if candidate.load_latest():
+                    self.predictor = candidate
+                    self.elogw_engine.predictor = candidate
+                    self._model_artifact_mtime = latest_mtime
+                    self._register_model_validation(candidate.validation_report)
+                    logger.info("Activated chronologically validated shadow model %s", candidate.model_version)
 
     async def _on_pump_event(self, event: Dict[str, Any]):
         token = event.get("token", "")

@@ -16,6 +16,8 @@ or safe operating assumption.
   concentration, and Jupiter sell-route checks.
 - Point-in-time launch episodes, immutable snapshot timestamps, observed price
   paths, route-feasible outcomes, P50X labels, and persistent outcome indices.
+- Budgeted Jupiter round-trip market marks collect price paths even while the
+  prediction model is blocked; hourly research leads persist in a JSONL ledger.
 - FIFO wallet round-trip scoring, public-chain coordination inference, public
   social/research discovery, creator genealogy, and continuous rug hazard.
 - Nested probability correction, disjoint outcome bins, net expected-log-wealth,
@@ -138,6 +140,12 @@ risk-constrained sizing, partial cost basis, chain-aware RPC health, PumpSwap an
 Raydium layouts, FIFO wallet scoring, point-in-time leakage, counterfactuals,
 public coordination, and rug hazard. A reduced fixture from Solana mainnet slot
 `441417557` exercises the same Pump.fun inner-instruction decoder used live.
+
+On a Dockerless VPS, `memecoin-shadow-user.service` runs the collector as an
+isolated user service. `memecoin-shadow-train.timer` invokes the strict
+chronological trainer every six hours. Insufficient samples, class coverage, or
+OOS E[log W] remain `DATA_BLOCKED`/`REJECTED`; only passed artifacts are loaded
+into forward dry-run shadow evaluation.
 
 ## Upstream specifications
 

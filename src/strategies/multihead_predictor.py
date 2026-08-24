@@ -10,7 +10,6 @@ import hashlib
 import os
 import numpy as np
 from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
-from sklearn.calibration import CalibratedClassifierCV
 from sklearn.isotonic import IsotonicRegression
 
 logger = logging.getLogger(__name__)
@@ -26,6 +25,12 @@ class PredictionTarget(Enum):
     P_RUG_5M = "p_rug_5m"
     EXPECTED_SLIPPAGE = "expected_slippage"
     EXPECTED_HOLD_TIME = "expected_hold_time"
+
+
+CLASSIFICATION_TARGETS = {
+    PredictionTarget.P_2X, PredictionTarget.P_5X, PredictionTarget.P_10X, PredictionTarget.P_50X,
+    PredictionTarget.P_MIGRATION, PredictionTarget.P_RUG_30S, PredictionTarget.P_RUG_5M,
+}
 
 
 @dataclass
@@ -72,6 +77,10 @@ class PredictionFeatures:
     
     regime: str = "unknown"
     time_since_launch: float = 0
+    data_coverage: float = 0
+    wallet_history_available: bool = False
+    social_available: bool = False
+    coordination_available: bool = False
     
     def to_array(self) -> np.ndarray:
         return np.array([
@@ -105,6 +114,10 @@ class PredictionFeatures:
             self.holder_concentration,
             self.top_10_pct / 100,
             self.deployer_pct / 100,
+            self.data_coverage,
+            float(self.wallet_history_available),
+            float(self.social_available),
+            float(self.coordination_available),
         ], dtype=np.float32)
 
 
@@ -143,18 +156,18 @@ class MultiHeadPredictor:
             "can_mint", "can_freeze", "social_velocity", "social_acceleration",
             "social_credibility", "chain_before_social", "cross_platform",
             "narrative_novelty", "narrative_momentum", "holder_concentration",
-            "top_10_pct", "deployer_pct"
+            "top_10_pct", "deployer_pct", "data_coverage", "wallet_history_available",
+            "social_available", "coordination_available"
         ]
         self.model_version = "1.0"
-        self._training_data: Dict[PredictionTarget, List[Tuple[np.ndarray, float]]] = defaultdict(list)
+        self._training_data: Dict[PredictionTarget, List[Tuple[np.ndarray, float, float]]] = defaultdict(list)
         self._is_trained = False
+        self.validation_report: Dict[str, Any] = {}
 
     def initialize_models(self):
         for target in PredictionTarget:
-            if target in [PredictionTarget.P_2X, PredictionTarget.P_5X,
-                         PredictionTarget.P_10X, PredictionTarget.P_50X, PredictionTarget.P_MIGRATION,
-                         PredictionTarget.P_RUG_30S, PredictionTarget.P_RUG_5M]:
-                base_model = GradientBoostingClassifier(
+            if target in CLASSIFICATION_TARGETS:
+                self.models[target] = GradientBoostingClassifier(
                     n_estimators=200,
                     max_depth=5,
                     learning_rate=0.05,
@@ -163,7 +176,6 @@ class MultiHeadPredictor:
                     min_samples_leaf=10,
                     random_state=42
                 )
-                self.models[target] = CalibratedClassifierCV(base_model, method='isotonic', cv=3)
             else:
                 self.models[target] = GradientBoostingRegressor(
                     n_estimators=200,
@@ -179,7 +191,7 @@ class MultiHeadPredictor:
         X = features.to_array()
         for target, y in labels.items():
             if target in self.models:
-                self._training_data[target].append((X, y))
+                self._training_data[target].append((X, y, features.timestamp))
 
     def train(self, min_samples: int = 100) -> Dict[str, Any]:
         results = {}
@@ -190,20 +202,23 @@ class MultiHeadPredictor:
                 results[target.value] = {"status": "insufficient_data", "samples": len(data)}
                 continue
             
-            X = np.array([d[0] for d in data])
-            y = np.array([d[1] for d in data])
+            ordered = sorted(data, key=lambda item: item[2])
+            X = np.array([d[0] for d in ordered])
+            y = np.array([d[1] for d in ordered])
             
             try:
                 model = self.models[target]
-                model.fit(X, y)
-                
-                if hasattr(model, 'calibrated_classifiers_'):
-                    self.calibrators[target] = model
-                else:
+                if target in CLASSIFICATION_TARGETS:
+                    split = max(1, int(len(X) * 0.8))
+                    X_fit, y_fit, X_cal, y_cal = X[:split], y[:split], X[split:], y[split:]
+                    if len(np.unique(y_fit)) < 2 or len(X_cal) < 10 or len(np.unique(y_cal)) < 2:
+                        raise ValueError("chronological fit/calibration windows require both classes")
+                    model.fit(X_fit, y_fit)
                     iso_reg = IsotonicRegression(out_of_bounds='clip')
-                    preds = model.predict(X)
-                    iso_reg.fit(preds, y)
+                    iso_reg.fit(model.predict_proba(X_cal)[:, 1], y_cal)
                     self.calibrators[target] = iso_reg
+                else:
+                    model.fit(X, y)
                 
                 results[target.value] = {"status": "trained", "samples": len(data)}
                 logger.info(f"Trained {target.value} on {len(data)} samples")
@@ -213,8 +228,7 @@ class MultiHeadPredictor:
                 results[target.value] = {"status": "failed", "error": str(e)}
         
         trained_targets = {PredictionTarget(key) for key, result in results.items() if result.get("status") == "trained"}
-        required = {PredictionTarget.P_2X, PredictionTarget.P_5X, PredictionTarget.P_10X, PredictionTarget.P_50X,
-                    PredictionTarget.P_RUG_30S, PredictionTarget.P_RUG_5M}
+        required = set(PredictionTarget)
         self._is_trained = required.issubset(trained_targets)
         self.model_version = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
         return results
@@ -236,13 +250,10 @@ class MultiHeadPredictor:
         
         for target, model in self.models.items():
             try:
-                if target in self.calibrators:
-                    calibrator = self.calibrators[target]
-                    if hasattr(calibrator, 'predict_proba'):
-                        prob = calibrator.predict_proba(X)[0, 1]
-                    else:
-                        raw = model.predict(X)[0]
-                        prob = calibrator.predict([raw])[0]
+                if target in CLASSIFICATION_TARGETS:
+                    raw = model.predict_proba(X)[:, 1]
+                    calibrator = self.calibrators.get(target)
+                    prob = calibrator.predict(raw)[0] if calibrator else raw[0]
                     setattr(pred, target.value, float(np.clip(prob, 0, 1)))
                 else:
                     val = model.predict(X)[0]
@@ -253,7 +264,7 @@ class MultiHeadPredictor:
                     setattr(pred, target.value, float(val))
             except Exception as e:
                 logger.error(f"Prediction failed for {target.value}: {e}")
-                setattr(pred, target.value, 0.0)
+                return None
         
         self._enforce_nested_monotonicity(pred)
         return pred
@@ -275,15 +286,13 @@ class MultiHeadPredictor:
                 feature_hash=feature_hash
             )
             
+            failed = False
             for target, model in self.models.items():
                 try:
-                    if target in self.calibrators:
-                        calibrator = self.calibrators[target]
-                        if hasattr(calibrator, 'predict_proba'):
-                            prob = calibrator.predict_proba(X[i:i+1])[0, 1]
-                        else:
-                            raw = model.predict(X[i:i+1])[0]
-                            prob = calibrator.predict([raw])[0]
+                    if target in CLASSIFICATION_TARGETS:
+                        raw = model.predict_proba(X[i:i+1])[:, 1]
+                        calibrator = self.calibrators.get(target)
+                        prob = calibrator.predict(raw)[0] if calibrator else raw[0]
                         setattr(pred, target.value, float(np.clip(prob, 0, 1)))
                     else:
                         val = model.predict(X[i:i+1])[0]
@@ -294,20 +303,32 @@ class MultiHeadPredictor:
                         setattr(pred, target.value, float(val))
                 except Exception as e:
                     logger.error(f"Batch prediction failed for {target.value}: {e}")
-                    setattr(pred, target.value, 0.0)
+                    failed = True
+                    break
             
-            self._enforce_nested_monotonicity(pred)
-            results.append(pred)
+            if failed:
+                results.append(None)
+            else:
+                self._enforce_nested_monotonicity(pred)
+                results.append(pred)
         
         return results
 
-    def save(self, path: str):
+    def save(self, path: str, validation_report: Optional[Dict[str, Any]] = None):
         import joblib
+        if not self._is_trained:
+            raise RuntimeError("refusing to save an incomplete model bundle")
+        if not validation_report or validation_report.get("status") != "PASSED":
+            raise RuntimeError("refusing to save a model without passed chronological validation")
         data = {
+            "artifact_version": 2,
             "models": self.models,
             "calibrators": self.calibrators,
             "model_version": self.model_version,
-            "feature_names": self.feature_names
+            "feature_names": self.feature_names,
+            "feature_schema_hash": hashlib.sha256("\n".join(self.feature_names).encode()).hexdigest(),
+            "validation_report": validation_report,
+            "trained_at": time.time(),
         }
         joblib.dump(data, path)
         logger.info(f"Saved models to {path}")
@@ -315,10 +336,17 @@ class MultiHeadPredictor:
     def load(self, path: str):
         import joblib
         data = joblib.load(path)
+        if data.get("artifact_version") != 2:
+            raise ValueError("unsupported or unvalidated model artifact")
+        expected_hash = hashlib.sha256("\n".join(self.feature_names).encode()).hexdigest()
+        if data.get("feature_schema_hash") != expected_hash or data.get("feature_names") != self.feature_names:
+            raise ValueError("model feature schema mismatch")
+        if (data.get("validation_report") or {}).get("status") != "PASSED":
+            raise ValueError("model artifact lacks passed chronological validation")
         self.models = data["models"]
         self.calibrators = data["calibrators"]
         self.model_version = data["model_version"]
-        self.feature_names = data["feature_names"]
+        self.validation_report = dict(data["validation_report"])
         self._is_trained = True
         logger.info(f"Loaded models from {path}, version: {self.model_version}")
 
@@ -333,13 +361,18 @@ class MultiHeadPredictor:
         ]
         if not candidates:
             return False
-        self.load(max(candidates, key=os.path.getmtime))
-        required = {target for target in PredictionTarget}
-        missing = required.difference(self.models)
-        if missing:
-            logger.error("Model bundle DATA_BLOCKED; missing heads: %s", sorted(item.value for item in missing))
-            self._is_trained = False
-        return self._is_trained
+        for candidate in sorted(candidates, key=os.path.getmtime, reverse=True):
+            try:
+                self.load(candidate)
+                required = set(PredictionTarget)
+                missing = required.difference(self.models)
+                if missing or not CLASSIFICATION_TARGETS.issubset(self.calibrators):
+                    raise ValueError(f"missing trained heads/calibrators: {sorted(item.value for item in missing)}")
+                return True
+            except Exception as exc:
+                logger.error("Model bundle rejected (%s): %s", candidate, exc)
+                self._is_trained = False
+        return False
 
     @staticmethod
     def _enforce_nested_monotonicity(prediction: MultiHeadPrediction):
@@ -354,11 +387,7 @@ class MultiHeadPredictor:
         if not model or not hasattr(model, 'feature_importances_'):
             return {}
         
-        if hasattr(model, 'calibrated_classifiers_'):
-            base_model = model.calibrated_classifiers_[0].base_estimator
-            importances = base_model.feature_importances_
-        else:
-            importances = model.feature_importances_
+        importances = model.feature_importances_
         
         return dict(zip(self.feature_names, importances.tolist()))
 
