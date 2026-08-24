@@ -14,7 +14,7 @@ from solders.message import MessageV0
 from solders.signature import Signature
 from solders.transaction import VersionedTransaction
 
-from src.chains.rpc_manager import ChainConfig, ChainRegistry, ChainType, RPCEndpointConfig, RPCManager
+from src.chains.rpc_manager import ChainConfig, ChainRegistry, ChainType, RPCEndpointConfig, RPCHealth, RPCManager
 from src.chains.yellowstone_grpc import (
     PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
     create_combined_subscription, enrich_trade_balances,
@@ -588,6 +588,19 @@ class TestWalletAndCoordination(unittest.TestCase):
 
 
 class TestRpcProtocol(unittest.TestCase):
+    def test_healthy_rpc_is_preferred_over_zero_latency_degraded_provider(self):
+        chain = solana_chain()
+        chain.rpc_endpoints = [
+            RPCEndpointConfig("https://healthy.invalid", "wss://healthy.invalid"),
+            RPCEndpointConfig("https://rejected.invalid", "wss://rejected.invalid"),
+        ]
+        manager = RPCManager(chain)
+        manager.endpoints[0].health = RPCHealth.HEALTHY
+        manager.endpoints[0].latency_ms = 100
+        manager.endpoints[1].health = RPCHealth.DEGRADED
+        manager.endpoints[1].latency_ms = 0
+        self.assertEqual(manager._select_endpoint(prefer_ws=True), manager.endpoints[0])
+
     def test_official_helius_endpoint_and_websocket_are_paired(self):
         with patch.dict("os.environ", {"HELIUS_API_KEY": "helius-test", "ALCHEMY_KEY": "alchemy-test"}):
             solana = ChainRegistry("config/chains.yaml").get_chain("solana")

@@ -149,15 +149,20 @@ class RPCManager:
         return isinstance(result, str) and result.startswith("0x")
 
     def _select_endpoint(self, prefer_ws: bool = False) -> Optional[EndpointHealth]:
-        healthy = [e for e in self.endpoints if e.health != RPCHealth.DOWN]
-        if not healthy:
+        candidates = [e for e in self.endpoints if e.health != RPCHealth.DOWN]
+        if not candidates:
             return None
         if prefer_ws:
-            healthy = [e for e in healthy if e.endpoint.ws_url]
-        if not healthy:
+            candidates = [e for e in candidates if e.endpoint.ws_url]
+        if not candidates:
             return None
-        weights = [e.endpoint.weight * (1 / max(e.latency_ms, 1)) for e in healthy]
-        return random.choices(healthy, weights=weights, k=1)[0]
+        # Never let a credential-rejected/degraded endpoint win merely because
+        # it has no measured latency yet. Degraded providers are a last resort
+        # only when no healthy provider supports the requested transport.
+        healthy = [e for e in candidates if e.health == RPCHealth.HEALTHY]
+        candidates = healthy or candidates
+        weights = [e.endpoint.weight * (1 / max(e.latency_ms, 1)) for e in candidates]
+        return random.choices(candidates, weights=weights, k=1)[0]
 
     async def request(self, method: str, params: List[Any]) -> Any:
         async with self._request_semaphore:
