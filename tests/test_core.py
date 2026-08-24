@@ -14,7 +14,7 @@ from solders.message import MessageV0
 from solders.signature import Signature
 from solders.transaction import VersionedTransaction
 
-from src.chains.rpc_manager import ChainConfig, ChainType, RPCEndpointConfig, RPCManager
+from src.chains.rpc_manager import ChainConfig, ChainRegistry, ChainType, RPCEndpointConfig, RPCManager
 from src.chains.yellowstone_grpc import (
     PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
     create_combined_subscription, enrich_trade_balances,
@@ -460,6 +460,13 @@ class TestWalletAndCoordination(unittest.TestCase):
 
 
 class TestRpcProtocol(unittest.TestCase):
+    def test_official_helius_endpoint_and_websocket_are_paired(self):
+        with patch.dict("os.environ", {"HELIUS_API_KEY": "helius-test", "ALCHEMY_KEY": "alchemy-test"}):
+            solana = ChainRegistry("config/chains.yaml").get_chain("solana")
+        helius = next(ep for ep in solana.rpc_endpoints if "helius" in ep.url)
+        self.assertEqual(helius.url, "https://mainnet.helius-rpc.com/?api-key=helius-test")
+        self.assertEqual(helius.ws_url, "wss://mainnet.helius-rpc.com/?api-key=helius-test")
+
     def test_health_stats_never_expose_rpc_credentials(self):
         chain = solana_chain()
         chain.rpc_endpoints = [RPCEndpointConfig(

@@ -116,10 +116,11 @@ chains:
     rpc_urls:
       - "https://api.mainnet-beta.solana.com"
       - "https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
-      - "https://rpc.helius.xyz/?api-key=${HELIUS_API_KEY}"
+      - "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
     ws_urls:
       - "wss://api.mainnet-beta.solana.com"
       - "wss://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+      - "wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
     explorer_api: "https://public-api.solscan.io"
     explorer_key: "${SOLSCAN_KEY}"
     native_token: "SOL"
