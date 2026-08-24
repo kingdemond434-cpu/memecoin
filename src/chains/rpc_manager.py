@@ -214,6 +214,13 @@ class RPCManager:
         ep = self._select_endpoint(prefer_ws=True)
         return ep.endpoint.ws_url if ep else None
 
+    def get_ws_urls(self) -> List[str]:
+        """Return transport candidates without exposing them through status output."""
+        usable = [item for item in self.endpoints if item.endpoint.ws_url and item.health != RPCHealth.DOWN]
+        healthy = [item for item in usable if item.health == RPCHealth.HEALTHY]
+        degraded = [item for item in usable if item.health == RPCHealth.DEGRADED]
+        return [item.endpoint.ws_url for item in healthy + degraded if item.endpoint.ws_url]
+
     def get_web3(self) -> AsyncWeb3:
         if self.chain_config.chain_type != ChainType.EVM:
             raise TypeError("get_web3() is only valid for EVM chains")

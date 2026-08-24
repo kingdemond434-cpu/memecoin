@@ -259,7 +259,7 @@ class SolanaRpcProgramStream:
         self._running = True
         self.status = "RPC_FALLBACK"
         self._task = asyncio.create_task(self._loop())
-        if hasattr(self.rpc, "get_ws_url") and self.rpc.get_ws_url():
+        if hasattr(self.rpc, "get_ws_urls") and self.rpc.get_ws_urls():
             self._ws_task = asyncio.create_task(self._ws_loop())
 
     async def stop(self):
@@ -303,12 +303,14 @@ class SolanaRpcProgramStream:
     async def _ws_loop(self):
         import websockets
 
+        candidate_index = 0
         while self._running:
-            url = self.rpc.get_ws_url()
-            if not url:
+            urls = self.rpc.get_ws_urls()
+            if not urls:
                 self._ws_connected = False
                 await asyncio.sleep(5)
                 continue
+            url = urls[candidate_index % len(urls)]
             try:
                 async with websockets.connect(
                     url, ping_interval=20, ping_timeout=20, close_timeout=5, max_size=8 * 1024 * 1024,
@@ -362,8 +364,9 @@ class SolanaRpcProgramStream:
             except Exception as exc:
                 self._ws_connected = False
                 self._ws_reconnects += 1
+                candidate_index += 1
                 logger.warning("Solana log WebSocket reconnecting: %s", exc)
-                await asyncio.sleep(min(10, 1 + self._ws_reconnects))
+                await asyncio.sleep(min(30, 2 + self._ws_reconnects * 2))
             finally:
                 self._ws = None
                 self._ws_connected = False

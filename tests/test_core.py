@@ -600,6 +600,7 @@ class TestRpcProtocol(unittest.TestCase):
         manager.endpoints[1].health = RPCHealth.DEGRADED
         manager.endpoints[1].latency_ms = 0
         self.assertEqual(manager._select_endpoint(prefer_ws=True), manager.endpoints[0])
+        self.assertEqual(manager.get_ws_urls(), ["wss://healthy.invalid", "wss://rejected.invalid"])
 
     def test_official_helius_endpoint_and_websocket_are_paired(self):
         with patch.dict("os.environ", {"HELIUS_API_KEY": "helius-test", "ALCHEMY_KEY": "alchemy-test"}):
