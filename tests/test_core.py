@@ -61,7 +61,7 @@ class TestSolanaParsing(unittest.IsolatedAsyncioTestCase):
         user_raw = bytes(range(33, 65))
         data = (
             PumpFunMonitor.TRADE_EVENT + mint_raw + struct.pack("<QQ?", 2_000_000_000, 5_000_000, True)
-            + user_raw + struct.pack("<q", 1_700_000_000)
+            + user_raw + struct.pack("<qQQ", 1_700_000_000, 30_000_000_000, 10_000_000_000)
         )
         event = monitor._decode_program_event(data, "event-sig", 98)
         from src.chains.yellowstone_grpc import b58encode
@@ -69,6 +69,7 @@ class TestSolanaParsing(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["wallet"], b58encode(user_raw))
         self.assertEqual(event["side"], "buy")
         self.assertEqual(event["notional_sol"], 2.0)
+        self.assertEqual(event["curve_price_raw"], 3.0)
         self.assertEqual(event["fill_data_status"], "OBSERVED_PROGRAM_EVENT")
 
     def test_pumpswap_program_events_populate_pool_then_trade(self):
@@ -87,12 +88,14 @@ class TestSolanaParsing(unittest.IsolatedAsyncioTestCase):
         buy = bytearray(184)
         buy[:8] = PumpSwapMonitor.BUY_EVENT
         struct.pack_into("<qQ", buy, 8, 1_700_000_001, 1_000_000)
+        struct.pack_into("<QQ", buy, 48, 10_000_000, 20_000_000_000)
         struct.pack_into("<Q", buy, 64, 500_000_000)
         buy[120:152], buy[152:184] = pool, user
         traded = monitor._decode_program_event(bytes(buy), "buy-sig", 100)
         self.assertEqual(traded["token"], created["token"])
         self.assertEqual(traded["side"], "buy")
         self.assertEqual(traded["actual_token_amount_ui"], 1.0)
+        self.assertEqual(traded["curve_price_raw"], 2_000.0)
 
     def test_websocket_launch_filter_rejects_position_noise(self):
         self.assertTrue(SolanaRpcProgramStream._looks_like_pool_creation([

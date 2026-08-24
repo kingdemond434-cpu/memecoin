@@ -657,11 +657,14 @@ class PumpFunMonitor:
             is_buy = bool(data[56])
             user = b58encode(data[57:89])
             timestamp = struct.unpack_from("<q", data, 89)[0]
+            virtual_sol = struct.unpack_from("<Q", data, 97)[0] if len(data) >= 105 else 0
+            virtual_token = struct.unpack_from("<Q", data, 105)[0] if len(data) >= 113 else 0
             return {
                 **base, "type": "token_trade", "token": mint, "wallet": user,
                 "side": "buy" if is_buy else "sell", "token_amount": token_amount,
                 "actual_token_delta_raw": token_amount if is_buy else -token_amount,
                 "notional_sol": sol_amount / 1_000_000_000, "timestamp": float(timestamp),
+                "curve_price_raw": virtual_sol / virtual_token if virtual_token else None,
                 "fill_data_status": "OBSERVED_PROGRAM_EVENT", "data_status": "OK",
             }
         if data.startswith(self.COMPLETE_EVENT):
@@ -850,6 +853,8 @@ class PumpSwapMonitor:
         timestamp = struct.unpack_from("<q", data, 8)[0]
         token_amount = struct.unpack_from("<Q", data, 16)[0]
         quote_amount = struct.unpack_from("<Q", data, 64)[0]
+        pool_base_reserves = struct.unpack_from("<Q", data, 48)[0]
+        pool_quote_reserves = struct.unpack_from("<Q", data, 56)[0]
         pool = b58encode(data[120:152])
         wallet = b58encode(data[152:184])
         token, quote_mint, decimals = self._pool_tokens.get(pool, ("", "", 0))
@@ -862,6 +867,7 @@ class PumpSwapMonitor:
             "token_amount": token_amount, "actual_token_delta_raw": token_amount if is_buy else -token_amount,
             "actual_token_amount_ui": token_ui, "notional_sol": notional_sol,
             "price_sol_per_token": (notional_sol / token_ui) if notional_sol is not None and token_ui else None,
+            "curve_price_raw": pool_quote_reserves / pool_base_reserves if pool_base_reserves else None,
             "timestamp": float(timestamp), "fill_data_status": "OBSERVED_PROGRAM_EVENT",
             "data_status": "OK" if token else "DATA_BLOCKED: pool mint mapping unavailable",
         }

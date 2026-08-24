@@ -127,6 +127,7 @@ class MemecoinQuantDesk:
         self.total_pnl = 0.0
         self._market_observed_at: Dict[str, float] = {}
         self._market_entry_price: Dict[str, float] = {}
+        self._curve_entry_price: Dict[str, float] = {}
         self._market_cursor = 0
         self._model_artifact_mtime = 0.0
 
@@ -325,8 +326,6 @@ class MemecoinQuantDesk:
     async def _setup_detection_and_risk(self):
         self.rug_detector = RugDetector(self.solana_config, self.solana_rpc, self.jupiter)
         self.detection_engine = TokenDetectionEngine(self.chain_registry)
-        if self.rpc_program_stream:
-            await self.rpc_program_stream.start()
 
     async def _setup_research(self):
         self.dataset_builder = PointInTimeDatasetBuilder(
@@ -340,6 +339,10 @@ class MemecoinQuantDesk:
         if not self.offline:
             await self.dataset_builder.start()
             await self.global_research.start()
+            # Event callbacks write to the PIT builder, hazard tracker, and
+            # research graphs. Start the stream only after all consumers exist.
+            if self.rpc_program_stream:
+                await self.rpc_program_stream.start()
 
     async def start(self):
         if self.offline:
@@ -698,6 +701,7 @@ class MemecoinQuantDesk:
         for stale in set(self._market_observed_at) - active:
             self._market_observed_at.pop(stale, None)
             self._market_entry_price.pop(stale, None)
+            self._curve_entry_price.pop(stale, None)
         if due:
             results = await asyncio.gather(
                 *(self._observe_token_market(token, now) for token in due),
@@ -814,6 +818,11 @@ class MemecoinQuantDesk:
         if not token:
             return
         if event.get("type") == "token_created":
+            self.dataset_builder.start_episode(
+                token, event.get("creator", ""), event.get("program", PumpFunMonitor.PUMP_FUN_PROGRAM),
+                event.get("bonding_curve", ""), WSOL_MINT, detected_at=event.get("timestamp", time.time()),
+                prelaunch_context=self._prelaunch_context(event.get("creator", ""), event.get("timestamp", time.time())),
+            )
             self.info_graph.record_event(token, LeadEventType.DEPLOYER_ACTIVITY, event.get("creator", ""),
                                          "deployer", event.get("timestamp", time.time()), event)
             if hasattr(self.genealogy, "record_token_creation"):
@@ -827,11 +836,18 @@ class MemecoinQuantDesk:
                 metadata={"name": event.get("name"), "symbol": event.get("symbol"), "uri": event.get("uri")},
             ))
         elif event.get("type") == "token_trade":
+            curve_price = float(event.get("curve_price_raw", 0) or 0)
+            curve_multiple = None
+            if curve_price > 0:
+                curve_entry = self._curve_entry_price.setdefault(token, curve_price)
+                curve_multiple = curve_price / max(curve_entry, 1e-30)
             observation = {"type": "trade", "side": event.get("side"), "wallet": event.get("wallet"),
                            "amount": event.get("actual_token_amount_ui"),
                            "amount_raw": event.get("actual_token_delta_raw"),
                            "notional_sol": event.get("notional_sol"),
                            "price": event.get("price_sol_per_token"),
+                           "curve_price_raw": curve_price or None,
+                           "price_multiple": curve_multiple,
                            "fill_data_status": event.get("fill_data_status", "DATA_BLOCKED"),
                            "instruction_token_amount": event.get("token_amount", 0),
                            "quote_limit_amount": event.get("quote_limit_amount", 0),
@@ -852,6 +868,12 @@ class MemecoinQuantDesk:
                                          event.get("timestamp", time.time()), event)
             self.dataset_builder.record_market_observation(token, {"type": "migration", **event})
         elif event.get("type") == "pool_created":
+            self.dataset_builder.start_episode(
+                token, event.get("creator", ""), event.get("program", PumpSwapMonitor.PUMP_AMM_PROGRAM),
+                event.get("pool", ""), event.get("quote_mint") or WSOL_MINT,
+                detected_at=event.get("timestamp", time.time()),
+                prelaunch_context=self._prelaunch_context(event.get("creator", ""), event.get("timestamp", time.time())),
+            )
             self.info_graph.record_event(token, LeadEventType.MIGRATION, event.get("pool", ""), "pumpswap_pool",
                                          event.get("timestamp", time.time()), event)
             self.dataset_builder.record_market_observation(token, {"type": "migration", **event})
@@ -873,6 +895,11 @@ class MemecoinQuantDesk:
             if not mint or mint in {WSOL_MINT, USDC_MINT}:
                 continue
             quote_mint = next((other for other in mints if other in {WSOL_MINT, USDC_MINT}), None)
+            self.dataset_builder.start_episode(
+                mint, event.get("creator", ""), event.get("program", ""), event.get("pool", ""),
+                quote_mint or "", detected_at=event.get("timestamp", time.time()),
+                prelaunch_context=self._prelaunch_context(event.get("creator", ""), event.get("timestamp", time.time())),
+            )
             self.info_graph.record_event(mint, LeadEventType.MIGRATION, event.get("pool", ""), "raydium_pool",
                                          event.get("timestamp", time.time()), event)
             self.dataset_builder.record_market_observation(mint, {"type": "migration", **event})

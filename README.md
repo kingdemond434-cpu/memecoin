@@ -15,6 +15,9 @@ or safe operating assumption.
   validation and reconnection. Without Yellowstone, processed Solana WebSocket
   logs decode official Pump/PumpSwap program events directly; confirmed HTTP
   polling is used only while the socket is unavailable, preserving free quota.
+- Pump/PumpSwap program events populate first-seconds wallet flow, SOL notional,
+  pool-reserve price multiples, and immediate PIT episodes without per-trade
+  HTTP requests. Jupiter marks remain the independent executable-route check.
 - Native SPL and Token-2022 mint-authority, freeze-authority, extension,
   concentration, and Jupiter sell-route checks.
 - Point-in-time launch episodes, immutable snapshot timestamps, observed price
