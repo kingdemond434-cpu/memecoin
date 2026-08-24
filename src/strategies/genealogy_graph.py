@@ -391,11 +391,20 @@ class GenealogyGraph:
         return None
 
     async def build_clusters(self, min_connections: int = 3):
+        # Rebuild deterministically from current evidence. Wallet profiles may
+        # exist before their first graph edge, and graph nodes may exist before
+        # their wallet profile is hydrated.
+        self.clusters.clear()
+        self._wallet_to_cluster.clear()
+        self._cluster_counter = 0
+        for profile in self.wallets.values():
+            profile.cluster_id = None
         visited = set()
-        for wallet in self.wallets:
+        for wallet in list(self.wallets):
             if wallet in visited:
                 continue
             cluster_wallets = self._find_connected_component(wallet, min_connections)
+            visited.update(cluster_wallets)
             if len(cluster_wallets) >= min_connections:
                 cluster_id = f"cluster_{self._cluster_counter}"
                 self._cluster_counter += 1
@@ -411,6 +420,10 @@ class GenealogyGraph:
                 self.clusters[cluster_id] = cluster
 
     def _find_connected_component(self, start: str, min_connections: int) -> Set[str]:
+        if start not in self.wallets:
+            return set()
+        if not self.graph.has_node(start):
+            return {start}
         component = set()
         queue = deque([start])
         while queue:
@@ -418,9 +431,11 @@ class GenealogyGraph:
             if node in component:
                 continue
             component.add(node)
+            if not self.graph.has_node(node):
+                continue
             neighbors = set(self.graph.predecessors(node)) | set(self.graph.successors(node))
             for n in neighbors:
-                if n not in component:
+                if n in self.wallets and n not in component:
                     edge_data = self.graph.get_edge_data(node, n) or self.graph.get_edge_data(n, node)
                     if edge_data:
                         total_weight = sum(d.get('weight', 1) for d in edge_data.values())

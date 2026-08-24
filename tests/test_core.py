@@ -33,6 +33,7 @@ from src.research.shadow_trainer import chronological_episode_split, train_shado
 from src.research.global_research_miner import GlobalResearchMiner, ResearchLead
 from src.strategies.champion_challenger import ChampionChallengerFramework, HypothesisSpec, TrialResult
 from src.strategies.rug_hazard import ContinuousRugHazardModel
+from src.strategies.genealogy_graph import GenealogyGraph, RelationshipType
 
 
 def solana_chain():
@@ -240,6 +241,21 @@ class TestApplicationStartup(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(desk.readiness()["mode"], "DRY_RUN")
             finally:
                 await desk.stop()
+
+
+class TestGenealogyClustering(unittest.IsolatedAsyncioTestCase):
+    async def test_profiles_without_graph_nodes_do_not_break_cluster_rebuild(self):
+        graph = GenealogyGraph(solana_chain(), FakeRpc(), "")
+        await graph._process_wallet_activity({"wallet": "isolated", "timestamp": 1})
+        await graph._process_wallet_activity({"wallet": "a", "timestamp": 1})
+        await graph._process_wallet_activity({"wallet": "b", "timestamp": 1})
+        for _ in range(3):
+            graph._add_relationship("a", "b", RelationshipType.CO_BOUGHT, 1)
+        graph._add_relationship("a", "unhydrated-node", RelationshipType.TRANSFERRED, 1)
+        await graph.build_clusters(min_connections=2)
+        self.assertIsNone(graph.wallets["isolated"].cluster_id)
+        self.assertEqual(graph.wallets["a"].cluster_id, graph.wallets["b"].cluster_id)
+        self.assertEqual(len(graph.clusters), 1)
 
 
 class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
