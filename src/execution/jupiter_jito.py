@@ -269,9 +269,21 @@ class JupiterClient:
 
 class JitoClient:
     def __init__(self, jito_url: str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles"):
-        self.jito_url = jito_url
+        configured = [value.strip().rstrip("/") for value in os.getenv("JITO_BLOCK_ENGINE_URLS", "").split(",")
+                      if value.strip()]
+        defaults = [
+            "https://dublin.mainnet.block-engine.jito.wtf/api/v1/bundles",
+            "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles",
+            "https://amsterdam.mainnet.block-engine.jito.wtf/api/v1/bundles",
+            "https://london.mainnet.block-engine.jito.wtf/api/v1/bundles",
+        ]
+        self.jito_urls = configured or defaults
+        self.jito_url = jito_url.rstrip("/")
+        if self.jito_url not in self.jito_urls:
+            self.jito_urls.append(self.jito_url)
         self._session: Optional[aiohttp.ClientSession] = None
         self._tip_accounts: List[str] = []
+        self._bundle_routes: Dict[str, List[str]] = {}
 
     async def start(self):
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
@@ -283,11 +295,14 @@ class JitoClient:
             self._session = None
 
     async def _rpc(self, method: str, params: List[Any]) -> Any:
+        return await self._rpc_at(self.jito_url, method, params)
+
+    async def _rpc_at(self, url: str, method: str, params: List[Any]) -> Any:
         if not self._session:
             raise RuntimeError("Jito client is not started")
         try:
             async with self._session.post(
-                self.jito_url,
+                url,
                 json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
             ) as resp:
                 if resp.status != 200:
@@ -302,10 +317,49 @@ class JitoClient:
             return None
 
     async def send_bundle(self, transactions: List[str]) -> Optional[str]:
-        return await self._rpc("sendBundle", [transactions, {"encoding": "base64"}])
+        tasks = {
+            asyncio.create_task(self._rpc_at(url, "sendBundle", [transactions, {"encoding": "base64"}])): url
+            for url in self.jito_urls
+        }
+        done, pending = await asyncio.wait(tasks, timeout=1.5)
+        for task in pending:
+            task.cancel()
+        accepted: Dict[str, List[str]] = defaultdict(list)
+        for task in done:
+            if task.cancelled() or task.exception() is not None:
+                continue
+            bundle_id = task.result()
+            if bundle_id:
+                accepted[str(bundle_id)].append(tasks[task])
+        if not accepted:
+            return None
+        bundle_id, routes = max(accepted.items(), key=lambda item: len(item[1]))
+        self._bundle_routes[bundle_id] = routes
+        return bundle_id
 
     async def get_bundle_status(self, bundle_id: str) -> Optional[Dict[str, Any]]:
-        return await self._rpc("getBundleStatuses", [[bundle_id]])
+        urls = self._bundle_routes.get(bundle_id) or self.jito_urls
+        tasks = [asyncio.create_task(self._rpc_at(url, "getBundleStatuses", [[bundle_id]])) for url in urls]
+        done, pending = await asyncio.wait(tasks, timeout=1.0)
+        for task in pending:
+            task.cancel()
+        results = [task.result() for task in done if not task.cancelled() and task.exception() is None]
+        return next((value for value in results if (value or {}).get("value")), None)
+
+    async def get_tip_floor_lamports(self, percentile: int = 75) -> Optional[int]:
+        """Return Jito's observed landed-tip floor, converted from SOL to lamports."""
+        if not self._session or percentile not in {25, 50, 75, 95, 99}:
+            return None
+        try:
+            async with self._session.get("https://bundles.jito.wtf/api/v1/bundles/tip_floor") as resp:
+                if resp.status != 200:
+                    return None
+                payload = await resp.json()
+            row = payload[0] if isinstance(payload, list) and payload else {}
+            value = float(row.get(f"landed_tips_{percentile}th_percentile", 0) or 0)
+            return max(1_000, int(value * 1_000_000_000)) if value > 0 else None
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError):
+            return None
 
 
 class SolanaTransactionBuilder:
@@ -406,6 +460,13 @@ class ExecutionEngine:
                 error="live submission is locked; ALLOW_LIVE_TRADING acknowledgement absent",
             )
 
+        if use_jito:
+            observed_tip = await self.jito.get_tip_floor_lamports(75)
+            if observed_tip:
+                # A single data-driven tip is safe and idempotent. Building a
+                # differently signed escalation ladder could double-fill when
+                # an earlier bundle lands late, so it is intentionally rejected.
+                jito_tip = min(max(jito_tip, observed_tip), 5_000_000)
         swap_tx = await self.jupiter.get_swap_transaction(
             quote,
             self.tx_builder.public_key,
@@ -472,7 +533,8 @@ class ExecutionEngine:
 
     async def _send_raw_transaction(self, signed_tx: str) -> Optional[str]:
         try:
-            return await self.rpc.request(
+            submit = getattr(self.rpc, "broadcast_request", self.rpc.request)
+            return await submit(
                 "sendTransaction",
                 [signed_tx, {"encoding": "base64", "skipPreflight": False, "maxRetries": 3}],
             )

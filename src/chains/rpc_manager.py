@@ -210,6 +210,34 @@ class RPCManager:
                     return [r.get("result") for r in data]
                 raise RPCError(await resp.text())
 
+    async def broadcast_request(self, method: str, params: List[Any], timeout: float = 1.5) -> Any:
+        """Race one idempotent signed transaction across every healthy RPC path."""
+        endpoints = [item for item in self.endpoints if item.health == RPCHealth.HEALTHY]
+        if not endpoints:
+            endpoints = [item for item in self.endpoints if item.health != RPCHealth.DOWN]
+        if not endpoints:
+            raise RuntimeError("No usable RPC endpoints")
+
+        async def submit(item: EndpointHealth):
+            async with self._session.post(
+                item.endpoint.url,
+                json={"jsonrpc": "2.0", "method": method, "params": params, "id": 1},
+                headers=item.endpoint.headers,
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                payload = await resp.json()
+                return payload.get("result")
+
+        tasks = [asyncio.create_task(submit(item)) for item in endpoints]
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        # Requests were launched together; cancel only sockets still stalled
+        # after the racing window. The identical signed transaction cannot fill twice.
+        for task in pending:
+            task.cancel()
+        results = [task.result() for task in done if not task.cancelled() and task.exception() is None]
+        return next((value for value in results if value), None)
+
     def get_ws_url(self) -> Optional[str]:
         ep = self._select_endpoint(prefer_ws=True)
         return ep.endpoint.ws_url if ep else None

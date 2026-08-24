@@ -156,6 +156,13 @@ global:
   dry_run: true
   paper_equity_usd: 10000
   max_total_exposure_pct: 0.30
+  # Broad shadow portfolio: many small independent trials capture rare tails
+  # without changing the separately gated live-capital policy above.
+  shadow_max_concurrent_positions: 100
+  shadow_max_position_pct: 0.01
+  shadow_max_position_size_usd: 100
+  shadow_max_total_exposure_pct: 0.50
+  shadow_max_portfolio_risk: 0.10
   max_liquidity_fraction: 0.01
   min_liquidity_usd: 5000
   reject_data_blocked_safety_checks: true

@@ -130,6 +130,7 @@ class MemecoinQuantDesk:
         self._market_observation_cohort: set[str] = set()
         self._market_entry_price: Dict[str, float] = {}
         self._curve_entry_price: Dict[str, float] = {}
+        self._latest_stream_mark: Dict[str, Dict[str, float]] = {}
         self._market_cursor = 0
         self._model_artifact_mtime = 0.0
 
@@ -260,13 +261,15 @@ class MemecoinQuantDesk:
         self.predictor = MultiHeadPredictor()
         self.predictor.initialize_models()
         model_loaded = self.predictor.load_latest()
+        prefix = "shadow_" if self.dry_run else ""
+        setting = lambda name, default: self.global_config.get(f"{prefix}{name}", self.global_config.get(name, default))
         self.elogw_engine = ElogwEngine(
             self.predictor,
-            max_position_pct=float(self.global_config.get("max_position_pct", 0.05)),
-            max_position_usd=float(self.global_config.get("max_position_size_usd", 500)),
-            max_portfolio_risk=float(self.global_config.get("max_portfolio_risk", 0.10)),
-            max_total_exposure_pct=float(self.global_config.get("max_total_exposure_pct", 0.30)),
-            max_concurrent_positions=int(self.global_config.get("max_concurrent_positions", 10)),
+            max_position_pct=float(setting("max_position_pct", 0.05)),
+            max_position_usd=float(setting("max_position_size_usd", 500)),
+            max_portfolio_risk=float(setting("max_portfolio_risk", 0.10)),
+            max_total_exposure_pct=float(setting("max_total_exposure_pct", 0.30)),
+            max_concurrent_positions=int(setting("max_concurrent_positions", 10)),
             max_daily_loss_usd=float(self.global_config.get("max_daily_loss_usd", 1_000)),
             max_liquidity_fraction=float(self.global_config.get("max_liquidity_fraction", 0.01)),
         )
@@ -680,6 +683,17 @@ class MemecoinQuantDesk:
                 await self._execute_exit(token, position, 1.0, "time_stop")
 
     async def _mark_position(self, token: str, position: Dict[str, Any]):
+        stream_mark = self._latest_stream_mark.get(token)
+        if self.dry_run and stream_mark and time.time() - stream_mark["timestamp"] <= 3.0:
+            multiple = float(stream_mark["multiple"])
+            current_value = max(0.0, float(position["remaining_cost_usd"]) * multiple)
+            observation = {"type": "stream_mark", "feasible": True, "value_usd": current_value,
+                           "price_multiple": multiple, "timestamp": stream_mark["timestamp"],
+                           "measurement": "decoded_onchain_reserve_event", "data_status": "OK"}
+            self.rug_hazard.record_observation(token, observation)
+            self.dataset_builder.record_market_observation(token, observation)
+            self.counterfactual_lab.record_market_observation(token, multiple, observation["timestamp"])
+            return multiple, current_value
         quote = await self.jupiter.get_quote(token, USDC_MINT, int(position["size_tokens"]), slippage_bps=500)
         if not quote:
             self.rug_hazard.record_observation(token, {"type": "route", "feasible": False, "timestamp": time.time()})
@@ -894,6 +908,9 @@ class MemecoinQuantDesk:
             if curve_price > 0:
                 curve_entry = self._curve_entry_price.setdefault(token, curve_price)
                 curve_multiple = curve_price / max(curve_entry, 1e-30)
+                self._latest_stream_mark[token] = {
+                    "multiple": curve_multiple, "timestamp": float(event.get("timestamp", time.time()))
+                }
             observation = {"type": "trade", "side": event.get("side"), "wallet": event.get("wallet"),
                            "amount": event.get("actual_token_amount_ui"),
                            "amount_raw": event.get("actual_token_delta_raw"),

@@ -23,7 +23,8 @@ from src.chains.yellowstone_grpc import (
 from src.detection.rug_detector import TOKEN_2022_PROGRAM, TOKEN_PROGRAM, RugDetector
 from src.detection.token_detector import DetectionSource
 from src.execution.jupiter_jito import (
-    ExecutionEngine, ExecutionResult, JupiterClient, RouteType, SolanaTransactionBuilder, SwapQuote, TransactionStatus,
+    ExecutionEngine, ExecutionResult, JitoClient, JupiterClient, RouteType, SolanaTransactionBuilder, SwapQuote,
+    TransactionStatus,
 )
 from src.main import MemecoinQuantDesk
 from src.strategies.information_graph import CounterfactualExecutionLab
@@ -616,6 +617,29 @@ class FakeRpc:
 
 
 class TestExecution(unittest.IsolatedAsyncioTestCase):
+    def test_jito_defaults_to_parallel_nearby_regions(self):
+        with patch.dict("os.environ", {"JITO_BLOCK_ENGINE_URLS": ""}, clear=False):
+            client = JitoClient()
+        self.assertGreaterEqual(len(client.jito_urls), 4)
+        self.assertTrue(any("dublin" in url for url in client.jito_urls))
+        self.assertTrue(any("frankfurt" in url for url in client.jito_urls))
+
+    async def test_identical_bundle_is_raced_across_relays(self):
+        client = JitoClient()
+        client.jito_urls = ["relay-a", "relay-b", "relay-c"]
+        called = []
+
+        async def rpc_at(url, method, params):
+            called.append((url, method))
+            await asyncio.sleep(0)
+            return "same-bundle-id"
+
+        client._rpc_at = rpc_at
+        bundle_id = await client.send_bundle(["signed-transaction"])
+        self.assertEqual(bundle_id, "same-bundle-id")
+        self.assertEqual({url for url, _ in called}, set(client.jito_urls))
+        self.assertEqual(len(client._bundle_routes[bundle_id]), 3)
+
     def test_jupiter_uses_current_gateway_and_free_tier_rate_gates(self):
         keyless = JupiterClient()
         keyed = JupiterClient(api_key="test-key")
