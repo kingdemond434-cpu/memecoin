@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import urlsplit
 
 import aiohttp
 import yaml
@@ -221,7 +222,11 @@ class RPCManager:
             "chain": self.chain_config.name,
             "endpoints": [
                 {
-                    "url": e.endpoint.url,
+                    # Provider keys commonly live in the query string or final
+                    # URL path segment. Health/status output is also journaled,
+                    # so expose only the origin and never credential-bearing
+                    # path/query/fragment data.
+                    "url": self._safe_endpoint_origin(e.endpoint.url),
                     "health": e.health.value,
                     "latency_ms": round(e.latency_ms, 2),
                     "success": e.success_count,
@@ -230,6 +235,16 @@ class RPCManager:
                 for e in self.endpoints
             ],
         }
+
+    @staticmethod
+    def _safe_endpoint_origin(url: str) -> str:
+        parsed = urlsplit(url)
+        if not parsed.scheme or not parsed.hostname:
+            return "REDACTED_ENDPOINT"
+        host = parsed.hostname
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        return f"{parsed.scheme}://{host}"
 
 
 class RPCError(Exception):

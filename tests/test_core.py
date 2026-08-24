@@ -415,6 +415,18 @@ class TestWalletAndCoordination(unittest.TestCase):
 
 
 class TestRpcProtocol(unittest.TestCase):
+    def test_health_stats_never_expose_rpc_credentials(self):
+        chain = solana_chain()
+        chain.rpc_endpoints = [RPCEndpointConfig(
+            "https://mainnet.helius-rpc.com/?api-key=super-secret",
+            "wss://solana-mainnet.g.alchemy.com/v2/another-secret",
+        )]
+        stats = RPCManager(chain).get_stats()
+        serialized = json.dumps(stats)
+        self.assertNotIn("super-secret", serialized)
+        self.assertNotIn("another-secret", serialized)
+        self.assertEqual(stats["endpoints"][0]["url"], "https://mainnet.helius-rpc.com")
+
     def test_chain_aware_health_probe(self):
         solana = RPCManager(solana_chain())
         self.assertEqual(solana._health_probe(), ("getHealth", []))
