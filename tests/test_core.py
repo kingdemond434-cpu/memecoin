@@ -769,7 +769,10 @@ class TestWalletAndCoordination(unittest.TestCase):
 
     def test_wallet_regime_is_not_fabricated_from_missing_history(self):
         engine = WalletIntelligenceEngine(solana_chain(), FakeRpc(), FakeGenealogy(), "")
-        self.assertIsNone(engine._classify_regime({"timestamp": 11, "multiple": 5.0}))
+        self.assertEqual(engine._classify_regime({"timestamp": 11, "multiple": 5.0, "data_status": "OK"}),
+                         WalletRegime.GENERAL_HISTORY)
+        self.assertIsNone(engine._classify_regime({"timestamp": 11, "multiple": 5.0,
+                                                   "data_status": "DATA_BLOCKED"}))
         self.assertEqual(engine._classify_regime({"regime": "post_migration"}), WalletRegime.POST_MIGRATION)
 
     def test_public_coordination_requires_evidence_and_detects_same_slot(self):

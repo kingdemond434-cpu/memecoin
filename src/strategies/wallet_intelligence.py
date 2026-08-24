@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class WalletRegime(Enum):
+    GENERAL_HISTORY = "general_history"
     ULTRA_EARLY = "ultra_early"
     EARLY_CURVE = "early_curve"
     PRE_MIGRATION = "pre_migration"
@@ -87,6 +88,7 @@ class WalletIntelligenceEngine:
         self._hunter_task: Optional[asyncio.Task] = None
         self._watcher_task: Optional[asyncio.Task] = None
         self._recalc_task: Optional[asyncio.Task] = None
+        self._history_task: Optional[asyncio.Task] = None
         
         self._live_watch_wallets: Set[str] = set()
         self._recent_buys: deque = deque(maxlen=10000)
@@ -96,6 +98,9 @@ class WalletIntelligenceEngine:
         self._social_wallet_candidates: Set[str] = set()
         self._token_launch_times: Dict[str, float] = {}
         self._token_migration_times: Dict[str, float] = {}
+        self._history_candidates: deque = deque(maxlen=20_000)
+        self._queued_history_wallets: Set[str] = set()
+        self._history_evaluated_at: Dict[str, float] = {}
         self.data_status: Dict[str, str] = {}
         
         self._helius_base = "https://api.helius.xyz/v0"
@@ -113,12 +118,13 @@ class WalletIntelligenceEngine:
         self._hunter_task = asyncio.create_task(self._hunter_loop())
         self._watcher_task = asyncio.create_task(self._watcher_loop())
         self._recalc_task = asyncio.create_task(self._recalc_loop())
+        self._history_task = asyncio.create_task(self._history_worker_loop())
         
         await self._initial_discovery()
 
     async def stop(self):
         self._running = False
-        for task in [self._hunter_task, self._watcher_task, self._recalc_task]:
+        for task in [self._hunter_task, self._watcher_task, self._recalc_task, self._history_task]:
             if task:
                 task.cancel()
         if self._session:
@@ -154,6 +160,29 @@ class WalletIntelligenceEngine:
             except Exception as e:
                 logger.error(f"Recalc loop error: {e}")
             await asyncio.sleep(300)
+
+    async def _history_worker_loop(self):
+        """Continuously reconstruct observed buyer histories within free-provider limits."""
+        while self._running:
+            if not self._history_candidates:
+                await asyncio.sleep(0.25)
+                continue
+            wallet, token = self._history_candidates.popleft()
+            self._queued_history_wallets.discard(wallet)
+            try:
+                await self._evaluate_new_wallet(wallet, token)
+                self._history_evaluated_at[wallet] = time.time()
+            except Exception as exc:
+                self.data_status[wallet] = f"DATA_BLOCKED: history worker: {exc}"
+            await asyncio.sleep(1.1)
+
+    def _queue_wallet_history(self, wallet: str, token: str):
+        if not wallet or not 32 <= len(wallet) <= 44 or wallet in self._queued_history_wallets:
+            return
+        if time.time() - self._history_evaluated_at.get(wallet, 0) < 3600:
+            return
+        self._queued_history_wallets.add(wallet)
+        self._history_candidates.append((wallet, token))
 
     async def _discover_wallets_from_recent_launches(self):
         # Launches are supplied by the validated Pump/Raydium program stream.
@@ -433,10 +462,10 @@ class WalletIntelligenceEngine:
                 return WalletRegime.ULTRA_EARLY
             if elapsed <= 300:
                 return WalletRegime.EARLY_CURVE
-        # Historical enhanced transactions do not establish launch-relative
-        # timing on their own. Defaulting every trade to EARLY_CURVE creates a
-        # false performance edge, so this remains explicitly unclassified.
-        return None
+        # This label asserts only a verified closed round trip. It does not
+        # fabricate launch-relative timing; dedicated regimes still require PIT
+        # launch/migration timestamps.
+        return WalletRegime.GENERAL_HISTORY if tx.get("data_status") == "OK" else None
 
     def record_token_lifecycle(self, token: str, *, launch_at: Optional[float] = None,
                                migration_at: Optional[float] = None):
@@ -572,6 +601,8 @@ class WalletIntelligenceEngine:
             "data_status": "OK" if event.get("price") else "DATA_BLOCKED_PRICE",
         }
         (self._recent_buys if side == "buy" else self._recent_sells).append(record)
+        if side == "buy":
+            self._queue_wallet_history(record["wallet"], token)
 
     def _determine_side(self, wallet: str, tx: Dict) -> str:
         try:
@@ -778,6 +809,8 @@ class WalletIntelligenceEngine:
             "tracked_wallets": len(self.genealogy.wallets),
             "scored_wallets": len(self.wallet_scores),
             "live_watching": len(self._live_watch_wallets),
+            "history_queue": len(self._history_candidates),
+            "histories_evaluated": len(self._history_evaluated_at),
             "regimes_tracked": len(WalletRegime),
             "recent_buys": len(self._recent_buys),
             "recent_sells": len(self._recent_sells),
