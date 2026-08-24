@@ -1,13 +1,16 @@
 """Continuous, evidence-backed Solana exit hazard tracking."""
 
 import asyncio
+import os
 import logging
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Deque, Dict, List, Optional, Tuple
+from pathlib import Path
 
+import joblib
 import numpy as np
 
 from src.chains.rpc_manager import ChainConfig, RPCManager
@@ -16,6 +19,11 @@ from src.strategies.information_graph import AdversarialAdaptationDetector
 from src.strategies.wallet_intelligence import WalletIntelligenceEngine
 
 logger = logging.getLogger(__name__)
+
+HAZARD_FEATURE_NAMES = (
+    "sell_share_60s", "buy_deceleration", "volume_collapse", "drawdown_to_date",
+    "route_degradation", "liquidity_withdrawal", "concentration_increase", "explicit_risk_event",
+)
 
 
 class HazardTrigger(Enum):
@@ -78,6 +86,8 @@ class ContinuousRugHazardModel:
         self.data_status_detail = "no versioned chronological hazard training artifact"
         self._running = False
         self._monitor_task: Optional[asyncio.Task] = None
+        self._historical_models: Dict[str, Any] = {}
+        self._historical_calibrators: Dict[str, Any] = {}
         self.trigger_weights = {
             HazardTrigger.CREATOR_TRANSFER: 0.38, HazardTrigger.INSIDER_SELL: 0.38,
             HazardTrigger.SMART_WALLET_EXIT: 0.24, HazardTrigger.LIQUIDITY_WITHDRAWAL: 0.45,
@@ -103,8 +113,31 @@ class ContinuousRugHazardModel:
                 return
 
     async def _load_historical_model(self):
-        self.data_status = "DATA_BLOCKED"
-        self.data_status_detail = "no versioned chronological hazard training artifact"
+        model_dir = Path(os.getenv("MODEL_DIR", "models"))
+        candidates = sorted(model_dir.glob("rug-hazard-*.joblib"), key=lambda path: path.stat().st_mtime, reverse=True)
+        if not candidates:
+            self.data_status = "DATA_BLOCKED"
+            self.data_status_detail = "no versioned chronological hazard training artifact"
+            return
+        try:
+            artifact = joblib.load(candidates[0])
+            if artifact.get("schema_version") != 1:
+                raise ValueError("unsupported hazard artifact schema")
+            if tuple(artifact.get("feature_names", ())) != HAZARD_FEATURE_NAMES:
+                raise ValueError("hazard feature schema mismatch")
+            if artifact.get("validation", {}).get("status") != "PASSED":
+                raise ValueError("hazard artifact lacks passed chronological validation")
+            self._historical_models = dict(artifact.get("models") or {})
+            self._historical_calibrators = dict(artifact.get("calibrators") or {})
+            if not {"rug_30s", "rug_5m"}.issubset(self._historical_models):
+                raise ValueError("hazard artifact is missing required heads")
+            self.is_trained = True
+            self.data_status = "OK"
+            self.data_status_detail = candidates[0].name
+        except Exception as exc:
+            self.is_trained = False
+            self.data_status = "DATA_BLOCKED"
+            self.data_status_detail = f"invalid chronological hazard artifact: {exc}"
 
     def register_token(self, token: str, metadata: Optional[Dict[str, Any]] = None) -> HazardState:
         state = self.hazard_states.setdefault(token, HazardState(token=token, chain=self.chain_config.name))
@@ -149,6 +182,13 @@ class ContinuousRugHazardModel:
         state.current_hazard = float(np.clip(1.0 - survival, 0, 1))
         state.hazard_30s = self._project_hazard(state.current_hazard, 30)
         state.hazard_5m = self._project_hazard(state.current_hazard, 300)
+        if self.is_trained:
+            features = self.feature_vector_from_observations(observations, time.time()).reshape(1, -1)
+            for key, attr in (("rug_30s", "hazard_30s"), ("rug_5m", "hazard_5m")):
+                raw = self._historical_models[key].predict_proba(features)[:, 1]
+                calibrator = self._historical_calibrators.get(key)
+                probability = float(calibrator.predict(raw)[0] if calibrator else raw[0])
+                setattr(state, attr, max(getattr(state, attr), float(np.clip(probability, 0, 1))))
         state.hazard_30m = self._project_hazard(state.current_hazard, 1_800)
         state.exit_urgency = self._get_urgency(state.hazard_30s, state.hazard_5m)
         state.exit_recommended = state.exit_urgency in {"HIGH", "CRITICAL"}
@@ -245,6 +285,61 @@ class ContinuousRugHazardModel:
         if item.get("notional_usd") is not None:
             return max(0.0, float(item["notional_usd"]))
         return max(0.0, float(item.get("amount", 0) or 0) * float(item.get("price", 0) or 0))
+
+    @staticmethod
+    def feature_vector_from_observations(observations: List[Dict[str, Any]], as_of: float) -> np.ndarray:
+        """Build a PIT-only vector shared by offline training and live inference."""
+        eligible = [item for item in observations if float(item.get("timestamp", 0) or 0) <= as_of]
+        recent = [item for item in eligible if 0 <= as_of - float(item.get("timestamp", 0) or 0) <= 60]
+        prior = [item for item in eligible if 60 < as_of - float(item.get("timestamp", 0) or 0) <= 300]
+        recent_trades = [item for item in recent if item.get("type") == "trade"]
+        prior_trades = [item for item in prior if item.get("type") == "trade"]
+
+        def volumes(items: List[Dict[str, Any]]) -> Tuple[float, float]:
+            buys = sum(ContinuousRugHazardModel._notional(item) for item in items if item.get("side") == "buy")
+            sells = sum(ContinuousRugHazardModel._notional(item) for item in items if item.get("side") == "sell")
+            if buys + sells <= 0 and items:
+                buys = float(sum(item.get("side") == "buy" for item in items))
+                sells = float(sum(item.get("side") == "sell" for item in items))
+            return buys, sells
+
+        buy_recent, sell_recent = volumes(recent_trades)
+        buy_prior, sell_prior = volumes(prior_trades)
+        prior_scale = 4.0
+        buy_prior /= prior_scale
+        sell_prior /= prior_scale
+        recent_total, prior_total = buy_recent + sell_recent, buy_prior + sell_prior
+        sell_share = sell_recent / recent_total if recent_total else 0.0
+        buy_deceleration = max(0.0, 1 - buy_recent / buy_prior) if buy_prior else 0.0
+        volume_collapse = max(0.0, 1 - recent_total / prior_total) if prior_total else 0.0
+
+        price_items = sorted(
+            (item for item in eligible if float(item.get("price_multiple", item.get("price_usd", 0)) or 0) > 0),
+            key=lambda item: float(item.get("timestamp", 0) or 0),
+        )
+        drawdown = 0.0
+        if price_items:
+            if all(float(item.get("price_multiple", 0) or 0) > 0 for item in price_items):
+                values = [float(item["price_multiple"]) for item in price_items]
+            else:
+                entry = float(price_items[0].get("price_usd", 0) or 0)
+                values = [float(item.get("price_usd", 0) or 0) / max(entry, 1e-12) for item in price_items]
+            drawdown = 1 - values[-1] / max(max(values), 1e-12)
+
+        latest = ContinuousRugHazardModel._latest_by_type(eligible)
+        route = latest.get("route", {})
+        impact = float(route.get("price_impact_pct", 0) or 0)
+        route_degradation = 1.0 if route.get("feasible") is False else min(1.0, impact / 0.15)
+        liquidity = latest.get("liquidity", {})
+        liquidity_withdrawal = min(1.0, max(0.0, -float(liquidity.get("change_pct", 0) or 0)))
+        concentration = latest.get("concentration", {})
+        concentration_increase = min(1.0, max(0.0, float(concentration.get("top10_change_pct", 0) or 0) * 3))
+        explicit_types = {"creator_transfer", "dev_wallet_activation", "failed_migration", "bundle"}
+        explicit = min(1.0, sum(str(item.get("type")) in explicit_types for item in recent) / 2)
+        return np.asarray([
+            sell_share, buy_deceleration, volume_collapse, max(0.0, min(1.0, drawdown)),
+            route_degradation, liquidity_withdrawal, concentration_increase, explicit,
+        ], dtype=float)
 
     @staticmethod
     def _latest_by_type(observations: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:

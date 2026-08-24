@@ -217,16 +217,22 @@ class MultiHeadPredictor:
                 if target in CLASSIFICATION_TARGETS:
                     split = max(1, int(len(X) * 0.8))
                     X_fit, y_fit, X_cal, y_cal = X[:split], y[:split], X[split:], y[split:]
-                    if len(np.unique(y_fit)) < 2 or len(X_cal) < 10 or len(np.unique(y_cal)) < 2:
-                        raise ValueError("chronological fit/calibration windows require both classes")
+                    if len(np.unique(y_fit)) < 2:
+                        raise ValueError("chronological fit window requires both classes")
                     model.fit(X_fit, y_fit)
-                    iso_reg = IsotonicRegression(out_of_bounds='clip')
-                    iso_reg.fit(model.predict_proba(X_cal)[:, 1], y_cal)
-                    self.calibrators[target] = iso_reg
+                    calibration = "raw_probability"
+                    if len(X_cal) >= 10 and len(np.unique(y_cal)) >= 2:
+                        iso_reg = IsotonicRegression(out_of_bounds='clip')
+                        iso_reg.fit(model.predict_proba(X_cal)[:, 1], y_cal)
+                        self.calibrators[target] = iso_reg
+                        calibration = "isotonic_chronological"
                 else:
                     model.fit(X, y)
+                    calibration = "not_applicable"
                 
-                results[target.value] = {"status": "trained", "samples": len(data)}
+                results[target.value] = {
+                    "status": "trained", "samples": len(data), "calibration": calibration,
+                }
                 logger.info(f"Trained {target.value} on {len(data)} samples")
                 
             except Exception as e:

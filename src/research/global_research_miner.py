@@ -42,6 +42,12 @@ class ResearchLead:
 
 
 class GlobalResearchMiner:
+    RSS_FEEDS = [
+        ("https://www.chaincatcher.com/rss/clist", "zh-cn", "chaincatcher"),
+        ("https://www.panewslab.com/rss.xml?lang=zh&type=NORMAL%2CNEWS", "zh-cn", "panews"),
+        ("https://www.panewslab.com/rss.xml?lang=ja&type=NORMAL%2CNEWS", "ja", "panews"),
+        ("https://www.panewslab.com/rss.xml?lang=ko&type=NORMAL%2CNEWS", "ko", "panews"),
+    ]
     QUERIES = [
         ("solana pump fun sniper trading", "en"),
         ("raydium solana mev execution", "en"),
@@ -61,15 +67,15 @@ class GlobalResearchMiner:
     ]
 
     FEATURE_PATTERNS = {
-        "wallet_copy_policy": (["copy", "wallet", "smart money"], ["wallet_lead_time", "wallet_independence", "copy_crowding"]),
-        "bundle_detection": (["bundle", "jito", "mev"], ["bundle_concentration", "same_slot_buyers", "independent_funding"]),
-        "curve_velocity": (["bonding curve", "pump", "velocity"], ["buy_velocity", "buy_acceleration", "curve_progress"]),
-        "liquidity_execution": (["liquidity", "slippage", "route"], ["liquidity_usd", "price_impact", "route_availability"]),
-        "social_propagation": (["telegram", "twitter", "social", "narrative"], ["social_velocity", "cross_platform", "source_lead_time"]),
+        "wallet_copy_policy": (["copy", "wallet", "smart money", "聪明钱", "钱包", "跟单"], ["wallet_lead_time", "wallet_independence", "copy_crowding"]),
+        "bundle_detection": (["bundle", "jito", "mev", "捆绑", "套利"], ["bundle_concentration", "same_slot_buyers", "independent_funding"]),
+        "curve_velocity": (["bonding curve", "pump", "velocity", "联合曲线", "绑定曲线", "发射"], ["buy_velocity", "buy_acceleration", "curve_progress"]),
+        "liquidity_execution": (["liquidity", "slippage", "route", "流动性", "滑点", "路由"], ["liquidity_usd", "price_impact", "route_availability"]),
+        "social_propagation": (["telegram", "twitter", "social", "narrative", "电报", "推特", "叙事"], ["social_velocity", "cross_platform", "source_lead_time"]),
         "risk_constrained_kelly": (["kelly", "geometric growth", "log utility"], ["tail_probabilities", "drawdown_budget", "calibration_width"]),
-        "optimal_stopping": (["optimal stopping", "trailing stop", "take profit"], ["high_water_mark", "continuation_probability", "hazard_rate"]),
-        "survival_hazard": (["survival", "hazard", "rug pull"], ["liquidity_change", "sell_acceleration", "route_degradation"]),
-        "order_flow_point_process": (["hawkes", "order flow", "self exciting"], ["buy_intensity", "sell_intensity", "intensity_acceleration"]),
+        "optimal_stopping": (["optimal stopping", "trailing stop", "take profit", "止盈", "止损", "追踪止损"], ["high_water_mark", "continuation_probability", "hazard_rate"]),
+        "survival_hazard": (["survival", "hazard", "rug pull", "风险率", "砸盘", "貔貅盘"], ["liquidity_change", "sell_acceleration", "route_degradation"]),
+        "order_flow_point_process": (["hawkes", "order flow", "self exciting", "订单流", "买盘", "卖盘"], ["buy_intensity", "sell_intensity", "intensity_acceleration"]),
         "probability_calibration": (["conformal", "calibration", "brier"], ["calibration_error", "interval_width", "regime_coverage"]),
         "public_coordination": (["same slot", "shared funder", "bundle detector"], ["same_slot_buyers", "shared_funder_fraction", "buy_size_similarity"]),
     }
@@ -123,6 +129,8 @@ class GlobalResearchMiner:
         for query, language in self.QUERIES:
             await self._mine_github(query, language)
         await self._mine_arxiv()
+        for url, language, source in self.RSS_FEEDS:
+            await self._mine_rss(url, language, source)
 
     async def _mine_github(self, query: str, language: str):
         try:
@@ -175,6 +183,31 @@ class GlobalResearchMiner:
             self.data_status["arxiv"] = "OK"
         except Exception as exc:
             self.data_status["arxiv"] = f"DATA_BLOCKED: {exc}"
+
+    async def _mine_rss(self, url: str, language: str, source: str):
+        """Ingest publisher-provided RSS summaries as research-only leads."""
+        status_key = f"rss:{source}:{language}"
+        try:
+            async with self._session.get(url) as resp:
+                if resp.status != 200:
+                    self.data_status[status_key] = f"DATA_BLOCKED: HTTP {resp.status}"
+                    return
+                raw = await resp.text()
+            root = ET.fromstring(raw)
+            for item in root.findall(".//item")[:100]:
+                title = (item.findtext("title") or "").strip()
+                link = (item.findtext("link") or item.findtext("guid") or "").strip()
+                summary = (item.findtext("description") or "").strip()
+                if not title or not link:
+                    continue
+                await self._register_lead(ResearchLead(
+                    source_type="publisher_rss", title=title, url=link,
+                    summary=summary[:4_000], language=language,
+                    license_spdx="RSS_SUMMARY_ONLY", source_quality=0.70,
+                ))
+            self.data_status[status_key] = "OK"
+        except (aiohttp.ClientError, asyncio.TimeoutError, ET.ParseError, ValueError) as exc:
+            self.data_status[status_key] = f"DATA_BLOCKED: {exc}"
 
     async def _load_ledger(self):
         if not self.ledger_path.exists():

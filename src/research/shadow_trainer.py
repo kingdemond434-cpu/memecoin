@@ -73,17 +73,22 @@ def snapshot_to_features(episode: Dict[str, Any], snapshot: Dict[str, Any]) -> P
     )
 
 
-def snapshot_labels(snapshot: Dict[str, Any]) -> Dict[PredictionTarget, float]:
+def snapshot_labels(
+    snapshot: Dict[str, Any], episode: Dict[str, Any], outcome: Dict[str, Any]
+) -> Dict[PredictionTarget, float]:
     labels = snapshot.get("labels") or {}
-    rug_time = labels.get("label_rug_time")
-    rugged = bool(labels.get("label_rug"))
+    rug_time = outcome.get("rug_time")
+    if rug_time is not None:
+        rug_time = (_number(episode, "created_at") + float(rug_time)
+                    - _number(snapshot, "timestamp", _number(episode, "created_at")))
+    rugged = bool(outcome.get("rugged")) and rug_time is not None and rug_time >= 0
     slippage = _number(snapshot.get("liquidity_features") or {}, "price_impact_pct")
     result = {
         PredictionTarget.P_2X: float(bool(labels.get("label_2x"))),
         PredictionTarget.P_5X: float(bool(labels.get("label_5x"))),
         PredictionTarget.P_10X: float(bool(labels.get("label_10x"))),
         PredictionTarget.P_50X: float(bool(labels.get("label_50x"))),
-        PredictionTarget.P_MIGRATION: float(bool(labels.get("label_migration"))),
+        PredictionTarget.P_MIGRATION: float(bool(outcome.get("migrated"))),
         PredictionTarget.P_RUG_30S: float(rugged and rug_time is not None and float(rug_time) <= 30),
         PredictionTarget.P_RUG_5M: float(rugged and rug_time is not None and float(rug_time) <= 300),
         PredictionTarget.EXPECTED_SLIPPAGE: float(np.clip(slippage, 0, 1)),
@@ -95,6 +100,46 @@ def snapshot_labels(snapshot: Dict[str, Any]) -> Dict[PredictionTarget, float]:
     return result
 
 
+def _repair_legacy_outcome(episode: Dict[str, Any], outcome: Dict[str, Any]) -> Dict[str, Any]:
+    """Derive labels from persisted observations when older outcome rows omitted them."""
+    repaired = dict(outcome)
+    observations = episode.get("market_observations") or []
+    migration_types = {"migration", "token_migrated", "graduation"}
+    if not repaired.get("migrated") and any(
+        item.get("migrated") is True or str(item.get("type", "")).lower() in migration_types
+        for item in observations
+    ):
+        repaired["migrated"] = True
+    if repaired.get("rugged") and repaired.get("rug_time") is None:
+        created_at = _number(episode, "created_at")
+        explicit = sorted(
+            (item for item in observations if item.get("rugged") and item.get("timestamp") is not None),
+            key=lambda item: float(item["timestamp"]),
+        )
+        rug_at = float(explicit[0]["timestamp"]) if explicit else None
+        prices = sorted(
+            (item for item in observations
+             if item.get("timestamp") is not None
+             and _number(item, "price_multiple", _number(item, "price_usd")) > 0),
+            key=lambda item: float(item["timestamp"]),
+        )
+        if rug_at is None and prices:
+            if all(_number(item, "price_multiple") > 0 for item in prices):
+                multiples = [_number(item, "price_multiple") for item in prices]
+            else:
+                entry = _number(prices[0], "price_usd")
+                multiples = [_number(item, "price_usd") / max(entry, 1e-12) for item in prices]
+            peak = multiples[0]
+            for item, multiple in zip(prices, multiples):
+                peak = max(peak, multiple)
+                if 1 - multiple / max(peak, 1e-12) >= 0.90:
+                    rug_at = float(item["timestamp"])
+                    break
+        if rug_at is not None:
+            repaired["rug_time"] = max(0.0, rug_at - created_at)
+    return repaired
+
+
 def load_samples(storage: Path) -> List[Tuple[PredictionFeatures, Dict[PredictionTarget, float], Dict[str, Any]]]:
     samples: List[Tuple[PredictionFeatures, Dict[PredictionTarget, float], Dict[str, Any]]] = []
     for path in storage.glob("*/*.json.gz"):
@@ -103,7 +148,7 @@ def load_samples(storage: Path) -> List[Tuple[PredictionFeatures, Dict[Predictio
                 episode = json.load(handle)
         except (OSError, json.JSONDecodeError):
             continue
-        outcome = episode.get("final_outcome") or {}
+        outcome = _repair_legacy_outcome(episode, episode.get("final_outcome") or {})
         if outcome.get("status") != "OK":
             continue
         snapshots = episode.get("snapshots") or {}
@@ -111,7 +156,10 @@ def load_samples(storage: Path) -> List[Tuple[PredictionFeatures, Dict[Predictio
             snapshot = snapshots.get(name)
             if not snapshot or (snapshot.get("labels") or {}).get("label_2x") is None:
                 continue
-            samples.append((snapshot_to_features(episode, snapshot), snapshot_labels(snapshot), outcome))
+            if (outcome.get("rugged") and outcome.get("rug_time") is not None
+                    and _number(snapshot, "timestamp") >= _number(episode, "created_at") + float(outcome["rug_time"])):
+                continue
+            samples.append((snapshot_to_features(episode, snapshot), snapshot_labels(snapshot, episode, outcome), outcome))
     return sorted(samples, key=lambda item: item[0].timestamp)
 
 
@@ -235,7 +283,7 @@ def train_shadow(storage: Path, model_dir: Path, min_samples: int = 250) -> Dict
         predictor.initialize_models()
         for features, labels, _ in train_samples:
             predictor.add_training_sample(features, labels)
-        training = predictor.train(min_samples=max(100, int(len(train_samples) * 0.5)))
+        training = predictor.train(min_samples=100)
         report["training"] = training
         if not predictor._is_trained:
             report.update({"status": "DATA_BLOCKED", "reason": "one_or_more_heads_lack_chronological_class_coverage"})

@@ -483,6 +483,17 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(second.leads), 1)
             self.assertEqual(len(second_framework.hypotheses), 1)
 
+    async def test_chinese_rss_lead_maps_to_research_mechanism(self):
+        framework = ChampionChallengerFramework()
+        miner = GlobalResearchMiner(framework)
+        await miner._register_lead(ResearchLead(
+            source_type="publisher_rss", title="聪明钱钱包跟单研究",
+            url="https://example.test/zh-lead", summary="链上钱包行为", language="zh-cn",
+            license_spdx="RSS_SUMMARY_ONLY",
+        ), persist=False)
+        self.assertEqual(miner.leads[0].mechanism, "wallet_copy_policy")
+        self.assertEqual(len(framework.hypotheses), 1)
+
 
 class FakeJupiter:
     def __init__(self):
@@ -798,7 +809,17 @@ class TestPointInTimeResearch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome["feasible_exit_multiple"], 6)
         self.assertTrue(outcome["migrated"])
         self.assertAlmostEqual(outcome["max_drawdown"], 0.95)
+        self.assertEqual(outcome["rug_time"], 20)
         self.assertEqual(outcome["realized_pnl"], 12.5)
+
+    async def test_pit_outcome_recognizes_native_migration_event(self):
+        episode = LaunchEpisode("token", "solana", 100, "dev", "pump", "curve", "wsol")
+        episode.market_observations.extend([
+            {"timestamp": 100, "price_usd": 1.0},
+            {"timestamp": 110, "price_usd": 1.2, "type": "migration"},
+        ])
+        outcome = await self.builder()._determine_final_outcome(episode)
+        self.assertTrue(outcome["migrated"])
 
     async def test_missing_prices_are_explicitly_data_blocked(self):
         episode = LaunchEpisode("token", "solana", 100, "dev", "pump", "curve", "wsol")
@@ -858,6 +879,23 @@ class TestCounterfactuals(unittest.TestCase):
 
 
 class TestHazardTracking(unittest.IsolatedAsyncioTestCase):
+    def test_hazard_feature_vector_is_point_in_time_and_detects_deterioration(self):
+        observations = [
+            {"timestamp": 100, "type": "trade", "side": "buy", "notional_usd": 1000,
+             "price_multiple": 2.0},
+            {"timestamp": 260, "type": "trade", "side": "sell", "notional_usd": 800,
+             "price_multiple": 0.1},
+            {"timestamp": 270, "type": "route", "feasible": False, "price_impact_pct": 0.5},
+            {"timestamp": 280, "type": "liquidity", "change_pct": -0.5},
+            {"timestamp": 400, "type": "trade", "side": "buy", "notional_usd": 10},
+        ]
+        vector = ContinuousRugHazardModel.feature_vector_from_observations(observations, 300)
+        self.assertEqual(len(vector), 8)
+        self.assertEqual(vector[0], 1.0)
+        self.assertGreaterEqual(vector[3], 0.9)
+        self.assertEqual(vector[4], 1.0)
+        self.assertEqual(vector[5], 0.5)
+
     async def test_route_loss_and_sell_pressure_create_actionable_hazard(self):
         class WalletIntel:
             def get_top_wallets(self, limit=50):

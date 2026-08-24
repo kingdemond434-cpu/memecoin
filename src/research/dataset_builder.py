@@ -487,22 +487,37 @@ class PointInTimeDatasetBuilder:
         peak_index = int(np.argmax(multiples))
         running_peak = multiples[0]
         max_drawdown = 0.0
-        for multiple in multiples:
+        inferred_rug = None
+        for multiple, item in zip(multiples, prices):
             running_peak = max(running_peak, multiple)
-            max_drawdown = max(max_drawdown, 1 - multiple / max(running_peak, 1e-12))
+            drawdown = 1 - multiple / max(running_peak, 1e-12)
+            max_drawdown = max(max_drawdown, drawdown)
+            if inferred_rug is None and drawdown >= 0.90:
+                inferred_rug = item
         feasible = [
             multiple for multiple, item in zip(multiples, prices)
             if item.get("route_feasible", item.get("feasible")) is True
             and float(item.get("price_impact_pct", 1) or 1) <= 0.15
         ]
-        explicit_rug = next((item for item in episode.market_observations if item.get("rugged")), None)
+        explicit_rugs = sorted(
+            (item for item in episode.market_observations if item.get("rugged")),
+            key=lambda item: float(item.get("timestamp", float("inf")) or float("inf")),
+        )
+        explicit_rug = explicit_rugs[0] if explicit_rugs else None
+        rug_observation = explicit_rug or inferred_rug
+        migration_types = {"migration", "token_migrated", "graduation"}
+        migrated = any(
+            item.get("migrated") is True or str(item.get("type", "")).lower() in migration_types
+            for item in episode.market_observations
+        )
         realized = sum(float(item.get("realized_pnl_usd", 0) or 0) for item in episode.execution_attempts)
         return {
             "status": "OK",
             "max_multiple": max(multiples),
-            "migrated": any(item.get("migrated") for item in episode.market_observations),
-            "rugged": bool(explicit_rug) or max_drawdown >= 0.90,
-            "rug_time": explicit_rug.get("timestamp") - episode.created_at if explicit_rug else None,
+            "migrated": migrated,
+            "rugged": rug_observation is not None,
+            "rug_time": max(0.0, float(rug_observation.get("timestamp", episode.created_at)) - episode.created_at)
+                        if rug_observation else None,
             "time_to_peak": prices[peak_index].get("timestamp", episode.created_at) - episode.created_at,
             "max_drawdown": max_drawdown,
             "feasible_exit_multiple": max(feasible) if feasible else None,
