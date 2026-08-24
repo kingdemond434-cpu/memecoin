@@ -23,12 +23,15 @@ fn anchor_discriminator(name: &str) -> Vec<u8> {
 #[pyfunction]
 fn looks_like_pool_creation(logs: Vec<String>) -> bool {
     logs.iter().any(|line| {
-        let lower = line.to_ascii_lowercase();
-        lower.contains("initialize2")
-            || lower.contains("initialize_pool")
-            || lower.contains("create_pool")
-            || lower.contains("initialize lb pair")
-            || lower.contains("initializeconfigextension")
+        let Some((_, instruction)) = line.rsplit_once("Instruction:") else { return false; };
+        let normalized = instruction.trim().to_ascii_lowercase().replace('_', "").replace(' ', "");
+        matches!(normalized.as_str(),
+            "initialize" | "initialize2" | "initializepool" | "initializepoolv2" | "createpool"
+            | "initializelbpair" | "initializecustomizablepermissionlesslbpair"
+            | "initializepermissionlesspool" | "initializepermissionlesspoolwithfeetier"
+            | "initializepermissionlessconstantproductpoolwithconfig"
+            | "initializepermissionlessconstantproductpoolwithconfig2"
+            | "initializecustomizablepermissionlessconstantproductpool")
     })
 }
 
@@ -58,5 +61,10 @@ mod tests {
     fn discriminator_is_stable() {
         assert_eq!(anchor_discriminator("buy"), vec![102, 6, 61, 18, 1, 218, 235, 234]);
     }
-}
 
+    #[test]
+    fn pool_filter_accepts_initializer_and_rejects_position_noise() {
+        assert!(looks_like_pool_creation(vec!["Program log: Instruction: InitializePoolV2".into()]));
+        assert!(!looks_like_pool_creation(vec!["Program log: Instruction: CreatePosition".into()]));
+    }
+}
