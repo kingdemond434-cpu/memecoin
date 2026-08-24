@@ -1,0 +1,154 @@
+chains:
+  ethereum:
+    name: "Ethereum Mainnet"
+    chain_id: 1
+    rpc_urls:
+      - "https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+      - "https://mainnet.infura.io/v3/${INFURA_KEY}"
+      - "https://eth.drpc.org"
+    ws_urls:
+      - "wss://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+      - "wss://mainnet.infura.io/ws/v3/${INFURA_KEY}"
+    explorer_api: "https://api.etherscan.io/api"
+    explorer_key: "${ETHERSCAN_KEY}"
+    native_token: "ETH"
+    decimals: 18
+    block_time: 12
+    factories:
+      uniswap_v2: "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
+      uniswap_v3: "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+    routers:
+      uniswap_v2: "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
+      uniswap_v3: "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+    base_tokens:
+      - "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"  # WETH
+      - "0xA0b86a33E6441e8C3D8a4b4B4C4C4C4C4C4C4C4C4"  # USDC
+      - "0xdAC17F958D2ee523a2206206994597C13D831ec7"  # USDT
+    min_liquidity_usd: 10000
+    max_tax: 15
+    honeypot_check: true
+
+  base:
+    name: "Base"
+    chain_id: 8453
+    rpc_urls:
+      - "https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+      - "https://base.rpcflashbots.net"
+      - "https://mainnet.base.org"
+    ws_urls:
+      - "wss://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+    explorer_api: "https://api.basescan.org/api"
+    explorer_key: "${BASESCAN_KEY}"
+    native_token: "ETH"
+    decimals: 18
+    block_time: 2
+    factories:
+      uniswap_v2: "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6"
+      uniswap_v3: "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"
+    routers:
+      uniswap_v2: "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24"
+      uniswap_v3: "0x2626664c2603336E57B271c5C0b26F421741e481"
+    base_tokens:
+      - "0x4200000000000000000000000000000000000006"  # WETH
+      - "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"  # USDC
+    min_liquidity_usd: 5000
+    max_tax: 20
+    honeypot_check: true
+
+  arbitrum:
+    name: "Arbitrum One"
+    chain_id: 42161
+    rpc_urls:
+      - "https://arb-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+      - "https://arbitrum.drpc.org"
+      - "https://arb1.arbitrum.io/rpc"
+    ws_urls:
+      - "wss://arb-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+    explorer_api: "https://api.arbiscan.io/api"
+    explorer_key: "${ARBISCAN_KEY}"
+    native_token: "ETH"
+    decimals: 18
+    block_time: 0.25
+    factories:
+      uniswap_v2: "0xFAf8c5E3C71d29E0993aD52a4a3F173f3d579Dd2"
+      uniswap_v3: "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+    routers:
+      uniswap_v2: "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+      uniswap_v3: "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+    base_tokens:
+      - "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"  # WETH
+      - "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8"  # USDC
+    min_liquidity_usd: 5000
+    max_tax: 20
+    honeypot_check: true
+
+  bsc:
+    name: "BNB Smart Chain"
+    chain_id: 56
+    rpc_urls:
+      - "https://bsc-dataseed1.binance.org"
+      - "https://bsc-dataseed2.binance.org"
+      - "https://bsc.drpc.org"
+    ws_urls:
+      - "wss://bsc-rpc.publicnode.com"
+    explorer_api: "https://api.bscscan.com/api"
+    explorer_key: "${BSCSCAN_KEY}"
+    native_token: "BNB"
+    decimals: 18
+    block_time: 3
+    factories:
+      pancakeswap_v2: "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
+      pancakeswap_v3: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"
+    routers:
+      pancakeswap_v2: "0x10ED43C718714eb63d5aA57B78B54704E256024E"
+      pancakeswap_v3: "0x1b81D678fcE49A6B6e2F06B3B6a81F4b5E5c1F8A"
+    base_tokens:
+      - "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"  # WBNB
+      - "0x55d398326f99059fF775485246999027B3197955"  # USDT
+      - "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d"  # USDC
+    min_liquidity_usd: 3000
+    max_tax: 25
+    honeypot_check: true
+
+  solana:
+    name: "Solana Mainnet"
+    chain_id: "solana"
+    rpc_urls:
+      - "https://api.mainnet-beta.solana.com"
+      - "https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+      - "https://rpc.helius.xyz/?api-key=${HELIUS_KEY}"
+    ws_urls:
+      - "wss://api.mainnet-beta.solana.com"
+      - "wss://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+    explorer_api: "https://public-api.solscan.io"
+    explorer_key: "${SOLSCAN_KEY}"
+    native_token: "SOL"
+    decimals: 9
+    block_time: 0.4
+    programs:
+      pump_fun: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+      raydium_amm: "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+      orca_whirlpool: "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+      meteora_dlmm: "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
+    base_tokens:
+      - "So11111111111111111111111111111111111111112"  # WSOL
+      - "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC
+    min_liquidity_usd: 2000
+    max_tax: 0  # N/A on Solana
+    honeypot_check: false
+
+global:
+  max_concurrent_positions: 10
+  max_position_size_usd: 500
+  max_daily_loss_usd: 1000
+  min_profit_target_pct: 50
+  max_hold_time_minutes: 60
+  stop_loss_pct: 30
+  trailing_stop_pct: 15
+  gas_multiplier: 1.5
+  priority_fee_gwei: 2
+  mev_protection: true
+  flashbots_relay: "https://relay.flashbots.net"
+  jito_tip_lamports: 100000
+  log_level: "INFO"
+  dry_run: true

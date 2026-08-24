@@ -1,0 +1,59 @@
+version: '3.8'
+
+services:
+  memecoin-bot:
+    build: .
+    container_name: memecoin-quant-desk
+    restart: unless-stopped
+    environment:
+      - SOLANA_PRIVATE_KEY=${SOLANA_PRIVATE_KEY}
+      - HELIUS_API_KEY=${HELIUS_API_KEY}
+      - YELLOWSTONE_GRPC_URL=${YELLOWSTONE_GRPC_URL}
+      - X_BEARER_TOKEN=${X_BEARER_TOKEN}
+      - TELEGRAM_API_KEY=${TELEGRAM_API_KEY}
+      - ALCHEMY_KEY=${ALCHEMY_KEY}
+      - INFURA_KEY=${INFURA_KEY}
+      - ETHERSCAN_KEY=${ETHERSCAN_KEY}
+      - BASESCAN_KEY=${BASESCAN_KEY}
+      - ARBISCAN_KEY=${ARBISCAN_KEY}
+      - BSCSCAN_KEY=${BSCSCAN_KEY}
+      - SOLSCAN_KEY=${SOLSCAN_KEY}
+      - LOG_LEVEL=INFO
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./models:/app/models
+      - ./config:/app/config:ro
+    deploy:
+      resources:
+        limits:
+          memory: 3.5G
+        reservations:
+          memory: 2G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  redis:
+    image: redis:7-alpine
+    container_name: memecoin-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    command: redis-server --maxmemory 200mb --maxmemory-policy allkeys-lru
+
+volumes:
+  redis_data:
