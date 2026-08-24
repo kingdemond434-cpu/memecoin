@@ -8,8 +8,9 @@ or safe operating assumption.
 ## What is implemented
 
 - Pump.fun bonding-curve and PumpSwap decoders derived from the official IDLs.
-- Raydium AMM v4 pool/swap parsing; CPMM and CLMM are subscribed but explicitly
-  not decoded until their native layouts and historical fixtures are added.
+- Official-layout pool creation decoders for Raydium AMM v4/CPMM/CLMM, Meteora
+  DLMM/Dynamic AMM, and Orca Whirlpools. Unknown instructions are ignored rather
+  than inferred from account positions.
 - Yellowstone gRPC with vendored official protobuf bindings, handshake
   validation, reconnection, and a confirmed-RPC fallback.
 - Native SPL and Token-2022 mint-authority, freeze-authority, extension,
@@ -147,15 +148,18 @@ journalctl -u memecoin-shadow -f
 - A versioned, chronologically validated model bundle is still required before
   prediction status changes from `DATA_BLOCKED`. No constant-score fallback is
   used.
-- PumpSwap has exact native parsing. Raydium CPMM/CLMM, Meteora, and Orca require
-  their own official-layout decoders and real fixtures before being marked OK.
+- PumpSwap and the supported Raydium/Meteora/Orca pool-creation instructions use
+  native layouts and official program IDs. Pump has a reduced real-mainnet replay
+  fixture; equivalent sanitized mainnet fixtures for every AMM remain an evidence
+  task and are not represented as complete validation.
 
 ## Tests
 
 The suite covers dry-run non-submission, the independent live lock,
 VersionedTransaction signatures, native mint checks, nested P2/P5/P10/P50 math,
 risk-constrained sizing, partial cost basis, chain-aware RPC health, PumpSwap and
-Raydium layouts, FIFO wallet scoring, point-in-time leakage, counterfactuals,
+Raydium/Meteora/Orca layouts, FIFO wallet accounting, non-fabricated wallet-regime
+labels, point-in-time leakage, counterfactuals,
 public coordination, rug hazard, active-episode recovery, promotion-state
 recovery, official social-source blocking/ingest, and landed wallet-delta accounting. A reduced fixture from Solana mainnet slot
 `441417557` exercises the same Pump.fun inner-instruction decoder used live.

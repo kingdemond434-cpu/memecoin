@@ -27,7 +27,7 @@ from src.main import MemecoinQuantDesk
 from src.strategies.information_graph import CounterfactualExecutionLab
 from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPrediction, MultiHeadPredictor, PredictionFeatures
 from src.strategies.public_coordination import PublicCoordinationMiner
-from src.strategies.wallet_intelligence import WalletIntelligenceEngine
+from src.strategies.wallet_intelligence import WalletIntelligenceEngine, WalletRegime
 from src.research.dataset_builder import LaunchEpisode, PointInTimeDatasetBuilder, SnapshotTimepoint
 from src.research.shadow_trainer import chronological_episode_split, train_shadow
 from src.research.global_research_miner import GlobalResearchMiner, ResearchLead
@@ -80,6 +80,75 @@ class TestSolanaParsing(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["mint_a"], "key8")
         self.assertEqual(event["mint_b"], "key9")
         self.assertEqual(event["creator"], "key17")
+
+    def test_raydium_cpmm_initialize_uses_official_idl_layout(self):
+        keys = [f"key{i}" for i in range(20)]
+        data = RaydiumMonitor.CPMM_INITIALIZE + struct.pack("<QQQ", 75_000, 50_000, 1234)
+        event = RaydiumMonitor._decode_cpmm(keys, list(range(20)), data, "cpmm-sig", 101)
+        self.assertEqual(event["program"], RaydiumMonitor.RAYDIUM_CPMM)
+        self.assertEqual(event["pool"], "key3")
+        self.assertEqual(event["mint_a"], "key4")
+        self.assertEqual(event["mint_b"], "key5")
+        self.assertEqual(event["creator"], "key0")
+        self.assertEqual(event["initial_base_amount"], 75_000)
+        self.assertEqual(event["initial_quote_amount"], 50_000)
+        self.assertEqual(event["data_status"], "OK")
+
+    def test_raydium_clmm_create_pool_uses_official_idl_layout(self):
+        keys = [f"key{i}" for i in range(13)]
+        sqrt_price_x64 = 1 << 64
+        data = RaydiumMonitor.CLMM_CREATE_POOL + sqrt_price_x64.to_bytes(16, "little") + struct.pack("<Q", 1234)
+        event = RaydiumMonitor._decode_clmm(keys, list(range(13)), data, "clmm-sig", 102)
+        self.assertEqual(event["program"], RaydiumMonitor.RAYDIUM_CLMM)
+        self.assertEqual(event["pool"], "key2")
+        self.assertEqual(event["mint_a"], "key3")
+        self.assertEqual(event["mint_b"], "key4")
+        self.assertEqual(event["creator"], "key0")
+        self.assertEqual(event["sqrt_price_x64"], sqrt_price_x64)
+        self.assertEqual(event["data_status"], "OK")
+
+    def test_raydium_official_program_addresses_are_subscribed(self):
+        programs = create_combined_subscription().transactions["memecoin_programs"].accounts_include
+        self.assertIn(RaydiumMonitor.RAYDIUM_CPMM, programs)
+        self.assertIn(RaydiumMonitor.RAYDIUM_CLMM, programs)
+
+    def test_meteora_dlmm_initialize_uses_official_idl_layout(self):
+        keys = [f"key{i}" for i in range(14)]
+        data = RaydiumMonitor.METEORA_DLMM_INITIALIZE + struct.pack("<iH", -25, 10)
+        event = RaydiumMonitor._decode_meteora_dlmm(keys, list(range(14)), data, "dlmm-sig", 103)
+        self.assertEqual(event["pool"], "key0")
+        self.assertEqual(event["mint_a"], "key2")
+        self.assertEqual(event["mint_b"], "key3")
+        self.assertEqual(event["creator"], "key8")
+        self.assertEqual(event["active_id"], -25)
+        self.assertEqual(event["bin_step"], 10)
+
+    def test_meteora_dynamic_amm_uses_official_idl_layout(self):
+        keys = [f"key{i}" for i in range(27)]
+        discriminator = bytes((118, 173, 41, 157, 173, 72, 97, 103))
+        event = RaydiumMonitor._decode_meteora_amm(keys, list(range(27)), discriminator, "amm-sig", 104)
+        self.assertEqual(event["pool"], "key0")
+        self.assertEqual(event["mint_a"], "key2")
+        self.assertEqual(event["mint_b"], "key3")
+        self.assertEqual(event["creator"], "key17")
+
+    def test_orca_v2_initialize_uses_official_program_layout(self):
+        keys = [f"key{i}" for i in range(14)]
+        sqrt_price_x64 = 1 << 64
+        data = RaydiumMonitor.ORCA_INITIALIZE_POOL_V2 + struct.pack("<H", 64) + sqrt_price_x64.to_bytes(16, "little")
+        event = RaydiumMonitor._decode_orca(keys, list(range(14)), data, "orca-sig", 105)
+        self.assertEqual(event["pool"], "key6")
+        self.assertEqual(event["mint_a"], "key1")
+        self.assertEqual(event["mint_b"], "key2")
+        self.assertEqual(event["creator"], "key5")
+        self.assertEqual(event["tick_spacing"], 64)
+        self.assertEqual(event["sqrt_price_x64"], sqrt_price_x64)
+
+    def test_all_native_amm_programs_are_subscribed(self):
+        programs = create_combined_subscription().transactions["memecoin_programs"].accounts_include
+        self.assertIn(RaydiumMonitor.METEORA_DLMM, programs)
+        self.assertIn(RaydiumMonitor.METEORA_DYNAMIC_AMM, programs)
+        self.assertIn(RaydiumMonitor.ORCA_WHIRLPOOL, programs)
 
     async def test_pumpswap_uses_native_amm_account_layout(self):
         keys = [f"key{i}" for i in range(24)] + [PumpSwapMonitor.PUMP_AMM_PROGRAM]
@@ -450,6 +519,11 @@ class TestWalletAndCoordination(unittest.TestCase):
         self.assertEqual(len(result["closed_trades"]), 1)
         self.assertAlmostEqual(result["closed_trades"][0]["multiple"], 5.0)
         self.assertAlmostEqual(result["closed_trades"][0]["realized_pnl"], 2.0)
+
+    def test_wallet_regime_is_not_fabricated_from_missing_history(self):
+        engine = WalletIntelligenceEngine(solana_chain(), FakeRpc(), FakeGenealogy(), "")
+        self.assertIsNone(engine._classify_regime({"timestamp": 11, "multiple": 5.0}))
+        self.assertEqual(engine._classify_regime({"regime": "post_migration"}), WalletRegime.POST_MIGRATION)
 
     def test_public_coordination_requires_evidence_and_detects_same_slot(self):
         class WalletIntel:

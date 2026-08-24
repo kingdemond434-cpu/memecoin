@@ -209,7 +209,9 @@ class MemecoinQuantDesk:
         elif not self.offline:
             self.rpc_program_stream = SolanaRpcProgramStream(
                 self.solana_rpc, [PumpFunMonitor.PUMP_FUN_PROGRAM, PumpSwapMonitor.PUMP_AMM_PROGRAM,
-                                  RaydiumMonitor.RAYDIUM_AMM_V4]
+                                  RaydiumMonitor.RAYDIUM_AMM_V4, RaydiumMonitor.RAYDIUM_CPMM,
+                                  RaydiumMonitor.RAYDIUM_CLMM, RaydiumMonitor.METEORA_DLMM,
+                                  RaydiumMonitor.METEORA_DYNAMIC_AMM, RaydiumMonitor.ORCA_WHIRLPOOL]
             )
             self.pump_monitor = PumpFunMonitor(self.rpc_program_stream, self._on_pump_event)
             self.pump_swap_monitor = PumpSwapMonitor(self.rpc_program_stream, self._on_pump_event)
@@ -866,18 +868,22 @@ class MemecoinQuantDesk:
     async def _on_raydium_event(self, event: Dict[str, Any]):
         if event.get("type") != "pool_created":
             return
-        for mint in (event.get("mint_a"), event.get("mint_b")):
+        mints = (event.get("mint_a"), event.get("mint_b"))
+        for mint in mints:
             if not mint or mint in {WSOL_MINT, USDC_MINT}:
                 continue
+            quote_mint = next((other for other in mints if other in {WSOL_MINT, USDC_MINT}), None)
             self.info_graph.record_event(mint, LeadEventType.MIGRATION, event.get("pool", ""), "raydium_pool",
                                          event.get("timestamp", time.time()), event)
             self.dataset_builder.record_market_observation(mint, {"type": "migration", **event})
             await self.detection_engine._on_candidate(TokenCandidate(
                 address=mint, chain="solana", source=DetectionSource.FACTORY, block_number=int(event.get("slot", 0)),
                 tx_hash=event.get("signature"), deployer=event.get("creator"), factory=event.get("program"),
-                pair=event.get("pool"), base_token=WSOL_MINT, timestamp=event.get("timestamp", time.time()),
+                pair=event.get("pool"), base_token=quote_mint, timestamp=event.get("timestamp", time.time()),
                 metadata={"initial_base_amount": event.get("initial_base_amount"),
-                          "initial_quote_amount": event.get("initial_quote_amount")},
+                          "initial_quote_amount": event.get("initial_quote_amount"),
+                          "venue": event.get("venue"),
+                          "data_status": event.get("data_status", "DATA_BLOCKED")},
             ))
 
     async def _on_social_mention(self, signal: Dict[str, Any]):

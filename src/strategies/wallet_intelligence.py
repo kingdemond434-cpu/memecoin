@@ -214,12 +214,21 @@ class WalletIntelligenceEngine:
         self._history_signatures[wallet].update(tx.get("signature") for tx in unseen if tx.get("signature"))
         wp.tx_count += reconstructed["swap_count"]
         wp.last_seen = max([float(tx.get("timestamp", 0) or 0) for tx in txs] + [wp.last_seen])
+        classified_trades = 0
         for trade in reconstructed["closed_trades"]:
             token = trade["token"]
             if token not in wp.launches_participated:
                 wp.launches_participated.append(token)
-            await self._update_regime_performance(wallet, self._classify_regime(trade), trade)
-        self.data_status[wallet] = "OK" if reconstructed["closed_trades"] else "DATA_BLOCKED"
+            regime = self._classify_regime(trade)
+            if regime is not None:
+                await self._update_regime_performance(wallet, regime, trade)
+                classified_trades += 1
+        if classified_trades:
+            self.data_status[wallet] = "OK"
+        elif reconstructed["closed_trades"]:
+            self.data_status[wallet] = "DATA_BLOCKED: closed trades lack PIT regime labels"
+        else:
+            self.data_status[wallet] = "DATA_BLOCKED: no complete comparable round trips"
 
     def _reconstruct_wallet_trades(self, wallet: str, txs: List[Dict]) -> Dict[str, Any]:
         """Reconstruct actual FIFO round trips from Helius transfer deltas."""
@@ -323,14 +332,19 @@ class WalletIntelligenceEngine:
             pass
         return None
 
-    def _classify_regime(self, tx: Dict) -> WalletRegime:
-        slot = tx.get("slot", 0)
-        timestamp = tx.get("timestamp", time.time())
-        
+    def _classify_regime(self, tx: Dict) -> Optional[WalletRegime]:
         if self.regime_classifier:
             return self.regime_classifier(tx)
-        
-        return WalletRegime.EARLY_CURVE
+        supplied = tx.get("regime")
+        if supplied:
+            try:
+                return supplied if isinstance(supplied, WalletRegime) else WalletRegime(str(supplied))
+            except ValueError:
+                return None
+        # Historical enhanced transactions do not establish launch-relative
+        # timing on their own. Defaulting every trade to EARLY_CURVE creates a
+        # false performance edge, so this remains explicitly unclassified.
+        return None
 
     async def _update_regime_performance(self, wallet: str, regime: WalletRegime, tx: Dict):
         if regime not in self.regime_performances[wallet]:

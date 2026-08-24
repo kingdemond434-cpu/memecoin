@@ -645,9 +645,32 @@ class PumpSwapMonitor:
 
 
 class RaydiumMonitor:
+    """Decode pool creation across the supported native Solana AMMs.
+
+    The historical class name is retained for API compatibility. Every layout
+    below is keyed by the deployed program and official Anchor IDL
+    discriminator; unknown instructions are ignored rather than guessed.
+    """
+
     RAYDIUM_AMM_V4 = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
     RAYDIUM_CPMM = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"
-    RAYDIUM_CLMM = "CAMMCzo5YL8w4VSA8KLpfqZrUQfM6NWzrgZt5Jg3u6R"
+    RAYDIUM_CLMM = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+    METEORA_DLMM = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
+    METEORA_DYNAMIC_AMM = "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB"
+    ORCA_WHIRLPOOL = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+    CPMM_INITIALIZE = bytes((175, 175, 109, 31, 13, 152, 155, 237))
+    CLMM_CREATE_POOL = bytes((233, 146, 209, 142, 207, 104, 64, 188))
+    METEORA_DLMM_INITIALIZE = bytes((45, 154, 237, 210, 221, 15, 166, 92))
+    METEORA_DLMM_CUSTOM_INITIALIZE = bytes((46, 39, 41, 135, 111, 183, 200, 64))
+    METEORA_AMM_INITIALIZERS = {
+        bytes((118, 173, 41, 157, 173, 72, 97, 103)): (0, 2, 3, 17),
+        bytes((6, 135, 68, 147, 229, 82, 169, 113)): (0, 2, 3, 17),
+        bytes((7, 166, 138, 171, 206, 171, 236, 244)): (0, 3, 4, 18),
+        bytes((48, 149, 220, 130, 61, 11, 9, 178)): (0, 3, 4, 18),
+        bytes((145, 24, 172, 194, 219, 125, 3, 190)): (0, 2, 3, 17),
+    }
+    ORCA_INITIALIZE_POOL = bytes((95, 180, 10, 172, 84, 174, 232, 40))
+    ORCA_INITIALIZE_POOL_V2 = bytes((207, 45, 87, 242, 27, 63, 204, 67))
 
     def __init__(self, yellowstone: YellowstoneClient, callback: Callable):
         self.yellowstone = yellowstone
@@ -664,20 +687,34 @@ class RaydiumMonitor:
                 if program_index < 0 or program_index >= len(keys) or not data:
                     continue
                 program = keys[program_index]
-                if program != self.RAYDIUM_AMM_V4:
-                    continue  # CPMM/CLMM layouts are intentionally not guessed.
-                tag = data[0]
+                supported = {
+                    self.RAYDIUM_AMM_V4, self.RAYDIUM_CPMM, self.RAYDIUM_CLMM,
+                    self.METEORA_DLMM, self.METEORA_DYNAMIC_AMM, self.ORCA_WHIRLPOOL,
+                }
+                if program not in supported:
+                    continue
                 dedupe = (signature, instruction_index)
                 if dedupe in self._seen:
                     continue
                 self._seen.add(dedupe)
-                event = self._decode_v4(tag, keys, accounts, data[1:], signature, slot)
+                if program == self.RAYDIUM_AMM_V4:
+                    event = self._decode_v4(data[0], keys, accounts, data[1:], signature, slot)
+                elif program == self.RAYDIUM_CPMM:
+                    event = self._decode_cpmm(keys, accounts, data, signature, slot)
+                elif program == self.RAYDIUM_CLMM:
+                    event = self._decode_clmm(keys, accounts, data, signature, slot)
+                elif program == self.METEORA_DLMM:
+                    event = self._decode_meteora_dlmm(keys, accounts, data, signature, slot)
+                elif program == self.METEORA_DYNAMIC_AMM:
+                    event = self._decode_meteora_amm(keys, accounts, data, signature, slot)
+                else:
+                    event = self._decode_orca(keys, accounts, data, signature, slot)
                 if event:
                     apply_event_timing(event, tx_data, received_ns)
                     result = self.callback(event)
                     if asyncio.iscoroutine(result):
                         await result
-            except (IndexError, struct.error):
+            except (IndexError, struct.error, ValueError):
                 continue
 
     @staticmethod
@@ -714,6 +751,126 @@ class RaydiumMonitor:
             }
         return None
 
+    @staticmethod
+    def _decode_cpmm(
+        keys: List[str], accounts: List[int], data: bytes, signature: str, slot: int
+    ) -> Optional[Dict[str, Any]]:
+        """Decode Raydium CPMM initialize using the official Anchor IDL layout."""
+        if not data.startswith(RaydiumMonitor.CPMM_INITIALIZE) or len(data) < 32:
+            return None
+        account = lambda index: keys[accounts[index]] if index < len(accounts) and accounts[index] < len(keys) else ""
+        amount_0, amount_1, open_time = struct.unpack_from("<QQQ", data, 8)
+        required = (account(3), account(4), account(5), account(0))
+        return {
+            "chain": "solana",
+            "program": RaydiumMonitor.RAYDIUM_CPMM,
+            "venue": "raydium_cpmm",
+            "signature": signature,
+            "slot": slot,
+            "timestamp": time.time(),
+            "type": "pool_created",
+            "pool": account(3),
+            "mint_a": account(4),
+            "mint_b": account(5),
+            "creator": account(0),
+            "initial_base_amount": amount_0,
+            "initial_quote_amount": amount_1,
+            "open_time": open_time,
+            "data_status": "OK" if all(required) and amount_0 and amount_1 else "DATA_BLOCKED",
+        }
+
+    @staticmethod
+    def _decode_clmm(
+        keys: List[str], accounts: List[int], data: bytes, signature: str, slot: int
+    ) -> Optional[Dict[str, Any]]:
+        """Decode Raydium CLMM create_pool using the official Anchor IDL layout."""
+        if not data.startswith(RaydiumMonitor.CLMM_CREATE_POOL) or len(data) < 32:
+            return None
+        account = lambda index: keys[accounts[index]] if index < len(accounts) and accounts[index] < len(keys) else ""
+        sqrt_price_x64 = int.from_bytes(data[8:24], "little")
+        open_time = struct.unpack_from("<Q", data, 24)[0]
+        required = (account(2), account(3), account(4), account(0))
+        return {
+            "chain": "solana",
+            "program": RaydiumMonitor.RAYDIUM_CLMM,
+            "venue": "raydium_clmm",
+            "signature": signature,
+            "slot": slot,
+            "timestamp": time.time(),
+            "type": "pool_created",
+            "pool": account(2),
+            "mint_a": account(3),
+            "mint_b": account(4),
+            "creator": account(0),
+            "sqrt_price_x64": sqrt_price_x64,
+            "open_time": open_time,
+            "data_status": "OK" if all(required) and sqrt_price_x64 else "DATA_BLOCKED",
+        }
+
+    @staticmethod
+    def _pool_event(
+        program: str, venue: str, keys: List[str], accounts: List[int], signature: str, slot: int,
+        pool_index: int, mint_a_index: int, mint_b_index: int, creator_index: int, **fields: Any,
+    ) -> Dict[str, Any]:
+        def account(index: int) -> str:
+            return keys[accounts[index]] if index < len(accounts) and accounts[index] < len(keys) else ""
+
+        required = (account(pool_index), account(mint_a_index), account(mint_b_index), account(creator_index))
+        return {
+            "chain": "solana", "program": program, "venue": venue, "signature": signature,
+            "slot": slot, "timestamp": time.time(), "type": "pool_created",
+            "pool": account(pool_index), "mint_a": account(mint_a_index),
+            "mint_b": account(mint_b_index), "creator": account(creator_index),
+            "data_status": "OK" if all(required) else "DATA_BLOCKED", **fields,
+        }
+
+    @staticmethod
+    def _decode_meteora_dlmm(
+        keys: List[str], accounts: List[int], data: bytes, signature: str, slot: int
+    ) -> Optional[Dict[str, Any]]:
+        if len(data) < 8 or data[:8] not in {
+            RaydiumMonitor.METEORA_DLMM_INITIALIZE, RaydiumMonitor.METEORA_DLMM_CUSTOM_INITIALIZE,
+        }:
+            return None
+        fields: Dict[str, Any] = {}
+        if data[:8] == RaydiumMonitor.METEORA_DLMM_INITIALIZE and len(data) >= 14:
+            fields["active_id"], fields["bin_step"] = struct.unpack_from("<iH", data, 8)
+        return RaydiumMonitor._pool_event(
+            RaydiumMonitor.METEORA_DLMM, "meteora_dlmm", keys, accounts, signature, slot,
+            0, 2, 3, 8, **fields,
+        )
+
+    @staticmethod
+    def _decode_meteora_amm(
+        keys: List[str], accounts: List[int], data: bytes, signature: str, slot: int
+    ) -> Optional[Dict[str, Any]]:
+        layout = RaydiumMonitor.METEORA_AMM_INITIALIZERS.get(data[:8])
+        if not layout:
+            return None
+        return RaydiumMonitor._pool_event(
+            RaydiumMonitor.METEORA_DYNAMIC_AMM, "meteora_dynamic_amm", keys, accounts,
+            signature, slot, *layout,
+        )
+
+    @staticmethod
+    def _decode_orca(
+        keys: List[str], accounts: List[int], data: bytes, signature: str, slot: int
+    ) -> Optional[Dict[str, Any]]:
+        if data.startswith(RaydiumMonitor.ORCA_INITIALIZE_POOL_V2) and len(data) >= 26:
+            tick_spacing = struct.unpack_from("<H", data, 8)[0]
+            sqrt_price_x64 = int.from_bytes(data[10:26], "little")
+            layout = (6, 1, 2, 5)
+        elif data.startswith(RaydiumMonitor.ORCA_INITIALIZE_POOL) and len(data) >= 27:
+            tick_spacing = struct.unpack_from("<H", data, 9)[0]
+            sqrt_price_x64 = int.from_bytes(data[11:27], "little")
+            layout = (4, 1, 2, 3)
+        else:
+            return None
+        return RaydiumMonitor._pool_event(
+            RaydiumMonitor.ORCA_WHIRLPOOL, "orca_whirlpool", keys, accounts, signature, slot,
+            *layout, tick_spacing=tick_spacing, sqrt_price_x64=sqrt_price_x64,
+        )
+
 
 def create_combined_subscription() -> SubscribeRequest:
     programs = [
@@ -722,6 +879,9 @@ def create_combined_subscription() -> SubscribeRequest:
         RaydiumMonitor.RAYDIUM_AMM_V4,
         RaydiumMonitor.RAYDIUM_CPMM,
         RaydiumMonitor.RAYDIUM_CLMM,
+        RaydiumMonitor.METEORA_DLMM,
+        RaydiumMonitor.METEORA_DYNAMIC_AMM,
+        RaydiumMonitor.ORCA_WHIRLPOOL,
     ]
     return SubscribeRequest(
         transactions={
