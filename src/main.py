@@ -24,7 +24,7 @@ from solders.keypair import Keypair
 from src.chains.provider_credentials import normalize_provider_environment
 from src.chains.rpc_manager import ChainRegistry, RPCManager
 from src.chains.yellowstone_grpc import (
-    PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
+    NATIVE_FASTPATH_STATUS, PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
     create_combined_subscription,
 )
 from src.detection.rug_detector import RugDetector
@@ -578,6 +578,13 @@ class MemecoinQuantDesk:
                                                        candidate.metadata.get("funding_wallets", []),
                                                        candidate.metadata.get("initial_buyers", []))
         features.deployer_cluster_risk = graph_risk.get("risk_score", 0)
+        if deployer and deployer.funding_wallets:
+            reuse = 0
+            for funder in deployer.funding_wallets:
+                funded = {target for _, target, data in self.genealogy.graph.out_edges(funder, data=True)
+                          if data.get("type") == "funded"}
+                reuse = max(reuse, len(funded))
+            features.funding_wallet_reuse = min(reuse / 10, 1)
         buys = [item for item in self.wallet_intel._recent_buys if item.get("token") == candidate.address]
         features.initial_buyers = len({item.get("wallet") for item in buys if item.get("wallet")})
         buyer_scores = [self.wallet_intel.get_wallet_score(item.get("wallet", "")) for item in buys]
@@ -602,8 +609,23 @@ class MemecoinQuantDesk:
         features.liquidity_locked = bool(risk.liquidity_locked)
         features.can_mint = bool(risk.can_mint)
         features.can_freeze = bool(risk.can_freeze)
+        features.token_extension_risk = float(getattr(risk, "extension_risk", 0) or 0)
         features.holder_concentration = float(risk.top_10_pct) / 100
         features.top_10_pct = float(risk.top_10_pct)
+        if episode:
+            token_state = await self.dataset_builder._capture_token_features(episode, features.timestamp)
+            market_state = await self.dataset_builder._capture_market_features(episode, features.timestamp)
+            features.holder_concentration_delta = float(token_state.get("top_10_delta_pct", 0) or 0) / 100
+            features.holder_concentration_velocity = float(
+                token_state.get("top_10_velocity_pct_per_second", 0) or 0
+            ) / 100
+            features.meme_launch_rate_1h = float(market_state.get("meme_launch_rate_1h", 0) or 0)
+            features.sol_change_24h = float(market_state.get("sol_change_24h", 0) or 0)
+            features.btc_change_24h = float(market_state.get("btc_change_24h", 0) or 0)
+            features.sol_btc_beta = float(market_state.get("sol_btc_beta", 0) or 0)
+            features.solana_tvl_change = float(market_state.get("solana_tvl_change", 0) or 0)
+            features.priority_fee_p90 = float(market_state.get("priority_fee_p90", 0) or 0)
+            features.fee_pressure = float(market_state.get("fee_pressure", 0) or 0)
         social = self.social_intel.get_token_social_signal(candidate.address)
         features.social_velocity = float(social.get("avg_velocity", 0) or 0)
         features.social_acceleration = float(social.get("acceleration", 0) or 0)
@@ -848,6 +870,7 @@ class MemecoinQuantDesk:
         if not token:
             return
         if event.get("type") == "token_created":
+            self.wallet_intel.record_token_lifecycle(token, launch_at=event.get("timestamp", time.time()))
             self.dataset_builder.start_episode(
                 token, event.get("creator", ""), event.get("program", PumpFunMonitor.PUMP_FUN_PROGRAM),
                 event.get("bonding_curve", ""), WSOL_MINT, detected_at=event.get("timestamp", time.time()),
@@ -894,10 +917,12 @@ class MemecoinQuantDesk:
                 self.info_graph.record_event(token, event_type, event.get("wallet", ""), "wallet",
                                              event.get("timestamp", time.time()), event)
         elif event.get("type") == "token_migrated":
+            self.wallet_intel.record_token_lifecycle(token, migration_at=event.get("timestamp", time.time()))
             self.info_graph.record_event(token, LeadEventType.MIGRATION, "pump_fun", "program",
                                          event.get("timestamp", time.time()), event)
             self.dataset_builder.record_market_observation(token, {"type": "migration", **event})
         elif event.get("type") == "pool_created":
+            self.wallet_intel.record_token_lifecycle(token, migration_at=event.get("timestamp", time.time()))
             self.dataset_builder.start_episode(
                 token, event.get("creator", ""), event.get("program", PumpSwapMonitor.PUMP_AMM_PROGRAM),
                 event.get("pool", ""), event.get("quote_mint") or WSOL_MINT,
@@ -924,6 +949,7 @@ class MemecoinQuantDesk:
         for mint in mints:
             if not mint or mint in {WSOL_MINT, USDC_MINT}:
                 continue
+            self.wallet_intel.record_token_lifecycle(mint, migration_at=event.get("timestamp", time.time()))
             quote_mint = next((other for other in mints if other in {WSOL_MINT, USDC_MINT}), None)
             self.dataset_builder.start_episode(
                 mint, event.get("creator", ""), event.get("program", ""), event.get("pool", ""),
@@ -996,6 +1022,7 @@ class MemecoinQuantDesk:
             "equity": {"status": self.equity_status, "wallet_equity_usd": self.wallet_equity_usd,
                        "sol_price_usd": self.sol_price_usd},
             "execution": {"dry_run": self.execution_engine.dry_run if self.execution_engine else True},
+            "native_fastpath": NATIVE_FASTPATH_STATUS,
             "portfolio": self.elogw_engine.get_portfolio_state() if self.elogw_engine else {},
             "rug_hazard": self.rug_hazard.get_stats() if self.rug_hazard else {},
             "dataset": self.dataset_builder.get_stats() if self.dataset_builder else {},

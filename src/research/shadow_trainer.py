@@ -31,6 +31,7 @@ def snapshot_to_features(episode: Dict[str, Any], snapshot: Dict[str, Any]) -> P
     social = snapshot.get("social_features") or {}
     token = snapshot.get("token_features") or {}
     graph = snapshot.get("entity_graph_features") or {}
+    market = snapshot.get("market_features") or {}
     statuses = [
         bool(deployer.get("has_profile")), bool(wallet), flow.get("status") == "OK",
         liquidity.get("status") == "OK", bool(social.get("mention_count")),
@@ -44,6 +45,7 @@ def snapshot_to_features(episode: Dict[str, Any], snapshot: Dict[str, Any]) -> P
         deployer_avg_multiple=_number(deployer, "avg_max_multiple"),
         deployer_cluster_risk=_number(graph, "deployer_cluster_risk"),
         funding_wallet_risk=_number(graph, "funding_wallet_risk"),
+        funding_wallet_reuse=_number(graph, "funding_wallet_reuse"),
         initial_buyers=int(_number(wallet, "initial_buyer_count")),
         smart_buyers=int(_number(wallet, "smart_buyer_count")),
         insider_buyers=int(_number(wallet, "insider_buyer_count")),
@@ -62,7 +64,17 @@ def snapshot_to_features(episode: Dict[str, Any], snapshot: Dict[str, Any]) -> P
         chain_before_social=_number(social, "chain_before_pct"),
         cross_platform=bool(social.get("cross_platform")),
         holder_concentration=_number(token, "top_10_pct") / 100,
+        holder_concentration_delta=_number(token, "top_10_delta_pct") / 100,
+        holder_concentration_velocity=_number(token, "top_10_velocity_pct_per_second") / 100,
         top_10_pct=_number(token, "top_10_pct"),
+        token_extension_risk=_number(token, "extension_risk"),
+        meme_launch_rate_1h=_number(market, "meme_launch_rate_1h"),
+        sol_change_24h=_number(market, "sol_change_24h"),
+        btc_change_24h=_number(market, "btc_change_24h"),
+        sol_btc_beta=_number(market, "sol_btc_beta"),
+        solana_tvl_change=_number(market, "solana_tvl_change"),
+        priority_fee_p90=_number(market, "priority_fee_p90"),
+        fee_pressure=_number(market, "fee_pressure"),
         data_coverage=sum(statuses) / len(statuses),
         wallet_history_available=bool(wallet.get("smart_buyer_count") is not None),
         social_available=bool(social.get("mention_count")),

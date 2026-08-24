@@ -10,6 +10,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
+import aiohttp
 
 from src.chains.rpc_manager import ChainConfig, RPCManager
 from src.strategies.genealogy_graph import GenealogyGraph
@@ -136,6 +137,10 @@ class PointInTimeDatasetBuilder:
         self._flush_task: Optional[asyncio.Task] = None
         self._snapshot_inflight: Set[Tuple[str, SnapshotTimepoint]] = set()
         self._capture_tasks: Set[asyncio.Task] = set()
+        self._market_session: Optional[aiohttp.ClientSession] = None
+        self._market_cache: Dict[str, Any] = {}
+        self._market_cache_at = 0.0
+        self._macro_history: deque = deque(maxlen=1440)
 
     async def start(self):
         import os
@@ -143,6 +148,10 @@ class PointInTimeDatasetBuilder:
         self._load_outcome_index()
         self._load_active_checkpoints()
         self._running = True
+        self._market_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=8),
+            headers={"User-Agent": "memecoin-shadow-research/1.0"},
+        )
         self._snapshot_task = asyncio.create_task(self._snapshot_loop())
         self._flush_task = asyncio.create_task(self._flush_loop())
 
@@ -157,6 +166,9 @@ class PointInTimeDatasetBuilder:
             await asyncio.gather(*self._capture_tasks, return_exceptions=True)
         await self._flush_active()
         await self._flush_all()
+        if self._market_session:
+            await self._market_session.close()
+            self._market_session = None
 
     def start_episode(
         self,
@@ -375,16 +387,28 @@ class PointInTimeDatasetBuilder:
         return social_signal
 
     async def _capture_token_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
-        if not episode.risk_report:
+        reports = [item for item in episode.market_observations
+                   if item.get("type") == "risk_report" and float(item.get("timestamp", 0) or 0) <= as_of]
+        report = max(reports, key=lambda item: float(item.get("timestamp", 0) or 0)) if reports else episode.risk_report
+        if not report:
             return {"status": "DATA_BLOCKED", "reason": "risk_report_not_recorded"}
+        concentrations = [float(item.get("top_10_pct", 0) or 0) for item in reports
+                          if item.get("top_10_pct") is not None]
+        concentration_delta = concentrations[-1] - concentrations[0] if len(concentrations) >= 2 else 0.0
+        duration = (float(reports[-1].get("timestamp", 0)) - float(reports[0].get("timestamp", 0))) if len(reports) >= 2 else 0.0
         return {
-            "status": episode.risk_report.get("data_status", "OK"),
-            "ownership_renounced": episode.risk_report.get("ownership_renounced"),
-            "can_mint": episode.risk_report.get("can_mint"),
-            "can_freeze": episode.risk_report.get("can_freeze"),
-            "top_10_pct": episode.risk_report.get("top_10_pct"),
-            "token_extensions": episode.risk_report.get("token_extensions", []),
-            "sell_route_feasible": episode.risk_report.get("sell_route_feasible"),
+            "status": report.get("data_status", "OK"),
+            "ownership_renounced": report.get("ownership_renounced"),
+            "can_mint": report.get("can_mint"),
+            "can_freeze": report.get("can_freeze"),
+            "top_10_pct": report.get("top_10_pct"),
+            "top_10_delta_pct": concentration_delta,
+            "top_10_velocity_pct_per_second": concentration_delta / duration if duration > 0 else 0.0,
+            "token_extensions": report.get("token_extensions", []),
+            # The chronological model learns the actual outcome correlation;
+            # this input is only the normalized native-extension hazard prior.
+            "extension_risk": float(report.get("extension_risk", 0) or 0),
+            "sell_route_feasible": report.get("sell_route_feasible"),
         }
 
     async def _capture_market_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
@@ -393,13 +417,23 @@ class PointInTimeDatasetBuilder:
             if item.get("sol_price_usd") and float(item.get("timestamp", 0) or 0) <= as_of
         ]
         recent_launches = [ep for ep in self.active_episodes.values() if 0 <= as_of - ep.created_at <= 3600]
-        if not observed:
-            return {"status": "DATA_BLOCKED", "meme_launch_rate_1h": len(recent_launches)}
-        latest = max(observed, key=lambda item: item.get("timestamp", 0))
+        external = await self._external_market_state()
+        latest = max(observed, key=lambda item: item.get("timestamp", 0)) if observed else {}
         eligible_launches = [ep for ep in self.active_episodes.values() if ep.created_at <= as_of]
         return {
-            "status": "OK",
-            "sol_price_usd": latest.get("sol_price_usd"),
+            "status": "OK" if external.get("status") == "OK" or observed else "DATA_BLOCKED",
+            "sol_price_usd": external.get("sol_price_usd") or latest.get("sol_price_usd"),
+            "btc_price_usd": external.get("btc_price_usd"),
+            "sol_change_24h": external.get("sol_change_24h"),
+            "btc_change_24h": external.get("btc_change_24h"),
+            "sol_btc_beta": external.get("sol_btc_beta"),
+            "solana_tvl_usd": external.get("solana_tvl_usd"),
+            "solana_tvl_change": external.get("solana_tvl_change"),
+            "priority_fee_median": external.get("priority_fee_median"),
+            "priority_fee_p90": external.get("priority_fee_p90"),
+            "fee_pressure": external.get("fee_pressure"),
+            "external_sources": external.get("sources", {}),
+            "observed_at": external.get("observed_at"),
             "meme_launch_rate_1h": len(recent_launches),
             "graduation_rate_observed": sum(
                 any(item.get("migrated") and float(item.get("timestamp", 0) or 0) <= as_of
@@ -407,6 +441,79 @@ class PointInTimeDatasetBuilder:
                 for ep in eligible_launches
             ) / max(len(eligible_launches), 1),
         }
+
+    async def _external_market_state(self) -> Dict[str, Any]:
+        """Collect free macro and congestion observations with a shared 60s cache."""
+        now = time.time()
+        if self._market_cache and now - self._market_cache_at < 60:
+            return dict(self._market_cache)
+        result: Dict[str, Any] = {"status": "DATA_BLOCKED", "observed_at": now, "sources": {}}
+
+        async def prices():
+            if not self._market_session:
+                return None
+            url = "https://api.coingecko.com/api/v3/simple/price"
+            params = {"ids": "solana,bitcoin", "vs_currencies": "usd", "include_24hr_change": "true"}
+            async with self._market_session.get(url, params=params) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                return await resp.json()
+
+        async def tvl():
+            if not self._market_session:
+                return None
+            async with self._market_session.get("https://api.llama.fi/v2/chains") as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                chains = await resp.json()
+                return next((row for row in chains if str(row.get("name", "")).lower() == "solana"), None)
+
+        fetched = await asyncio.gather(prices(), tvl(), return_exceptions=True)
+        price_data, tvl_data = fetched
+        if isinstance(price_data, dict):
+            sol, btc = price_data.get("solana", {}), price_data.get("bitcoin", {})
+            result.update(sol_price_usd=sol.get("usd"), btc_price_usd=btc.get("usd"),
+                          sol_change_24h=sol.get("usd_24h_change"), btc_change_24h=btc.get("usd_24h_change"))
+            result["sources"]["coingecko"] = "OK"
+        else:
+            result["sources"]["coingecko"] = f"DATA_BLOCKED: {price_data}"
+        if isinstance(tvl_data, dict):
+            current_tvl = float(tvl_data.get("tvl", 0) or 0)
+            prior_tvl = next((float(row["solana_tvl_usd"]) for row in reversed(self._macro_history)
+                              if row.get("solana_tvl_usd")), None)
+            result["solana_tvl_usd"] = current_tvl or None
+            result["solana_tvl_change"] = ((current_tvl / prior_tvl) - 1) if current_tvl and prior_tvl else None
+            result["sources"]["defillama"] = "OK"
+        else:
+            result["sources"]["defillama"] = f"DATA_BLOCKED: {tvl_data}"
+        try:
+            fees = await self.rpc.request("getRecentPrioritizationFees", [])
+            values = sorted(float(row.get("prioritizationFee", 0) or 0) for row in (fees or []))
+            if values:
+                median = float(np.median(values))
+                p90 = float(np.percentile(values, 90))
+                result.update(priority_fee_median=median, priority_fee_p90=p90,
+                              fee_pressure=min(p90 / max(median, 1.0), 100.0))
+                result["sources"]["solana_priority_fees"] = "OK"
+            else:
+                result["sources"]["solana_priority_fees"] = "DATA_BLOCKED: empty response"
+        except Exception as exc:
+            result["sources"]["solana_priority_fees"] = f"DATA_BLOCKED: {exc}"
+
+        if result.get("sol_price_usd") and result.get("btc_price_usd"):
+            self._macro_history.append(dict(result))
+        if len(self._macro_history) >= 10:
+            sol_prices = np.array([row["sol_price_usd"] for row in self._macro_history], dtype=float)
+            btc_prices = np.array([row["btc_price_usd"] for row in self._macro_history], dtype=float)
+            sol_returns, btc_returns = np.diff(np.log(sol_prices)), np.diff(np.log(btc_prices))
+            variance = float(np.var(btc_returns))
+            result["sol_btc_beta"] = (float(np.cov(sol_returns, btc_returns, ddof=0)[0, 1]) / variance
+                                      if variance > 1e-12 else None)
+        else:
+            result["sol_btc_beta"] = None
+        result["status"] = "OK" if any(value == "OK" for value in result["sources"].values()) else "DATA_BLOCKED"
+        self._market_cache, self._market_cache_at = dict(result), now
+        return dict(result)
 
     async def _capture_entity_graph_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
         dp = self.genealogy.get_deployer_profile(episode.deployer)
@@ -418,14 +525,21 @@ class PointInTimeDatasetBuilder:
                 cluster_risk = 1 if cluster.risk_level == "critical" else 0.5 if cluster.risk_level == "high" else 0
         
         funding_risks = []
+        funding_reuse = 0
         if dp:
             for wallet in dp.funding_wallets:
                 profile = self.genealogy.get_wallet_profile(wallet)
                 if profile:
                     funding_risks.append(1 - profile.trust_score)
+                funded_deployers = {
+                    target for _, target, data in self.genealogy.graph.out_edges(wallet, data=True)
+                    if data.get("type") == "funded" and float(data.get("timestamp", 0) or 0) <= as_of
+                }
+                funding_reuse = max(funding_reuse, len(funded_deployers))
         return {
             "deployer_cluster_risk": cluster_risk,
             "funding_wallet_risk": max(funding_risks) if funding_risks else None,
+            "funding_wallet_reuse": min(funding_reuse / 10, 1),
             "creator_genealogy_depth": len(dp.funding_wallets) if dp else None,
             "status": "OK" if dp else "DATA_BLOCKED",
         }
@@ -535,7 +649,9 @@ class PointInTimeDatasetBuilder:
     def record_risk_report(self, token: str, report: Dict[str, Any]):
         episode = self.active_episodes.get(token)
         if episode:
-            episode.risk_report = report
+            recorded = {**report, "type": "risk_report", "timestamp": time.time()}
+            episode.market_observations.append(recorded)
+            episode.risk_report = recorded
 
     def get_outcome(self, token: str) -> Dict[str, Any]:
         if token in self.outcome_index:

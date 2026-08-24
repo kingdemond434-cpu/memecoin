@@ -8,6 +8,8 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import json
 import hashlib
+import os
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import aiohttp
@@ -88,7 +90,11 @@ class NarrativeCluster:
 
 
 class SocialIntelligenceEngine:
-    YOUTUBE_QUERIES = ("solana memecoin", "pump fun solana", "solana rug pull")
+    YOUTUBE_QUERIES = (
+        "solana memecoin", "pump fun solana", "solana rug pull",
+        "Solana 模因币", "Solana 聪明钱 钱包", "Solana 貔貅盘",
+        "ソラナ ミームコイン", "솔라나 밈코인", "솔라나 지갑 추적",
+    )
 
     def __init__(
         self,
@@ -126,6 +132,7 @@ class SocialIntelligenceEngine:
         self._seen_social_items: Set[str] = set()
         self._reddit_access_token = ""
         self._reddit_token_expires_at = 0.0
+        self._youtube_query_cursor = 0
         
         self._known_contracts: Set[str] = set()
         self._mention_callbacks: List[Callable] = []
@@ -168,6 +175,7 @@ class SocialIntelligenceEngine:
         await self._discover_accounts_from_successful_wallets()
         await self._discover_accounts_from_recent_launches()
         await self._discover_youtube_sources()
+        await self._discover_foreign_platform_sources()
         await self._recalculate_account_credibility()
 
     async def _hunter_loop(self):
@@ -178,6 +186,7 @@ class SocialIntelligenceEngine:
                 await self._discover_accounts_from_foreign_sources()
                 await self._discover_accounts_from_competitors()
                 await self._discover_youtube_sources()
+                await self._discover_foreign_platform_sources()
                 await self._recalculate_account_credibility()
             except Exception as e:
                 logger.error(f"Social hunter error: {e}")
@@ -271,7 +280,13 @@ class SocialIntelligenceEngine:
         published_after = datetime.fromtimestamp(time.time() - 86400, timezone.utc).isoformat(timespec="seconds")
         try:
             items = []
-            for query in self.YOUTUBE_QUERIES:
+            # YouTube search costs 100 quota units. Rotate three languages per
+            # cycle rather than exhausting the free daily quota in one run.
+            query_count = min(3, len(self.YOUTUBE_QUERIES))
+            queries = [self.YOUTUBE_QUERIES[(self._youtube_query_cursor + i) % len(self.YOUTUBE_QUERIES)]
+                       for i in range(query_count)]
+            self._youtube_query_cursor = (self._youtube_query_cursor + query_count) % len(self.YOUTUBE_QUERIES)
+            for query in queries:
                 async with self._session.get(
                     "https://www.googleapis.com/youtube/v3/search",
                     params={
@@ -313,6 +328,54 @@ class SocialIntelligenceEngine:
             self.data_status["youtube"] = "OK"
         except Exception as exc:
             self.data_status["youtube"] = f"DATA_BLOCKED: {exc}"
+
+    async def _discover_foreign_platform_sources(self):
+        """Read opt-in Bilibili/Zhihu RSS bridges without scraping either site."""
+        for platform, variable in ((SocialPlatform.BILIBILI, "BILIBILI_RSS_FEEDS"),
+                                   (SocialPlatform.ZHIHU, "ZHIHU_RSS_FEEDS")):
+            feeds = [value.strip() for value in os.getenv(variable, "").split(",") if value.strip()]
+            status_key = platform.value
+            if not feeds:
+                self.data_status[status_key] = f"DATA_BLOCKED: {variable} empty"
+                continue
+            successes = 0
+            failures = []
+            for feed in feeds:
+                try:
+                    async with self._session.get(feed) as resp:
+                        if resp.status != 200:
+                            raise RuntimeError(f"HTTP {resp.status}")
+                        root = ET.fromstring(await resp.text())
+                    items = list(root.findall(".//item"))
+                    if not items:
+                        items = list(root.findall(".//{http://www.w3.org/2005/Atom}entry"))
+                    for item in items[:50]:
+                        title = (item.findtext("title") or item.findtext("{http://www.w3.org/2005/Atom}title") or "").strip()
+                        summary = (item.findtext("description") or item.findtext("summary")
+                                   or item.findtext("{http://www.w3.org/2005/Atom}summary") or "").strip()
+                        link = (item.findtext("link") or "").strip()
+                        if not link:
+                            link_node = item.find("{http://www.w3.org/2005/Atom}link")
+                            link = (link_node.get("href", "") if link_node is not None else "").strip()
+                        item_id = link or hashlib.sha256(f"{title}:{summary}".encode()).hexdigest()
+                        dedupe = f"{platform.value}:{item_id}"
+                        if dedupe in self._seen_social_items:
+                            continue
+                        self._seen_social_items.add(dedupe)
+                        handle = feed
+                        await self._add_account({"platform": platform.value, "handle": handle,
+                                                 "account_id": handle, "display_name": platform.value})
+                        account = self.accounts[f"{platform.value}:{handle}"]
+                        for token in self._extract_contracts(f"{title}\n{summary}"):
+                            await self._process_mention(SocialMention(
+                                platform=platform, account=account, token=token,
+                                content=f"{title}\n{summary}"[:500], timestamp=time.time(), url=link,
+                            ))
+                    successes += 1
+                except (aiohttp.ClientError, asyncio.TimeoutError, ET.ParseError, ValueError, RuntimeError) as exc:
+                    failures.append(str(exc))
+            self.data_status[status_key] = (f"OK: {successes}/{len(feeds)} feeds"
+                                            if successes else f"DATA_BLOCKED: {'; '.join(failures[:3])}")
 
     async def _process_youtube_video(self, account: SocialAccount, item: Dict, statistics: Dict):
         video_id = item.get("id", {}).get("videoId", "")

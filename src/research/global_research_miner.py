@@ -43,6 +43,10 @@ class ResearchLead:
 
 class GlobalResearchMiner:
     RSS_FEEDS = [
+        ("https://solana.com/rss.xml", "en", "solana"),
+        ("https://www.coindesk.com/arc/outboundfeeds/rss/", "en", "coindesk"),
+        ("https://blog.chainalysis.com/feed/", "en", "chainalysis"),
+        ("https://www.theblock.co/rss.xml", "en", "theblock"),
         ("https://www.chaincatcher.com/rss/clist", "zh-cn", "chaincatcher"),
         ("https://rss.odaily.news/rss/newsflash", "zh-cn", "odaily"),
         ("https://rss.odaily.news/rss/post", "zh-cn", "odaily"),
@@ -94,6 +98,7 @@ class GlobalResearchMiner:
         self.data_status: Dict[str, str] = {}
         self._github_token = ""
         self.ledger_path = Path(ledger_path)
+        self._query_cursor = 0
 
     async def start(self):
         await self._load_ledger()
@@ -127,7 +132,13 @@ class GlobalResearchMiner:
             await asyncio.sleep(self.interval_seconds)
 
     async def run_once(self):
-        for query, language in self.QUERIES:
+        # Anonymous GitHub search permits only 10 requests/minute. Rotate eight
+        # queries per hourly cycle so a bad/expired token never exhausts the
+        # fallback budget while all languages are still covered over time.
+        count = min(8, len(self.QUERIES))
+        selected = [self.QUERIES[(self._query_cursor + i) % len(self.QUERIES)] for i in range(count)]
+        self._query_cursor = (self._query_cursor + count) % len(self.QUERIES)
+        for query, language in selected:
             await self._mine_github(query, language)
         await self._mine_arxiv()
         for url, language, source in self.RSS_FEEDS:

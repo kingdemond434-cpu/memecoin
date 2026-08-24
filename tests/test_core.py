@@ -316,6 +316,12 @@ class TestOfficialSocialCollectors(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.mentions[0].engagement["views"], 12)
         self.assertEqual(engine.mentions[0].url, "https://www.youtube.com/watch?v=video1")
 
+    def test_youtube_discovery_rotates_foreign_language_queries(self):
+        queries = " ".join(SocialIntelligenceEngine.YOUTUBE_QUERIES)
+        self.assertIn("模因币", queries)
+        self.assertIn("ミームコイン", queries)
+        self.assertIn("밈코인", queries)
+
     async def test_reddit_stays_blocked_without_approved_credentials(self):
         engine = self.make_engine()
         self.assertIsNone(await engine._reddit_headers())
@@ -701,6 +707,27 @@ class FakeGenealogy:
 
 
 class TestWalletAndCoordination(unittest.TestCase):
+    def test_standard_solana_transaction_becomes_wallet_swap(self):
+        wallet = "wallet"
+        tx = {
+            "blockTime": 123,
+            "transaction": {"message": {"accountKeys": [{"pubkey": wallet}]}},
+            "meta": {
+                "fee": 5_000, "preBalances": [2_000_005_000], "postBalances": [1_000_000_000],
+                "preTokenBalances": [{"owner": wallet, "mint": "token",
+                                       "uiTokenAmount": {"uiAmountString": "0"}}],
+                "postTokenBalances": [{"owner": wallet, "mint": "token",
+                                        "uiTokenAmount": {"uiAmountString": "100"}}],
+            },
+        }
+        enhanced = WalletIntelligenceEngine._standard_tx_to_enhanced(
+            wallet, {"signature": "sig", "blockTime": 123}, tx,
+        )
+        normalized = WalletIntelligenceEngine._normalize_swap(wallet, enhanced)
+        self.assertEqual(normalized["side"], "buy")
+        self.assertEqual(normalized["amount"], 100)
+        self.assertEqual(normalized["base_value"], 1.0)
+
     def test_wallet_history_uses_fifo_closed_round_trips(self):
         wallet = "wallet"
         engine = WalletIntelligenceEngine(solana_chain(), FakeRpc(), FakeGenealogy(), "")
