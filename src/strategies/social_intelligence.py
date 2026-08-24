@@ -619,7 +619,8 @@ class SocialIntelligenceEngine:
             self.data_status["telegram"] = "DATA_BLOCKED: authorized Telegram session unavailable"
             return
         try:
-            async for message in self._telegram_client.iter_messages(account.handle, limit=100):
+            target = int(account.handle) if account.handle.lstrip("-").isdigit() else account.handle
+            async for message in self._telegram_client.iter_messages(target, limit=100):
                 await self._process_telegram_message(account, message)
             self._telegram_poll_successes.add(account.handle)
             self._telegram_poll_failures.pop(account.handle, None)
@@ -642,7 +643,7 @@ class SocialIntelligenceEngine:
         """Process configured bot/channel messages from Telegram's push stream."""
         try:
             chat = await event.get_chat()
-            handle = str(getattr(chat, "username", "") or "").lstrip("@")
+            handle = str(getattr(chat, "username", "") or event.chat_id or "").lstrip("@")
             if not handle or handle.casefold() not in self._telegram_handles:
                 return
             key = f"telegram:{handle}"

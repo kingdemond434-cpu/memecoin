@@ -362,6 +362,22 @@ class TestOfficialSocialCollectors(unittest.IsolatedAsyncioTestCase):
         await engine._fetch_telegram_posts(missing)
         self.assertEqual(engine.data_status["telegram"], "OK_PARTIAL: 1 configured channels unavailable")
 
+    async def test_numeric_telegram_entity_is_polled_as_integer(self):
+        engine = self.make_engine()
+
+        class TelegramStub:
+            target = None
+
+            async def iter_messages(self, target, limit):
+                self.target = target
+                if False:
+                    yield None
+
+        engine._telegram_client = TelegramStub()
+        account = SocialAccount(SocialPlatform.TELEGRAM, "-10012345", "-10012345", "Private bot")
+        await engine._fetch_telegram_posts(account)
+        self.assertEqual(engine._telegram_client.target, -10012345)
+
 
 class TestNativeMintChecks(unittest.TestCase):
     @staticmethod
