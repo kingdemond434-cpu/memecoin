@@ -55,6 +55,53 @@ class DummyYellowstone:
 
 
 class TestSolanaParsing(unittest.IsolatedAsyncioTestCase):
+    def test_pump_trade_program_event_decodes_without_http_transaction_fetch(self):
+        monitor = PumpFunMonitor(DummyYellowstone(), lambda _: None)
+        mint_raw = bytes(range(1, 33))
+        user_raw = bytes(range(33, 65))
+        data = (
+            PumpFunMonitor.TRADE_EVENT + mint_raw + struct.pack("<QQ?", 2_000_000_000, 5_000_000, True)
+            + user_raw + struct.pack("<q", 1_700_000_000)
+        )
+        event = monitor._decode_program_event(data, "event-sig", 98)
+        from src.chains.yellowstone_grpc import b58encode
+        self.assertEqual(event["token"], b58encode(mint_raw))
+        self.assertEqual(event["wallet"], b58encode(user_raw))
+        self.assertEqual(event["side"], "buy")
+        self.assertEqual(event["notional_sol"], 2.0)
+        self.assertEqual(event["fill_data_status"], "OBSERVED_PROGRAM_EVENT")
+
+    def test_pumpswap_program_events_populate_pool_then_trade(self):
+        monitor = PumpSwapMonitor(DummyYellowstone(), lambda _: None)
+        creator, mint, quote, pool, user = (bytes([value]) * 32 for value in range(1, 6))
+        create = bytearray(205)
+        create[:8] = PumpSwapMonitor.CREATE_POOL_EVENT
+        struct.pack_into("<qH", create, 8, 1_700_000_000, 7)
+        create[18:50], create[50:82], create[82:114] = creator, mint, quote
+        create[114], create[115] = 6, 9
+        struct.pack_into("<QQ", create, 116, 5_000_000, 2_000_000_000)
+        create[173:205] = pool
+        created = monitor._decode_program_event(bytes(create), "create-sig", 99)
+        self.assertEqual(created["initial_base_amount"], 5_000_000)
+
+        buy = bytearray(184)
+        buy[:8] = PumpSwapMonitor.BUY_EVENT
+        struct.pack_into("<qQ", buy, 8, 1_700_000_001, 1_000_000)
+        struct.pack_into("<Q", buy, 64, 500_000_000)
+        buy[120:152], buy[152:184] = pool, user
+        traded = monitor._decode_program_event(bytes(buy), "buy-sig", 100)
+        self.assertEqual(traded["token"], created["token"])
+        self.assertEqual(traded["side"], "buy")
+        self.assertEqual(traded["actual_token_amount_ui"], 1.0)
+
+    def test_websocket_launch_filter_rejects_position_noise(self):
+        self.assertTrue(SolanaRpcProgramStream._looks_like_pool_creation([
+            "Program log: Instruction: InitializePoolV2",
+        ]))
+        self.assertFalse(SolanaRpcProgramStream._looks_like_pool_creation([
+            "Program log: Instruction: CreatePosition",
+        ]))
+
     async def test_real_historical_pump_sell_inner_instruction(self):
         fixture = json.loads((Path(__file__).parent / "fixtures" / "pump_sell_441417557.json").read_text())
         fixture["blockTime"] = 1_700_000_000
@@ -595,10 +642,23 @@ class TestRpcFallback(unittest.IsolatedAsyncioTestCase):
         events = []
         stream = SolanaRpcProgramStream(Rpc(), ["program"])
         stream.on("transaction", events.append)
-        await stream.poll_once()
+        successes, failures = await stream.poll_once()
+        self.assertEqual((successes, failures), (1, {}))
         self.assertEqual(events, [])
         await stream.poll_once()
         self.assertEqual(events, [{"signature": "new"}])
+
+    async def test_one_failing_program_does_not_poison_rpc_fallback(self):
+        class Rpc:
+            async def request(self, method, params):
+                if params[0] == "bad-program":
+                    raise RuntimeError("provider throttled")
+                return []
+
+        stream = SolanaRpcProgramStream(Rpc(), ["good-program", "bad-program"])
+        successes, failures = await stream.poll_once()
+        self.assertEqual(successes, 1)
+        self.assertEqual(failures, {"bad-program": "provider throttled"})
 
 
 class TestShadowMarketObservation(unittest.IsolatedAsyncioTestCase):

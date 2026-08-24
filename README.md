@@ -12,7 +12,9 @@ or safe operating assumption.
   DLMM/Dynamic AMM, and Orca Whirlpools. Unknown instructions are ignored rather
   than inferred from account positions.
 - Yellowstone gRPC with vendored official protobuf bindings, handshake
-  validation, reconnection, and a confirmed-RPC fallback.
+  validation and reconnection. Without Yellowstone, processed Solana WebSocket
+  logs decode official Pump/PumpSwap program events directly; confirmed HTTP
+  polling is used only while the socket is unavailable, preserving free quota.
 - Native SPL and Token-2022 mint-authority, freeze-authority, extension,
   concentration, and Jupiter sell-route checks.
 - Point-in-time launch episodes, immutable snapshot timestamps, observed price

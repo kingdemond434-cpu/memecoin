@@ -7,8 +7,10 @@ path as the live feed, including inner CPI instructions.
 
 import asyncio
 import base64
+import binascii
 import hashlib
 import importlib
+import json
 import logging
 import struct
 import time
@@ -243,6 +245,10 @@ class SolanaRpcProgramStream:
         self._primed_programs: Set[str] = set()
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._ws_task: Optional[asyncio.Task] = None
+        self._ws = None
+        self._ws_connected = False
+        self._ws_reconnects = 0
         self.status = "NOT_STARTED"
         self.status_detail = ""
 
@@ -253,54 +259,195 @@ class SolanaRpcProgramStream:
         self._running = True
         self.status = "RPC_FALLBACK"
         self._task = asyncio.create_task(self._loop())
+        if hasattr(self.rpc, "get_ws_url") and self.rpc.get_ws_url():
+            self._ws_task = asyncio.create_task(self._ws_loop())
 
     async def stop(self):
         self._running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                return
+        for task in (self._task, self._ws_task):
+            if task:
+                task.cancel()
+        if self._ws:
+            await self._ws.close()
+        for task in (self._task, self._ws_task):
+            if task:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
     async def _loop(self):
         while self._running:
+            if self._ws_connected:
+                self.status = "RPC_WS"
+                self.status_detail = (
+                    f"processed WebSocket logs for {len(self.programs)} programs; "
+                    "HTTP polling paused to preserve free quota"
+                )
+                await asyncio.sleep(max(self.poll_interval, 2.0))
+                continue
             try:
-                await self.poll_once()
+                successes, failures = await self.poll_once()
                 self.status = "RPC_FALLBACK"
-                self.status_detail = "confirmed polling; lower timeliness than Yellowstone"
+                self.status_detail = (
+                    f"confirmed polling; {successes}/{len(self.programs)} programs; "
+                    "lower timeliness than Yellowstone"
+                )
+                if failures:
+                    self.status_detail += f"; {len(failures)} program polls delayed"
             except Exception as exc:
                 self.status = "DEGRADED"
                 self.status_detail = str(exc)
             await asyncio.sleep(self.poll_interval)
 
-    async def poll_once(self):
-        for program in self.programs:
-            signatures = await self.rpc.request(
-                "getSignaturesForAddress", [program, {"limit": 50, "commitment": "confirmed"}]
-            )
-            if program not in self._primed_programs:
-                # Establish a high-water mark without replaying an arbitrary
-                # startup backlog as if it were newly detected point-in-time.
-                self._seen.update(item.get("signature") for item in signatures or [] if item.get("signature"))
-                self._primed_programs.add(program)
+    async def _ws_loop(self):
+        import websockets
+
+        while self._running:
+            url = self.rpc.get_ws_url()
+            if not url:
+                self._ws_connected = False
+                await asyncio.sleep(5)
                 continue
-            for item in reversed(signatures or []):
-                signature = item.get("signature")
-                if not signature or signature in self._seen or item.get("err") is not None:
-                    continue
-                self._seen.add(signature)
+            try:
+                async with websockets.connect(
+                    url, ping_interval=20, ping_timeout=20, close_timeout=5, max_size=8 * 1024 * 1024,
+                ) as ws:
+                    self._ws = ws
+                    request_program: Dict[int, str] = {}
+                    subscription_program: Dict[int, str] = {}
+                    for request_id, program in enumerate(self.programs, 1):
+                        request_program[request_id] = program
+                        await ws.send(json.dumps({
+                            "jsonrpc": "2.0", "id": request_id, "method": "logsSubscribe",
+                            "params": [{"mentions": [program]}, {"commitment": "processed"}],
+                        }))
+                    while len(subscription_program) < len(request_program):
+                        response = json.loads(await asyncio.wait_for(ws.recv(), timeout=20))
+                        if "error" in response:
+                            raise RuntimeError(f"logsSubscribe rejected: {response['error']}")
+                        request_id = int(response.get("id", 0) or 0)
+                        if request_id in request_program and response.get("result") is not None:
+                            subscription_program[int(response["result"])] = request_program[request_id]
+                    self._ws_connected = True
+                    self._ws_reconnects = 0
+                    while self._running:
+                        message = json.loads(await asyncio.wait_for(ws.recv(), timeout=40))
+                        params = message.get("params") or {}
+                        result = params.get("result") or {}
+                        value = result.get("value") or {}
+                        if value.get("err") is not None:
+                            continue
+                        program = subscription_program.get(int(params.get("subscription", -1)))
+                        signature = value.get("signature", "")
+                        logs = value.get("logs") or []
+                        slot = int((result.get("context") or {}).get("slot", 0))
+                        received_ns = time.time_ns()
+                        for line in logs:
+                            if not isinstance(line, str) or not line.startswith("Program data: "):
+                                continue
+                            try:
+                                raw = base64.b64decode(line.split(": ", 1)[1], validate=True)
+                            except (ValueError, binascii.Error):
+                                continue
+                            await self._dispatch("program_data", {
+                                "program": program, "signature": signature, "slot": slot,
+                                "data": raw, "received_ns": received_ns,
+                            })
+                        if program not in {PumpFunMonitor.PUMP_FUN_PROGRAM, PumpSwapMonitor.PUMP_AMM_PROGRAM}:
+                            if self._looks_like_pool_creation(logs):
+                                asyncio.create_task(self._fetch_confirmed_transaction(signature))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._ws_connected = False
+                self._ws_reconnects += 1
+                logger.warning("Solana log WebSocket reconnecting: %s", exc)
+                await asyncio.sleep(min(10, 1 + self._ws_reconnects))
+            finally:
+                self._ws = None
+                self._ws_connected = False
+
+    async def _dispatch(self, event_type: str, data: Any):
+        for handler in self._handlers.get(event_type, []):
+            result = handler(data)
+            if asyncio.iscoroutine(result):
+                await result
+
+    async def _fetch_confirmed_transaction(self, signature: str):
+        if not signature or signature in self._seen:
+            return
+        for delay in (0.2, 0.4, 0.8, 1.6, 3.2):
+            await asyncio.sleep(delay)
+            try:
                 transaction = await self.rpc.request(
                     "getTransaction",
-                    [signature, {"encoding": "json", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}],
+                    [signature, {"encoding": "json", "commitment": "confirmed",
+                                 "maxSupportedTransactionVersion": 0}],
                 )
                 if transaction:
-                    for handler in self._handlers.get("transaction", []):
-                        result = handler(transaction)
-                        if asyncio.iscoroutine(result):
-                            await result
+                    self._seen.add(signature)
+                    await self._dispatch("transaction", transaction)
+                    return
+            except Exception as exc:
+                logger.debug("Confirmed launch fetch delayed for %s: %s", signature, exc)
+
+    @staticmethod
+    def _looks_like_pool_creation(logs: List[str]) -> bool:
+        names = {
+            "initialize", "initialize2", "initializepool", "initializepoolv2", "createpool",
+            "initializelbpair", "initializecustomizablepermissionlesslbpair",
+            "initializepermissionlesspool", "initializepermissionlesspoolwithfeetier",
+            "initializepermissionlessconstantproductpoolwithconfig",
+            "initializepermissionlessconstantproductpoolwithconfig2",
+            "initializecustomizablepermissionlessconstantproductpool",
+        }
+        for line in logs:
+            if not isinstance(line, str) or "Instruction:" not in line:
+                continue
+            instruction = line.rsplit("Instruction:", 1)[1].strip().lower().replace("_", "")
+            if instruction in names:
+                return True
+        return False
+
+    async def poll_once(self) -> Tuple[int, Dict[str, str]]:
+        successes = 0
+        failures: Dict[str, str] = {}
+        for program in self.programs:
+            try:
+                signatures = await self.rpc.request(
+                    "getSignaturesForAddress", [program, {"limit": 50, "commitment": "confirmed"}]
+                )
+                successes += 1
+                if program not in self._primed_programs:
+                    # Establish a high-water mark without replaying an arbitrary
+                    # startup backlog as if it were newly detected point-in-time.
+                    self._seen.update(item.get("signature") for item in signatures or [] if item.get("signature"))
+                    self._primed_programs.add(program)
+                    continue
+                for item in reversed(signatures or []):
+                    signature = item.get("signature")
+                    if not signature or signature in self._seen or item.get("err") is not None:
+                        continue
+                    self._seen.add(signature)
+                    transaction = await self.rpc.request(
+                        "getTransaction",
+                        [signature, {"encoding": "json", "commitment": "confirmed",
+                                     "maxSupportedTransactionVersion": 0}],
+                    )
+                    if transaction:
+                        for handler in self._handlers.get("transaction", []):
+                            result = handler(transaction)
+                            if asyncio.iscoroutine(result):
+                                await result
+            except Exception as exc:
+                failures[program] = str(exc)
+                logger.debug("RPC fallback program poll delayed for %s: %s", program, exc)
         if len(self._seen) > 100_000:
             self._seen = set(list(self._seen)[-50_000:])
+        if not successes:
+            raise RuntimeError(f"all {len(self.programs)} program polls failed")
+        return successes, failures
 
     def get_status(self) -> Dict[str, str]:
         return {"status": self.status, "detail": self.status_detail}
@@ -443,12 +590,89 @@ class PumpFunMonitor:
         hashlib.sha256(f"global:{name}".encode()).digest()[:8]: name
         for name in ("create", "create_v2", "buy", "buy_v2", "sell", "sell_v2", "migrate")
     }
+    CREATE_EVENT = bytes((27, 114, 169, 77, 222, 235, 99, 118))
+    TRADE_EVENT = bytes((189, 219, 127, 211, 78, 230, 97, 238))
+    COMPLETE_EVENT = bytes((95, 114, 97, 156, 212, 46, 152, 8))
 
     def __init__(self, yellowstone: YellowstoneClient, callback: Callable):
         self.yellowstone = yellowstone
         self.callback = callback
         self._seen: Set[Tuple[str, str]] = set()
+        self._seen_program_events: Set[Tuple[str, bytes]] = set()
         yellowstone.on("transaction", self._on_transaction)
+        yellowstone.on("program_data", self._on_program_data)
+
+    async def _on_program_data(self, update: Dict[str, Any]):
+        if update.get("program") != self.PUMP_FUN_PROGRAM:
+            return
+        data = bytes(update.get("data") or b"")
+        signature = update.get("signature", "")
+        dedupe = (signature, hashlib.sha256(data).digest())
+        if len(data) < 8 or dedupe in self._seen_program_events:
+            return
+        self._seen_program_events.add(dedupe)
+        if len(self._seen_program_events) > 100_000:
+            self._seen_program_events = set(list(self._seen_program_events)[-50_000:])
+        try:
+            event = self._decode_program_event(data, signature, int(update.get("slot", 0)))
+        except (ValueError, IndexError, struct.error) as exc:
+            logger.debug("Pump program event rejected: %s", exc)
+            return
+        if not event:
+            return
+        event["received_ns"] = int(update.get("received_ns", time.time_ns()))
+        event["decoded_ns"] = time.time_ns()
+        result = self.callback(event)
+        if asyncio.iscoroutine(result):
+            await result
+
+    def _decode_program_event(self, data: bytes, signature: str, slot: int) -> Optional[Dict[str, Any]]:
+        base = {
+            "chain": "solana", "program": self.PUMP_FUN_PROGRAM, "signature": signature,
+            "slot": slot, "timestamp": time.time(), "source": "official_program_event",
+        }
+        if data.startswith(self.CREATE_EVENT):
+            name, symbol, uri, offset = self._parse_create_strings(data[8:])
+            offset += 8
+            if len(data) < offset + 136:
+                raise ValueError("truncated Pump CreateEvent")
+            mint = b58encode(data[offset:offset + 32])
+            curve = b58encode(data[offset + 32:offset + 64])
+            user = b58encode(data[offset + 64:offset + 96])
+            creator = b58encode(data[offset + 96:offset + 128])
+            timestamp = struct.unpack_from("<q", data, offset + 128)[0]
+            return {
+                **base, "type": "token_created", "token": mint, "bonding_curve": curve,
+                "wallet": user, "creator": creator, "name": name, "symbol": symbol, "uri": uri,
+                "timestamp": float(timestamp), "data_status": "OK",
+            }
+        if data.startswith(self.TRADE_EVENT):
+            if len(data) < 97:
+                raise ValueError("truncated Pump TradeEvent")
+            mint = b58encode(data[8:40])
+            sol_amount, token_amount = struct.unpack_from("<QQ", data, 40)
+            is_buy = bool(data[56])
+            user = b58encode(data[57:89])
+            timestamp = struct.unpack_from("<q", data, 89)[0]
+            return {
+                **base, "type": "token_trade", "token": mint, "wallet": user,
+                "side": "buy" if is_buy else "sell", "token_amount": token_amount,
+                "actual_token_delta_raw": token_amount if is_buy else -token_amount,
+                "notional_sol": sol_amount / 1_000_000_000, "timestamp": float(timestamp),
+                "fill_data_status": "OBSERVED_PROGRAM_EVENT", "data_status": "OK",
+            }
+        if data.startswith(self.COMPLETE_EVENT):
+            if len(data) < 112:
+                raise ValueError("truncated Pump CompleteEvent")
+            user = b58encode(data[8:40])
+            mint = b58encode(data[40:72])
+            curve = b58encode(data[72:104])
+            timestamp = struct.unpack_from("<q", data, 104)[0]
+            return {
+                **base, "type": "token_migrated", "token": mint, "wallet": user,
+                "bonding_curve": curve, "timestamp": float(timestamp), "data_status": "OK",
+            }
+        return None
 
     async def _on_transaction(self, tx_data: Any):
         received_ns = time.time_ns()
@@ -557,12 +781,87 @@ class PumpSwapMonitor:
         bytes((102, 6, 61, 18, 1, 218, 235, 234)): "buy",
         bytes((51, 230, 133, 164, 1, 127, 131, 173)): "sell",
     }
+    CREATE_POOL_EVENT = bytes((177, 49, 12, 210, 160, 118, 167, 116))
+    BUY_EVENT = bytes((103, 244, 82, 31, 44, 245, 119, 119))
+    SELL_EVENT = bytes((62, 47, 55, 10, 165, 3, 220, 42))
 
     def __init__(self, yellowstone: YellowstoneClient, callback: Callable):
         self.yellowstone = yellowstone
         self.callback = callback
         self._seen: Set[Tuple[str, int]] = set()
+        self._seen_program_events: Set[Tuple[str, bytes]] = set()
+        self._pool_tokens: Dict[str, Tuple[str, str, int]] = {}
         yellowstone.on("transaction", self._on_transaction)
+        yellowstone.on("program_data", self._on_program_data)
+
+    async def _on_program_data(self, update: Dict[str, Any]):
+        if update.get("program") != self.PUMP_AMM_PROGRAM:
+            return
+        data = bytes(update.get("data") or b"")
+        signature = update.get("signature", "")
+        dedupe = (signature, hashlib.sha256(data).digest())
+        if len(data) < 8 or dedupe in self._seen_program_events:
+            return
+        self._seen_program_events.add(dedupe)
+        if len(self._seen_program_events) > 100_000:
+            self._seen_program_events = set(list(self._seen_program_events)[-50_000:])
+        try:
+            event = self._decode_program_event(data, signature, int(update.get("slot", 0)))
+        except (ValueError, IndexError, struct.error) as exc:
+            logger.debug("PumpSwap program event rejected: %s", exc)
+            return
+        if not event:
+            return
+        event["received_ns"] = int(update.get("received_ns", time.time_ns()))
+        event["decoded_ns"] = time.time_ns()
+        result = self.callback(event)
+        if asyncio.iscoroutine(result):
+            await result
+
+    def _decode_program_event(self, data: bytes, signature: str, slot: int) -> Optional[Dict[str, Any]]:
+        base = {
+            "chain": "solana", "program": self.PUMP_AMM_PROGRAM, "signature": signature,
+            "slot": slot, "timestamp": time.time(), "source": "official_program_event",
+        }
+        if data.startswith(self.CREATE_POOL_EVENT):
+            if len(data) < 205:
+                raise ValueError("truncated PumpSwap CreatePoolEvent")
+            timestamp = struct.unpack_from("<q", data, 8)[0]
+            index = struct.unpack_from("<H", data, 16)[0]
+            creator = b58encode(data[18:50])
+            base_mint = b58encode(data[50:82])
+            quote_mint = b58encode(data[82:114])
+            base_decimals, quote_decimals = data[114], data[115]
+            base_amount, quote_amount = struct.unpack_from("<QQ", data, 116)
+            pool = b58encode(data[173:205])
+            self._pool_tokens[pool] = (base_mint, quote_mint, base_decimals)
+            return {
+                **base, "type": "pool_created", "pool": pool, "creator": creator,
+                "token": base_mint, "base_mint": base_mint, "quote_mint": quote_mint,
+                "base_mint_decimals": base_decimals, "quote_mint_decimals": quote_decimals,
+                "pool_index": index, "initial_base_amount": base_amount,
+                "initial_quote_amount": quote_amount, "timestamp": float(timestamp), "data_status": "OK",
+            }
+        if data[:8] not in {self.BUY_EVENT, self.SELL_EVENT} or len(data) < 184:
+            return None
+        timestamp = struct.unpack_from("<q", data, 8)[0]
+        token_amount = struct.unpack_from("<Q", data, 16)[0]
+        quote_amount = struct.unpack_from("<Q", data, 64)[0]
+        pool = b58encode(data[120:152])
+        wallet = b58encode(data[152:184])
+        token, quote_mint, decimals = self._pool_tokens.get(pool, ("", "", 0))
+        token_ui = token_amount / (10 ** decimals) if token and decimals >= 0 else None
+        notional_sol = quote_amount / 1_000_000_000 if quote_mint == "So11111111111111111111111111111111111111112" else None
+        is_buy = data.startswith(self.BUY_EVENT)
+        return {
+            **base, "type": "token_trade", "pool": pool, "token": token,
+            "quote_mint": quote_mint, "wallet": wallet, "side": "buy" if is_buy else "sell",
+            "token_amount": token_amount, "actual_token_delta_raw": token_amount if is_buy else -token_amount,
+            "actual_token_amount_ui": token_ui, "notional_sol": notional_sol,
+            "price_sol_per_token": (notional_sol / token_ui) if notional_sol is not None and token_ui else None,
+            "timestamp": float(timestamp), "fill_data_status": "OBSERVED_PROGRAM_EVENT",
+            "data_status": "OK" if token else "DATA_BLOCKED: pool mint mapping unavailable",
+        }
 
     async def _on_transaction(self, tx_data: Any):
         received_ns = time.time_ns()
@@ -585,6 +884,11 @@ class PumpSwapMonitor:
                     self._seen = set(list(self._seen)[-50_000:])
                 event = self._decode_instruction(name, keys, accounts, data[8:], signature, slot)
                 if event:
+                    if event.get("type") == "pool_created" and event.get("pool") and event.get("token"):
+                        self._pool_tokens[event["pool"]] = (
+                            event["token"], event.get("quote_mint", ""),
+                            int(event.get("base_mint_decimals", 0) or 0),
+                        )
                     apply_event_timing(event, tx_data, received_ns)
                     enrich_trade_balances(event, tx_data, keys)
                     result = self.callback(event)
