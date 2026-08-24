@@ -14,6 +14,7 @@ from solders.message import MessageV0
 from solders.signature import Signature
 from solders.transaction import VersionedTransaction
 
+from src.chains.provider_credentials import extract_provider_key
 from src.chains.rpc_manager import ChainConfig, ChainRegistry, ChainType, RPCEndpointConfig, RPCHealth, RPCManager
 from src.chains.yellowstone_grpc import (
     PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
@@ -45,6 +46,23 @@ def solana_chain():
         native_token="SOL", decimals=9, block_time=0.4, factories={}, routers={}, base_tokens=[],
         min_liquidity_usd=2_000, max_tax=0, honeypot_check=False, programs={},
     )
+
+
+class TestProviderCredentials(unittest.TestCase):
+    def test_extracts_helius_key_from_rpc_url(self):
+        self.assertEqual(
+            extract_provider_key("https://mainnet.helius-rpc.com/?api-key=helius-secret", "helius"),
+            "helius-secret",
+        )
+
+    def test_extracts_alchemy_key_from_rpc_url(self):
+        self.assertEqual(
+            extract_provider_key("https://solana-mainnet.g.alchemy.com/v2/alchemy-secret", "alchemy"),
+            "alchemy-secret",
+        )
+
+    def test_preserves_bare_keys(self):
+        self.assertEqual(extract_provider_key("bare-secret", "helius"), "bare-secret")
 
 
 class DummyYellowstone:

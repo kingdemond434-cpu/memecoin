@@ -92,14 +92,13 @@ class GlobalResearchMiner:
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self.data_status: Dict[str, str] = {}
+        self._github_token = ""
         self.ledger_path = Path(ledger_path)
 
     async def start(self):
         await self._load_ledger()
-        github_token = os.getenv("GITHUB_TOKEN", "").strip()
+        self._github_token = os.getenv("GITHUB_TOKEN", "").strip()
         headers = {"User-Agent": "memecoin-quant-public-research/1.0"}
-        if github_token:
-            headers["Authorization"] = f"Bearer {github_token}"
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=20),
             headers=headers,
@@ -136,14 +135,24 @@ class GlobalResearchMiner:
 
     async def _mine_github(self, query: str, language: str):
         try:
-            async with self._session.get(
-                "https://api.github.com/search/repositories",
-                params={"q": query, "sort": "updated", "order": "desc", "per_page": 10},
-            ) as resp:
-                if resp.status != 200:
+            params = {"q": query, "sort": "updated", "order": "desc", "per_page": 10}
+            headers = {"Authorization": f"Bearer {self._github_token}"} if self._github_token else {}
+            fallback_used = False
+            async with self._session.get("https://api.github.com/search/repositories", params=params,
+                                         headers=headers) as resp:
+                if resp.status in (401, 403) and self._github_token:
+                    async with self._session.get("https://api.github.com/search/repositories",
+                                                 params=params) as fallback:
+                        if fallback.status != 200:
+                            self.data_status["github"] = f"DATA_BLOCKED: HTTP {fallback.status}"
+                            return
+                        payload = await fallback.json()
+                    fallback_used = True
+                elif resp.status != 200:
                     self.data_status["github"] = f"DATA_BLOCKED: HTTP {resp.status}"
                     return
-                payload = await resp.json()
+                else:
+                    payload = await resp.json()
             for item in payload.get("items", []):
                 await self._register_lead(ResearchLead(
                     source_type="github",
@@ -156,7 +165,7 @@ class GlobalResearchMiner:
                     updated_at=item.get("pushed_at", ""),
                     source_quality=min(1.0, 0.25 + np.log1p(int(item.get("stargazers_count", 0) or 0)) / 10),
                 ))
-            self.data_status["github"] = "OK"
+            self.data_status["github"] = "OK_FALLBACK_UNAUTHENTICATED" if fallback_used else "OK"
         except Exception as exc:
             self.data_status["github"] = f"DATA_BLOCKED: {exc}"
 

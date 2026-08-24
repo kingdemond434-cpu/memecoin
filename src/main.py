@@ -21,6 +21,7 @@ import yaml
 from aiohttp import web
 from solders.keypair import Keypair
 
+from src.chains.provider_credentials import normalize_provider_environment
 from src.chains.rpc_manager import ChainRegistry, RPCManager
 from src.chains.yellowstone_grpc import (
     PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
@@ -133,6 +134,7 @@ class MemecoinQuantDesk:
         self._model_artifact_mtime = 0.0
 
     async def initialize(self):
+        normalize_provider_environment(os.environ)
         with open(self.config_path, encoding="utf-8") as handle:
             self.config = yaml.safe_load(handle)
         self.global_config = self.config.get("global", {})
