@@ -1,0 +1,25 @@
+[Unit]
+Description=Memecoin Shadow Desk (isolated user dry-run)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/opt/memecoin-shadow
+EnvironmentFile=-%h/.config/memecoin-shadow/env
+Environment=ALLOW_LIVE_TRADING=
+Environment=HEALTH_PORT=18080
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.main --dry-run
+Restart=always
+RestartSec=10
+TimeoutStopSec=60
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+MemoryMax=1536M
+CPUQuota=150%
+Nice=5
+
+[Install]
+WantedBy=default.target
