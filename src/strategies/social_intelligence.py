@@ -3,14 +3,20 @@ import logging
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import json
 import hashlib
+from pathlib import Path
 
 import aiohttp
 import numpy as np
+
+try:
+    from telethon import TelegramClient
+except ImportError:  # Dependency absence remains an explicit data blocker.
+    TelegramClient = None
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +87,8 @@ class NarrativeCluster:
 
 
 class SocialIntelligenceEngine:
+    YOUTUBE_QUERIES = ("solana memecoin", "pump fun solana", "solana rug pull")
+
     def __init__(
         self,
         chain_config,
@@ -108,6 +116,11 @@ class SocialIntelligenceEngine:
         self._watcher_task: Optional[asyncio.Task] = None
         self._narrative_task: Optional[asyncio.Task] = None
         self._recalc_task: Optional[asyncio.Task] = None
+        self._telegram_client = None
+        self._account_fetched_at: Dict[str, float] = {}
+        self._seen_social_items: Set[str] = set()
+        self._reddit_access_token = ""
+        self._reddit_token_expires_at = 0.0
         
         self._known_contracts: Set[str] = set()
         self._mention_callbacks: List[Callable] = []
@@ -119,6 +132,7 @@ class SocialIntelligenceEngine:
             connector=aiohttp.TCPConnector(limit=50)
         )
         self._running = True
+        await self._setup_telegram()
         
         if initial_accounts:
             for acc_data in initial_accounts:
@@ -138,6 +152,9 @@ class SocialIntelligenceEngine:
                 task.cancel()
         if self._session:
             await self._session.close()
+        if self._telegram_client:
+            await self._telegram_client.disconnect()
+            self._telegram_client = None
 
     def on_mention(self, callback: Callable):
         self._mention_callbacks.append(callback)
@@ -145,6 +162,7 @@ class SocialIntelligenceEngine:
     async def _initial_discovery(self):
         await self._discover_accounts_from_successful_wallets()
         await self._discover_accounts_from_recent_launches()
+        await self._discover_youtube_sources()
         await self._recalculate_account_credibility()
 
     async def _hunter_loop(self):
@@ -154,6 +172,7 @@ class SocialIntelligenceEngine:
                 await self._discover_accounts_from_recent_launches()
                 await self._discover_accounts_from_foreign_sources()
                 await self._discover_accounts_from_competitors()
+                await self._discover_youtube_sources()
                 await self._recalculate_account_credibility()
             except Exception as e:
                 logger.error(f"Social hunter error: {e}")
@@ -190,6 +209,112 @@ class SocialIntelligenceEngine:
         for ws in smart_wallets:
             await self._find_linked_social(ws.wallet)
 
+    async def _setup_telegram(self):
+        api_id = str(self.api_keys.get("telegram_api_id", "")).strip()
+        api_hash = str(self.api_keys.get("telegram_api_hash", "")).strip()
+        if not api_id or not api_hash:
+            self.data_status["telegram"] = "DATA_BLOCKED: TELEGRAM_API_ID/API_HASH missing"
+            return
+        if TelegramClient is None:
+            self.data_status["telegram"] = "DATA_BLOCKED: Telethon dependency unavailable"
+            return
+        try:
+            session_dir = Path("data/telegram")
+            session_dir.mkdir(parents=True, exist_ok=True)
+            self._telegram_client = TelegramClient(
+                str(session_dir / "collector"), int(api_id), api_hash,
+                receive_updates=False,
+            )
+            await self._telegram_client.connect()
+            if not await self._telegram_client.is_user_authorized():
+                self.data_status["telegram"] = "DATA_BLOCKED: interactive Telegram authorization required"
+                await self._telegram_client.disconnect()
+                self._telegram_client = None
+                return
+            channels = [
+                value.strip().lstrip("@").replace("https://t.me/", "")
+                for value in str(self.api_keys.get("telegram_channels", "")).split(",")
+                if value.strip()
+            ]
+            for channel in channels:
+                await self._add_account({
+                    "platform": "telegram", "handle": channel, "account_id": channel,
+                })
+            self.data_status["telegram"] = "OK" if channels else "DATA_BLOCKED: TELEGRAM_CHANNELS empty"
+        except Exception as exc:
+            self.data_status["telegram"] = f"DATA_BLOCKED: {exc}"
+            if self._telegram_client:
+                await self._telegram_client.disconnect()
+                self._telegram_client = None
+
+    async def _discover_youtube_sources(self):
+        api_key = str(self.api_keys.get("youtube", "")).strip()
+        if not api_key or not self._session:
+            self.data_status["youtube"] = "DATA_BLOCKED: YOUTUBE_API_KEY missing"
+            return
+        published_after = datetime.fromtimestamp(time.time() - 86400, timezone.utc).isoformat(timespec="seconds")
+        try:
+            items = []
+            for query in self.YOUTUBE_QUERIES:
+                async with self._session.get(
+                    "https://www.googleapis.com/youtube/v3/search",
+                    params={
+                        "part": "snippet", "type": "video", "order": "date", "maxResults": 10,
+                        "publishedAfter": published_after, "q": query, "key": api_key,
+                    },
+                ) as resp:
+                    if resp.status != 200:
+                        self.data_status["youtube"] = f"DATA_BLOCKED: HTTP {resp.status}"
+                        return
+                    items.extend((await resp.json()).get("items", []))
+            video_ids = [item.get("id", {}).get("videoId") for item in items if item.get("id", {}).get("videoId")]
+            statistics = {}
+            if video_ids:
+                async with self._session.get(
+                    "https://www.googleapis.com/youtube/v3/videos",
+                    params={"part": "statistics", "id": ",".join(video_ids[:50]), "key": api_key},
+                ) as resp:
+                    if resp.status == 200:
+                        statistics = {item.get("id"): item.get("statistics", {})
+                                      for item in (await resp.json()).get("items", [])}
+            for item in items:
+                video_id = item.get("id", {}).get("videoId")
+                snippet = item.get("snippet", {})
+                channel_id = snippet.get("channelId")
+                if not video_id or not channel_id:
+                    continue
+                dedupe = f"youtube:{video_id}"
+                if dedupe in self._seen_social_items:
+                    continue
+                self._seen_social_items.add(dedupe)
+                await self._add_account({
+                    "platform": "youtube", "handle": channel_id, "account_id": channel_id,
+                    "display_name": snippet.get("channelTitle", channel_id),
+                })
+                await self._process_youtube_video(
+                    self.accounts[f"youtube:{channel_id}"], item, statistics.get(video_id, {}),
+                )
+            self.data_status["youtube"] = "OK"
+        except Exception as exc:
+            self.data_status["youtube"] = f"DATA_BLOCKED: {exc}"
+
+    async def _process_youtube_video(self, account: SocialAccount, item: Dict, statistics: Dict):
+        video_id = item.get("id", {}).get("videoId", "")
+        snippet = item.get("snippet", {})
+        content = f"{snippet.get('title', '')}\n{snippet.get('description', '')}"
+        timestamp = self._parse_twitter_time(snippet.get("publishedAt", ""))
+        for token in self._extract_contracts(content):
+            await self._process_mention(SocialMention(
+                platform=SocialPlatform.YOUTUBE, account=account, token=token,
+                content=content[:500], timestamp=timestamp,
+                engagement={
+                    "views": int(statistics.get("viewCount", 0) or 0),
+                    "likes": int(statistics.get("likeCount", 0) or 0),
+                    "comments": int(statistics.get("commentCount", 0) or 0),
+                },
+                url=f"https://www.youtube.com/watch?v={video_id}",
+            ))
+
     async def _find_linked_social(self, wallet: str):
         # There is no verified Helius wallet-to-social endpoint. Treat this as
         # unavailable instead of fabricating identity links from display names.
@@ -216,7 +341,7 @@ class SocialIntelligenceEngine:
         elif platform == SocialPlatform.REDDIT:
             await self._search_reddit(token)
         elif platform == SocialPlatform.TELEGRAM:
-            self.data_status["telegram_search"] = "DATA_BLOCKED: Bot API cannot search arbitrary public channels"
+            self.data_status["telegram_search"] = "DATA_BLOCKED: Telegram API has no global public-channel search; configured channels are monitored"
 
     async def _search_x_query(self, query: str):
         bearer = self.api_keys.get("x_bearer", "")
@@ -256,11 +381,14 @@ class SocialIntelligenceEngine:
             self.data_status["x"] = f"DATA_BLOCKED: {exc}"
 
     async def _search_reddit(self, query: str):
+        headers = await self._reddit_headers()
+        if not headers:
+            return
         try:
             async with self._session.get(
-                "https://www.reddit.com/search.json",
+                "https://oauth.reddit.com/search",
                 params={"q": query, "sort": "new", "limit": 25, "t": "week"},
-                headers={"User-Agent": "memecoin-quant-research/1.0"},
+                headers=headers,
             ) as resp:
                 if resp.status != 200:
                     self.data_status["reddit"] = f"DATA_BLOCKED: HTTP {resp.status}"
@@ -276,6 +404,38 @@ class SocialIntelligenceEngine:
             self.data_status["reddit"] = "OK"
         except Exception as exc:
             self.data_status["reddit"] = f"DATA_BLOCKED: {exc}"
+
+    async def _reddit_headers(self) -> Optional[Dict[str, str]]:
+        client_id = str(self.api_keys.get("reddit", "")).strip()
+        client_secret = str(self.api_keys.get("reddit_secret", "")).strip()
+        if not client_id or not client_secret:
+            self.data_status["reddit"] = "DATA_BLOCKED: REDDIT_CLIENT_ID/SECRET missing or approval pending"
+            return None
+        if self._reddit_access_token and time.time() < self._reddit_token_expires_at - 60:
+            return {
+                "Authorization": f"bearer {self._reddit_access_token}",
+                "User-Agent": "memecoin-shadow/1.0 read-only research collector",
+            }
+        try:
+            async with self._session.post(
+                "https://www.reddit.com/api/v1/access_token",
+                data={"grant_type": "client_credentials"},
+                auth=aiohttp.BasicAuth(client_id, client_secret),
+                headers={"User-Agent": "memecoin-shadow/1.0 read-only research collector"},
+            ) as resp:
+                payload = await resp.json(content_type=None)
+                if resp.status != 200 or not payload.get("access_token"):
+                    self.data_status["reddit"] = f"DATA_BLOCKED: OAuth HTTP {resp.status}"
+                    return None
+            self._reddit_access_token = str(payload["access_token"])
+            self._reddit_token_expires_at = time.time() + int(payload.get("expires_in", 3600))
+            return {
+                "Authorization": f"bearer {self._reddit_access_token}",
+                "User-Agent": "memecoin-shadow/1.0 read-only research collector",
+            }
+        except Exception as exc:
+            self.data_status["reddit"] = f"DATA_BLOCKED: OAuth {exc}"
+            return None
 
     async def _discover_accounts_from_foreign_sources(self):
         terms = ["solana memecoin", "ソラナ ミームコイン", "솔라나 밈코인", "солана мемкоин", "عملة سولانا ميم"]
@@ -357,6 +517,10 @@ class SocialIntelligenceEngine:
             await self._fetch_recent_posts(account)
 
     async def _fetch_recent_posts(self, account: SocialAccount):
+        key = f"{account.platform.value}:{account.handle}"
+        if time.time() - self._account_fetched_at.get(key, 0) < 60:
+            return
+        self._account_fetched_at[key] = time.time()
         if account.platform == SocialPlatform.X:
             await self._fetch_x_posts(account)
         elif account.platform == SocialPlatform.TELEGRAM:
@@ -435,37 +599,38 @@ class SocialIntelligenceEngine:
             return time.time()
 
     async def _fetch_telegram_posts(self, account: SocialAccount):
-        token = self.api_keys.get("telegram", "")
-        if not token:
-            self.data_status["telegram"] = "DATA_BLOCKED: TELEGRAM_API_KEY missing"
+        if not self._telegram_client:
+            self.data_status["telegram"] = "DATA_BLOCKED: authorized Telegram session unavailable"
             return
         try:
-            async with self._session.get(f"https://api.telegram.org/bot{token}/getUpdates", params={"limit": 100}) as resp:
-                if resp.status != 200:
-                    self.data_status["telegram"] = f"DATA_BLOCKED: HTTP {resp.status}"
-                    return
-                payload = await resp.json()
-            for update in payload.get("result", []):
-                message = update.get("channel_post") or update.get("message") or {}
-                chat = message.get("chat", {})
-                if chat.get("username") != account.handle:
+            async for message in self._telegram_client.iter_messages(account.handle, limit=100):
+                dedupe = f"telegram:{account.handle}:{message.id}"
+                if dedupe in self._seen_social_items:
                     continue
-                content = message.get("text") or message.get("caption") or ""
+                self._seen_social_items.add(dedupe)
+                content = message.message or ""
                 for token_address in self._extract_contracts(content):
                     await self._process_mention(SocialMention(
                         platform=SocialPlatform.TELEGRAM, account=account, token=token_address,
-                        content=content[:500], timestamp=float(message.get("date", time.time())),
-                        url=f"https://t.me/{account.handle}/{message.get('message_id', '')}",
+                        content=content[:500], timestamp=message.date.timestamp(),
+                        engagement={
+                            "views": int(message.views or 0), "forwards": int(message.forwards or 0),
+                            "replies": int(getattr(message.replies, "replies", 0) or 0),
+                        },
+                        url=f"https://t.me/{account.handle}/{message.id}",
                     ))
             self.data_status["telegram"] = "OK"
         except Exception as exc:
             self.data_status["telegram"] = f"DATA_BLOCKED: {exc}"
 
     async def _fetch_reddit_posts(self, account: SocialAccount):
+        headers = await self._reddit_headers()
+        if not headers:
+            return
         try:
             async with self._session.get(
-                f"https://www.reddit.com/user/{account.handle}/submitted.json",
-                params={"limit": 50}, headers={"User-Agent": "memecoin-quant-research/1.0"},
+                f"https://oauth.reddit.com/user/{account.handle}/submitted",
+                params={"limit": 50}, headers=headers,
             ) as resp:
                 if resp.status != 200:
                     return

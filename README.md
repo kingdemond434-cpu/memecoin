@@ -128,8 +128,19 @@ journalctl -u memecoin-shadow -f
 - `YELLOWSTONE_GRPC_URL` and token: lowest-latency program stream. Without it,
   confirmed RPC polling is slower and provider-rate-limited.
 - `HELIUS_API_KEY`: enhanced address transaction history for wallet round trips.
-- `X_BEARER_TOKEN`, `TELEGRAM_BOT_TOKEN`, and `REDDIT_CLIENT_ID`: optional public
-  social sources. Telegram Bot API cannot search arbitrary public channels.
+- `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, and comma-separated
+  `TELEGRAM_CHANNELS`: read-only monitoring of channels that the dedicated
+  Telegram research account can access. Authorize its persistent session once
+  with `.venv/bin/python -m src.research.telegram_authorize`; the collector
+  never performs global Telegram search.
+- `YOUTUBE_API_KEY`: official YouTube Data API monitoring for recent Solana
+  launch/rug research videos. Contract strings are evidence signals, never
+  endorsements or automatic live orders.
+- `X_BEARER_TOKEN`: optional official recent-search and public-account source.
+  No unofficial browser/session scraping fallback is included.
+- `REDDIT_CLIENT_ID` and `REDDIT_CLIENT_SECRET`: optional approved Reddit
+  application-only OAuth source. Until Reddit approves and issues both values,
+  its status remains explicitly `DATA_BLOCKED`.
 - `GITHUB_TOKEN`: optional higher public-research API quota. Only repositories
   with an identified compatible license become research leads; all leads remain
   challengers pending evidence.
@@ -146,7 +157,7 @@ VersionedTransaction signatures, native mint checks, nested P2/P5/P10/P50 math,
 risk-constrained sizing, partial cost basis, chain-aware RPC health, PumpSwap and
 Raydium layouts, FIFO wallet scoring, point-in-time leakage, counterfactuals,
 public coordination, rug hazard, active-episode recovery, promotion-state
-recovery, and landed wallet-delta accounting. A reduced fixture from Solana mainnet slot
+recovery, official social-source blocking/ingest, and landed wallet-delta accounting. A reduced fixture from Solana mainnet slot
 `441417557` exercises the same Pump.fun inner-instruction decoder used live.
 
 On a Dockerless VPS, `memecoin-shadow-user.service` runs the collector as an

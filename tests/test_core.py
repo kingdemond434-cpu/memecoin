@@ -34,6 +34,7 @@ from src.research.global_research_miner import GlobalResearchMiner, ResearchLead
 from src.strategies.champion_challenger import ChampionChallengerFramework, HypothesisSpec, TrialResult
 from src.strategies.rug_hazard import ContinuousRugHazardModel
 from src.strategies.genealogy_graph import GenealogyGraph, RelationshipType
+from src.strategies.social_intelligence import SocialAccount, SocialIntelligenceEngine, SocialPlatform
 
 
 def solana_chain():
@@ -126,6 +127,50 @@ class TestSolanaParsing(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["fill_data_status"], "OBSERVED_WALLET_BALANCE_DELTA")
         self.assertEqual(event["actual_token_amount_ui"], 25)
         self.assertEqual(event["notional_sol"], 0.5)
+
+
+class TestOfficialSocialCollectors(unittest.IsolatedAsyncioTestCase):
+    def make_engine(self, api_keys=None):
+        wallet_intel = SimpleNamespace(get_top_wallets=lambda limit=100: [], register_social_wallet=lambda wallet: None)
+        return SocialIntelligenceEngine(
+            solana_chain(), SimpleNamespace(request=self._rpc_request), SimpleNamespace(), wallet_intel,
+            api_keys or {},
+        )
+
+    async def _rpc_request(self, method, params):
+        if method == "getTokenLargestAccounts":
+            return {"value": []}
+        raise AssertionError(f"unexpected RPC method: {method}")
+
+    async def test_youtube_video_extracts_real_contract_and_engagement(self):
+        engine = self.make_engine()
+        account = SocialAccount(SocialPlatform.YOUTUBE, "channel", "channel", "Channel")
+        mint = "FySyjuXTts9mTz2wjyuSXAz4bEBv6v5qxCTcLAMd4mVX"
+        await engine._process_youtube_video(account, {
+            "id": {"videoId": "video1"},
+            "snippet": {
+                "title": f"New Solana launch {mint}", "description": "observed, not endorsed",
+                "publishedAt": "2026-01-01T00:00:00Z",
+            },
+        }, {"viewCount": "12", "likeCount": "3", "commentCount": "2"})
+        self.assertEqual(len(engine.mentions), 1)
+        self.assertEqual(engine.mentions[0].token, mint)
+        self.assertEqual(engine.mentions[0].engagement["views"], 12)
+        self.assertEqual(engine.mentions[0].url, "https://www.youtube.com/watch?v=video1")
+
+    async def test_reddit_stays_blocked_without_approved_credentials(self):
+        engine = self.make_engine()
+        self.assertIsNone(await engine._reddit_headers())
+        self.assertIn("REDDIT_CLIENT_ID/SECRET", engine.data_status["reddit"])
+
+    async def test_telegram_channels_are_normalized(self):
+        engine = self.make_engine()
+        engine.api_keys["telegram_channels"] = "@alpha, https://t.me/beta"
+        values = [
+            value.strip().lstrip("@").replace("https://t.me/", "")
+            for value in engine.api_keys["telegram_channels"].split(",") if value.strip()
+        ]
+        self.assertEqual(values, ["alpha", "beta"])
 
 
 class TestNativeMintChecks(unittest.TestCase):

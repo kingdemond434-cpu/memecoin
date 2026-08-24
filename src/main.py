@@ -222,7 +222,13 @@ class MemecoinQuantDesk:
         self.social_intel = SocialIntelligenceEngine(
             self.solana_config, self.solana_rpc, self.genealogy, self.wallet_intel,
             {"helius": helius, "x_bearer": os.getenv("X_BEARER_TOKEN", ""),
-             "telegram": os.getenv("TELEGRAM_BOT_TOKEN", ""), "reddit": os.getenv("REDDIT_CLIENT_ID", "")},
+             "telegram": os.getenv("TELEGRAM_BOT_TOKEN", ""),
+             "telegram_api_id": os.getenv("TELEGRAM_API_ID", ""),
+             "telegram_api_hash": os.getenv("TELEGRAM_API_HASH", ""),
+             "telegram_channels": os.getenv("TELEGRAM_CHANNELS", ""),
+             "youtube": os.getenv("YOUTUBE_API_KEY", ""),
+             "reddit": os.getenv("REDDIT_CLIENT_ID", ""),
+             "reddit_secret": os.getenv("REDDIT_CLIENT_SECRET", "")},
         )
         self.prelaunch = PrelaunchIntentModel(self.solana_config, self.solana_rpc, self.genealogy, self.wallet_intel, helius)
         self.counterfactual_lab = CounterfactualExecutionLab()
@@ -899,6 +905,7 @@ class MemecoinQuantDesk:
             "rug_hazard": self.rug_hazard.get_stats() if self.rug_hazard else {},
             "dataset": self.dataset_builder.get_stats() if self.dataset_builder else {},
             "research": self.global_research.get_stats() if self.global_research else {},
+            "social": self.social_intel.get_stats() if self.social_intel else {},
             "public_coordination": self.public_coordination.get_stats() if self.public_coordination else {},
             "champions": self.champion_challenger.get_stats() if self.champion_challenger else {},
         }
