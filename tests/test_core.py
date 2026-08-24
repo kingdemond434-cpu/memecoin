@@ -35,6 +35,8 @@ from src.strategies.wallet_intelligence import WalletIntelligenceEngine, WalletR
 from src.research.dataset_builder import LaunchEpisode, PointInTimeDatasetBuilder, SnapshotTimepoint
 from src.research.shadow_trainer import chronological_episode_split, train_shadow
 from src.research.hazard_trainer import train_hazard_calibration
+from src.research.exit_policy_trainer import simulate, train_exit_policy
+from src.strategies.exit_policy import ExitPolicy, evaluate_exit, load_latest_exit_policy
 from src.research.global_research_miner import GlobalResearchMiner, ResearchLead
 from src.strategies.champion_challenger import ChampionChallengerFramework, HypothesisSpec, ModelStatus, TrialResult
 from src.strategies.rug_hazard import (
@@ -639,6 +641,115 @@ class TestPartialExitAccounting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(still_open["remaining_cost_usd"], 100.0)
         self.assertEqual(len(desk.dataset_builder.attempts), 1)
         self.assertNotIn("realized_pnl_usd", desk.dataset_builder.attempts[0][1])
+
+
+class TestExitPolicy(unittest.TestCase):
+    def test_default_policy_reproduces_the_previous_hardcoded_thresholds(self):
+        policy = ExitPolicy.default()
+        self.assertEqual(evaluate_exit(policy, 0.70, 1.0, 0.0, set(), 0),
+                         ("hard_stop_loss", 1.0))
+        reason, fraction = evaluate_exit(policy, 2.0, 2.0, 0.0, set(), 0)
+        self.assertEqual(reason, "profit_ratchet_cost_recovery")
+        self.assertAlmostEqual(fraction, 0.5)
+        self.assertEqual(evaluate_exit(policy, 5.0, 5.0, 0.0, {"cost_recovery"}, 0),
+                         ("profit_ratchet_5x", 0.25))
+        self.assertEqual(evaluate_exit(policy, 10.0, 10.0, 0.0, {"cost_recovery", "bank_5x"}, 0),
+                         ("profit_ratchet_10x", 0.20))
+        self.assertEqual(evaluate_exit(policy, 1.5, 1.5, 0.0, set(), 4000),
+                         ("time_stop", 1.0))
+
+    def test_a_ratchet_stage_only_fires_once(self):
+        policy = ExitPolicy.default()
+        self.assertIsNotNone(evaluate_exit(policy, 2.5, 2.5, 0.9, set(), 0))
+        # Same price, stage already banked, and the trailing stop has not been
+        # breached -> the policy must hold rather than re-selling.
+        self.assertIsNone(evaluate_exit(policy, 2.5, 2.5, 0.9, {"cost_recovery"}, 0))
+
+    def test_trailing_stop_widens_when_continuation_probability_is_low(self):
+        policy = ExitPolicy.default()
+        # High continuation -> tighter trail -> a higher floor, so a pullback
+        # to 3.5 from a 6x high water exits...
+        self.assertEqual(
+            evaluate_exit(policy, 3.5, 6.0, 0.9, {"cost_recovery", "bank_5x"}, 0),
+            ("adaptive_profit_trailing_stop", 1.0),
+        )
+        # ...while low continuation uses the widest trail, whose floor sits
+        # above that same price, so it also exits. The meaningful difference
+        # is the floor itself.
+        self.assertGreater(policy.trail_floor(6.0, 0.05), policy.trail_floor(6.0, 0.9))
+
+    def test_trailing_stop_does_not_fire_before_the_activation_high_water(self):
+        policy = ExitPolicy.default()
+        self.assertIsNone(evaluate_exit(policy, 1.05, 1.2, 0.0, set(), 0))
+
+
+class TestExitPolicyTrainer(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _write_episode(storage: Path, token: str, created_at: float, marks):
+        directory = storage / "day"
+        directory.mkdir(parents=True, exist_ok=True)
+        observations = [
+            {"timestamp": created_at + elapsed, "price_multiple": multiple,
+             "route_feasible": True, "price_impact_pct": 0.02}
+            for elapsed, multiple in marks
+        ]
+        with gzip.open(directory / f"{token}.json.gz", "wt", encoding="utf-8") as handle:
+            json.dump({
+                "token": token, "created_at": created_at,
+                "market_observations": observations,
+                "final_outcome": {"status": "OK"},
+            }, handle)
+
+    def test_insufficient_history_remains_explicitly_data_blocked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = train_exit_policy(root / "episodes", root / "models", min_episodes=60)
+            self.assertEqual(report["status"], "DATA_BLOCKED")
+            persisted = json.loads((root / "models" / "last_exit_policy_report.json").read_text())
+            self.assertEqual(persisted["status"], "DATA_BLOCKED")
+
+    def test_simulation_only_credits_route_feasible_exits(self):
+        policy = ExitPolicy.default()
+        # Price collapses through the hard stop, but the route is never
+        # feasible at or after the breach, so the position cannot actually be
+        # sold there and must be marked down rather than booked at the stop.
+        marks = [(0.0, 1.0, True), (10.0, 0.5, False), (20.0, 0.4, False)]
+        blocked = simulate(policy, marks)
+        feasible = simulate(policy, [(0.0, 1.0, True), (10.0, 0.5, True), (20.0, 0.4, True)])
+        self.assertLess(blocked, feasible)
+
+    def test_a_policy_only_ships_when_it_beats_default_and_hold_out_of_sample(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            storage = root / "episodes"
+            # Every episode spikes then round-trips back down: cutting losses
+            # and banking beats holding to the end, so some non-default
+            # candidate should win and clear both baselines.
+            for index in range(80):
+                self._write_episode(storage, f"pump-dump-{index}", float(index * 1000),
+                                    [(0.0, 1.0), (30.0, 3.0), (60.0, 6.0), (120.0, 0.6), (600.0, 0.2)])
+            report = train_exit_policy(storage, root / "models", min_episodes=60)
+            self.assertIn(report["status"], {"PASSED", "REJECTED"})
+            if report["status"] == "PASSED":
+                self.assertNotEqual(report["selected_policy"], "default")
+                self.assertGreater(report["oos_elogw"], report["oos_elogw_default_policy"])
+                self.assertGreater(report["oos_elogw"], report["oos_elogw_hold_baseline"])
+                policy, loaded = load_latest_exit_policy(str(root / "models"))
+                self.assertIsNotNone(policy)
+                self.assertEqual(loaded["status"], "PASSED")
+
+    def test_a_policy_that_cannot_beat_holding_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            storage = root / "episodes"
+            # Monotonic winners: any early exit strictly loses to holding, so
+            # nothing should ship.
+            for index in range(80):
+                self._write_episode(storage, f"moon-{index}", float(index * 1000),
+                                    [(0.0, 1.0), (30.0, 2.0), (60.0, 5.0), (120.0, 12.0), (600.0, 30.0)])
+            report = train_exit_policy(storage, root / "models", min_episodes=60)
+            self.assertEqual(report["status"], "REJECTED", report)
+            self.assertIsNone(load_latest_exit_policy(str(root / "models"))[0])
 
 
 class TestShadowTrainer(unittest.TestCase):

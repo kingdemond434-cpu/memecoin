@@ -13,7 +13,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace as dataclasses_replace
 from enum import Enum
 from typing import Any, Dict, Optional
 
@@ -39,6 +39,7 @@ from src.execution.jupiter_jito import (
 from src.research.dataset_builder import PointInTimeDatasetBuilder
 from src.research.global_research_miner import GlobalResearchMiner
 from src.strategies.champion_challenger import ChampionChallengerFramework, HypothesisSpec, TrialResult
+from src.strategies.exit_policy import ExitPolicy, evaluate_exit, load_latest_exit_policy
 from src.strategies.genealogy_graph import GenealogyGraph
 from src.strategies.information_graph import (
     AdversarialAdaptationDetector,
@@ -101,6 +102,9 @@ class MemecoinQuantDesk:
         self.rug_hazard: Optional[ContinuousRugHazardModel] = None
         self.public_coordination: Optional[PublicCoordinationMiner] = None
         self.predictor: Optional[MultiHeadPredictor] = None
+        self.exit_policy: ExitPolicy = ExitPolicy.default()
+        self.exit_policy_status = "DATA_BLOCKED"
+        self.exit_policy_detail = "not initialized"
         self.elogw_engine: Optional[ElogwEngine] = None
         self.champion_challenger: Optional[ChampionChallengerFramework] = None
         self.jupiter: Optional[JupiterClient] = None
@@ -257,6 +261,18 @@ class MemecoinQuantDesk:
         self.predictor = MultiHeadPredictor()
         self.predictor.initialize_models()
         model_loaded = self.predictor.load_latest()
+        trained_policy, policy_report = load_latest_exit_policy(os.getenv("MODEL_DIR", "models"))
+        # Without a validated policy the operator's configured hold time still
+        # governs; a trained policy has earned the right to set its own.
+        self.exit_policy = trained_policy or dataclasses_replace(
+            ExitPolicy.default(),
+            max_hold_seconds=float(self.global_config.get("max_hold_time_minutes", 60)) * 60,
+        )
+        self.exit_policy_status = "OK" if trained_policy else "DATA_BLOCKED"
+        self.exit_policy_detail = (
+            policy_report.get("model_path", "") if trained_policy
+            else "no chronologically validated exit policy; using default thresholds"
+        )
         self.elogw_engine = ElogwEngine(
             self.predictor,
             max_position_pct=float(self.global_config.get("max_position_pct", 0.05)),
@@ -636,31 +652,21 @@ class MemecoinQuantDesk:
             multiple, current_value = marked
             position["high_water_multiple"] = max(float(position.get("high_water_multiple", 1)), multiple)
             stages = position.setdefault("ratchet_stages", [])
-            if multiple <= 0.70:
-                await self._execute_exit(token, position, 1.0, "hard_stop_loss")
+            continuation = max(float(position["prediction"].get("p_5x", 0)),
+                               float(position["prediction"].get("p_10x", 0)))
+            decision = evaluate_exit(
+                self.exit_policy, multiple, float(position["high_water_multiple"]), continuation,
+                set(stages), time.time() - float(position["entry_time"]),
+            )
+            if not decision:
                 continue
-            if multiple >= 2 and "cost_recovery" not in stages:
-                stages.append("cost_recovery")
-                await self._execute_exit(token, position, min(0.50, 1.0 / multiple), "profit_ratchet_cost_recovery")
-                continue
-            if multiple >= 5 and "bank_5x" not in stages:
-                stages.append("bank_5x")
-                await self._execute_exit(token, position, 0.25, "profit_ratchet_5x")
-                continue
-            if multiple >= 10 and "bank_10x" not in stages:
-                stages.append("bank_10x")
-                await self._execute_exit(token, position, 0.20, "profit_ratchet_10x")
-                continue
-            high = position["high_water_multiple"]
-            continuation = max(float(position["prediction"].get("p_5x", 0)), float(position["prediction"].get("p_10x", 0)))
-            trail_ratio = 0.78 if continuation < 0.15 else 0.68 if high >= 5 else 0.58
-            floor = max(1.10 if high >= 2 else 0.70, high * trail_ratio)
-            if multiple <= floor and high >= 1.5:
-                await self._execute_exit(token, position, 1.0, "adaptive_profit_trailing_stop")
-                continue
-            max_hold = float(self.global_config.get("max_hold_time_minutes", 60)) * 60
-            if time.time() - float(position["entry_time"]) >= max_hold:
-                await self._execute_exit(token, position, 1.0, "time_stop")
+            reason, exit_pct = decision
+            stage_name = {"profit_ratchet_cost_recovery": "cost_recovery",
+                          "profit_ratchet_5x": "bank_5x",
+                          "profit_ratchet_10x": "bank_10x"}.get(reason)
+            if stage_name:
+                stages.append(stage_name)
+            await self._execute_exit(token, position, exit_pct, reason)
 
     async def _mark_position(self, token: str, position: Dict[str, Any]):
         quote = await self.jupiter.get_quote(token, USDC_MINT, int(position["size_tokens"]), slippage_bps=500)
@@ -945,6 +951,8 @@ class MemecoinQuantDesk:
             "yellowstone": self.yellowstone.get_status() if self.yellowstone else {"status": "NOT_STARTED"},
             "rpc_program_stream": self.rpc_program_stream.get_status() if self.rpc_program_stream else None,
             "prediction": "OK" if self.predictor and self.predictor._is_trained else "DATA_BLOCKED",
+            "exit_policy": {"status": self.exit_policy_status, "detail": self.exit_policy_detail,
+                            "policy": asdict(self.exit_policy)},
             "equity": {"status": self.equity_status, "wallet_equity_usd": self.wallet_equity_usd,
                        "sol_price_usd": self.sol_price_usd},
             "execution": {"dry_run": self.execution_engine.dry_run if self.execution_engine else True},
