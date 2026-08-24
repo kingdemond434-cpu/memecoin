@@ -593,6 +593,17 @@ class PointInTimeDatasetBuilder:
         )
         if not prices:
             return {"status": "DATA_BLOCKED", "reason": "no_point_in_time_price_observations"}
+        distinct_times = sorted({float(item.get("timestamp", 0) or 0) for item in prices})
+        if len(distinct_times) < 3 or distinct_times[-1] - distinct_times[0] < 1:
+            return {"status": "DATA_BLOCKED", "reason": "need_repeated_price_observations"}
+        provenance_sources = sorted({
+            "signed_program_event" if item.get("signature") and item.get("program") else
+            "jupiter_executable_quote" if item.get("measurement") == "jupiter_round_trip_probe" else
+            "decoded_reserve_event" if item.get("measurement") == "decoded_onchain_reserve_event" else
+            "unknown"
+            for item in prices
+        })
+        provenance_verified = any(source != "unknown" for source in provenance_sources)
         if all(float(item.get("price_multiple", 0) or 0) > 0 for item in prices):
             multiples = [float(item["price_multiple"]) for item in prices]
         else:
@@ -637,6 +648,8 @@ class PointInTimeDatasetBuilder:
             "feasible_exit_multiple": max(feasible) if feasible else None,
             "realized_pnl": realized,
             "observations": len(prices),
+            "provenance": {"verified": provenance_verified, "sources": provenance_sources,
+                           "first_observed_at": distinct_times[0], "last_observed_at": distinct_times[-1]},
         }
 
     def record_market_observation(self, token: str, observation: Dict[str, Any]):

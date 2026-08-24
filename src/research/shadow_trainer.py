@@ -163,6 +163,16 @@ def load_samples(storage: Path) -> List[Tuple[PredictionFeatures, Dict[Predictio
         outcome = _repair_legacy_outcome(episode, episode.get("final_outcome") or {})
         if outcome.get("status") != "OK":
             continue
+        observations = [item for item in (episode.get("market_observations") or [])
+                        if _number(item, "price_multiple", _number(item, "price_usd")) > 0]
+        timestamps = sorted({_number(item, "timestamp") for item in observations if _number(item, "timestamp") > 0})
+        recognized = any(
+            (item.get("signature") and item.get("program"))
+            or item.get("measurement") in {"jupiter_round_trip_probe", "decoded_onchain_reserve_event"}
+            for item in observations
+        )
+        if len(timestamps) < 3 or timestamps[-1] - timestamps[0] < 1 or not recognized:
+            continue
         snapshots = episode.get("snapshots") or {}
         for name in SNAPSHOT_ORDER:
             snapshot = snapshots.get(name)

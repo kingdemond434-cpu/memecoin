@@ -1,10 +1,10 @@
 [Unit]
-Description=Run memecoin chronological shadow training every six hours
+Description=Run memecoin chronological shadow training hourly
 
 [Timer]
-OnBootSec=30min
-OnUnitActiveSec=6h
-RandomizedDelaySec=10min
+OnBootSec=5min
+OnUnitActiveSec=1h
+RandomizedDelaySec=2min
 Persistent=true
 
 [Install]

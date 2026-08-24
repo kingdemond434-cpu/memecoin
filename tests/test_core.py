@@ -987,6 +987,7 @@ class TestPointInTimeResearch(unittest.IsolatedAsyncioTestCase):
         episode.market_observations.extend([
             {"timestamp": 100, "price_usd": 1.0},
             {"timestamp": 110, "price_usd": 1.2, "type": "migration"},
+            {"timestamp": 120, "price_usd": 1.1},
         ])
         outcome = await self.builder()._determine_final_outcome(episode)
         self.assertTrue(outcome["migrated"])
