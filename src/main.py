@@ -753,15 +753,25 @@ class MemecoinQuantDesk:
         if not result.success:
             self.dataset_builder.record_execution_attempt(token, attempt)
             return
+        actual_sold = int(result.actual_input_amount)
+        if actual_sold <= 0 or actual_sold > current_tokens:
+            attempt.update({
+                "status": "DATA_BLOCKED_ACCOUNTING",
+                "reason": "filled exit lacks a valid verified input-token balance decrease",
+            })
+            self.dataset_builder.record_execution_attempt(token, attempt)
+            return
         proceeds = result.output_amount / 1_000_000
         native_delta_usd = int(result.native_balance_delta_lamports) / 1e9 * self.sol_price_usd
-        allocated_cost = float(position["remaining_cost_usd"]) * sold_tokens / max(current_tokens, 1)
+        allocated_cost = float(position["remaining_cost_usd"]) * actual_sold / max(current_tokens, 1)
         pnl = proceeds + native_delta_usd - allocated_cost
         self.total_pnl += pnl
         self.successful_exits += int(pnl > 0)
         self.elogw_engine.update_pnl(pnl)
-        self.elogw_engine.reduce_position(token, sold_tokens, allocated_cost)
-        attempt.update({"proceeds_usd": proceeds, "native_balance_delta_usd": native_delta_usd,
+        self.elogw_engine.reduce_position(token, actual_sold, allocated_cost)
+        attempt.update({"exit_pct": actual_sold / max(current_tokens, 1),
+                        "requested_tokens": sold_tokens, "actual_sold_tokens": actual_sold,
+                        "proceeds_usd": proceeds, "native_balance_delta_usd": native_delta_usd,
                         "allocated_cost_usd": allocated_cost,
                         "realized_pnl_usd": pnl})
         self.dataset_builder.record_execution_attempt(token, attempt)
@@ -769,7 +779,7 @@ class MemecoinQuantDesk:
         for counterfactual in resolved:
             self.dataset_builder.record_counterfactual(token, counterfactual)
         logger.info("%s EXIT %s %.1f%% reason=%s proceeds=$%.2f allocated_cost=$%.2f pnl=$%.2f",
-                    "PAPER" if self.dry_run else "LIVE", token, sold_tokens / max(current_tokens, 1) * 100,
+                    "PAPER" if self.dry_run else "LIVE", token, actual_sold / max(current_tokens, 1) * 100,
                     reason, proceeds, allocated_cost, pnl)
 
     async def _refresh_portfolio_state(self):

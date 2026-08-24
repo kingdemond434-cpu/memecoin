@@ -22,7 +22,7 @@ from src.chains.yellowstone_grpc import (
 from src.detection.rug_detector import TOKEN_2022_PROGRAM, TOKEN_PROGRAM, RugDetector
 from src.detection.token_detector import DetectionSource
 from src.execution.jupiter_jito import (
-    ExecutionEngine, JupiterClient, RouteType, SolanaTransactionBuilder, SwapQuote, TransactionStatus,
+    ExecutionEngine, ExecutionResult, JupiterClient, RouteType, SolanaTransactionBuilder, SwapQuote, TransactionStatus,
 )
 from src.main import MemecoinQuantDesk
 from src.strategies.information_graph import CounterfactualExecutionLab
@@ -200,6 +200,26 @@ class TestSolanaParsing(unittest.IsolatedAsyncioTestCase):
         self.assertIn(RaydiumMonitor.METEORA_DLMM, programs)
         self.assertIn(RaydiumMonitor.METEORA_DYNAMIC_AMM, programs)
         self.assertIn(RaydiumMonitor.ORCA_WHIRLPOOL, programs)
+
+    async def test_real_historical_native_pool_initializers(self):
+        fixtures = {
+            "raydium_cpmm_441464653.json": RaydiumMonitor.RAYDIUM_CPMM,
+            "raydium_clmm_441462011.json": RaydiumMonitor.RAYDIUM_CLMM,
+            "meteora_amm_441464551.json": RaydiumMonitor.METEORA_DYNAMIC_AMM,
+            "orca_441468893.json": RaydiumMonitor.ORCA_WHIRLPOOL,
+        }
+        for filename, program in fixtures.items():
+            with self.subTest(filename=filename):
+                fixture = json.loads((Path(__file__).parent / "fixtures" / filename).read_text())
+                events = []
+                monitor = RaydiumMonitor(DummyYellowstone(), events.append)
+                await monitor._on_transaction(fixture)
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["program"], program)
+                self.assertEqual(events[0]["type"], "pool_created")
+                self.assertEqual(events[0]["data_status"], "OK")
+                self.assertEqual(events[0]["signature"], fixture["signature"])
+                self.assertEqual(events[0]["slot"], fixture["slot"])
 
     async def test_pumpswap_uses_native_amm_account_layout(self):
         keys = [f"key{i}" for i in range(24)] + [PumpSwapMonitor.PUMP_AMM_PROGRAM]
@@ -572,6 +592,34 @@ class TestExecution(unittest.IsolatedAsyncioTestCase):
             "postTokenBalances": [{"mint": "token", "owner": owner, "uiTokenAmount": {"amount": "125"}}],
         }
         self.assertEqual(ExecutionEngine._token_balance_decrease(meta, "token", owner), 375)
+
+    async def test_partial_exit_uses_verified_token_debit_for_cost_basis(self):
+        class PartialExecution:
+            async def execute_sell(self, *args, **kwargs):
+                return ExecutionResult(
+                    True, TransactionStatus.FILLED, actual_input_amount=200,
+                    filled_output_amount=40_000_000, filled=True, landed=True, submitted=True,
+                )
+        class Recorder:
+            def __init__(self): self.attempts=[]
+            def record_execution_attempt(self, token, attempt): self.attempts.append(attempt)
+        desk = MemecoinQuantDesk()
+        desk.execution_engine = PartialExecution()
+        desk.dataset_builder = Recorder()
+        desk.elogw_engine = ElogwEngine(MultiHeadPredictor())
+        desk.counterfactual_lab = CounterfactualExecutionLab()
+        desk.sol_price_usd = 100
+        position = {
+            "token": "token", "size_tokens": 1_000, "remaining_cost_usd": 100,
+            "risk_contribution": 0.02, "decision_id": "missing",
+        }
+        desk.elogw_engine.update_position("token", position)
+        await desk._execute_exit("token", position, 0.5, "test_partial")
+        remaining = desk.elogw_engine.open_positions["token"]
+        self.assertEqual(remaining["size_tokens"], 800)
+        self.assertEqual(remaining["remaining_cost_usd"], 80)
+        self.assertEqual(desk.dataset_builder.attempts[-1]["requested_tokens"], 500)
+        self.assertEqual(desk.dataset_builder.attempts[-1]["actual_sold_tokens"], 200)
 
 
 class FakeGenealogy:
