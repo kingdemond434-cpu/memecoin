@@ -440,6 +440,11 @@ class MemecoinQuantDesk:
     async def _candidate_pipeline(self, candidate: TokenCandidate):
         delays = self.global_config.get("candidate_recheck_delays_seconds", [0, 1, 3, 5, 10])
         checkpoints = sorted({max(0.0, float(delay)) for delay in delays})
+        if self.predictor is not None and not self.predictor._is_trained:
+            # A blocked model has no trading authority. One pass registers the
+            # episode/risk state; Yellowstone continues collecting outcomes.
+            # Holding thousands of five-pass tasks here adds latency but no evidence.
+            checkpoints = [0.0]
         started = time.monotonic()
         for delay in checkpoints:
             await asyncio.sleep(max(0.0, started + delay - time.monotonic()))
@@ -474,6 +479,9 @@ class MemecoinQuantDesk:
             return
         if risk.data_status == "DATA_BLOCKED" and self.global_config.get("reject_data_blocked_safety_checks", True):
             self._record_blocked_decision(token, "DATA_BLOCKED_safety_checks", risk_data)
+            return
+        if not self.predictor._is_trained:
+            self._record_blocked_decision(token, "DATA_BLOCKED_prediction_model", {})
             return
         liquidity = await self._resolve_liquidity(candidate)
         if liquidity <= 0:
