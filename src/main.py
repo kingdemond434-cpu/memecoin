@@ -922,6 +922,38 @@ class MemecoinQuantDesk:
                                          "social", signal.get("timestamp", time.time()), signal)
         self.rug_hazard.record_observation(token, {"type": "social", **signal})
         self.dataset_builder.record_market_observation(token, {"type": "social", **signal})
+        if signal.get("type") == "new_mention" and signal.get("first_mention"):
+            self._spawn_background(self._triage_social_candidate(signal))
+
+    async def _triage_social_candidate(self, signal: Dict[str, Any]):
+        """Evaluate social addresses only after verifying that the account is an SPL mint."""
+        token = str(signal.get("token", ""))
+        if not token or not self.solana_rpc or not self.detection_engine:
+            return
+        try:
+            result = await self.solana_rpc.request(
+                "getAccountInfo", [token, {"encoding": "jsonParsed", "commitment": "processed"}],
+            )
+            value = (result or {}).get("value") or {}
+            owner = str(value.get("owner", ""))
+            parsed = (((value.get("data") or {}).get("parsed") or {}))
+            if owner not in {
+                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+            } or parsed.get("type") != "mint":
+                return
+            await self.detection_engine._on_candidate(TokenCandidate(
+                address=token, chain="solana", source=DetectionSource.SOCIAL,
+                block_number=0, timestamp=float(signal.get("timestamp", time.time())),
+                metadata={
+                    "social_platform": signal.get("platform"),
+                    "social_account": signal.get("account"),
+                    "social_credibility": signal.get("credibility"),
+                    "mint_verified": True,
+                },
+            ))
+        except Exception as exc:
+            logger.debug("Social candidate mint verification blocked for %s: %s", token, exc)
 
     def readiness(self) -> Dict[str, Any]:
         return {

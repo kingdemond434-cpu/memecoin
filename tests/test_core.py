@@ -20,6 +20,7 @@ from src.chains.yellowstone_grpc import (
     create_combined_subscription, enrich_trade_balances,
 )
 from src.detection.rug_detector import TOKEN_2022_PROGRAM, TOKEN_PROGRAM, RugDetector
+from src.detection.token_detector import DetectionSource
 from src.execution.jupiter_jito import (
     ExecutionEngine, JupiterClient, RouteType, SolanaTransactionBuilder, SwapQuote, TransactionStatus,
 )
@@ -290,6 +291,21 @@ class TestOfficialSocialCollectors(unittest.IsolatedAsyncioTestCase):
             for value in engine.api_keys["telegram_channels"].split(",") if value.strip()
         ]
         self.assertEqual(values, ["alpha", "beta"])
+
+    async def test_telegram_push_and_polling_share_dedupe_path(self):
+        engine = self.make_engine()
+        account = SocialAccount(SocialPlatform.TELEGRAM, "alerts_bot", "1", "Alerts")
+        mint = "FySyjuXTts9mTz2wjyuSXAz4bEBv6v5qxCTcLAMd4mVX"
+        message = SimpleNamespace(
+            id=42, message=f"new token {mint}",
+            date=SimpleNamespace(timestamp=lambda: 1_700_000_000.0),
+            views=3, forwards=1, replies=None,
+        )
+        await engine._process_telegram_message(account, message)
+        await engine._process_telegram_message(account, message)
+        self.assertEqual(len(engine.mentions), 1)
+        self.assertEqual(engine.mentions[0].token, mint)
+        self.assertEqual(engine.mentions[0].engagement["views"], 3)
 
 
 class TestNativeMintChecks(unittest.TestCase):
@@ -679,6 +695,35 @@ class TestRpcFallback(unittest.IsolatedAsyncioTestCase):
 
 
 class TestShadowMarketObservation(unittest.IsolatedAsyncioTestCase):
+    async def test_social_candidate_requires_verified_spl_mint(self):
+        class Rpc:
+            async def request(self, method, params):
+                self.method = method
+                return {"value": {
+                    "owner": TOKEN_PROGRAM,
+                    "data": {"parsed": {"type": "mint", "info": {}}},
+                }}
+
+        class Detector:
+            def __init__(self):
+                self.candidates = []
+
+            async def _on_candidate(self, candidate):
+                self.candidates.append(candidate)
+
+        desk = MemecoinQuantDesk()
+        desk.solana_rpc = Rpc()
+        desk.detection_engine = Detector()
+        await desk._triage_social_candidate({
+            "token": "FySyjuXTts9mTz2wjyuSXAz4bEBv6v5qxCTcLAMd4mVX",
+            "platform": "telegram", "account": "alerts_bot", "credibility": 0.5,
+            "timestamp": 1_700_000_000,
+        })
+        self.assertEqual(len(desk.detection_engine.candidates), 1)
+        candidate = desk.detection_engine.candidates[0]
+        self.assertEqual(candidate.source, DetectionSource.SOCIAL)
+        self.assertTrue(candidate.metadata["mint_verified"])
+
     async def test_candidate_pipeline_rechecks_first_seconds_without_duplicates(self):
         desk = MemecoinQuantDesk()
         desk.global_config = {"candidate_recheck_delays_seconds": [0, 0.001, 0.003]}

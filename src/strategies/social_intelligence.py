@@ -14,9 +14,10 @@ import aiohttp
 import numpy as np
 
 try:
-    from telethon import TelegramClient
+    from telethon import TelegramClient, events
 except ImportError:  # Dependency absence remains an explicit data blocker.
     TelegramClient = None
+    events = None
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,8 @@ class SocialIntelligenceEngine:
         self._narrative_task: Optional[asyncio.Task] = None
         self._recalc_task: Optional[asyncio.Task] = None
         self._telegram_client = None
+        self._telegram_handles: Set[str] = set()
+        self._telegram_event_handler = None
         self._account_fetched_at: Dict[str, float] = {}
         self._seen_social_items: Set[str] = set()
         self._reddit_access_token = ""
@@ -223,7 +226,7 @@ class SocialIntelligenceEngine:
             session_dir.mkdir(parents=True, exist_ok=True)
             self._telegram_client = TelegramClient(
                 str(session_dir / "collector"), int(api_id), api_hash,
-                receive_updates=False,
+                receive_updates=True,
             )
             await self._telegram_client.connect()
             if not await self._telegram_client.is_user_authorized():
@@ -240,7 +243,18 @@ class SocialIntelligenceEngine:
                 await self._add_account({
                     "platform": "telegram", "handle": channel, "account_id": channel,
                 })
-            self.data_status["telegram"] = "OK" if channels else "DATA_BLOCKED: TELEGRAM_CHANNELS empty"
+            self._telegram_handles = {channel.casefold() for channel in channels}
+            if events is not None:
+                self._telegram_event_handler = self._handle_telegram_event
+                self._telegram_client.add_event_handler(
+                    self._telegram_event_handler, events.NewMessage(incoming=True)
+                )
+            if not channels:
+                self.data_status["telegram"] = "DATA_BLOCKED: TELEGRAM_CHANNELS empty"
+            elif self._telegram_event_handler is not None:
+                self.data_status["telegram"] = "OK_PUSH"
+            else:
+                self.data_status["telegram"] = "OK_POLLING"
         except Exception as exc:
             self.data_status["telegram"] = f"DATA_BLOCKED: {exc}"
             if self._telegram_client:
@@ -604,24 +618,55 @@ class SocialIntelligenceEngine:
             return
         try:
             async for message in self._telegram_client.iter_messages(account.handle, limit=100):
-                dedupe = f"telegram:{account.handle}:{message.id}"
-                if dedupe in self._seen_social_items:
-                    continue
-                self._seen_social_items.add(dedupe)
-                content = message.message or ""
-                for token_address in self._extract_contracts(content):
-                    await self._process_mention(SocialMention(
-                        platform=SocialPlatform.TELEGRAM, account=account, token=token_address,
-                        content=content[:500], timestamp=message.date.timestamp(),
-                        engagement={
-                            "views": int(message.views or 0), "forwards": int(message.forwards or 0),
-                            "replies": int(getattr(message.replies, "replies", 0) or 0),
-                        },
-                        url=f"https://t.me/{account.handle}/{message.id}",
-                    ))
+                await self._process_telegram_message(account, message)
             self.data_status["telegram"] = "OK"
         except Exception as exc:
             self.data_status["telegram"] = f"DATA_BLOCKED: {exc}"
+
+    async def _handle_telegram_event(self, event):
+        """Process configured bot/channel messages from Telegram's push stream."""
+        try:
+            chat = await event.get_chat()
+            handle = str(getattr(chat, "username", "") or "").lstrip("@")
+            if not handle or handle.casefold() not in self._telegram_handles:
+                return
+            key = f"telegram:{handle}"
+            account = self.accounts.get(key)
+            if account is None:
+                await self._add_account({
+                    "platform": "telegram", "handle": handle, "account_id": str(event.chat_id),
+                    "display_name": str(getattr(chat, "title", "") or getattr(chat, "first_name", "") or handle),
+                })
+                account = self.accounts.get(key)
+            if account is not None:
+                await self._process_telegram_message(account, event.message)
+                self.data_status["telegram"] = "OK_PUSH"
+        except Exception as exc:
+            logger.warning("Telegram push ingest failed; polling backfill remains active: %s", exc)
+            self.data_status["telegram_push"] = f"DEGRADED: {exc}"
+
+    async def _process_telegram_message(self, account: SocialAccount, message):
+        message_id = getattr(message, "id", None)
+        if message_id is None:
+            return
+        dedupe = f"telegram:{account.handle}:{message_id}"
+        if dedupe in self._seen_social_items:
+            return
+        self._seen_social_items.add(dedupe)
+        content = getattr(message, "message", "") or ""
+        timestamp = getattr(message, "date", None)
+        timestamp_value = timestamp.timestamp() if timestamp else time.time()
+        for token_address in self._extract_contracts(content):
+            await self._process_mention(SocialMention(
+                platform=SocialPlatform.TELEGRAM, account=account, token=token_address,
+                content=content[:500], timestamp=timestamp_value,
+                engagement={
+                    "views": int(getattr(message, "views", 0) or 0),
+                    "forwards": int(getattr(message, "forwards", 0) or 0),
+                    "replies": int(getattr(getattr(message, "replies", None), "replies", 0) or 0),
+                },
+                url=f"https://t.me/{account.handle}/{message_id}",
+            ))
 
     async def _fetch_reddit_posts(self, account: SocialAccount):
         headers = await self._reddit_headers()
