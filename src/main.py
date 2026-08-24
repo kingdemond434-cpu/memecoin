@@ -126,6 +126,7 @@ class MemecoinQuantDesk:
         self.successful_exits = 0
         self.total_pnl = 0.0
         self._market_observed_at: Dict[str, float] = {}
+        self._market_observation_cohort: set[str] = set()
         self._market_entry_price: Dict[str, float] = {}
         self._curve_entry_price: Dict[str, float] = {}
         self._market_cursor = 0
@@ -678,7 +679,10 @@ class MemecoinQuantDesk:
         """
         if not self.jupiter or not self.jupiter._session or not self.dataset_builder.active_episodes:
             return
-        tokens = list(self.dataset_builder.active_episodes)
+        self._refresh_market_observation_cohort()
+        tokens = list(self._market_observation_cohort)
+        if not tokens:
+            return
         budget = min(int(self.global_config.get("market_observation_budget", 5)), len(tokens))
         now = time.time()
         inspected = 0
@@ -697,8 +701,8 @@ class MemecoinQuantDesk:
             self._market_observed_at[token] = now
             budget -= 1
             due.append(token)
-        active = set(tokens)
-        for stale in set(self._market_observed_at) - active:
+        all_active = set(self.dataset_builder.active_episodes)
+        for stale in set(self._market_observed_at) - all_active:
             self._market_observed_at.pop(stale, None)
             self._market_entry_price.pop(stale, None)
             self._curve_entry_price.pop(stale, None)
@@ -710,6 +714,20 @@ class MemecoinQuantDesk:
             for token, result in zip(due, results):
                 if isinstance(result, Exception):
                     logger.warning("Market observation failed for %s: %s", token, result)
+
+    def _refresh_market_observation_cohort(self):
+        """Keep a bounded cohort long enough to collect repeated executable marks."""
+        active = self.dataset_builder.active_episodes
+        limit = max(1, int(self.global_config.get("market_observation_cohort_size", 100)))
+        self._market_observation_cohort.intersection_update(active)
+        if len(self._market_observation_cohort) >= limit:
+            return
+        newest = sorted(
+            (episode for token, episode in active.items() if token not in self._market_observation_cohort),
+            key=lambda episode: (float(episode.created_at), episode.token), reverse=True,
+        )
+        for episode in newest[:limit - len(self._market_observation_cohort)]:
+            self._market_observation_cohort.add(episode.token)
 
     async def _observe_token_market(self, token: str, observed_at: float):
         probe_lamports = int(self.global_config.get("market_probe_lamports", 10_000_000))

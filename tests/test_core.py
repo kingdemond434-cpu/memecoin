@@ -436,6 +436,20 @@ class TestShadowTrainer(unittest.TestCase):
 
 
 class TestApplicationStartup(unittest.IsolatedAsyncioTestCase):
+    def test_market_observation_cohort_is_bounded_and_stable(self):
+        desk = MemecoinQuantDesk()
+        desk.global_config = {"market_observation_cohort_size": 2}
+        desk.dataset_builder = SimpleNamespace(active_episodes={
+            "old": SimpleNamespace(token="old", created_at=1),
+            "middle": SimpleNamespace(token="middle", created_at=2),
+            "new": SimpleNamespace(token="new", created_at=3),
+        })
+        desk._refresh_market_observation_cohort()
+        self.assertEqual(desk._market_observation_cohort, {"middle", "new"})
+        del desk.dataset_builder.active_episodes["middle"]
+        desk._refresh_market_observation_cohort()
+        self.assertEqual(desk._market_observation_cohort, {"old", "new"})
+
     async def test_offline_dry_run_initializes_without_provider_credentials(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             "os.environ", {"CHAMPION_STATE_PATH": str(Path(directory) / "champion.json")}

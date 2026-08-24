@@ -163,5 +163,6 @@ global:
   max_candidate_pipelines: 100
   candidate_recheck_delays_seconds: [0, 1, 3, 5, 10]
   market_observation_budget: 1
+  market_observation_cohort_size: 100
   market_observer_sleep_seconds: 0.25
   market_probe_lamports: 10000000
