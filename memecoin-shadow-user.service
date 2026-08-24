@@ -8,6 +8,7 @@ Type=simple
 WorkingDirectory=%h/.local/opt/memecoin-shadow
 EnvironmentFile=-%h/.config/memecoin-shadow/env
 Environment=ALLOW_LIVE_TRADING=
+Environment=SOLANA_PRIVATE_KEY=
 Environment=HEALTH_PORT=18080
 Environment=PYTHONUNBUFFERED=1
 ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.main --dry-run
