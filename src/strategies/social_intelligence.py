@@ -282,7 +282,7 @@ class SocialIntelligenceEngine:
             items = []
             # YouTube search costs 100 quota units. Rotate three languages per
             # cycle rather than exhausting the free daily quota in one run.
-            query_count = min(3, len(self.YOUTUBE_QUERIES))
+            query_count = min(1, len(self.YOUTUBE_QUERIES))
             queries = [self.YOUTUBE_QUERIES[(self._youtube_query_cursor + i) % len(self.YOUTUBE_QUERIES)]
                        for i in range(query_count)]
             self._youtube_query_cursor = (self._youtube_query_cursor + query_count) % len(self.YOUTUBE_QUERIES)

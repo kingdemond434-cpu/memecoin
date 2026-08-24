@@ -883,5 +883,7 @@ class PointInTimeDatasetBuilder:
             "active_episodes": len(self.active_episodes),
             "completed_episodes": len(self.completed_episodes),
             "indexed_outcomes": len(self.outcome_index),
-            "storage_path": self.storage_path
+            "storage_path": self.storage_path,
+            "market_sources": dict(self._market_cache.get("sources", {})),
+            "market_observed_at": self._market_cache.get("observed_at"),
         }
