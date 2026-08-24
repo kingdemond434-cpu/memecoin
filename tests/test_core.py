@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import gzip
 import json
 import struct
 import tempfile
@@ -8,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 from solders.hash import Hash
 from solders.keypair import Keypair
 from solders.message import MessageV0
@@ -21,7 +23,8 @@ from src.chains.yellowstone_grpc import (
 )
 from src.detection.rug_detector import TOKEN_2022_PROGRAM, TOKEN_PROGRAM, RugDetector
 from src.execution.jupiter_jito import (
-    ExecutionEngine, JupiterClient, RouteType, SolanaTransactionBuilder, SwapQuote, TransactionStatus,
+    ExecutionEngine, ExecutionResult, JupiterClient, RouteType, SolanaTransactionBuilder, SwapQuote,
+    SwapTransaction, TransactionStatus,
 )
 from src.main import MemecoinQuantDesk
 from src.strategies.information_graph import CounterfactualExecutionLab
@@ -30,9 +33,13 @@ from src.strategies.public_coordination import PublicCoordinationMiner
 from src.strategies.wallet_intelligence import WalletIntelligenceEngine, WalletRegime
 from src.research.dataset_builder import LaunchEpisode, PointInTimeDatasetBuilder, SnapshotTimepoint
 from src.research.shadow_trainer import chronological_episode_split, train_shadow
+from src.research.hazard_trainer import train_hazard_calibration
 from src.research.global_research_miner import GlobalResearchMiner, ResearchLead
-from src.strategies.champion_challenger import ChampionChallengerFramework, HypothesisSpec, TrialResult
-from src.strategies.rug_hazard import ContinuousRugHazardModel
+from src.strategies.champion_challenger import ChampionChallengerFramework, HypothesisSpec, ModelStatus, TrialResult
+from src.strategies.rug_hazard import (
+    ContinuousRugHazardModel, DEFAULT_TRIGGER_WEIGHTS, collect_observation_signals,
+    load_latest_hazard_calibration, score_signals,
+)
 from src.strategies.genealogy_graph import GenealogyGraph, RelationshipType
 from src.strategies.social_intelligence import SocialAccount, SocialIntelligenceEngine, SocialPlatform
 
@@ -291,6 +298,63 @@ class TestOfficialSocialCollectors(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(values, ["alpha", "beta"])
 
+    async def test_telegram_setup_blocks_without_credentials(self):
+        engine = self.make_engine({"telegram_channels": "@alpha"})
+        with patch("src.strategies.social_intelligence.TelegramClient") as client_cls:
+            await engine._setup_telegram()
+        client_cls.assert_not_called()
+        self.assertIn("TELEGRAM_API_ID/API_HASH missing", engine.data_status["telegram"])
+        self.assertEqual(engine.accounts, {})
+
+    async def test_telegram_setup_blocks_and_disconnects_when_session_unauthorized(self):
+        engine = self.make_engine({
+            "telegram_api_id": "123", "telegram_api_hash": "hash", "telegram_channels": "@alpha",
+        })
+        fake_client = FakeTelegramClient("path", 123, "hash")
+        fake_client.authorized = False
+        with patch("src.strategies.social_intelligence.TelegramClient", return_value=fake_client):
+            await engine._setup_telegram()
+        self.assertIn("interactive Telegram authorization required", engine.data_status["telegram"])
+        self.assertTrue(fake_client.disconnected)
+        self.assertIsNone(engine._telegram_client)
+        self.assertEqual(engine.accounts, {})
+
+    async def test_telegram_setup_normalizes_and_registers_configured_channels(self):
+        engine = self.make_engine({
+            "telegram_api_id": "123", "telegram_api_hash": "hash",
+            "telegram_channels": "@alpha, https://t.me/beta ,gamma",
+        })
+        fake_client = FakeTelegramClient("path", 123, "hash")
+        with patch("src.strategies.social_intelligence.TelegramClient", return_value=fake_client):
+            await engine._setup_telegram()
+        self.assertEqual(engine.data_status["telegram"], "OK")
+        self.assertTrue(fake_client.connected)
+        self.assertEqual(set(engine.accounts), {"telegram:alpha", "telegram:beta", "telegram:gamma"})
+        for handle in ("alpha", "beta", "gamma"):
+            self.assertEqual(engine.accounts[f"telegram:{handle}"].handle, handle)
+
+    async def test_fetch_telegram_posts_extracts_contract_and_dedupes_read_only(self):
+        engine = self.make_engine()
+        engine._telegram_client = FakeTelegramClient("path", 123, "hash")
+        mint = "FySyjuXTts9mTz2wjyuSXAz4bEBv6v5qxCTcLAMd4mVX"
+        message = FakeTelegramMessage(1, f"gm, new call {mint}", 1_700_000_000, views=42, forwards=3)
+        engine._telegram_client.messages_by_entity["alpha"] = [message]
+        account = SocialAccount(SocialPlatform.TELEGRAM, "alpha", "alpha", "alpha")
+
+        await engine._fetch_telegram_posts(account)
+        self.assertEqual(engine.data_status["telegram"], "OK")
+        self.assertEqual(len(engine.mentions), 1)
+        mention = engine.mentions[0]
+        self.assertEqual(mention.token, mint)
+        self.assertEqual(mention.engagement["views"], 42)
+        self.assertEqual(mention.url, "https://t.me/alpha/1")
+
+        # A second pass over the same message must not double-count it, and
+        # the collector never mutates the channel (no send/delete/react call
+        # exists anywhere on FakeTelegramClient for it to reach).
+        await engine._fetch_telegram_posts(account)
+        self.assertEqual(len(engine.mentions), 1)
+
 
 class TestNativeMintChecks(unittest.TestCase):
     @staticmethod
@@ -369,6 +433,124 @@ class TestProbabilityAndAccounting(unittest.TestCase):
                 predictor.save(str(Path(directory) / "unsafe.joblib"), {"status": "REJECTED"})
 
 
+class FakeExecutionEngineForExit:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    async def execute_sell(self, token, sold_tokens, **kwargs):
+        self.calls.append((token, sold_tokens, kwargs))
+        return self.result
+
+
+class FakeDatasetBuilderForExit:
+    def __init__(self):
+        self.attempts = []
+        self.counterfactuals = []
+
+    def record_execution_attempt(self, token, attempt):
+        self.attempts.append((token, attempt))
+
+    def record_counterfactual(self, token, counterfactual):
+        self.counterfactuals.append((token, counterfactual))
+
+
+class FakeCounterfactualLabForExit:
+    def resolve_decision(self, decision_id, pnl):
+        return []
+
+
+class TestPartialExitAccounting(unittest.IsolatedAsyncioTestCase):
+    def _desk(self, result):
+        desk = SimpleNamespace(
+            execution_engine=FakeExecutionEngineForExit(result),
+            dataset_builder=FakeDatasetBuilderForExit(),
+            counterfactual_lab=FakeCounterfactualLabForExit(),
+            elogw_engine=ElogwEngine(None),
+            sol_price_usd=150.0, total_pnl=0.0, successful_exits=0, dry_run=True,
+        )
+        return desk
+
+    @staticmethod
+    def _position():
+        return {
+            "size_tokens": 1_000, "initial_size_tokens": 1_000,
+            "remaining_cost_usd": 100.0, "initial_cost_usd": 100.0,
+            "risk_contribution": 0.02, "initial_risk_contribution": 0.02,
+            "decision_id": "d1",
+        }
+
+    async def test_partial_exit_banks_pnl_on_only_the_sold_slice_and_leaves_remainder_open(self):
+        result = ExecutionResult(
+            success=True, status=TransactionStatus.SIMULATED, simulated=True,
+            quoted_output_amount=150_000_000, native_balance_delta_lamports=0,
+        )
+        desk = self._desk(result)
+        position = self._position()
+        desk.elogw_engine.update_position("mint", position)
+
+        await MemecoinQuantDesk._execute_exit(desk, "mint", position, 0.5, "profit_ratchet_cost_recovery")
+
+        self.assertEqual(desk.execution_engine.calls[0][1], 500)
+        self.assertAlmostEqual(desk.total_pnl, 100.0)
+        self.assertEqual(desk.successful_exits, 1)
+        self.assertIn("mint", desk.elogw_engine.open_positions)
+        remaining = desk.elogw_engine.open_positions["mint"]
+        self.assertEqual(remaining["size_tokens"], 500)
+        self.assertAlmostEqual(remaining["remaining_cost_usd"], 50.0)
+        self.assertAlmostEqual(remaining["risk_contribution"], 0.01)
+        attempt = desk.dataset_builder.attempts[-1][1]
+        self.assertAlmostEqual(attempt["proceeds_usd"], 150.0)
+        self.assertAlmostEqual(attempt["allocated_cost_usd"], 50.0)
+        self.assertAlmostEqual(attempt["realized_pnl_usd"], 100.0)
+
+    async def test_full_exit_closes_the_position(self):
+        result = ExecutionResult(
+            success=True, status=TransactionStatus.SIMULATED, simulated=True,
+            quoted_output_amount=40_000_000, native_balance_delta_lamports=0,
+        )
+        desk = self._desk(result)
+        position = self._position()
+        desk.elogw_engine.update_position("mint", position)
+
+        await MemecoinQuantDesk._execute_exit(desk, "mint", position, 1.0, "hard_stop_loss")
+
+        self.assertAlmostEqual(desk.total_pnl, -60.0)
+        self.assertEqual(desk.successful_exits, 0)
+        self.assertNotIn("mint", desk.elogw_engine.open_positions)
+
+    async def test_live_exit_pnl_nets_out_the_native_sol_fee_delta(self):
+        result = ExecutionResult(
+            success=True, status=TransactionStatus.FILLED, filled=True, landed=True, submitted=True,
+            filled_output_amount=150_000_000, native_balance_delta_lamports=-5_000_000,
+        )
+        desk = self._desk(result)
+        desk.dry_run = False
+        position = self._position()
+        desk.elogw_engine.update_position("mint", position)
+
+        await MemecoinQuantDesk._execute_exit(desk, "mint", position, 0.5, "profit_ratchet_cost_recovery")
+
+        fee_usd = 5_000_000 / 1e9 * 150.0
+        self.assertAlmostEqual(desk.total_pnl, 100.0 - fee_usd)
+
+    async def test_failed_exit_never_mutates_pnl_or_the_position(self):
+        result = ExecutionResult(success=False, status=TransactionStatus.TIMEOUT, error="no fill")
+        desk = self._desk(result)
+        position = self._position()
+        desk.elogw_engine.update_position("mint", position)
+
+        await MemecoinQuantDesk._execute_exit(desk, "mint", position, 0.5, "profit_ratchet_cost_recovery")
+
+        self.assertEqual(desk.total_pnl, 0.0)
+        self.assertEqual(desk.successful_exits, 0)
+        still_open = desk.elogw_engine.open_positions["mint"]
+        self.assertEqual(still_open["size_tokens"], 1_000)
+        self.assertEqual(still_open["remaining_cost_usd"], 100.0)
+        self.assertEqual(len(desk.dataset_builder.attempts), 1)
+        self.assertNotIn("realized_pnl_usd", desk.dataset_builder.attempts[0][1])
+
+
 class TestShadowTrainer(unittest.TestCase):
     def test_chronological_split_keeps_launch_episodes_disjoint(self):
         samples = []
@@ -384,6 +566,25 @@ class TestShadowTrainer(unittest.TestCase):
         self.assertFalse(train_tokens & oos_tokens)
         self.assertEqual(train_tokens | oos_tokens, {f"token-{index}" for index in range(5)})
 
+    def test_snapshot_labels_derive_rug_targets_from_drawdown_based_rug_time(self):
+        from src.research.shadow_trainer import snapshot_labels
+        from src.strategies.multihead_predictor import PredictionTarget
+        snapshot = {
+            "labels": {"label_rug": True, "label_rug_time": 12},
+            "liquidity_features": {},
+        }
+        labels = snapshot_labels(snapshot)
+        self.assertEqual(labels[PredictionTarget.P_RUG_30S], 1.0)
+        self.assertEqual(labels[PredictionTarget.P_RUG_5M], 1.0)
+
+        slow_bleed = {
+            "labels": {"label_rug": True, "label_rug_time": 240},
+            "liquidity_features": {},
+        }
+        slow_labels = snapshot_labels(slow_bleed)
+        self.assertEqual(slow_labels[PredictionTarget.P_RUG_30S], 0.0)
+        self.assertEqual(slow_labels[PredictionTarget.P_RUG_5M], 1.0)
+
     def test_insufficient_history_remains_explicitly_data_blocked(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -391,6 +592,106 @@ class TestShadowTrainer(unittest.TestCase):
             self.assertEqual(report["status"], "DATA_BLOCKED")
             persisted = json.loads((root / "models" / "last_training_report.json").read_text())
             self.assertEqual(persisted["status"], "DATA_BLOCKED")
+
+
+def _write_hazard_episode(storage: Path, token: str, created_at: float, observations, final_outcome):
+    directory = storage / "day"
+    directory.mkdir(parents=True, exist_ok=True)
+    with gzip.open(directory / f"{token}.json.gz", "wt", encoding="utf-8") as handle:
+        json.dump({
+            "token": token, "chain": "solana", "created_at": created_at,
+            "market_observations": observations, "final_outcome": final_outcome,
+        }, handle)
+
+
+def _build_hazard_fixture(storage: Path, count: int = 40):
+    """40 episodes interleaved rug/healthy (3-in-8 rug) so both the train
+    and the chronologically-last OOS fold contain rug episodes."""
+    for index in range(count):
+        created_at = float(index * 1000)
+        if index % 8 < 3:
+            observations = [
+                {"type": "liquidity", "timestamp": created_at + 15, "change_pct": -0.5},
+                {"type": "route", "timestamp": created_at + 16, "feasible": False},
+                {"type": "trade", "side": "buy", "timestamp": created_at + 35, "notional_usd": 1},
+            ]
+            _write_hazard_episode(storage, f"rug-{index}", created_at, observations,
+                                 {"status": "OK", "rugged": True, "rug_time": 45})
+        else:
+            observations = [
+                {"type": "trade", "side": "buy", "timestamp": created_at + 1, "notional_usd": 50},
+                {"type": "trade", "side": "buy", "timestamp": created_at + 650, "notional_usd": 50},
+            ]
+            _write_hazard_episode(storage, f"healthy-{index}", created_at, observations,
+                                 {"status": "OK", "rugged": False, "rug_time": None})
+
+
+class TestHazardTrainer(unittest.IsolatedAsyncioTestCase):
+    def test_insufficient_history_remains_explicitly_data_blocked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = train_hazard_calibration(root / "episodes", root / "models", min_samples=200)
+            self.assertEqual(report["status"], "DATA_BLOCKED")
+            persisted = json.loads((root / "models" / "last_hazard_training_report.json").read_text())
+            self.assertEqual(persisted["status"], "DATA_BLOCKED")
+
+    def test_calibration_trains_and_separates_rug_from_healthy_checkpoints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            storage = root / "episodes"
+            _build_hazard_fixture(storage)
+
+            report = train_hazard_calibration(storage, root / "models", min_samples=150, min_positive=10)
+            self.assertEqual(report["status"], "PASSED", report)
+            self.assertGreater(report["brier_skill_vs_base_rate"], 0)
+            self.assertTrue(Path(report["model_path"]).exists())
+
+            calibrator, loaded_report = load_latest_hazard_calibration(str(root / "models"))
+            self.assertIsNotNone(calibrator)
+            self.assertEqual(loaded_report["status"], "PASSED")
+            # A clearly rug-like raw score must calibrate higher than a clean one.
+            rug_like = collect_observation_signals(
+                [{"type": "liquidity", "timestamp": 15, "change_pct": -0.5},
+                 {"type": "route", "timestamp": 16, "feasible": False}], 20,
+            )
+            healthy = collect_observation_signals(
+                [{"type": "trade", "side": "buy", "timestamp": 1, "notional_usd": 50}], 20,
+            )
+            raw_rug = score_signals(rug_like, DEFAULT_TRIGGER_WEIGHTS)
+            raw_healthy = score_signals(healthy, DEFAULT_TRIGGER_WEIGHTS)
+            self.assertGreater(calibrator.predict([raw_rug])[0], calibrator.predict([raw_healthy])[0])
+
+    async def test_rug_hazard_model_loads_and_applies_a_passed_calibration_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            storage = root / "episodes"
+            _build_hazard_fixture(storage)
+            model_dir = root / "models"
+            report = train_hazard_calibration(storage, model_dir, min_samples=150, min_positive=10)
+            self.assertEqual(report["status"], "PASSED", report)
+
+            with patch.dict("os.environ", {"HAZARD_MODEL_DIR": str(model_dir)}):
+                class WalletIntel:
+                    def get_top_wallets(self, limit=50):
+                        return []
+                class Adversarial:
+                    def get_adaptive_weight(self, feature, base):
+                        return base
+                model = ContinuousRugHazardModel(solana_chain(), FakeRpc(), FakeGenealogy(), WalletIntel(), Adversarial())
+                await model._load_historical_model()
+            self.assertTrue(model.is_trained)
+            self.assertEqual(model.data_status, "OK")
+            self.assertIsNotNone(model.hazard_calibrator)
+
+            model.register_token("token")
+            model.record_observation("token", {"type": "liquidity", "change_pct": -0.5})
+            model.record_observation("token", {"type": "route", "feasible": False})
+            state = await model._compute_hazard("token")
+            self.assertGreater(state.raw_hazard, 0)
+            self.assertAlmostEqual(
+                state.current_hazard,
+                float(np.clip(model.hazard_calibrator.predict([state.raw_hazard])[0], 0, 1)),
+            )
 
 
 class TestApplicationStartup(unittest.IsolatedAsyncioTestCase):
@@ -451,6 +752,100 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(second.trial_results), 1)
             self.assertEqual(second.hypotheses["model-v1"].feature_hash, "schema-1")
 
+    @staticmethod
+    def _hypothesis(hypothesis_id: str) -> HypothesisSpec:
+        return HypothesisSpec(
+            hypothesis_id=hypothesis_id, mechanism="test", target="net_elogw",
+            features=["flow"], feature_hash="schema-1", model_type="test",
+            model_params={}, training_window="point-in-time", threshold=0.0,
+            sizing_rule={}, exit_rule={}, execution_policy={}, fakeability={},
+            cost_model={}, falsifier="negative oos", kill_thesis="decay",
+            source_provenance="fixture", trial_family="test", created_at=1.0,
+        )
+
+    async def test_full_promotion_pipeline_discovered_to_live_champion(self):
+        framework = ChampionChallengerFramework(
+            min_oos_samples=1, min_portfolio_impact=0.0,
+            shadow_duration_hours=0, canary_duration_hours=0,
+        )
+        framework.submit_hypothesis(self._hypothesis("promo-1"))
+        self.assertEqual(framework.hypotheses["promo-1"].status, ModelStatus.DISCOVERED.value)
+
+        framework.record_trial_result(TrialResult(
+            hypothesis_id="promo-1", stage="CHRONOLOGICAL_OOS", samples=10,
+            metrics={}, oos_metrics={"elogw": 0.02}, portfolio_impact=0.02,
+            passed=True, timestamp=2.0,
+        ))
+        await framework._evaluate_challengers()
+        self.assertIn("promo-1", framework.shadow_models)
+        self.assertNotIn("promo-1", framework.challengers)
+        self.assertEqual(framework.hypotheses["promo-1"].status, ModelStatus.FORWARD_SHADOW.value)
+
+        for _ in range(5):
+            framework.record_forward_result("promo-1", {"elogw": 0.01, "pnl": 5.0})
+        await framework._evaluate_shadow_models()
+        self.assertIn("promo-1", framework.canary_models)
+        self.assertNotIn("promo-1", framework.shadow_models)
+        self.assertEqual(framework.hypotheses["promo-1"].status, ModelStatus.CANARY.value)
+
+        for _ in range(20):
+            framework.record_forward_result("promo-1", {"elogw": 0.01, "pnl": 5.0})
+        await framework._evaluate_canary_models()
+        self.assertIn("promo-1", framework.champions)
+        self.assertNotIn("promo-1", framework.canary_models)
+        self.assertTrue(framework.is_live("promo-1"))
+        self.assertEqual(framework.hypotheses["promo-1"].status, ModelStatus.LIVE.value)
+        self.assertEqual(framework.get_stats()["live_champions"], 1)
+
+        for _ in range(framework.decay_window):
+            framework.record_forward_result("promo-1", {"elogw": -0.01, "pnl": -5.0})
+        await framework._monitor_champion_decay()
+        self.assertEqual(framework.champions["promo-1"].status, "HIBERNATED")
+        self.assertEqual(framework.get_stats()["hibernated_champions"], 1)
+
+    async def test_shadow_and_canary_failures_retire_the_hypothesis(self):
+        shadow_framework = ChampionChallengerFramework(
+            min_oos_samples=1, min_portfolio_impact=0.0,
+            shadow_duration_hours=0, canary_duration_hours=0,
+        )
+        shadow_framework.submit_hypothesis(self._hypothesis("shadow-fail"))
+        shadow_framework.record_trial_result(TrialResult(
+            hypothesis_id="shadow-fail", stage="CHRONOLOGICAL_OOS", samples=10,
+            metrics={}, oos_metrics={"elogw": 0.02}, portfolio_impact=0.02,
+            passed=True, timestamp=2.0,
+        ))
+        await shadow_framework._evaluate_challengers()
+        for _ in range(5):
+            shadow_framework.record_forward_result("shadow-fail", {"elogw": -0.01, "pnl": -5.0})
+        await shadow_framework._evaluate_shadow_models()
+        self.assertNotIn("shadow-fail", shadow_framework.shadow_models)
+        self.assertNotIn("shadow-fail", shadow_framework.canary_models)
+        self.assertEqual(shadow_framework.hypotheses["shadow-fail"].status, ModelStatus.RETIRED.value)
+        self.assertEqual(shadow_framework.get_stats()["retired"], 1)
+
+        canary_framework = ChampionChallengerFramework(
+            min_oos_samples=1, min_portfolio_impact=0.0,
+            shadow_duration_hours=0, canary_duration_hours=0,
+        )
+        canary_framework.submit_hypothesis(self._hypothesis("canary-fail"))
+        canary_framework.record_trial_result(TrialResult(
+            hypothesis_id="canary-fail", stage="CHRONOLOGICAL_OOS", samples=10,
+            metrics={}, oos_metrics={"elogw": 0.02}, portfolio_impact=0.02,
+            passed=True, timestamp=2.0,
+        ))
+        await canary_framework._evaluate_challengers()
+        for _ in range(5):
+            canary_framework.record_forward_result("canary-fail", {"elogw": 0.01, "pnl": 5.0})
+        await canary_framework._evaluate_shadow_models()
+        self.assertIn("canary-fail", canary_framework.canary_models)
+        # Fewer than 20 canary trades -> retired for insufficient evidence, not promoted.
+        for _ in range(5):
+            canary_framework.record_forward_result("canary-fail", {"elogw": 0.01, "pnl": 5.0})
+        await canary_framework._evaluate_canary_models()
+        self.assertNotIn("canary-fail", canary_framework.canary_models)
+        self.assertNotIn("canary-fail", canary_framework.champions)
+        self.assertEqual(canary_framework.hypotheses["canary-fail"].status, ModelStatus.RETIRED.value)
+
     async def test_hourly_leads_survive_restart_and_restore_challengers(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = Path(directory) / "leads.jsonl"
@@ -489,6 +884,93 @@ class FakeJito:
 class FakeRpc:
     async def request(self, method, params):
         raise AssertionError("dry-run must not submit or confirm a transaction")
+
+
+class LiveFakeJupiter:
+    """Returns a real, signable unsigned VersionedTransaction for live-path tests."""
+
+    def __init__(self, keypair):
+        self.keypair = keypair
+
+    async def get_quote(self, input_mint, output_mint, amount, slippage_bps):
+        return SwapQuote(input_mint, output_mint, amount, 12345, 0.01, [], RouteType.JUPITER_V1,
+                         30, 12000, raw_quote={"outAmount": "12345"})
+
+    async def get_swap_transaction(self, quote, user_public_key, *, priority_fee_lamports=0, jito_tip_lamports=0):
+        message = MessageV0.try_compile(self.keypair.pubkey(), [], [], Hash.default())
+        unsigned = VersionedTransaction.populate(message, [Signature.default()])
+        return SwapTransaction(
+            transaction=base64.b64encode(bytes(unsigned)).decode("ascii"),
+            last_valid_block_height=1000, fee_payer=user_public_key, quote=quote,
+            priority_fee=priority_fee_lamports, jito_tip=jito_tip_lamports,
+            route_type=RouteType.JITO_BUNDLE if jito_tip_lamports else quote.route_type,
+        )
+
+
+class LiveFakeJito:
+    def __init__(self, bundle_id=None, status=None):
+        self.bundle_id = bundle_id
+        self.status = status or {"value": []}
+        self.sent = []
+
+    async def send_bundle(self, transactions):
+        self.sent.append(transactions)
+        return self.bundle_id
+
+    async def get_bundle_status(self, bundle_id):
+        return self.status
+
+
+class LiveFakeRpc:
+    def __init__(self, send_transaction_response=None, get_transaction_response=None):
+        self.send_transaction_response = send_transaction_response
+        self.get_transaction_response = get_transaction_response
+        self.sent = []
+
+    async def request(self, method, params):
+        if method == "sendTransaction":
+            self.sent.append(params)
+            return self.send_transaction_response
+        if method == "getTransaction":
+            return self.get_transaction_response
+        raise AssertionError(f"unexpected RPC method: {method}")
+
+
+class FakeTelegramMessage:
+    def __init__(self, message_id, text, ts, views=0, forwards=0):
+        self.id = message_id
+        self.message = text
+        self.date = SimpleNamespace(timestamp=lambda: ts)
+        self.views = views
+        self.forwards = forwards
+        self.replies = None
+
+
+class FakeTelegramClient:
+    """Stands in for telethon.TelegramClient: connect/read only, never send/delete/react."""
+
+    def __init__(self, session_path, api_id, api_hash, receive_updates=False):
+        self.session_path = session_path
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.receive_updates = receive_updates
+        self.connected = False
+        self.disconnected = False
+        self.authorized = True
+        self.messages_by_entity = {}
+
+    async def connect(self):
+        self.connected = True
+
+    async def is_user_authorized(self):
+        return self.authorized
+
+    async def disconnect(self):
+        self.disconnected = True
+
+    async def iter_messages(self, entity, limit=100):
+        for message in self.messages_by_entity.get(entity, [])[:limit]:
+            yield message
 
 
 class TestExecution(unittest.IsolatedAsyncioTestCase):
@@ -546,15 +1028,102 @@ class TestExecution(unittest.IsolatedAsyncioTestCase):
         }
         self.assertEqual(ExecutionEngine._token_balance_decrease(meta, "token", owner), 375)
 
+    def _live_engine(self, jupiter=None, jito=None, rpc=None, confirmation_timeout=45.0):
+        keypair = Keypair()
+        builder = SolanaTransactionBuilder(rpc or LiveFakeRpc(), keypair)
+        engine = ExecutionEngine(
+            solana_chain(), rpc or LiveFakeRpc(), jupiter or LiveFakeJupiter(keypair),
+            jito or LiveFakeJito(), builder, CounterfactualExecutionLab(),
+            dry_run=False, confirmation_timeout=confirmation_timeout,
+        )
+        return engine
+
+    async def test_live_jito_bundle_fills_with_verified_output_balance_delta(self):
+        with patch.dict("os.environ", {"ALLOW_LIVE_TRADING": "yes-i-understand"}):
+            rpc = LiveFakeRpc(get_transaction_response={
+                "slot": 555, "meta": {
+                    "err": None, "fee": 5000,
+                    "preTokenBalances": [], "postTokenBalances": [
+                        {"mint": "out", "owner": None, "uiTokenAmount": {"amount": "12345"}},
+                    ],
+                    "preBalances": [2_000_000_000], "postBalances": [1_998_995_000],
+                },
+                "transaction": {"message": {"accountKeys": [{"pubkey": None}]}},
+            })
+            jito = LiveFakeJito(bundle_id="bundle-1",
+                                status={"value": [{"confirmationStatus": "confirmed", "transactions": ["sig-1"]}]})
+            engine = self._live_engine(rpc=rpc, jito=jito)
+            rpc.owner = engine.tx_builder.public_key
+            rpc.get_transaction_response["meta"]["postTokenBalances"][0]["owner"] = engine.tx_builder.public_key
+            rpc.get_transaction_response["transaction"]["message"]["accountKeys"][0]["pubkey"] = engine.tx_builder.public_key
+            result = await engine.execute_swap("in", "out", 1000, use_jito=True)
+        self.assertEqual(result.status, TransactionStatus.FILLED)
+        self.assertTrue(result.success)
+        self.assertTrue(result.submitted)
+        self.assertTrue(result.landed)
+        self.assertTrue(result.filled)
+        self.assertEqual(result.signature, "sig-1")
+        self.assertEqual(result.bundle_id, "bundle-1")
+        self.assertEqual(result.filled_output_amount, 12345)
+        self.assertEqual(result.slot, 555)
+
+    async def test_live_jito_bundle_rejected_never_reaches_submitted(self):
+        with patch.dict("os.environ", {"ALLOW_LIVE_TRADING": "yes-i-understand"}):
+            jito = LiveFakeJito(bundle_id=None)
+            engine = self._live_engine(jito=jito)
+            result = await engine.execute_swap("in", "out", 1000, use_jito=True)
+        self.assertEqual(result.status, TransactionStatus.FAILED)
+        self.assertFalse(result.success)
+        self.assertFalse(result.submitted)
+        self.assertIsNone(result.signature)
+
+    async def test_live_jito_bundle_submitted_but_never_confirmed_is_a_distinct_timeout_state(self):
+        with patch.dict("os.environ", {"ALLOW_LIVE_TRADING": "yes-i-understand"}):
+            jito = LiveFakeJito(bundle_id="bundle-2", status={"value": []})
+            engine = self._live_engine(jito=jito, confirmation_timeout=0.05)
+            result = await engine.execute_swap("in", "out", 1000, use_jito=True)
+        self.assertEqual(result.status, TransactionStatus.TIMEOUT)
+        self.assertFalse(result.success)
+        self.assertTrue(result.submitted)
+        self.assertEqual(result.bundle_id, "bundle-2")
+        self.assertIsNone(result.signature)
+
+    async def test_live_raw_submission_lands_but_does_not_fill_on_chain_revert(self):
+        with patch.dict("os.environ", {"ALLOW_LIVE_TRADING": "yes-i-understand"}):
+            rpc = LiveFakeRpc(
+                send_transaction_response="sig-revert",
+                get_transaction_response={"slot": 9, "meta": {"err": {"InstructionError": [0, "Custom"]}, "fee": 5000}},
+            )
+            engine = self._live_engine(rpc=rpc)
+            result = await engine.execute_swap("in", "out", 1000, use_jito=False)
+        self.assertEqual(result.status, TransactionStatus.LANDED)
+        self.assertFalse(result.success)
+        self.assertTrue(result.submitted)
+        self.assertTrue(result.landed)
+        self.assertFalse(result.filled)
+        self.assertEqual(result.signature, "sig-revert")
+
+    async def test_live_raw_submission_that_never_lands_times_out(self):
+        with patch.dict("os.environ", {"ALLOW_LIVE_TRADING": "yes-i-understand"}):
+            rpc = LiveFakeRpc(send_transaction_response="sig-lost", get_transaction_response=None)
+            engine = self._live_engine(rpc=rpc, confirmation_timeout=0.05)
+            result = await engine.execute_swap("in", "out", 1000, use_jito=False)
+        self.assertEqual(result.status, TransactionStatus.TIMEOUT)
+        self.assertFalse(result.success)
+        self.assertTrue(result.submitted)
+        self.assertFalse(result.landed)
+        self.assertFalse(result.filled)
+
 
 class FakeGenealogy:
     wallets = {}
+    token_launch_times = {}
 
     def get_deployer_profile(self, address):
         return None
 
 
-class TestWalletAndCoordination(unittest.TestCase):
+class TestWalletAndCoordination(unittest.IsolatedAsyncioTestCase):
     def test_wallet_history_uses_fifo_closed_round_trips(self):
         wallet = "wallet"
         engine = WalletIntelligenceEngine(solana_chain(), FakeRpc(), FakeGenealogy(), "")
@@ -574,6 +1143,70 @@ class TestWalletAndCoordination(unittest.TestCase):
         engine = WalletIntelligenceEngine(solana_chain(), FakeRpc(), FakeGenealogy(), "")
         self.assertIsNone(engine._classify_regime({"timestamp": 11, "multiple": 5.0}))
         self.assertEqual(engine._classify_regime({"regime": "post_migration"}), WalletRegime.POST_MIGRATION)
+
+    async def test_wallet_history_classifies_ultra_early_from_a_real_detected_launch_time(self):
+        wallet = "wallet"
+        graph = GenealogyGraph(solana_chain(), FakeRpc(), "")
+        await graph._process_token_creation({"token": "token", "deployer": "dev", "timestamp": 0})
+        engine = WalletIntelligenceEngine(solana_chain(), FakeRpc(), graph, "")
+        txs = [
+            {"signature": "buy", "timestamp": 1, "nativeTransfers": [{"fromUserAccount": wallet, "amount": 1_000_000_000}],
+             "tokenTransfers": [{"toUserAccount": wallet, "fromUserAccount": "curve", "mint": "token", "tokenAmount": 100}]},
+            {"signature": "sell", "timestamp": 11, "nativeTransfers": [{"toUserAccount": wallet, "amount": 2_500_000_000}],
+             "tokenTransfers": [{"fromUserAccount": wallet, "toUserAccount": "curve", "mint": "token", "tokenAmount": 50}]},
+        ]
+        await engine._build_wallet_history(wallet, txs)
+        self.assertEqual(engine.data_status[wallet], "OK")
+        perf = engine.regime_performances[wallet][WalletRegime.ULTRA_EARLY]
+        self.assertEqual(perf.trades, 1)
+        self.assertEqual(perf.win_rate_2x, 1.0)
+
+    async def test_wallet_history_classifies_early_curve_and_leaves_late_entries_unclassified(self):
+        wallet = "wallet"
+        graph = GenealogyGraph(solana_chain(), FakeRpc(), "")
+        await graph._process_token_creation({"token": "early", "deployer": "dev", "timestamp": 0})
+        await graph._process_token_creation({"token": "late", "deployer": "dev", "timestamp": 0})
+        engine = WalletIntelligenceEngine(solana_chain(), FakeRpc(), graph, "")
+        early_txs = [
+            {"signature": "buy-early", "timestamp": 60,
+             "nativeTransfers": [{"fromUserAccount": wallet, "amount": 1_000_000_000}],
+             "tokenTransfers": [{"toUserAccount": wallet, "fromUserAccount": "curve", "mint": "early", "tokenAmount": 100}]},
+            {"signature": "sell-early", "timestamp": 70,
+             "nativeTransfers": [{"toUserAccount": wallet, "amount": 2_000_000_000}],
+             "tokenTransfers": [{"fromUserAccount": wallet, "toUserAccount": "curve", "mint": "early", "tokenAmount": 50}]},
+        ]
+        late_txs = [
+            {"signature": "buy-late", "timestamp": 900,
+             "nativeTransfers": [{"fromUserAccount": wallet, "amount": 1_000_000_000}],
+             "tokenTransfers": [{"toUserAccount": wallet, "fromUserAccount": "curve", "mint": "late", "tokenAmount": 100}]},
+            {"signature": "sell-late", "timestamp": 910,
+             "nativeTransfers": [{"toUserAccount": wallet, "amount": 2_000_000_000}],
+             "tokenTransfers": [{"fromUserAccount": wallet, "toUserAccount": "curve", "mint": "late", "tokenAmount": 50}]},
+        ]
+        await engine._build_wallet_history(wallet, early_txs)
+        self.assertIn(WalletRegime.EARLY_CURVE, engine.regime_performances[wallet])
+        self.assertNotIn(WalletRegime.ULTRA_EARLY, engine.regime_performances[wallet])
+
+        await engine._build_wallet_history(wallet, late_txs)
+        # A launch time is known for "late" too, but the entry is well past
+        # both timing buckets, so it must stay unclassified rather than be
+        # forced into a bucket the timing evidence does not support.
+        self.assertEqual(engine.data_status[wallet], "DATA_BLOCKED: closed trades lack PIT regime labels")
+        self.assertNotIn(WalletRegime.PRE_MIGRATION, engine.regime_performances[wallet])
+        self.assertNotIn(WalletRegime.POST_MIGRATION, engine.regime_performances[wallet])
+
+    async def test_wallet_history_stays_unclassified_without_a_known_launch_time(self):
+        wallet = "wallet"
+        engine = WalletIntelligenceEngine(solana_chain(), FakeRpc(), FakeGenealogy(), "")
+        txs = [
+            {"signature": "buy", "timestamp": 1, "nativeTransfers": [{"fromUserAccount": wallet, "amount": 1_000_000_000}],
+             "tokenTransfers": [{"toUserAccount": wallet, "fromUserAccount": "curve", "mint": "token", "tokenAmount": 100}]},
+            {"signature": "sell", "timestamp": 11, "nativeTransfers": [{"toUserAccount": wallet, "amount": 2_500_000_000}],
+             "tokenTransfers": [{"fromUserAccount": wallet, "toUserAccount": "curve", "mint": "token", "tokenAmount": 50}]},
+        ]
+        await engine._build_wallet_history(wallet, txs)
+        self.assertEqual(engine.regime_performances[wallet], {})
+        self.assertEqual(engine.data_status[wallet], "DATA_BLOCKED: closed trades lack PIT regime labels")
 
     def test_public_coordination_requires_evidence_and_detects_same_slot(self):
         class WalletIntel:
@@ -754,6 +1387,27 @@ class TestPointInTimeResearch(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(outcome["migrated"])
         self.assertAlmostEqual(outcome["max_drawdown"], 0.95)
         self.assertEqual(outcome["realized_pnl"], 12.5)
+        # A drawdown past 90% is the only rug signal any producer in this
+        # codebase currently emits (nothing sets "rugged": True on an
+        # observation). It must supply rug_time itself, or every rugged
+        # episode's rug_time stays null and the P_RUG_30S/P_RUG_5M labels
+        # would be unconditionally 0.0 -- see snapshot_labels_uses_drawdown
+        # below for the label-level consequence.
+        self.assertTrue(outcome["rugged"])
+        self.assertEqual(outcome["rug_time"], 20)
+
+    async def test_slow_bleed_without_explicit_rug_event_still_gets_a_rug_time(self):
+        builder = self.builder()
+        episode = LaunchEpisode("token", "solana", 0, "dev", "pump", "curve", "wsol")
+        episode.market_observations.extend([
+            {"timestamp": 0, "price_usd": 1.0},
+            {"timestamp": 5, "price_usd": 2.0},
+            {"timestamp": 12, "price_usd": 0.1},
+            {"timestamp": 40, "price_usd": 0.02},
+        ])
+        outcome = await builder._determine_final_outcome(episode)
+        self.assertTrue(outcome["rugged"])
+        self.assertEqual(outcome["rug_time"], 12)
 
     async def test_missing_prices_are_explicitly_data_blocked(self):
         episode = LaunchEpisode("token", "solana", 100, "dev", "pump", "curve", "wsol")

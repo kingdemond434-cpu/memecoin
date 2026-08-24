@@ -133,6 +133,10 @@ class GenealogyGraph:
         self._processing = False
         self.outcome_provider = None
         self.data_status: Dict[str, str] = {}
+        # Real detected launch timestamps, keyed by token. This is the only
+        # genuine point-in-time evidence available for launch-relative wallet
+        # regime classification (see WalletIntelligenceEngine._build_wallet_history).
+        self.token_launch_times: Dict[str, float] = {}
 
     async def start(self):
         self._session = aiohttp.ClientSession(
@@ -197,7 +201,9 @@ class GenealogyGraph:
         funding_wallets = data.get("funding_wallets", [])
         initial_buyers = data.get("initial_buyers", [])
         timestamp = data.get("timestamp", time.time())
-        
+        if token:
+            self.token_launch_times.setdefault(token, timestamp)
+
         if deployer not in self.wallets:
             self.wallets[deployer] = WalletProfile(
                 address=deployer,

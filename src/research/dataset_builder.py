@@ -487,22 +487,40 @@ class PointInTimeDatasetBuilder:
         peak_index = int(np.argmax(multiples))
         running_peak = multiples[0]
         max_drawdown = 0.0
-        for multiple in multiples:
+        drawdown_rug_at: Optional[float] = None
+        for multiple, item in zip(multiples, prices):
             running_peak = max(running_peak, multiple)
-            max_drawdown = max(max_drawdown, 1 - multiple / max(running_peak, 1e-12))
+            drawdown = 1 - multiple / max(running_peak, 1e-12)
+            max_drawdown = max(max_drawdown, drawdown)
+            if drawdown_rug_at is None and drawdown >= 0.90:
+                drawdown_rug_at = float(item.get("timestamp", episode.created_at))
         feasible = [
             multiple for multiple, item in zip(multiples, prices)
             if item.get("route_feasible", item.get("feasible")) is True
             and float(item.get("price_impact_pct", 1) or 1) <= 0.15
         ]
+        # No producer currently tags an observation "rugged": True (that path
+        # is kept for a future explicit on-chain rug signal). The only rug
+        # evidence actually generated today is the observed drawdown itself,
+        # so it must also supply rug_time -- otherwise every "rugged" episode
+        # would carry a null rug_time and the P_RUG_30S/P_RUG_5M labels would
+        # be unconditionally 0.0, which starves those heads of any positive
+        # class and blocks their chronological training.
         explicit_rug = next((item for item in episode.market_observations if item.get("rugged")), None)
+        rugged = bool(explicit_rug) or max_drawdown >= 0.90
+        if explicit_rug is not None:
+            rug_time = float(explicit_rug.get("timestamp", episode.created_at)) - episode.created_at
+        elif drawdown_rug_at is not None:
+            rug_time = drawdown_rug_at - episode.created_at
+        else:
+            rug_time = None
         realized = sum(float(item.get("realized_pnl_usd", 0) or 0) for item in episode.execution_attempts)
         return {
             "status": "OK",
             "max_multiple": max(multiples),
             "migrated": any(item.get("migrated") for item in episode.market_observations),
-            "rugged": bool(explicit_rug) or max_drawdown >= 0.90,
-            "rug_time": explicit_rug.get("timestamp") - episode.created_at if explicit_rug else None,
+            "rugged": rugged,
+            "rug_time": rug_time,
             "time_to_peak": prices[peak_index].get("timestamp", episode.created_at) - episode.created_at,
             "max_drawdown": max_drawdown,
             "feasible_exit_multiple": max(feasible) if feasible else None,
@@ -712,40 +730,6 @@ class PointInTimeDatasetBuilder:
         episode.risk_report = dict(data.get("risk_report") or {})
         episode.prelaunch_status = str(data.get("prelaunch_status", "DATA_BLOCKED"))
         return episode
-
-    def get_training_data(self, target_label: str, timepoints: List[SnapshotTimepoint] = None) -> Tuple[np.ndarray, np.ndarray]:
-        if timepoints is None:
-            timepoints = [SnapshotTimepoint.T10S, SnapshotTimepoint.T30S, SnapshotTimepoint.T1M]
-        
-        X_list = []
-        y_list = []
-        
-        for episode in self.completed_episodes.values():
-            for tp in timepoints:
-                if tp in episode.snapshots:
-                    snapshot = episode.snapshots[tp]
-                    label_val = getattr(snapshot, f"label_{target_label}", None)
-                    if label_val is not None:
-                        features = self._flatten_features(snapshot)
-                        X_list.append(features)
-                        y_list.append(float(label_val))
-        
-        if not X_list:
-            return np.array([]), np.array([])
-        
-        return np.array(X_list), np.array(y_list)
-
-    def _flatten_features(self, snapshot: LaunchSnapshot) -> np.ndarray:
-        feature_dict = {}
-        for category in ["deployer_features", "wallet_features", "flow_features", 
-                        "liquidity_features", "social_features", "token_features",
-                        "market_features", "entity_graph_features"]:
-            feat_dict = getattr(snapshot, category, {})
-            for k, v in feat_dict.items():
-                if isinstance(v, (int, float, bool)):
-                    feature_dict[f"{category}.{k}"] = float(v) if isinstance(v, bool) else v
-        
-        return np.array([feature_dict[key] for key in sorted(feature_dict)])
 
     def get_stats(self) -> Dict:
         return {

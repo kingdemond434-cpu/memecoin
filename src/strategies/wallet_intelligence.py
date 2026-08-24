@@ -219,6 +219,7 @@ class WalletIntelligenceEngine:
             token = trade["token"]
             if token not in wp.launches_participated:
                 wp.launches_participated.append(token)
+            self._attach_launch_relative_regime(trade)
             regime = self._classify_regime(trade)
             if regime is not None:
                 await self._update_regime_performance(wallet, regime, trade)
@@ -273,6 +274,7 @@ class WalletIntelligenceEngine:
             closed.append({
                 "token": token,
                 "timestamp": normalized["timestamp"],
+                "entry_timestamp": first_entry if first_entry is not None else normalized["timestamp"],
                 "multiple": proceeds / allocated_cost,
                 "realized_pnl": proceeds - allocated_cost,
                 "hold_time": normalized["timestamp"] - (first_entry or normalized["timestamp"]),
@@ -331,6 +333,30 @@ class WalletIntelligenceEngine:
         except Exception:
             pass
         return None
+
+    ULTRA_EARLY_SECONDS = 15.0
+    EARLY_CURVE_SECONDS = 120.0
+
+    def _attach_launch_relative_regime(self, trade: Dict[str, Any]):
+        """Classify the two regimes that a real detected launch timestamp can
+        honestly support. A launch time is only known for tokens this desk
+        itself observed being created (GenealogyGraph.token_launch_times);
+        Helius history alone never establishes launch-relative timing, so
+        every other regime (narrative, volume, migration-phase) stays
+        unclassified rather than guessed.
+        """
+        if trade.get("regime") is not None:
+            return
+        launch_times = getattr(self.genealogy, "token_launch_times", None) or {}
+        launch_time = launch_times.get(trade["token"])
+        entry_time = trade.get("entry_timestamp")
+        if launch_time is None or entry_time is None or entry_time < launch_time:
+            return
+        elapsed = entry_time - launch_time
+        if elapsed <= self.ULTRA_EARLY_SECONDS:
+            trade["regime"] = WalletRegime.ULTRA_EARLY
+        elif elapsed <= self.EARLY_CURVE_SECONDS:
+            trade["regime"] = WalletRegime.EARLY_CURVE
 
     def _classify_regime(self, tx: Dict) -> Optional[WalletRegime]:
         if self.regime_classifier:

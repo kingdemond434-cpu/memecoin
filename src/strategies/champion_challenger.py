@@ -55,7 +55,8 @@ class HypothesisSpec:
     created_at: float
     frozen_at: Optional[float] = None
     hash: str = ""
-    
+    status: str = ModelStatus.DISCOVERED.value
+
     def __post_init__(self):
         if not self.hash:
             content = json.dumps({
@@ -179,6 +180,7 @@ class ChampionChallengerFramework:
         challenger = self.challengers.setdefault(hypothesis_id, {"hypothesis": self.hypotheses[hypothesis_id]})
         challenger["status"] = ModelStatus.DATA_BLOCKED.value
         challenger["reason"] = reason
+        self.hypotheses[hypothesis_id].status = ModelStatus.DATA_BLOCKED.value
         self._save_state()
 
     def is_live(self, hypothesis_id: str) -> bool:
@@ -236,6 +238,7 @@ class ChampionChallengerFramework:
                         "forward_results": deque(maxlen=1000),
                         "oos_metrics": latest.oos_metrics
                     }
+                    hyp.status = ModelStatus.FORWARD_SHADOW.value
                     del self.challengers[hyp_id]
                     logger.info(f"Promoted {hyp_id} to SHADOW")
 
@@ -256,6 +259,7 @@ class ChampionChallengerFramework:
                             "total_pnl": 0.0,
                             "forward_results": deque(maxlen=1000)
                         }
+                        shadow["hypothesis"].status = ModelStatus.CANARY.value
                         logger.info(f"Promoted {hyp_id} to CANARY")
                     else:
                         self._retire_hypothesis(hyp_id, "shadow_failed")
@@ -276,6 +280,7 @@ class ChampionChallengerFramework:
                             promoted_at=now
                         )
                         self.champions[hyp_id] = champion
+                        canary["hypothesis"].status = ModelStatus.LIVE.value
                         logger.info(f"Promoted {hyp_id} to LIVE CHAMPION")
                     else:
                         self._retire_hypothesis(hyp_id, "canary_failed")
@@ -286,7 +291,7 @@ class ChampionChallengerFramework:
 
     def _retire_hypothesis(self, hyp_id: str, reason: str):
         if hyp_id in self.hypotheses:
-            self.hypotheses[hyp_id].status = ModelStatus.RETIRED
+            self.hypotheses[hyp_id].status = ModelStatus.RETIRED.value
             logger.info(f"Retired {hyp_id}: {reason}")
 
     async def _monitor_champion_decay(self):
@@ -433,7 +438,8 @@ class ChampionChallengerFramework:
             "canary_models": len(self.canary_models),
             "live_champions": len(self.get_live_champions()),
             "decaying_champions": len([c for c in self.champions.values() if c.status == "DECAYING"]),
-            "hibernated_champions": len([c for c in self.champions.values() if c.status == "HIBERNATED"])
+            "hibernated_champions": len([c for c in self.champions.values() if c.status == "HIBERNATED"]),
+            "retired": len([h for h in self.hypotheses.values() if h.status == ModelStatus.RETIRED.value]),
         }
 
 

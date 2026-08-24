@@ -27,8 +27,11 @@ or safe operating assumption.
   quote observation runs separately so research I/O does not stall discovery.
 - Budgeted Jupiter round-trip market marks collect price paths even while the
   prediction model is blocked; hourly research leads persist in a JSONL ledger.
-- FIFO wallet round-trip scoring, public-chain coordination inference, public
-  social/research discovery, creator genealogy, and continuous rug hazard.
+- FIFO wallet round-trip scoring with launch-relative regime classification
+  sourced from real detected launch timestamps (never fabricated timing),
+  public-chain coordination inference, public social/research discovery,
+  creator genealogy, and continuous rug hazard with a chronologically
+  validated calibration layer over the leakage-free half of its signals.
 - Nested probability correction, disjoint outcome bins, a route-feasible return
   head, net expected-log-wealth, risk-constrained Kelly sizing, live
   equity/SOL-USD inputs, and hard exposure limits.
@@ -152,28 +155,59 @@ journalctl -u memecoin-shadow -f
   challengers pending evidence.
 - A versioned, chronologically validated model bundle is still required before
   prediction status changes from `DATA_BLOCKED`. No constant-score fallback is
-  used.
+  used. The same applies to `ContinuousRugHazardModel`'s calibration layer: it
+  runs on its uncalibrated heuristic score until `src.research.hazard_trainer`
+  produces a chronologically passed artifact.
 - PumpSwap and the supported Raydium/Meteora/Orca pool-creation instructions use
-  native layouts and official program IDs. Pump has a reduced real-mainnet replay
-  fixture; equivalent sanitized mainnet fixtures for every AMM remain an evidence
-  task and are not represented as complete validation.
+  native layouts and official program IDs. Every Anchor instruction
+  discriminator in the decoder (Pump, PumpSwap, Raydium AMM v4/CPMM/CLMM,
+  Meteora DLMM/Dynamic AMM, Orca v1/v2) has been independently recomputed from
+  its real snake_case instruction name and matches exactly; the CPMM, CLMM, and
+  Orca v1 account orderings were checked line-by-line against the current
+  official on-chain program source and match exactly. Pump has a reduced
+  real-mainnet replay fixture; literal captured-transaction-byte fixtures for
+  the other AMMs remain an evidence task -- this environment had no outbound
+  access to Solana RPC to capture them, so real (not fabricated) mainnet
+  fixtures for those decoders are still not represented as complete
+  validation, only as layout-verified.
+- Wallet-history regime classification only fires for a token whose launch
+  this desk actually observed (`GenealogyGraph.token_launch_times`, populated
+  from real detected `pool_created` events) and only for the two regimes pure
+  entry timing can honestly support (`ULTRA_EARLY` within 15s, `EARLY_CURVE`
+  within 120s). Every other regime, and every trade against a token with no
+  known launch time, stays unclassified rather than guessed.
 
 ## Tests
 
 The suite covers dry-run non-submission, the independent live lock,
 VersionedTransaction signatures, native mint checks, nested P2/P5/P10/P50 math,
-risk-constrained sizing, partial cost basis, chain-aware RPC health, PumpSwap and
-Raydium/Meteora/Orca layouts, FIFO wallet accounting, non-fabricated wallet-regime
-labels, point-in-time leakage, counterfactuals,
-public coordination, rug hazard, active-episode recovery, promotion-state
-recovery, official social-source blocking/ingest, and landed wallet-delta accounting. A reduced fixture from Solana mainnet slot
-`441417557` exercises the same Pump.fun inner-instruction decoder used live.
+risk-constrained sizing, partial-exit cost basis and realized PnL, chain-aware
+RPC health, PumpSwap and Raydium/Meteora/Orca layouts (account ordering and
+Anchor instruction discriminators independently verified against the current
+official on-chain program source), FIFO wallet accounting, launch-relative
+wallet-regime classification and its refusal to guess when no real launch
+timestamp is known, point-in-time leakage, counterfactuals, public
+coordination, rug hazard and its chronological calibration trainer, the full
+champion/challenger promotion pipeline end to end (discovered through
+shadow/canary to live, plus retirement and decay), distinct Jito
+bundle/raw-submission confirmation states (filled, landed-without-fill,
+timeout, rejected), active-episode recovery, promotion-state recovery,
+official social-source blocking/ingest including read-only Telegram
+collection, and landed wallet-delta accounting. A reduced fixture from Solana
+mainnet slot `441417557` exercises the same Pump.fun inner-instruction decoder
+used live.
 
 On a Dockerless VPS, `memecoin-shadow-user.service` runs the collector as an
 isolated user service. `memecoin-shadow-train.timer` invokes the strict
-chronological trainer every six hours. Insufficient samples, class coverage, or
-OOS E[log W] remain `DATA_BLOCKED`/`REJECTED`; only passed artifacts are loaded
-into forward dry-run shadow evaluation.
+chronological multi-head trainer and the rug-hazard calibration trainer every
+six hours. Insufficient samples, class coverage, or OOS E[log W] remain
+`DATA_BLOCKED`/`REJECTED`; only passed artifacts are loaded into forward
+dry-run shadow evaluation. The hazard calibration trainer only fits on the
+leakage-free half of the hazard signal set (trade flow, liquidity, route,
+concentration, social velocity, and explicit event tags) -- wallet-reputation
+signals are excluded from replay because they are live state, never
+point-in-time snapshotted per episode, and calibrating against them would
+leak information the model would not have had at that moment.
 
 ## Upstream specifications
 

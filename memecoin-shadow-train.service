@@ -9,6 +9,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=SOLANA_PRIVATE_KEY=
 Environment=ALLOW_LIVE_TRADING=
 ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.research.shadow_trainer
+ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.research.hazard_trainer
 NoNewPrivileges=true
 PrivateTmp=true
 UMask=0077
