@@ -404,6 +404,12 @@ class TestProbabilityAndAccounting(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 predictor.save(str(Path(directory) / "unsafe.joblib"), {"status": "REJECTED"})
 
+    def test_model_loader_ignores_other_validated_artifact_families(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "rug-hazard-1.joblib").write_bytes(b"not a multihead artifact")
+            predictor = MultiHeadPredictor(directory)
+            self.assertFalse(predictor.load_latest())
+
 
 class TestShadowTrainer(unittest.TestCase):
     def test_chronological_split_keeps_launch_episodes_disjoint(self):

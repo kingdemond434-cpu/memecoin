@@ -373,7 +373,7 @@ class MultiHeadPredictor:
         candidates = [
             os.path.join(self.model_dir, name)
             for name in os.listdir(self.model_dir)
-            if name.endswith((".joblib", ".pkl"))
+            if name.startswith("multihead-shadow-") and name.endswith((".joblib", ".pkl"))
         ]
         if not candidates:
             return False
