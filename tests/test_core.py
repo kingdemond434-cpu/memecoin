@@ -18,8 +18,9 @@ from solders.transaction import VersionedTransaction
 
 from src.chains.rpc_manager import ChainConfig, ChainRegistry, ChainType, RPCEndpointConfig, RPCHealth, RPCManager
 from src.chains.yellowstone_grpc import (
-    PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
-    create_combined_subscription, enrich_trade_balances,
+    SYSTEM_PROGRAM, PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream,
+    YellowstoneClient, b58encode, create_combined_subscription, enrich_trade_balances,
+    extract_system_transfers,
 )
 from src.detection.rug_detector import TOKEN_2022_PROGRAM, TOKEN_PROGRAM, RugDetector
 from src.execution.jupiter_jito import (
@@ -127,6 +128,95 @@ class TestSolanaParsing(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0]["timestamp"], 1_700_000_000)
         self.assertEqual(events[0]["block_time"], 1_700_000_000)
         self.assertLessEqual(events[0]["received_ns"], events[0]["decoded_ns"])
+
+    def test_extract_system_transfers_decodes_native_transfer_instruction(self):
+        keys = ["funder", "recipient", "unrelated-program", SYSTEM_PROGRAM]
+        transfer_data = struct.pack("<IQ", 2, 5_000_000_000)
+        instructions = [
+            {"programIdIndex": 3, "accounts": [0, 1], "data": b58encode(transfer_data)},
+            {"programIdIndex": 2, "accounts": [0, 1], "data": b58encode(b"not a transfer")},
+        ]
+        transfers = extract_system_transfers(keys, instructions)
+        self.assertEqual(transfers, [{"from": "funder", "to": "recipient", "lamports": 5_000_000_000}])
+
+    async def test_pump_create_attaches_same_transaction_funding_wallets(self):
+        events = []
+        monitor = PumpFunMonitor(DummyYellowstone(), events.append)
+        creator_raw = bytes(range(1, 33))
+        creator_address = b58encode(creator_raw)
+        keys = ["mint-key", "funder-wallet", "curve-key", creator_address,
+               PumpFunMonitor.PUMP_FUN_PROGRAM, SYSTEM_PROGRAM]
+
+        def length_prefixed(value: str) -> bytes:
+            encoded = value.encode("utf-8")
+            return struct.pack("<I", len(encoded)) + encoded
+
+        payload = length_prefixed("Test Token") + length_prefixed("TEST") + length_prefixed("uri://x") + creator_raw
+        discriminator = {name: disc for disc, name in PumpFunMonitor.DISCRIMINATORS.items()}["create"]
+        tx_data = {
+            "signature": "create-sig", "slot": 12345,
+            "transaction": {
+                "signatures": ["create-sig"],
+                "message": {
+                    "accountKeys": keys,
+                    "instructions": [
+                        {"programIdIndex": 5, "accounts": [1, 3],
+                         "data": b58encode(struct.pack("<IQ", 2, 5_000_000_000))},
+                        {"programIdIndex": 4, "accounts": [0, 1, 2], "data": b58encode(discriminator + payload)},
+                    ],
+                },
+            },
+            "meta": {"innerInstructions": []},
+        }
+        await monitor._on_transaction(tx_data)
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["type"], "token_created")
+        self.assertEqual(event["token"], "mint-key")
+        self.assertEqual(event["bonding_curve"], "curve-key")
+        self.assertEqual(event["creator"], creator_address)
+        self.assertEqual(event["funding_wallets"], ["funder-wallet"])
+        self.assertEqual(event["funding_transfers"],
+                         [{"from": "funder-wallet", "to": creator_address, "lamports": 5_000_000_000}])
+
+    async def test_raydium_pool_created_attaches_same_transaction_funding_wallets(self):
+        events = []
+        monitor = RaydiumMonitor(DummyYellowstone(), events.append)
+        keys = [f"key{i}" for i in range(9)]
+        keys[0] = "creator-wallet"   # CPMM account index 0
+        keys[3] = "pool-key"         # CPMM account index 3
+        keys[4] = "mint-a"           # CPMM account index 4
+        keys[5] = "mint-b"           # CPMM account index 5
+        keys[6] = "funder-wallet"
+        keys[7] = RaydiumMonitor.RAYDIUM_CPMM
+        keys[8] = SYSTEM_PROGRAM
+        data = RaydiumMonitor.CPMM_INITIALIZE + struct.pack("<QQQ", 75_000, 50_000, 1234)
+        tx_data = {
+            "signature": "cpmm-sig", "slot": 555,
+            "transaction": {
+                "signatures": ["cpmm-sig"],
+                "message": {
+                    "accountKeys": keys,
+                    "instructions": [
+                        {"programIdIndex": 8, "accounts": [6, 0],
+                         "data": b58encode(struct.pack("<IQ", 2, 2_000_000_000))},
+                        {"programIdIndex": 7, "accounts": list(range(9)), "data": b58encode(data)},
+                    ],
+                },
+            },
+            "meta": {"innerInstructions": []},
+        }
+        await monitor._on_transaction(tx_data)
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["type"], "pool_created")
+        self.assertEqual(event["creator"], "creator-wallet")
+        self.assertEqual(event["pool"], "pool-key")
+        self.assertEqual(event["mint_a"], "mint-a")
+        self.assertEqual(event["mint_b"], "mint-b")
+        self.assertEqual(event["funding_wallets"], ["funder-wallet"])
+        self.assertEqual(event["funding_transfers"],
+                         [{"from": "funder-wallet", "to": "creator-wallet", "lamports": 2_000_000_000}])
 
     async def test_raydium_v4_initialize2_layout(self):
         keys = [f"key{i}" for i in range(18)]
@@ -1221,6 +1311,27 @@ class TestWalletAndCoordination(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(features["status"], "OK")
         self.assertGreater(features["coordination_score"], 0)
         self.assertEqual(features["coordinated_buyer_fraction"], 1)
+
+    def test_shared_funder_fires_from_same_transaction_funding_transfers(self):
+        """End to end: a bundled launch tx funds 3 different buyer wallets
+        from one operator wallet -- exactly what extract_system_transfers
+        surfaces from a real transaction with zero extra RPC calls."""
+        class WalletIntel:
+            def get_top_wallets(self, limit=50):
+                return []
+        miner = PublicCoordinationMiner(FakeGenealogy(), WalletIntel())
+        funding_transfers = [
+            {"from": "operator", "to": f"buyer{i}", "lamports": 1_000_000_000} for i in range(3)
+        ]
+        for transfer in funding_transfers:
+            miner.record_funding("token", transfer["to"], transfer["from"], transfer["lamports"] / 1e9, 100)
+        for i in range(3):
+            miner.record_trade("token", {"side": "buy", "wallet": f"buyer{i}", "amount": 1})
+        features = miner.get_features("token")
+        self.assertEqual(features["status"], "OK")
+        kinds = {item["kind"] for item in features["evidence"]}
+        self.assertIn("shared_funder", kinds)
+        self.assertEqual(set(features["coordinated_wallets"]), {"buyer0", "buyer1", "buyer2"})
 
 
 class TestRpcProtocol(unittest.TestCase):

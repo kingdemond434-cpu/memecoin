@@ -458,10 +458,16 @@ class MemecoinQuantDesk:
         self.dataset_builder.record_risk_report(token, risk_data)
         self.rug_hazard.register_token(token, {"deployer": candidate.deployer or "", "pair": candidate.pair or ""})
         self.public_coordination.record_creator(token, candidate.deployer or "")
-        for item in candidate.metadata.get("funding", []):
+        # Wallets funded within the same atomic launch transaction as the pool
+        # creation -- the only funding evidence available without an extra
+        # RPC call. record_funding keys on the *funded* wallet so that N
+        # different wallets sharing one funder inside this transaction (a
+        # common bundled-sniper-bot pattern) is what actually trips the
+        # shared_funder coordination signal.
+        for item in candidate.metadata.get("funding_transfers", []):
             self.public_coordination.record_funding(
-                token, item.get("wallet", ""), item.get("funder", ""),
-                float(item.get("amount_sol", 0) or 0), item.get("timestamp"),
+                token, item.get("to", ""), item.get("from", ""),
+                float(item.get("lamports", 0) or 0) / 1e9, candidate.timestamp,
             )
         if risk.risk_level.value in {"high", "critical", "honeypot", "rugged"}:
             self._record_blocked_decision(token, "safety_rejection", risk_data)
@@ -571,12 +577,14 @@ class MemecoinQuantDesk:
             features.deployer_rug_rate = deployer.rug_rate
             features.deployer_success_rate = deployer.success_rate
             features.deployer_avg_multiple = deployer.avg_max_multiple
-        graph_risk = self.genealogy.assess_launch_risk(candidate.deployer or "",
-                                                       candidate.metadata.get("funding_wallets", []),
-                                                       candidate.metadata.get("initial_buyers", []))
-        features.deployer_cluster_risk = graph_risk.get("risk_score", 0)
         buys = [item for item in self.wallet_intel._recent_buys if item.get("token") == candidate.address]
-        features.initial_buyers = len({item.get("wallet") for item in buys if item.get("wallet")})
+        buyer_wallets = {item.get("wallet") for item in buys if item.get("wallet")}
+        graph_risk = self.genealogy.assess_launch_risk(
+            candidate.deployer or "", candidate.metadata.get("funding_wallets", []),
+            [{"address": wallet} for wallet in buyer_wallets],
+        )
+        features.deployer_cluster_risk = graph_risk.get("risk_score", 0)
+        features.initial_buyers = len(buyer_wallets)
         buyer_scores = [self.wallet_intel.get_wallet_score(item.get("wallet", "")) for item in buys]
         features.smart_buyers = sum(score is not None and score.overall_score >= 0.7 for score in buyer_scores)
         features.wallet_history_available = any(score is not None for score in buyer_scores)
@@ -833,7 +841,9 @@ class MemecoinQuantDesk:
                 address=token, chain="solana", source=DetectionSource.FACTORY, block_number=int(event.get("slot", 0)),
                 tx_hash=event.get("signature"), deployer=event.get("creator"), factory=PumpFunMonitor.PUMP_FUN_PROGRAM,
                 pair=event.get("bonding_curve"), base_token=WSOL_MINT, timestamp=event.get("timestamp", time.time()),
-                metadata={"name": event.get("name"), "symbol": event.get("symbol"), "uri": event.get("uri")},
+                metadata={"name": event.get("name"), "symbol": event.get("symbol"), "uri": event.get("uri"),
+                         "funding_wallets": event.get("funding_wallets", []),
+                         "funding_transfers": event.get("funding_transfers", [])},
             ))
         elif event.get("type") == "token_trade":
             curve_price = float(event.get("curve_price_raw", 0) or 0)
@@ -903,6 +913,8 @@ class MemecoinQuantDesk:
             self.info_graph.record_event(mint, LeadEventType.MIGRATION, event.get("pool", ""), "raydium_pool",
                                          event.get("timestamp", time.time()), event)
             self.dataset_builder.record_market_observation(mint, {"type": "migration", **event})
+            if hasattr(self.genealogy, "record_token_creation"):
+                self.genealogy.record_token_creation(mint, event.get("creator", ""), event)
             await self.detection_engine._on_candidate(TokenCandidate(
                 address=mint, chain="solana", source=DetectionSource.FACTORY, block_number=int(event.get("slot", 0)),
                 tx_hash=event.get("signature"), deployer=event.get("creator"), factory=event.get("program"),
@@ -910,7 +922,9 @@ class MemecoinQuantDesk:
                 metadata={"initial_base_amount": event.get("initial_base_amount"),
                           "initial_quote_amount": event.get("initial_quote_amount"),
                           "venue": event.get("venue"),
-                          "data_status": event.get("data_status", "DATA_BLOCKED")},
+                          "data_status": event.get("data_status", "DATA_BLOCKED"),
+                          "funding_wallets": event.get("funding_wallets", []),
+                          "funding_transfers": event.get("funding_transfers", [])},
             ))
 
     async def _on_social_mention(self, signal: Dict[str, Any]):

@@ -586,6 +586,43 @@ def instruction_fields(instruction: Any) -> Tuple[int, List[int], bytes]:
     return int(instruction.program_id_index), list(instruction.accounts), bytes(instruction.data)
 
 
+SYSTEM_PROGRAM = "11111111111111111111111111111111"
+
+
+def extract_system_transfers(keys: List[str], instructions: Iterable[Any]) -> List[Dict[str, Any]]:
+    """Decode native SystemProgram Transfer instructions from a transaction.
+
+    Native programs predate Anchor and use a 4-byte little-endian instruction
+    index rather than an 8-byte Anchor sighash; Transfer is index 2, followed
+    by an 8-byte little-endian lamport amount. A launch bundle that funds its
+    deployer and initial-buyer wallets in the same atomic transaction as the
+    pool creation exposes that funding here for free -- no extra RPC call --
+    which is the only source this codebase has for shared-funder coordination
+    evidence (see PublicCoordinationMiner.record_funding).
+    """
+    transfers: List[Dict[str, Any]] = []
+    for instruction in instructions:
+        try:
+            program_index, accounts, data = instruction_fields(instruction)
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if program_index < 0 or program_index >= len(keys) or keys[program_index] != SYSTEM_PROGRAM:
+            continue
+        if len(data) < 12 or len(accounts) < 2:
+            continue
+        tag = struct.unpack_from("<I", data, 0)[0]
+        if tag != 2:
+            continue
+        from_index, to_index = accounts[0], accounts[1]
+        if from_index >= len(keys) or to_index >= len(keys):
+            continue
+        lamports = struct.unpack_from("<Q", data, 4)[0]
+        if lamports <= 0:
+            continue
+        transfers.append({"from": keys[from_index], "to": keys[to_index], "lamports": lamports})
+    return transfers
+
+
 class PumpFunMonitor:
     PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
     PUMP_AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
@@ -700,6 +737,13 @@ class PumpFunMonitor:
                     self._seen = set(list(self._seen)[-50_000:])
                 event = self._decode_instruction(name, keys, accounts, data[8:], signature, slot)
                 if event:
+                    if event.get("type") == "token_created" and event.get("creator"):
+                        transfers = extract_system_transfers(keys, instructions)
+                        event["funding_transfers"] = transfers
+                        event["funding_wallets"] = sorted({
+                            item["from"] for item in transfers
+                            if item["to"] == event["creator"] and item["from"] != event["creator"]
+                        })
                     apply_event_timing(event, tx_data, received_ns)
                     enrich_trade_balances(event, tx_data, keys)
                     result = self.callback(event)
@@ -1023,6 +1067,13 @@ class RaydiumMonitor:
                 else:
                     event = self._decode_orca(keys, accounts, data, signature, slot)
                 if event:
+                    if event.get("type") == "pool_created" and event.get("creator"):
+                        transfers = extract_system_transfers(keys, instructions)
+                        event["funding_transfers"] = transfers
+                        event["funding_wallets"] = sorted({
+                            item["from"] for item in transfers
+                            if item["to"] == event["creator"] and item["from"] != event["creator"]
+                        })
                     apply_event_timing(event, tx_data, received_ns)
                     result = self.callback(event)
                     if asyncio.iscoroutine(result):
