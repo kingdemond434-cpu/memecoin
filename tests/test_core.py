@@ -327,6 +327,23 @@ class TestOfficialSocialCollectors(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.mentions[0].token, mint)
         self.assertEqual(engine.mentions[0].engagement["views"], 3)
 
+    async def test_one_invalid_telegram_channel_does_not_mask_healthy_ingestion(self):
+        engine = self.make_engine()
+
+        class TelegramStub:
+            async def iter_messages(self, handle, limit):
+                if handle == "missing":
+                    raise ValueError("No user has missing as username")
+                if False:
+                    yield None
+
+        engine._telegram_client = TelegramStub()
+        healthy = SocialAccount(SocialPlatform.TELEGRAM, "healthy", "1", "Healthy")
+        missing = SocialAccount(SocialPlatform.TELEGRAM, "missing", "2", "Missing")
+        await engine._fetch_telegram_posts(healthy)
+        await engine._fetch_telegram_posts(missing)
+        self.assertEqual(engine.data_status["telegram"], "OK_PARTIAL: 1 configured channels unavailable")
+
 
 class TestNativeMintChecks(unittest.TestCase):
     @staticmethod

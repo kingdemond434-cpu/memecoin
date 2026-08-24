@@ -44,6 +44,8 @@ class ResearchLead:
 class GlobalResearchMiner:
     RSS_FEEDS = [
         ("https://www.chaincatcher.com/rss/clist", "zh-cn", "chaincatcher"),
+        ("https://rss.odaily.news/rss/newsflash", "zh-cn", "odaily"),
+        ("https://rss.odaily.news/rss/post", "zh-cn", "odaily"),
         ("https://www.panewslab.com/rss.xml?lang=zh&type=NORMAL%2CNEWS", "zh-cn", "panews"),
         ("https://www.panewslab.com/rss.xml?lang=ja&type=NORMAL%2CNEWS", "ja", "panews"),
         ("https://www.panewslab.com/rss.xml?lang=ko&type=NORMAL%2CNEWS", "ko", "panews"),

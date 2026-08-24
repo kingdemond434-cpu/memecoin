@@ -120,6 +120,8 @@ class SocialIntelligenceEngine:
         self._telegram_client = None
         self._telegram_handles: Set[str] = set()
         self._telegram_event_handler = None
+        self._telegram_poll_successes: Set[str] = set()
+        self._telegram_poll_failures: Dict[str, str] = {}
         self._account_fetched_at: Dict[str, float] = {}
         self._seen_social_items: Set[str] = set()
         self._reddit_access_token = ""
@@ -619,9 +621,22 @@ class SocialIntelligenceEngine:
         try:
             async for message in self._telegram_client.iter_messages(account.handle, limit=100):
                 await self._process_telegram_message(account, message)
-            self.data_status["telegram"] = "OK"
+            self._telegram_poll_successes.add(account.handle)
+            self._telegram_poll_failures.pop(account.handle, None)
+            self._update_telegram_poll_status()
         except Exception as exc:
-            self.data_status["telegram"] = f"DATA_BLOCKED: {exc}"
+            self._telegram_poll_failures[account.handle] = str(exc)
+            self._update_telegram_poll_status()
+
+    def _update_telegram_poll_status(self):
+        """An invalid optional channel must not mask healthy Telegram ingestion."""
+        failed = len(self._telegram_poll_failures)
+        if failed and self._telegram_poll_successes:
+            self.data_status["telegram"] = f"OK_PARTIAL: {failed} configured channels unavailable"
+        elif failed:
+            self.data_status["telegram"] = f"DATA_BLOCKED: {failed} configured channels unavailable"
+        else:
+            self.data_status["telegram"] = "OK"
 
     async def _handle_telegram_event(self, event):
         """Process configured bot/channel messages from Telegram's push stream."""
@@ -640,7 +655,9 @@ class SocialIntelligenceEngine:
                 account = self.accounts.get(key)
             if account is not None:
                 await self._process_telegram_message(account, event.message)
-                self.data_status["telegram"] = "OK_PUSH"
+                self._telegram_poll_successes.add(handle)
+                self._telegram_poll_failures.pop(handle, None)
+                self._update_telegram_poll_status()
         except Exception as exc:
             logger.warning("Telegram push ingest failed; polling backfill remains active: %s", exc)
             self.data_status["telegram_push"] = f"DEGRADED: {exc}"
