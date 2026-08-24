@@ -112,9 +112,33 @@ class ExecutionResult:
 
 class JupiterClient:
     def __init__(self, base_url: Optional[str] = None, api_key: Optional[str] = None):
-        self.base_url = (base_url or os.getenv("JUPITER_API_URL") or "https://lite-api.jup.ag/swap/v1").rstrip("/")
+        self.base_url = (base_url or os.getenv("JUPITER_API_URL") or "https://api.jup.ag/swap/v1").rstrip("/")
         self.api_key = api_key or os.getenv("JUPITER_API_KEY", "")
         self._session: Optional[aiohttp.ClientSession] = None
+        # Jupiter's current free tier is 1 RPS with a key and keyless access is
+        # 0.5 RPS. A single shared gate prevents the research observer, equity
+        # marker and execution path from creating synchronized quote bursts.
+        self._minimum_interval = 1.05 if self.api_key else 2.05
+        self._next_request_at = 0.0
+        self._rate_lock = asyncio.Lock()
+
+    async def _enter_rate_limit(self):
+        await self._rate_lock.acquire()
+        try:
+            delay = self._next_request_at - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(min(delay, 30.0))
+            self._next_request_at = time.monotonic() + self._minimum_interval
+        except BaseException:
+            self._rate_lock.release()
+            raise
+
+    def _leave_rate_limit(self, retry_after: float = 0.0):
+        if retry_after > 0:
+            self._next_request_at = max(
+                self._next_request_at, time.monotonic() + min(retry_after, 30.0),
+            )
+        self._rate_lock.release()
 
     async def start(self):
         headers = {"x-api-key": self.api_key} if self.api_key else {}
@@ -155,16 +179,27 @@ class JupiterClient:
             "platformFeeBps": str(platform_fee_bps),
             "restrictIntermediateTokens": "true",
         }
+        await self._enter_rate_limit()
         try:
             async with self._session.get(f"{self.base_url}/quote", params=params) as resp:
                 if resp.status != 200:
                     logger.warning("Jupiter quote DATA_BLOCKED: HTTP %s", resp.status)
+                    if resp.status == 429:
+                        try:
+                            retry_after = float(resp.headers.get("Retry-After", self._minimum_interval * 2))
+                        except ValueError:
+                            retry_after = self._minimum_interval * 2
+                        self._next_request_at = max(
+                            self._next_request_at, time.monotonic() + min(retry_after, 30.0),
+                        )
                     return None
                 data = await resp.json()
                 return self._parse_quote(data, input_mint, output_mint, amount)
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
             logger.warning("Jupiter quote DATA_BLOCKED: %s", exc)
             return None
+        finally:
+            self._leave_rate_limit()
 
     async def get_swap_transaction(
         self,
@@ -188,6 +223,7 @@ class JupiterClient:
             payload["prioritizationFeeLamports"] = {"jitoTipLamports": jito_tip_lamports}
         elif priority_fee_lamports > 0:
             payload["prioritizationFeeLamports"] = priority_fee_lamports
+        await self._enter_rate_limit()
         try:
             async with self._session.post(f"{self.base_url}/swap", json=payload) as resp:
                 if resp.status != 200:
@@ -209,6 +245,8 @@ class JupiterClient:
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
             logger.warning("Jupiter transaction DATA_BLOCKED: %s", exc)
             return None
+        finally:
+            self._leave_rate_limit()
 
     def _parse_quote(self, data: Dict[str, Any], input_mint: str, output_mint: str, amount: int) -> SwapQuote:
         out_amount = int(data.get("outAmount", 0))

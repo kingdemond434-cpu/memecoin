@@ -21,7 +21,7 @@ from src.chains.yellowstone_grpc import (
 )
 from src.detection.rug_detector import TOKEN_2022_PROGRAM, TOKEN_PROGRAM, RugDetector
 from src.execution.jupiter_jito import (
-    ExecutionEngine, RouteType, SolanaTransactionBuilder, SwapQuote, TransactionStatus,
+    ExecutionEngine, JupiterClient, RouteType, SolanaTransactionBuilder, SwapQuote, TransactionStatus,
 )
 from src.main import MemecoinQuantDesk
 from src.strategies.information_graph import CounterfactualExecutionLab
@@ -373,6 +373,13 @@ class FakeRpc:
 
 
 class TestExecution(unittest.IsolatedAsyncioTestCase):
+    def test_jupiter_uses_current_gateway_and_free_tier_rate_gates(self):
+        keyless = JupiterClient()
+        keyed = JupiterClient(api_key="test-key")
+        self.assertEqual(keyless.base_url, "https://api.jup.ag/swap/v1")
+        self.assertGreaterEqual(keyless._minimum_interval, 2.0)
+        self.assertGreaterEqual(keyed._minimum_interval, 1.0)
+
     async def test_dry_run_never_builds_signs_or_submits(self):
         keypair = Keypair()
         jupiter = FakeJupiter()
