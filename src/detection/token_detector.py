@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import time
 from abc import ABC, abstractmethod
@@ -380,7 +381,11 @@ class SolanaTokenDetector(BaseDetector):
                     sigs = await self.rpc.request("getSignaturesForAddress", [prog_id, {"limit": 20}])
                     for sig_info in sigs:
                         sig = sig_info["signature"]
-                        tx = await self.rpc.request("getTransaction", [sig, {"encoding": "jsonParsed"}])
+                        tx = await self.rpc.request("getTransaction", [sig, {
+                            "encoding": "jsonParsed",
+                            "commitment": "confirmed",
+                            "maxSupportedTransactionVersion": 0,
+                        }])
                         if tx:
                             mint = self._extract_mint_from_tx(tx)
                             if mint and mint not in self._known_mints:

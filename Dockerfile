@@ -8,9 +8,7 @@ ENV PYTHONUNBUFFERED=1 \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
-    libpq-dev \
     curl \
-    git \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -20,9 +18,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
 COPY config/ ./config/
-COPY main.py .
+COPY tests/ ./tests/
 
-RUN mkdir -p /app/data/launch_episodes /app/logs /app/models
+RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin app \
+    && mkdir -p /app/data/launch_episodes /app/logs /app/models \
+    && chown -R app:app /app
 
 ENV PYTHONPATH=/app
 
@@ -31,4 +31,6 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
 
 EXPOSE 8080
 
-CMD ["python", "main.py"]
+USER app
+
+CMD ["python", "-m", "src.main", "--dry-run"]

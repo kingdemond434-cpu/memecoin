@@ -91,6 +91,10 @@ class WalletIntelligenceEngine:
         self._live_watch_wallets: Set[str] = set()
         self._recent_buys: deque = deque(maxlen=10000)
         self._recent_sells: deque = deque(maxlen=10000)
+        self._seen_live_signatures: Set[str] = set()
+        self._history_signatures: Dict[str, Set[str]] = defaultdict(set)
+        self._social_wallet_candidates: Set[str] = set()
+        self.data_status: Dict[str, str] = {}
         
         self._helius_base = "https://api.helius.xyz/v0"
 
@@ -150,34 +154,39 @@ class WalletIntelligenceEngine:
             await asyncio.sleep(300)
 
     async def _discover_wallets_from_recent_launches(self):
-        try:
-            async with self._session.get(
-                f"{self._helius_base}/tokens/mintlist",
-                params={"api-key": self.helius_key, "limit": 100}
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for token in data:
-                        await self._analyze_token_early_buyers(token.get("mint"))
-        except Exception as e:
-            logger.debug(f"Launch discovery error: {e}")
+        # Launches are supplied by the validated Pump/Raydium program stream.
+        # Helius does not expose a universal `/tokens/mintlist` endpoint.
+        self.data_status["launch_discovery"] = "OK: program_stream"
 
     async def _analyze_token_early_buyers(self, token: str):
+        if not token:
+            return
         try:
-            async with self._session.get(
-                f"{self._helius_base}/token-accounts",
-                params={"api-key": self.helius_key, "mint": token, "limit": 50}
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for acc in data.get("token_accounts", []):
-                        owner = acc.get("owner")
-                        if owner and owner not in self.genealogy.wallets:
-                            await self._evaluate_new_wallet(owner, token)
+            largest = await self.rpc.request("getTokenLargestAccounts", [token, {"commitment": "confirmed"}])
+            token_accounts = [item.get("address") for item in (largest or {}).get("value", []) if item.get("address")]
+            if not token_accounts:
+                self.data_status[f"holders:{token}"] = "DATA_BLOCKED: no token accounts observed"
+                return
+            account_data = await self.rpc.request(
+                "getMultipleAccounts", [token_accounts, {"encoding": "jsonParsed", "commitment": "confirmed"}],
+            )
+            for item in (account_data or {}).get("value", []):
+                owner = (((item or {}).get("data") or {}).get("parsed") or {}).get("info", {}).get("owner")
+                if owner and owner not in self.genealogy.wallets:
+                    await self._evaluate_new_wallet(owner, token)
+            self.data_status[f"holders:{token}"] = "OK"
         except Exception as e:
-            logger.debug(f"Token buyer analysis error: {e}")
+            self.data_status[f"holders:{token}"] = f"DATA_BLOCKED: {e}"
+            logger.debug("Token holder analysis error: %s", e)
+
+    async def analyze_token_early_buyers(self, token: str):
+        """Public entrypoint used by the canonical launch stream."""
+        await self._analyze_token_early_buyers(token)
 
     async def _evaluate_new_wallet(self, wallet: str, trigger_token: str):
+        if not self.helius_key:
+            self.data_status[wallet] = "DATA_BLOCKED: HELIUS_API_KEY missing"
+            return
         try:
             async with self._session.get(
                 f"{self._helius_base}/addresses/{wallet}/transactions",
@@ -200,14 +209,110 @@ class WalletIntelligenceEngine:
         
         wp = self.genealogy.wallets[wallet]
         
-        for tx in txs:
-            token = self._extract_token_from_tx(tx)
-            if token:
-                if token not in wp.launches_participated:
-                    wp.launches_participated.append(token)
-                
-                regime = self._classify_regime(tx)
-                await self._update_regime_performance(wallet, regime, tx)
+        unseen = [tx for tx in txs if tx.get("signature") and tx.get("signature") not in self._history_signatures[wallet]]
+        reconstructed = self._reconstruct_wallet_trades(wallet, unseen)
+        self._history_signatures[wallet].update(tx.get("signature") for tx in unseen if tx.get("signature"))
+        wp.tx_count += reconstructed["swap_count"]
+        wp.last_seen = max([float(tx.get("timestamp", 0) or 0) for tx in txs] + [wp.last_seen])
+        for trade in reconstructed["closed_trades"]:
+            token = trade["token"]
+            if token not in wp.launches_participated:
+                wp.launches_participated.append(token)
+            await self._update_regime_performance(wallet, self._classify_regime(trade), trade)
+        self.data_status[wallet] = "OK" if reconstructed["closed_trades"] else "DATA_BLOCKED"
+
+    def _reconstruct_wallet_trades(self, wallet: str, txs: List[Dict]) -> Dict[str, Any]:
+        """Reconstruct actual FIFO round trips from Helius transfer deltas."""
+        positions: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        closed: List[Dict[str, Any]] = []
+        signatures: Set[str] = set()
+        for tx in sorted(txs, key=lambda item: float(item.get("timestamp", 0) or 0)):
+            normalized = self._normalize_swap(wallet, tx)
+            if not normalized:
+                continue
+            signatures.add(normalized["signature"])
+            token = normalized["token"]
+            if normalized["side"] == "buy":
+                positions[token].append({
+                    "amount": normalized["amount"],
+                    "remaining": normalized["amount"],
+                    "cost": normalized["base_value"],
+                    "base_unit": normalized["base_unit"],
+                    "timestamp": normalized["timestamp"],
+                })
+                continue
+            remaining_sell = normalized["amount"]
+            total_sold = normalized["amount"]
+            allocated_cost = 0.0
+            first_entry = None
+            comparable = True
+            for lot in positions[token]:
+                if remaining_sell <= 0:
+                    break
+                used = min(lot["remaining"], remaining_sell)
+                if used <= 0:
+                    continue
+                allocated_cost += lot["cost"] * used / max(lot["amount"], 1e-12)
+                first_entry = lot["timestamp"] if first_entry is None else min(first_entry, lot["timestamp"])
+                comparable = comparable and lot["base_unit"] == normalized["base_unit"]
+                lot["remaining"] -= used
+                remaining_sell -= used
+            matched = total_sold - remaining_sell
+            if matched <= 0 or allocated_cost <= 0 or not comparable:
+                continue
+            proceeds = normalized["base_value"] * matched / max(total_sold, 1e-12)
+            closed.append({
+                "token": token,
+                "timestamp": normalized["timestamp"],
+                "multiple": proceeds / allocated_cost,
+                "realized_pnl": proceeds - allocated_cost,
+                "hold_time": normalized["timestamp"] - (first_entry or normalized["timestamp"]),
+                "base_unit": normalized["base_unit"],
+                "data_status": "OK",
+            })
+        return {"swap_count": len(signatures), "closed_trades": closed}
+
+    @staticmethod
+    def _normalize_swap(wallet: str, tx: Dict) -> Optional[Dict[str, Any]]:
+        transfers = tx.get("tokenTransfers", []) or []
+        received = [item for item in transfers if item.get("toUserAccount") == wallet]
+        sent = [item for item in transfers if item.get("fromUserAccount") == wallet]
+        stable_mints = {
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        }
+        token_received = next((item for item in received if item.get("mint") not in stable_mints), None)
+        token_sent = next((item for item in sent if item.get("mint") not in stable_mints), None)
+        side = "buy" if token_received else "sell" if token_sent else None
+        token_transfer = token_received or token_sent
+        if not side or not token_transfer:
+            return None
+        base_value = 0.0
+        base_unit = ""
+        native = tx.get("nativeTransfers", []) or []
+        native_in = sum(float(item.get("amount", 0) or 0) for item in native if item.get("toUserAccount") == wallet) / 1e9
+        native_out = sum(float(item.get("amount", 0) or 0) for item in native if item.get("fromUserAccount") == wallet) / 1e9
+        if max(native_in, native_out) > 0:
+            base_value = native_out if side == "buy" else native_in
+            base_unit = "SOL"
+        else:
+            stable = [item for item in transfers if item.get("mint") in stable_mints]
+            stable_in = sum(float(item.get("tokenAmount", 0) or 0) for item in stable if item.get("toUserAccount") == wallet)
+            stable_out = sum(float(item.get("tokenAmount", 0) or 0) for item in stable if item.get("fromUserAccount") == wallet)
+            base_value = stable_out if side == "buy" else stable_in
+            base_unit = "USD_STABLE"
+        amount = float(token_transfer.get("tokenAmount", 0) or 0)
+        signature = tx.get("signature")
+        if not signature or amount <= 0 or base_value <= 0:
+            return None
+        return {
+            "signature": signature,
+            "token": token_transfer.get("mint"),
+            "side": side,
+            "amount": amount,
+            "base_value": base_value,
+            "base_unit": base_unit,
+            "timestamp": float(tx.get("timestamp", 0) or 0),
+        }
 
     def _extract_token_from_tx(self, tx: Dict) -> Optional[str]:
         try:
@@ -252,11 +357,12 @@ class WalletIntelligenceEngine:
         else:
             perf.win_rate_10x = (perf.win_rate_10x * (perf.trades - 1)) / perf.trades
         
-        entry_pct = tx.get("entry_pct", 50)
-        perf.avg_entry_pct = (perf.avg_entry_pct * (perf.trades - 1) + entry_pct) / perf.trades
-        
-        exit_pct = tx.get("exit_pct", 50)
-        perf.avg_exit_pct = (perf.avg_exit_pct * (perf.trades - 1) + exit_pct) / perf.trades
+        if tx.get("entry_pct") is not None:
+            entry_pct = tx["entry_pct"]
+            perf.avg_entry_pct = (perf.avg_entry_pct * (perf.trades - 1) + entry_pct) / perf.trades
+        if tx.get("exit_pct") is not None:
+            exit_pct = tx["exit_pct"]
+            perf.avg_exit_pct = (perf.avg_exit_pct * (perf.trades - 1) + exit_pct) / perf.trades
         
         hold_time = tx.get("hold_time", 0)
         perf.avg_hold_time = (perf.avg_hold_time * (perf.trades - 1) + hold_time) / perf.trades
@@ -264,18 +370,26 @@ class WalletIntelligenceEngine:
         pnl = tx.get("realized_pnl", 0)
         perf.realized_pnl = (perf.realized_pnl * (perf.trades - 1) + pnl) / perf.trades
         
-        rugged = tx.get("rugged", False)
-        if rugged:
-            perf.rug_exposure = (perf.rug_exposure * (perf.trades - 1) + 1) / perf.trades
-        else:
-            perf.rug_exposure = (perf.rug_exposure * (perf.trades - 1)) / perf.trades
+        if tx.get("rugged") is not None:
+            rugged = bool(tx["rugged"])
+            perf.rug_exposure = (perf.rug_exposure * (perf.trades - 1) + int(rugged)) / perf.trades
         
         perf.last_updated = time.time()
 
     async def _discover_wallets_from_social(self):
-        pass
+        candidates = list(self._social_wallet_candidates)[:100]
+        self._social_wallet_candidates.difference_update(candidates)
+        for wallet in candidates:
+            await self._evaluate_new_wallet(wallet, "social_discovery")
+
+    def register_social_wallet(self, wallet: str):
+        if wallet and 32 <= len(wallet) <= 44:
+            self._social_wallet_candidates.add(wallet)
 
     async def _watch_live_wallets(self):
+        if not self.helius_key:
+            self.data_status["live_wallet_watch"] = "DATA_BLOCKED: HELIUS_API_KEY missing"
+            return
         if not self._live_watch_wallets:
             return
         
@@ -301,8 +415,11 @@ class WalletIntelligenceEngine:
 
     async def _process_live_transaction(self, wallet: str, tx: Dict):
         sig = tx.get("signature")
-        if not sig:
+        if not sig or sig in self._seen_live_signatures:
             return
+        self._seen_live_signatures.add(sig)
+        if len(self._seen_live_signatures) > 100_000:
+            self._seen_live_signatures = set(list(self._seen_live_signatures)[-50_000:])
         
         token = self._extract_token_from_tx(tx)
         if not token:
@@ -326,6 +443,19 @@ class WalletIntelligenceEngine:
             self._recent_buys.append(event)
         else:
             self._recent_sells.append(event)
+
+    def record_live_trade(self, token: str, event: Dict[str, Any]):
+        """Register a decoded stream trade without pretending its limit is a fill price."""
+        side = event.get("side")
+        if side not in {"buy", "sell"}:
+            return
+        record = {
+            "wallet": event.get("wallet", ""), "token": token, "side": side,
+            "amount": float(event.get("amount", 0) or 0), "price": float(event.get("price", 0) or 0),
+            "timestamp": float(event.get("timestamp", time.time())), "signature": event.get("signature"),
+            "data_status": "OK" if event.get("price") else "DATA_BLOCKED_PRICE",
+        }
+        (self._recent_buys if side == "buy" else self._recent_sells).append(record)
 
     def _determine_side(self, wallet: str, tx: Dict) -> str:
         try:
@@ -535,5 +665,7 @@ class WalletIntelligenceEngine:
             "regimes_tracked": len(WalletRegime),
             "recent_buys": len(self._recent_buys),
             "recent_sells": len(self._recent_sells),
-            "top_10": [{"wallet": s.wallet[:8], "score": round(s.overall_score, 3)} for s in self.get_top_wallets(limit=10)]
+            "top_10": [{"wallet": s.wallet[:8], "score": round(s.overall_score, 3)} for s in self.get_top_wallets(limit=10)],
+            "data_blocked_wallets": sum(1 for status in self.data_status.values() if status.startswith("DATA_BLOCKED")),
+            "data_status": dict(self.data_status),
         }

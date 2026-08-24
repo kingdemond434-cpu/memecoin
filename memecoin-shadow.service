@@ -1,0 +1,17 @@
+[Unit]
+Description=Memecoin Shadow Desk (dry-run only)
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/memecoin-shadow
+ExecStart=/usr/bin/docker compose -p memecoin-shadow -f /opt/memecoin-shadow/docker-compose.yml up -d --build
+ExecStop=/usr/bin/docker compose -p memecoin-shadow -f /opt/memecoin-shadow/docker-compose.yml stop -t 30
+TimeoutStartSec=600
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

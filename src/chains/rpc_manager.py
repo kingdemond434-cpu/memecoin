@@ -1,19 +1,16 @@
 import asyncio
-import json
 import logging
+import os
 import random
 import time
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set
-from urllib.parse import urlparse
+from typing import Any, Dict, Iterable, List, Optional
 
 import aiohttp
 import yaml
 from web3 import AsyncWeb3
-from web3.providers import AsyncHTTPProvider, WebSocketProvider
-from web3.types import RPCEndpoint, RPCResponse
+from web3.providers import AsyncHTTPProvider
 
 logger = logging.getLogger(__name__)
 
@@ -113,22 +110,24 @@ class RPCManager:
 
     async def _check_endpoint(self, ep: EndpointHealth):
         start = time.time()
+        method, params = self._health_probe()
         try:
             async with self._session.post(
                 ep.endpoint.url,
-                json={"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1},
+                json={"jsonrpc": "2.0", "method": method, "params": params, "id": 1},
                 headers=ep.endpoint.headers,
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    if "result" in data:
+                    if "result" in data and self._valid_health_result(data["result"]):
                         ep.health = RPCHealth.HEALTHY
                         ep.latency_ms = (time.time() - start) * 1000
                         ep.success_count += 1
                         ep.consecutive_failures = 0
+                        ep.last_check = time.time()
                         return
-        except Exception:
-            pass
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            logger.debug("RPC health probe failed for %s", ep.endpoint.url)
         ep.error_count += 1
         ep.consecutive_failures += 1
         if ep.consecutive_failures >= 3:
@@ -136,6 +135,17 @@ class RPCManager:
         elif ep.consecutive_failures >= 1:
             ep.health = RPCHealth.DEGRADED
         ep.last_check = time.time()
+
+    def _health_probe(self) -> tuple[str, List[Any]]:
+        """Return a protocol-correct, inexpensive probe for this chain."""
+        if self.chain_config.chain_type == ChainType.SOLANA:
+            return "getHealth", []
+        return "eth_blockNumber", []
+
+    def _valid_health_result(self, result: Any) -> bool:
+        if self.chain_config.chain_type == ChainType.SOLANA:
+            return result == "ok"
+        return isinstance(result, str) and result.startswith("0x")
 
     def _select_endpoint(self, prefer_ws: bool = False) -> Optional[EndpointHealth]:
         healthy = [e for e in self.endpoints if e.health != RPCHealth.DOWN]
@@ -164,6 +174,8 @@ class RPCManager:
                             data = await resp.json()
                             if "result" in data:
                                 ep.success_count += 1
+                                ep.consecutive_failures = 0
+                                ep.health = RPCHealth.HEALTHY
                                 return data["result"]
                             if "error" in data:
                                 raise RPCError(data["error"])
@@ -197,6 +209,8 @@ class RPCManager:
         return ep.endpoint.ws_url if ep else None
 
     def get_web3(self) -> AsyncWeb3:
+        if self.chain_config.chain_type != ChainType.EVM:
+            raise TypeError("get_web3() is only valid for EVM chains")
         ep = self._select_endpoint()
         if not ep:
             raise RuntimeError("No healthy RPC endpoints")
@@ -236,14 +250,19 @@ class ChainRegistry:
         globals_cfg = raw.get("global", {})
         for name, cfg in raw.get("chains", {}).items():
             chain_type = ChainType.SOLANA if name == "solana" else ChainType.EVM
-            endpoints = [
-                RPCEndpointConfig(
-                    url=self._interpolate(ep),
-                    ws_url=self._interpolate(cfg.get("ws_urls", [None])[i]) if i < len(cfg.get("ws_urls", [])) else None,
-                    weight=1,
-                )
-                for i, ep in enumerate(cfg["rpc_urls"])
-            ]
+            endpoints = []
+            ws_urls = cfg.get("ws_urls", [])
+            for i, endpoint_url in enumerate(cfg["rpc_urls"]):
+                url = self._interpolate(endpoint_url)
+                ws_url = self._interpolate(ws_urls[i]) if i < len(ws_urls) else None
+                if self._has_unresolved_placeholder(url):
+                    logger.info("Skipping %s RPC endpoint with missing environment value", name)
+                    continue
+                if ws_url and self._has_unresolved_placeholder(ws_url):
+                    ws_url = None
+                endpoints.append(RPCEndpointConfig(url=url, ws_url=ws_url, weight=1))
+            if not endpoints:
+                raise ValueError(f"No usable RPC endpoints configured for {name}")
             self.chains[name] = ChainConfig(
                 name=cfg["name"],
                 chain_id=cfg["chain_id"],
@@ -263,20 +282,28 @@ class ChainRegistry:
                 programs=cfg.get("programs", {}),
             )
 
-    def _interpolate(self, value: str) -> str:
-        import os
-        for key, val in os.environ.items():
-            value = value.replace(f"${{{key}}}", val)
-        return value
+    def _interpolate(self, value: Optional[str]) -> Optional[str]:
+        return os.path.expandvars(value) if value else value
 
-    async def start_all(self):
+    @staticmethod
+    def _has_unresolved_placeholder(value: str) -> bool:
+        return "${" in value
+
+    async def start_all(self, enabled_chains: Optional[Iterable[str]] = None):
+        selected = set(enabled_chains or self.chains.keys())
         for name, chain in self.chains.items():
+            if name not in selected:
+                continue
             self.rpc_managers[name] = RPCManager(chain)
             await self.rpc_managers[name].start()
 
     async def stop_all(self):
         for mgr in self.rpc_managers.values():
             await mgr.stop()
+
+    async def stop(self):
+        """Lifecycle alias used by the desk's uniform component shutdown."""
+        await self.stop_all()
 
     def get_chain(self, name: str) -> Optional[ChainConfig]:
         return self.chains.get(name)

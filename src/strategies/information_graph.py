@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 import time
 from collections import defaultdict, deque
@@ -75,6 +76,10 @@ class InformationLeadGraph:
         
         self._running = False
         self._analysis_task: Optional[asyncio.Task] = None
+        self.outcome_provider = None
+
+    def set_outcome_provider(self, provider):
+        self.outcome_provider = provider
 
     async def start(self):
         self._running = True
@@ -142,12 +147,12 @@ class InformationLeadGraph:
             self.completed_paths = self.completed_paths[-5000:]
 
     async def _get_token_outcome(self, token: str) -> Dict[str, Any]:
-        return {
-            "max_multiple": 0,
-            "rugged": False,
-            "migrated": False,
-            "time_to_peak": 0
-        }
+        if not self.outcome_provider:
+            return {"status": "DATA_BLOCKED", "reason": "outcome_provider_unavailable"}
+        result = self.outcome_provider(token)
+        if asyncio.iscoroutine(result):
+            result = await result
+        return result or {"status": "DATA_BLOCKED", "reason": "outcome_not_observed"}
 
     async def _update_source_rankings(self):
         type_performance = defaultdict(lambda: defaultdict(list))
@@ -227,12 +232,73 @@ class CounterfactualExecutionLab:
     def __init__(self):
         self.counterfactuals: List[Dict] = []
         self.execution_policies: Dict[str, Dict] = {}
+        self.decisions: Dict[str, Dict] = {}
+        self.executions: Dict[str, Dict] = {}
 
     def record_decision(self, token: str, signal_snapshot: Dict, decision: Dict):
-        pass
+        created_at = time.time()
+        decision_id = hashlib.sha256(
+            f"{token}:{created_at}:{len(self.decisions)}".encode()
+        ).hexdigest()[:20]
+        policies = {
+            "now": {"delay_seconds": 0, "requires_second_wallet": False},
+            "wait_1s": {"delay_seconds": 1, "requires_second_wallet": False},
+            "wait_3s": {"delay_seconds": 3, "requires_second_wallet": False},
+            "second_wallet_confirmation": {"delay_seconds": None, "requires_second_wallet": True},
+            "no_jito": {"delay_seconds": 0, "use_jito": False},
+        }
+        self.decisions[decision_id] = {
+            "decision_id": decision_id,
+            "token": token,
+            "created_at": created_at,
+            "signal_snapshot": signal_snapshot,
+            "decision": decision,
+            "policies": policies,
+            "observations": [],
+            "status": "PENDING",
+        }
+        return decision_id
 
-    def record_execution(self, token: str, execution_result: Dict):
-        pass
+    def record_execution(self, decision_id: str, execution_result: Dict):
+        self.executions[decision_id] = {**execution_result, "recorded_at": time.time()}
+        if decision_id in self.decisions:
+            self.decisions[decision_id]["actual_execution"] = execution_result
+            self.decisions[decision_id]["status"] = "EXECUTED"
+
+    def record_market_observation(self, token: str, price: float, timestamp: float = None):
+        timestamp = timestamp or time.time()
+        if price <= 0:
+            return
+        for decision in self.decisions.values():
+            if decision["token"] != token:
+                continue
+            decision["observations"].append({"timestamp": timestamp, "price": price})
+
+    def resolve_decision(self, decision_id: str, actual_pnl: float = 0.0) -> List[Dict]:
+        decision = self.decisions.get(decision_id)
+        if not decision:
+            return []
+        observations = sorted(decision["observations"], key=lambda item: item["timestamp"])
+        if not observations:
+            decision["status"] = "DATA_BLOCKED"
+            return []
+        baseline = observations[0]["price"]
+        actual = {"pnl": actual_pnl, **self.executions.get(decision_id, {})}
+        resolved = []
+        for policy, spec in decision["policies"].items():
+            delay = spec.get("delay_seconds")
+            if delay is None:
+                continue
+            target = decision["created_at"] + delay
+            observation = next((item for item in observations if item["timestamp"] >= target), None)
+            if not observation:
+                continue
+            relative_capture = baseline / observation["price"] if observation["price"] > 0 else 0
+            counterfactual = {"pnl": actual_pnl * relative_capture, "entry_price": observation["price"]}
+            self.add_counterfactual(decision["token"], policy, actual, counterfactual)
+            resolved.append(self.counterfactuals[-1])
+        decision["status"] = "RESOLVED" if resolved else "DATA_BLOCKED"
+        return resolved
 
     def add_counterfactual(self, token: str, policy_name: str, 
                            actual_result: Dict, counterfactual_result: Dict):

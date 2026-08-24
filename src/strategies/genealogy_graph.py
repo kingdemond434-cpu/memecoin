@@ -131,6 +131,8 @@ class GenealogyGraph:
         
         self._update_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
         self._processing = False
+        self.outcome_provider = None
+        self.data_status: Dict[str, str] = {}
 
     async def start(self):
         self._session = aiohttp.ClientSession(
@@ -147,7 +149,26 @@ class GenealogyGraph:
             await self._session.close()
 
     async def _load_historical_data(self):
-        pass
+        self.data_status["historical_genealogy"] = (
+            "DATA_BLOCKED: no versioned historical genealogy artifact; building from observed launches"
+        )
+
+    def set_outcome_provider(self, provider):
+        self.outcome_provider = provider
+
+    def record_token_creation(self, token: str, deployer: str, metadata: Optional[Dict] = None):
+        update = {
+            "type": "token_created",
+            "token": token,
+            "deployer": deployer,
+            "timestamp": (metadata or {}).get("timestamp", time.time()),
+            "funding_wallets": (metadata or {}).get("funding_wallets", []),
+            "initial_buyers": (metadata or {}).get("initial_buyers", []),
+        }
+        try:
+            self._update_queue.put_nowait(update)
+        except asyncio.QueueFull:
+            self.data_status["update_queue"] = "DATA_BLOCKED: genealogy update queue full"
 
     async def _process_updates(self):
         while self._processing:
@@ -344,7 +365,18 @@ class GenealogyGraph:
         return max(0, min(1, score))
 
     async def _get_launch_outcomes(self, tokens: List[str]) -> List[Dict]:
-        return []
+        if not self.outcome_provider:
+            self.data_status["launch_outcomes"] = "DATA_BLOCKED: PIT outcome provider unavailable"
+            return []
+        outcomes = []
+        for token in tokens:
+            outcome = self.outcome_provider(token)
+            if asyncio.iscoroutine(outcome):
+                outcome = await outcome
+            if outcome and outcome.get("status") != "DATA_BLOCKED":
+                outcomes.append(outcome)
+        self.data_status["launch_outcomes"] = "OK" if outcomes else "DATA_BLOCKED: no finalized outcomes"
+        return outcomes
 
     def get_wallet_profile(self, address: str) -> Optional[WalletProfile]:
         return self.wallets.get(address)
@@ -494,6 +526,7 @@ class GenealogyGraph:
             "rugged_deployers": sum(1 for d in self.deployers.values() if d.wallet_profile.is_rugged_deployer),
             "graph_nodes": self.graph.number_of_nodes(),
             "graph_edges": self.graph.number_of_edges()
+            ,"data_status": dict(self.data_status)
         }
 
     def serialize(self) -> Dict:

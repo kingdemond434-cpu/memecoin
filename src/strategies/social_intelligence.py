@@ -48,6 +48,7 @@ class SocialAccount:
     language: str = "en"
     region: str = "global"
     last_active: float = field(default_factory=time.time)
+    linked_wallets: Set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -110,6 +111,7 @@ class SocialIntelligenceEngine:
         
         self._known_contracts: Set[str] = set()
         self._mention_callbacks: List[Callable] = []
+        self.data_status: Dict[str, str] = {}
 
     async def start(self, initial_accounts: List[Dict] = None):
         self._session = aiohttp.ClientSession(
@@ -189,36 +191,12 @@ class SocialIntelligenceEngine:
             await self._find_linked_social(ws.wallet)
 
     async def _find_linked_social(self, wallet: str):
-        try:
-            async with self._session.get(
-                f"https://api.helius.xyz/v0/addresses/{wallet}/social",
-                params={"api-key": self.api_keys.get("helius", "")}
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for link in data.get("social_links", []):
-                        await self._add_account({
-                            "platform": link.get("platform"),
-                            "handle": link.get("username"),
-                            "account_id": link.get("user_id"),
-                            "source": "wallet_link",
-                            "source_wallet": wallet
-                        })
-        except Exception:
-            pass
+        # There is no verified Helius wallet-to-social endpoint. Treat this as
+        # unavailable instead of fabricating identity links from display names.
+        self.data_status["wallet_social_links"] = "DATA_BLOCKED: no verified public identity-link source"
 
     async def _discover_accounts_from_recent_launches(self):
-        try:
-            async with self._session.get(
-                "https://api.helius.xyz/v0/tokens/mintlist",
-                params={"api-key": self.api_keys.get("helius", ""), "limit": 50}
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for token in data:
-                        await self._scan_token_social(token.get("mint"))
-        except Exception as e:
-            logger.debug(f"Launch social discovery error: {e}")
+        self.data_status["recent_launches"] = "OK: program_stream"
 
     async def _scan_token_social(self, token: str):
         if token in self._known_contracts:
@@ -228,11 +206,81 @@ class SocialIntelligenceEngine:
         for platform in [SocialPlatform.X, SocialPlatform.TELEGRAM, SocialPlatform.REDDIT]:
             await self._search_platform_for_token(platform, token)
 
+    async def scan_token(self, token: str):
+        """Search configured public sources for a stream-validated launch."""
+        await self._scan_token_social(token)
+
     async def _search_platform_for_token(self, platform: SocialPlatform, token: str):
-        pass
+        if platform == SocialPlatform.X:
+            await self._search_x_query(token)
+        elif platform == SocialPlatform.REDDIT:
+            await self._search_reddit(token)
+        elif platform == SocialPlatform.TELEGRAM:
+            self.data_status["telegram_search"] = "DATA_BLOCKED: Bot API cannot search arbitrary public channels"
+
+    async def _search_x_query(self, query: str):
+        bearer = self.api_keys.get("x_bearer", "")
+        if not bearer:
+            self.data_status["x"] = "DATA_BLOCKED: X_BEARER_TOKEN missing"
+            return
+        try:
+            async with self._session.get(
+                "https://api.twitter.com/2/tweets/search/recent",
+                headers={"Authorization": f"Bearer {bearer}"},
+                params={
+                    "query": f"{query} -is:retweet",
+                    "max_results": 25,
+                    "tweet.fields": "created_at,public_metrics,lang,author_id",
+                    "expansions": "author_id",
+                    "user.fields": "username,name,public_metrics,created_at,verified",
+                },
+            ) as resp:
+                if resp.status != 200:
+                    self.data_status["x"] = f"DATA_BLOCKED: HTTP {resp.status}"
+                    return
+                payload = await resp.json()
+            users = {item["id"]: item for item in payload.get("includes", {}).get("users", [])}
+            for tweet in payload.get("data", []):
+                user = users.get(tweet.get("author_id"), {})
+                handle = user.get("username")
+                if not handle:
+                    continue
+                await self._add_account({
+                    "platform": "x", "handle": handle, "account_id": user.get("id", handle),
+                    "display_name": user.get("name", handle), "followers": user.get("public_metrics", {}).get("followers_count", 0),
+                    "verified": user.get("verified", False), "language": tweet.get("lang", "unknown"),
+                })
+                await self._process_x_tweet(self.accounts[f"x:{handle}"], tweet)
+            self.data_status["x"] = "OK"
+        except Exception as exc:
+            self.data_status["x"] = f"DATA_BLOCKED: {exc}"
+
+    async def _search_reddit(self, query: str):
+        try:
+            async with self._session.get(
+                "https://www.reddit.com/search.json",
+                params={"q": query, "sort": "new", "limit": 25, "t": "week"},
+                headers={"User-Agent": "memecoin-quant-research/1.0"},
+            ) as resp:
+                if resp.status != 200:
+                    self.data_status["reddit"] = f"DATA_BLOCKED: HTTP {resp.status}"
+                    return
+                payload = await resp.json()
+            for child in payload.get("data", {}).get("children", []):
+                post = child.get("data", {})
+                handle = post.get("author")
+                if not handle or handle == "[deleted]":
+                    continue
+                await self._add_account({"platform": "reddit", "handle": handle, "account_id": handle})
+                await self._process_reddit_post(self.accounts[f"reddit:{handle}"], post)
+            self.data_status["reddit"] = "OK"
+        except Exception as exc:
+            self.data_status["reddit"] = f"DATA_BLOCKED: {exc}"
 
     async def _discover_accounts_from_foreign_sources(self):
-        pass
+        terms = ["solana memecoin", "ソラナ ミームコイン", "솔라나 밈코인", "солана мемкоин", "عملة سولانا ميم"]
+        for term in terms:
+            await self._search_x_query(term)
 
     async def _discover_accounts_from_competitors(self):
         known_bots = [
@@ -243,9 +291,41 @@ class SocialIntelligenceEngine:
             await self._scan_competitor_followers(bot)
 
     async def _scan_competitor_followers(self, bot_name: str):
-        pass
+        bearer = self.api_keys.get("x_bearer", "")
+        if not bearer:
+            self.data_status["competitor_followers"] = "DATA_BLOCKED: X_BEARER_TOKEN missing"
+            return
+        headers = {"Authorization": f"Bearer {bearer}"}
+        try:
+            async with self._session.get(f"https://api.twitter.com/2/users/by/username/{bot_name}", headers=headers) as resp:
+                if resp.status != 200:
+                    return
+                user_id = (await resp.json()).get("data", {}).get("id")
+            if not user_id:
+                return
+            async with self._session.get(
+                f"https://api.twitter.com/2/users/{user_id}/followers",
+                headers=headers,
+                params={"max_results": 100, "user.fields": "public_metrics,verified"},
+            ) as resp:
+                if resp.status != 200:
+                    return
+                payload = await resp.json()
+            for user in payload.get("data", []):
+                await self._add_account({
+                    "platform": "x", "handle": user.get("username"), "account_id": user.get("id"),
+                    "display_name": user.get("name", user.get("username")),
+                    "followers": user.get("public_metrics", {}).get("followers_count", 0),
+                    "verified": user.get("verified", False),
+                })
+            self.data_status["competitor_followers"] = "OK"
+        except Exception as exc:
+            self.data_status["competitor_followers"] = f"DATA_BLOCKED: {exc}"
 
     async def _add_account(self, data: Dict):
+        if not data.get("platform") or not data.get("handle"):
+            self.data_status["account_ingest"] = "DATA_BLOCKED: source account missing platform or handle"
+            return
         key = f"{data['platform']}:{data['handle']}"
         if key in self.accounts:
             return
@@ -257,8 +337,13 @@ class SocialIntelligenceEngine:
             account_id=data.get("account_id", key),
             display_name=data.get("display_name", data["handle"]),
             language=data.get("language", "en"),
-            region=data.get("region", "global")
+            region=data.get("region", "global"),
+            followers=int(data.get("followers", 0) or 0),
+            verified=bool(data.get("verified", False)),
         )
+        if data.get("source_wallet"):
+            account.linked_wallets.add(data["source_wallet"])
+            self.wallet_intel.register_social_wallet(data["source_wallet"])
         self.accounts[key] = account
 
     async def _watch_known_accounts(self):
@@ -350,10 +435,58 @@ class SocialIntelligenceEngine:
             return time.time()
 
     async def _fetch_telegram_posts(self, account: SocialAccount):
-        pass
+        token = self.api_keys.get("telegram", "")
+        if not token:
+            self.data_status["telegram"] = "DATA_BLOCKED: TELEGRAM_API_KEY missing"
+            return
+        try:
+            async with self._session.get(f"https://api.telegram.org/bot{token}/getUpdates", params={"limit": 100}) as resp:
+                if resp.status != 200:
+                    self.data_status["telegram"] = f"DATA_BLOCKED: HTTP {resp.status}"
+                    return
+                payload = await resp.json()
+            for update in payload.get("result", []):
+                message = update.get("channel_post") or update.get("message") or {}
+                chat = message.get("chat", {})
+                if chat.get("username") != account.handle:
+                    continue
+                content = message.get("text") or message.get("caption") or ""
+                for token_address in self._extract_contracts(content):
+                    await self._process_mention(SocialMention(
+                        platform=SocialPlatform.TELEGRAM, account=account, token=token_address,
+                        content=content[:500], timestamp=float(message.get("date", time.time())),
+                        url=f"https://t.me/{account.handle}/{message.get('message_id', '')}",
+                    ))
+            self.data_status["telegram"] = "OK"
+        except Exception as exc:
+            self.data_status["telegram"] = f"DATA_BLOCKED: {exc}"
 
     async def _fetch_reddit_posts(self, account: SocialAccount):
-        pass
+        try:
+            async with self._session.get(
+                f"https://www.reddit.com/user/{account.handle}/submitted.json",
+                params={"limit": 50}, headers={"User-Agent": "memecoin-quant-research/1.0"},
+            ) as resp:
+                if resp.status != 200:
+                    return
+                payload = await resp.json()
+            for child in payload.get("data", {}).get("children", []):
+                await self._process_reddit_post(account, child.get("data", {}))
+        except Exception as exc:
+            self.data_status["reddit"] = f"DATA_BLOCKED: {exc}"
+
+    async def _process_reddit_post(self, account: SocialAccount, post: Dict):
+        content = f"{post.get('title', '')}\n{post.get('selftext', '')}"
+        for token in self._extract_contracts(content):
+            await self._process_mention(SocialMention(
+                platform=SocialPlatform.REDDIT,
+                account=account,
+                token=token,
+                content=content[:500],
+                timestamp=float(post.get("created_utc", time.time())),
+                engagement={"score": int(post.get("score", 0) or 0), "comments": int(post.get("num_comments", 0) or 0)},
+                url=f"https://reddit.com{post.get('permalink', '')}",
+            ))
 
     async def _watch_token_mentions(self):
         for token, mentions in list(self.token_mentions.items()):
@@ -401,6 +534,8 @@ class SocialIntelligenceEngine:
         token = mention.token
         self.token_mentions[token].append(mention)
         self.mentions.append(mention)
+        mention.account.total_calls += 1
+        mention.account.call_history.append({"token": token, "timestamp": mention.timestamp, "url": mention.url})
         
         is_first = len(self.token_mentions[token]) == 1
         mention.token_first_mention = is_first
@@ -428,24 +563,45 @@ class SocialIntelligenceEngine:
         mention_time = mention.timestamp
         
         try:
-            async with self._session.get(
-                f"https://api.helius.xyz/v0/token-accounts",
-                params={"api-key": self.api_keys.get("helius", ""), "mint": token, "limit": 100}
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for acc in data.get("token_accounts", []):
-                        owner = acc.get("owner")
-                        if owner:
-                            txs = await self._get_wallet_txs_before(owner, mention_time, limit=10)
-                            if txs:
-                                mention.chain_activity_before = True
-                                break
-        except Exception:
-            pass
+            largest = await self.rpc.request("getTokenLargestAccounts", [token, {"commitment": "confirmed"}])
+            accounts = [item.get("address") for item in (largest or {}).get("value", []) if item.get("address")]
+            parsed = await self.rpc.request(
+                "getMultipleAccounts", [accounts, {"encoding": "jsonParsed", "commitment": "confirmed"}],
+            ) if accounts else None
+            for item in (parsed or {}).get("value", []):
+                owner = (((item or {}).get("data") or {}).get("parsed") or {}).get("info", {}).get("owner")
+                if owner and await self._get_wallet_txs_before(owner, mention_time, limit=10):
+                    mention.chain_activity_before = True
+                    break
+        except Exception as exc:
+            self.data_status["chain_causality"] = f"DATA_BLOCKED: {exc}"
 
     async def _get_wallet_txs_before(self, wallet: str, before_time: float, limit: int = 10) -> List:
-        return []
+        helius = self.api_keys.get("helius", "")
+        if not helius:
+            self.data_status["chain_causality"] = "DATA_BLOCKED: HELIUS_API_KEY missing"
+            return []
+        try:
+            async with self._session.get(
+                f"https://api.helius.xyz/v0/addresses/{wallet}/transactions",
+                params={"api-key": helius, "limit": min(100, max(limit * 5, 20))},
+            ) as resp:
+                if resp.status != 200:
+                    return []
+                transactions = await resp.json()
+            return [item for item in transactions if float(item.get("timestamp", 0) or 0) < before_time][:limit]
+        except Exception:
+            return []
+
+    def record_token_outcome(self, token: str, outcome: Dict[str, Any]):
+        multiple = float(outcome.get("max_multiple", 0) or 0)
+        rugged = bool(outcome.get("rugged", False))
+        for mention in self.token_mentions.get(token, []):
+            account = mention.account
+            account.successful_calls += int(multiple >= 2 and not rugged)
+            n = max(account.total_calls, 1)
+            account.avg_roi = (account.avg_roi * (n - 1) + (multiple - 1)) / n
+            account.rug_exposure = (account.rug_exposure * (n - 1) + int(rugged)) / n
 
     async def _update_narratives(self):
         recent_mentions = [m for m in self.mentions if time.time() - m.timestamp < 3600]
@@ -508,7 +664,7 @@ class SocialIntelligenceEngine:
             account.credibility_score = max(0, min(1, credibility))
             
             if account.credibility_score > 0.7:
-                account.is_verified = True
+                account.verified = True
 
     def _calculate_account_independence(self, account: SocialAccount) -> float:
         if not account.call_history:
@@ -603,5 +759,6 @@ class SocialIntelligenceEngine:
             "top_10_accounts": [
                 {"handle": a.handle, "platform": a.platform.value, "cred": round(a.credibility_score, 3), "calls": a.total_calls}
                 for a in self.get_top_accounts(limit=10)
-            ]
+            ],
+            "data_status": dict(self.data_status),
         }

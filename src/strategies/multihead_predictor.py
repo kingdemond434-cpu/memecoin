@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import json
 import hashlib
+import os
 import numpy as np
 from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
 from sklearn.calibration import CalibratedClassifierCV
@@ -19,6 +20,7 @@ class PredictionTarget(Enum):
     P_2X = "p_2x"
     P_5X = "p_5x"
     P_10X = "p_10x"
+    P_50X = "p_50x"
     P_MIGRATION = "p_migration"
     P_RUG_30S = "p_rug_30s"
     P_RUG_5M = "p_rug_5m"
@@ -115,6 +117,7 @@ class MultiHeadPrediction:
     p_2x: float = 0
     p_5x: float = 0
     p_10x: float = 0
+    p_50x: float = 0
     p_migration: float = 0
     p_rug_30s: float = 0
     p_rug_5m: float = 0
@@ -148,8 +151,8 @@ class MultiHeadPredictor:
 
     def initialize_models(self):
         for target in PredictionTarget:
-            if target in [PredictionTarget.P_2X, PredictionTarget.P_5X, 
-                         PredictionTarget.P_10X, PredictionTarget.P_MIGRATION,
+            if target in [PredictionTarget.P_2X, PredictionTarget.P_5X,
+                         PredictionTarget.P_10X, PredictionTarget.P_50X, PredictionTarget.P_MIGRATION,
                          PredictionTarget.P_RUG_30S, PredictionTarget.P_RUG_5M]:
                 base_model = GradientBoostingClassifier(
                     n_estimators=200,
@@ -209,7 +212,10 @@ class MultiHeadPredictor:
                 logger.error(f"Training failed for {target.value}: {e}")
                 results[target.value] = {"status": "failed", "error": str(e)}
         
-        self._is_trained = True
+        trained_targets = {PredictionTarget(key) for key, result in results.items() if result.get("status") == "trained"}
+        required = {PredictionTarget.P_2X, PredictionTarget.P_5X, PredictionTarget.P_10X, PredictionTarget.P_50X,
+                    PredictionTarget.P_RUG_30S, PredictionTarget.P_RUG_5M}
+        self._is_trained = required.issubset(trained_targets)
         self.model_version = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
         return results
 
@@ -249,6 +255,7 @@ class MultiHeadPredictor:
                 logger.error(f"Prediction failed for {target.value}: {e}")
                 setattr(pred, target.value, 0.0)
         
+        self._enforce_nested_monotonicity(pred)
         return pred
 
     def predict_batch(self, features_list: List[PredictionFeatures]) -> List[Optional[MultiHeadPrediction]]:
@@ -289,6 +296,7 @@ class MultiHeadPredictor:
                     logger.error(f"Batch prediction failed for {target.value}: {e}")
                     setattr(pred, target.value, 0.0)
             
+            self._enforce_nested_monotonicity(pred)
             results.append(pred)
         
         return results
@@ -314,6 +322,33 @@ class MultiHeadPredictor:
         self._is_trained = True
         logger.info(f"Loaded models from {path}, version: {self.model_version}")
 
+    def load_latest(self) -> bool:
+        """Load the newest persisted model bundle; never invent bootstrap scores."""
+        if not os.path.isdir(self.model_dir):
+            return False
+        candidates = [
+            os.path.join(self.model_dir, name)
+            for name in os.listdir(self.model_dir)
+            if name.endswith((".joblib", ".pkl"))
+        ]
+        if not candidates:
+            return False
+        self.load(max(candidates, key=os.path.getmtime))
+        required = {target for target in PredictionTarget}
+        missing = required.difference(self.models)
+        if missing:
+            logger.error("Model bundle DATA_BLOCKED; missing heads: %s", sorted(item.value for item in missing))
+            self._is_trained = False
+        return self._is_trained
+
+    @staticmethod
+    def _enforce_nested_monotonicity(prediction: MultiHeadPrediction):
+        levels = np.clip(
+            [prediction.p_2x, prediction.p_5x, prediction.p_10x, prediction.p_50x], 0, 1
+        )
+        levels = np.minimum.accumulate(levels)
+        prediction.p_2x, prediction.p_5x, prediction.p_10x, prediction.p_50x = map(float, levels)
+
     def get_feature_importance(self, target: PredictionTarget) -> Dict[str, float]:
         model = self.models.get(target)
         if not model or not hasattr(model, 'feature_importances_'):
@@ -329,178 +364,203 @@ class MultiHeadPredictor:
 
 
 class ElogwEngine:
+    """Portfolio decision engine using disjoint tail-probability bins."""
+
     def __init__(
         self,
         predictor: MultiHeadPredictor,
         risk_aversion: float = 1.0,
         max_position_pct: float = 0.05,
-        max_portfolio_risk: float = 0.1,
+        max_position_usd: float = 500.0,
+        max_portfolio_risk: float = 0.10,
+        max_total_exposure_pct: float = 0.30,
+        max_concurrent_positions: int = 10,
+        max_daily_loss_usd: float = 1_000.0,
         min_edge_bps: float = 50,
-        rug_penalty_multiplier: float = 3.0,
-        slippage_penalty_multiplier: float = 2.0,
-        uncertainty_penalty: float = 0.5
+        max_liquidity_fraction: float = 0.01,
+        uncertainty_penalty: float = 0.15,
+        drawdown_aversion_lambda: float = 3.0,
     ):
         self.predictor = predictor
-        self.risk_aversion = risk_aversion
+        self.risk_aversion = max(risk_aversion, 0.1)
         self.max_position_pct = max_position_pct
+        self.max_position_usd = max_position_usd
         self.max_portfolio_risk = max_portfolio_risk
+        self.max_total_exposure_pct = max_total_exposure_pct
+        self.max_concurrent_positions = max_concurrent_positions
+        self.max_daily_loss = max_daily_loss_usd
         self.min_edge_bps = min_edge_bps
-        self.rug_penalty = rug_penalty_multiplier
-        self.slippage_penalty = slippage_penalty_multiplier
+        self.max_liquidity_fraction = max_liquidity_fraction
         self.uncertainty_penalty = uncertainty_penalty
-        
-        self.portfolio_value = 10000.0
+        self.drawdown_aversion_lambda = max(0.0, drawdown_aversion_lambda)
+
+        self.portfolio_value = 0.0
         self.open_positions: Dict[str, Dict] = {}
         self.daily_pnl = 0.0
-        self.max_daily_loss = 0.05 * self.portfolio_value
+        self.kill_switch_active = False
 
-    def calculate_expected_log_growth(self, prediction: MultiHeadPrediction, 
-                                       position_size_sol: float,
-                                       current_price: float,
-                                       liquidity_usd: float) -> float:
-        p_2x = prediction.p_2x
-        p_5x = prediction.p_5x
-        p_10x = prediction.p_10x
-        p_rug_30s = prediction.p_rug_30s
-        p_rug_5m = prediction.p_rug_5m
-        p_migration = prediction.p_migration
-        expected_slippage = prediction.expected_slippage
-        expected_hold_time = prediction.expected_hold_time
-        
-        if p_2x == 0 and p_5x == 0 and p_10x == 0:
-            return -float('inf')
-        
-        p_rug = max(p_rug_30s, p_rug_5m)
-        
-        outcomes = []
-        probs = []
-        
-        p_loss = p_rug
-        if p_loss > 0:
-            outcomes.append(-0.95)
-            probs.append(p_loss)
-        
-        p_1x = max(0, 1 - p_2x - p_5x - p_10x - p_loss)
-        if p_1x > 0:
-            outcomes.append(0)
-            probs.append(p_1x)
-        
-        if p_2x > 0:
-            outcomes.append(1.0)
-            probs.append(p_2x * 0.6)
-        
-        if p_5x > 0:
-            outcomes.append(4.0)
-            probs.append(p_5x * 0.3)
-        
-        if p_10x > 0:
-            outcomes.append(9.0)
-            probs.append(p_10x * 0.1)
-        
-        total_p = sum(probs)
-        if total_p == 0:
-            return -float('inf')
-        probs = [p / total_p for p in probs]
-        
-        fees_bps = 30
-        slippage_cost = expected_slippage * self.slippage_penalty
-        execution_cost = (fees_bps + slippage_cost * 10000) / 10000
-        
-        net_outcomes = [o - execution_cost for o in outcomes]
-        
-        kelly_fractions = []
-        for i, (outcome, prob) in enumerate(zip(net_outcomes, probs)):
-            if outcome > 0:
-                kelly_f = (prob * outcome - (1 - prob) * abs(min(net_outcomes))) / outcome
-                kelly_fractions.append(max(0, kelly_f))
-            else:
-                kelly_fractions.append(0)
-        
-        avg_kelly = np.mean(kelly_fractions) if kelly_fractions else 0
-        kelly_fraction = avg_kelly / self.risk_aversion
-        
-        uncertainty = 1 - (p_2x + p_5x + p_10x)
-        kelly_fraction *= (1 - uncertainty * self.uncertainty_penalty)
-        
-        if p_rug > 0.2:
-            kelly_fraction *= (1 - p_rug * self.rug_penalty)
-        
-        kelly_fraction = max(0, min(kelly_fraction, self.max_position_pct))
-        
-        position_value = self.portfolio_value * kelly_fraction
-        position_size_sol = position_value / current_price if current_price > 0 else 0
-        
-        expected_log_growth = 0
-        for outcome, prob in zip(net_outcomes, probs):
-            if outcome > -1:
-                expected_log_growth += prob * np.log(1 + kelly_fraction * outcome)
-        
-        expected_log_growth -= self.uncertainty_penalty * uncertainty * kelly_fraction
-        expected_log_growth -= p_rug * self.rug_penalty * kelly_fraction
-        
-        return expected_log_growth, kelly_fraction, position_size_sol
+    @staticmethod
+    def probability_bins(prediction: MultiHeadPrediction) -> List[Tuple[str, float, float]]:
+        """Convert cumulative P(2x/5x/10x/50x) into disjoint outcomes.
 
-    def should_trade(self, prediction: MultiHeadPrediction, 
-                     current_price: float, liquidity_usd: float,
-                     portfolio_value: float) -> Tuple[bool, Dict]:
-        self.portfolio_value = portfolio_value
-        
-        if prediction.p_rug_30s > 0.4 or prediction.p_rug_5m > 0.5:
-            return False, {"reason": "rug_risk_too_high", "p_rug_30s": prediction.p_rug_30s, "p_rug_5m": prediction.p_rug_5m}
-        
-        if prediction.p_2x < 0.1 and prediction.p_5x < 0.05:
-            return False, {"reason": "insufficient_upside", "p_2x": prediction.p_2x, "p_5x": prediction.p_5x}
-        
-        if prediction.expected_slippage > 0.15:
-            return False, {"reason": "slippage_too_high", "expected_slippage": prediction.expected_slippage}
-        
-        if liquidity_usd < 5000:
-            return False, {"reason": "liquidity_too_low", "liquidity_usd": liquidity_usd}
-        
-        expected_log_growth, kelly_fraction, position_size = self.calculate_expected_log_growth(
-            prediction, 0, current_price, liquidity_usd
+        Returns ``(name, probability, gross return)``. Tail buckets use their
+        conservative lower bound rather than an optimistic midpoint.
+        """
+        MultiHeadPredictor._enforce_nested_monotonicity(prediction)
+        p2, p5, p10, p50 = prediction.p_2x, prediction.p_5x, prediction.p_10x, prediction.p_50x
+        survival = [
+            ("under_2x", max(0.0, 1.0 - p2), -0.35),
+            ("2x_to_5x", max(0.0, p2 - p5), 1.0),
+            ("5x_to_10x", max(0.0, p5 - p10), 4.0),
+            ("10x_to_50x", max(0.0, p10 - p50), 9.0),
+            ("50x_plus", max(0.0, p50), 49.0),
+        ]
+        p_rug = float(np.clip(max(prediction.p_rug_30s, prediction.p_rug_5m), 0, 1))
+        bins = [(name, probability * (1 - p_rug), outcome) for name, probability, outcome in survival]
+        bins.append(("rug", p_rug, -0.98))
+        total = sum(probability for _, probability, _ in bins)
+        return [(name, probability / total, outcome) for name, probability, outcome in bins] if total else []
+
+    def calculate_expected_log_growth(
+        self,
+        prediction: MultiHeadPrediction,
+        sol_price_usd: float,
+        liquidity_usd: float,
+    ) -> Tuple[float, float, float]:
+        if self.portfolio_value <= 0 or sol_price_usd <= 0 or liquidity_usd <= 0:
+            return -float("inf"), 0.0, 0.0
+        bins = self.probability_bins(prediction)
+        if not bins or prediction.p_2x <= 0:
+            return -float("inf"), 0.0, 0.0
+
+        execution_cost = 0.003 + max(0.0, prediction.expected_slippage)
+        probabilities = np.array([probability for _, probability, _ in bins], dtype=float)
+        returns = np.array([outcome - execution_cost for _, _, outcome in bins], dtype=float)
+        entropy = -float(np.sum(probabilities * np.log(np.clip(probabilities, 1e-12, 1))))
+        entropy /= max(np.log(len(probabilities)), 1e-12)
+
+        exposure_cap = min(
+            self.max_position_pct,
+            self.max_position_usd / self.portfolio_value,
+            liquidity_usd * self.max_liquidity_fraction / self.portfolio_value,
         )
-        
-        if expected_log_growth <= 0:
-            return False, {"reason": "negative_expected_growth", "elogw": expected_log_growth}
-        
-        edge_bps = expected_log_growth * 10000
-        if edge_bps < self.min_edge_bps:
-            return False, {"reason": "edge_below_threshold", "edge_bps": edge_bps, "threshold": self.min_edge_bps}
-        
-        current_portfolio_risk = sum(pos.get("risk_contribution", 0) for pos in self.open_positions.values())
-        position_risk = kelly_fraction * (prediction.p_rug_30s + prediction.p_rug_5m)
-        
-        if current_portfolio_risk + position_risk > self.max_portfolio_risk:
-            return False, {"reason": "portfolio_risk_limit", "current_risk": current_portfolio_risk, "position_risk": position_risk}
-        
+        if exposure_cap <= 0:
+            return -float("inf"), 0.0, 0.0
+        fractions = np.linspace(0, exposure_cap, 401)
+        growth = []
+        for fraction in fractions:
+            wealth = 1 + fraction * returns
+            if np.any(wealth <= 0):
+                growth.append(-float("inf"))
+                continue
+            # Risk-constrained Kelly drawdown surrogate: E[W^-lambda] <= 1.
+            # This preserves the log-growth objective while rejecting fractions
+            # whose modeled tail distribution violates the configured bound.
+            if self.drawdown_aversion_lambda > 0:
+                drawdown_moment = float(np.sum(probabilities * wealth ** (-self.drawdown_aversion_lambda)))
+                if drawdown_moment > 1.0 + 1e-12:
+                    growth.append(-float("inf"))
+                    continue
+            value = float(np.sum(probabilities * np.log(wealth)))
+            value -= self.uncertainty_penalty * entropy * fraction
+            growth.append(value / self.risk_aversion)
+        index = int(np.argmax(growth))
+        fraction = float(fractions[index])
+        position_value = self.portfolio_value * fraction
+        return float(growth[index]), fraction, position_value / sol_price_usd
+
+    def should_trade(
+        self,
+        prediction: MultiHeadPrediction,
+        sol_price_usd: float,
+        liquidity_usd: float,
+        portfolio_value: float,
+    ) -> Tuple[bool, Dict]:
+        self.portfolio_value = max(0.0, portfolio_value)
+        if not self.predictor._is_trained:
+            return False, {"reason": "DATA_BLOCKED", "detail": "no validated multi-head model bundle"}
+        if self.kill_switch_active or self.daily_pnl <= -self.max_daily_loss:
+            self.kill_switch_active = True
+            return False, {"reason": "daily_loss_kill_switch", "daily_pnl": self.daily_pnl}
+        if self.portfolio_value <= 0 or sol_price_usd <= 0:
+            return False, {"reason": "DATA_BLOCKED", "detail": "wallet equity or SOL/USD unavailable"}
+        if len(self.open_positions) >= self.max_concurrent_positions:
+            return False, {"reason": "max_concurrent_positions"}
+        if prediction.p_rug_30s > 0.40 or prediction.p_rug_5m > 0.50:
+            return False, {"reason": "rug_risk_too_high"}
+        if prediction.p_2x < 0.10 or prediction.p_5x < 0.05:
+            return False, {"reason": "insufficient_upside"}
+        if prediction.expected_slippage < 0 or prediction.expected_slippage > 0.15:
+            return False, {"reason": "slippage_too_high"}
+        if liquidity_usd < 5_000:
+            return False, {"reason": "liquidity_too_low", "liquidity_usd": liquidity_usd}
+
+        elogw, fraction, size_sol = self.calculate_expected_log_growth(prediction, sol_price_usd, liquidity_usd)
+        edge_bps = elogw * 10_000
+        if not np.isfinite(elogw) or edge_bps < self.min_edge_bps:
+            return False, {"reason": "edge_below_threshold", "edge_bps": edge_bps}
+
+        position_value = size_sol * sol_price_usd
+        current_exposure = sum(float(pos.get("remaining_cost_usd", pos.get("cost_basis_usd", 0))) for pos in self.open_positions.values())
+        if current_exposure + position_value > self.portfolio_value * self.max_total_exposure_pct:
+            return False, {"reason": "total_exposure_limit"}
+        current_risk = sum(float(pos.get("risk_contribution", 0)) for pos in self.open_positions.values())
+        p_rug = max(prediction.p_rug_30s, prediction.p_rug_5m)
+        position_risk = fraction * p_rug
+        if current_risk + position_risk > self.max_portfolio_risk:
+            return False, {"reason": "portfolio_risk_limit"}
+
         return True, {
-            "elogw": expected_log_growth,
-            "kelly_fraction": kelly_fraction,
-            "position_size_sol": position_size,
-            "position_value_usd": portfolio_value * kelly_fraction,
+            "elogw": elogw,
+            "kelly_fraction": fraction,
+            "position_size_sol": size_sol,
+            "position_value_usd": position_value,
+            "risk_contribution": position_risk,
             "edge_bps": edge_bps,
-            "p_rug": max(prediction.p_rug_30s, prediction.p_rug_5m),
-            "expected_slippage": prediction.expected_slippage
+            "p_rug": p_rug,
+            "probability_bins": self.probability_bins(prediction),
+            "drawdown_aversion_lambda": self.drawdown_aversion_lambda,
         }
 
     def update_position(self, token: str, position_data: Dict):
+        if token in self.open_positions:
+            raise ValueError(f"position already exists for {token}")
+        required = {"size_tokens", "remaining_cost_usd", "risk_contribution"}
+        missing = required.difference(position_data)
+        if missing:
+            raise ValueError(f"position missing risk/accounting fields: {sorted(missing)}")
+        position_data.setdefault("initial_size_tokens", int(position_data["size_tokens"]))
+        position_data.setdefault("initial_risk_contribution", float(position_data["risk_contribution"]))
         self.open_positions[token] = position_data
+
+    def reduce_position(self, token: str, sold_tokens: int, allocated_cost_usd: float):
+        position = self.open_positions[token]
+        position["size_tokens"] = max(0, int(position["size_tokens"]) - int(sold_tokens))
+        position["remaining_cost_usd"] = max(0.0, float(position["remaining_cost_usd"]) - allocated_cost_usd)
+        original = max(float(position.get("initial_size_tokens", position["size_tokens"])), 1)
+        initial_risk = float(position.get("initial_risk_contribution", position["risk_contribution"]))
+        position["risk_contribution"] = initial_risk * position["size_tokens"] / original
+        if position["size_tokens"] == 0:
+            self.close_position(token)
 
     def close_position(self, token: str):
         self.open_positions.pop(token, None)
 
     def update_pnl(self, pnl: float):
-        self.daily_pnl += pnl
-        if self.daily_pnl < -self.max_daily_loss:
-            logger.warning(f"Daily loss limit approached: {self.daily_pnl:.2f}")
+        self.daily_pnl += float(pnl)
+        if self.daily_pnl <= -self.max_daily_loss:
+            self.kill_switch_active = True
+            logger.critical("Daily loss kill switch activated: %.2f", self.daily_pnl)
 
     def get_portfolio_state(self) -> Dict:
+        exposure = sum(float(pos.get("remaining_cost_usd", 0)) for pos in self.open_positions.values())
         return {
             "portfolio_value": self.portfolio_value,
             "daily_pnl": self.daily_pnl,
             "open_positions": len(self.open_positions),
-            "portfolio_risk": sum(pos.get("risk_contribution", 0) for pos in self.open_positions.values()),
+            "exposure_usd": exposure,
+            "portfolio_risk": sum(float(pos.get("risk_contribution", 0)) for pos in self.open_positions.values()),
             "max_daily_loss": self.max_daily_loss,
-            "risk_budget_remaining": max(0, self.max_daily_loss + self.daily_pnl)
+            "kill_switch_active": self.kill_switch_active,
+            "risk_budget_remaining": max(0.0, self.max_daily_loss + self.daily_pnl),
         }

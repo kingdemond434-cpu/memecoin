@@ -1,161 +1,149 @@
-# Memecoin Quant Desk
+# Memecoin Shadow Research Desk
 
-A production-grade Solana memecoin prediction and execution system built on quantitative research principles.
+Solana-native launch research, prediction, risk, and execution simulation. The
+repository defaults to **dry-run** and does not ship a trained production model.
+It cannot promise a return, and a target such as 10% per day is not a realistic
+or safe operating assumption.
 
-## Architecture Overview
+## What is implemented
 
+- Pump.fun bonding-curve and PumpSwap decoders derived from the official IDLs.
+- Raydium AMM v4 pool/swap parsing; CPMM and CLMM are subscribed but explicitly
+  not decoded until their native layouts and historical fixtures are added.
+- Yellowstone gRPC with vendored official protobuf bindings, handshake
+  validation, reconnection, and a confirmed-RPC fallback.
+- Native SPL and Token-2022 mint-authority, freeze-authority, extension,
+  concentration, and Jupiter sell-route checks.
+- Point-in-time launch episodes, immutable snapshot timestamps, observed price
+  paths, route-feasible outcomes, P50X labels, and persistent outcome indices.
+- FIFO wallet round-trip scoring, public-chain coordination inference, public
+  social/research discovery, creator genealogy, and continuous rug hazard.
+- Nested probability correction, disjoint outcome bins, net expected-log-wealth,
+  risk-constrained Kelly sizing, live equity/SOL-USD inputs, and hard exposure
+  limits.
+- Champion/challenger registration, shadow-only research hypotheses, execution
+  counterfactuals, partial-exit cost basis, profit ratchets, and adaptive exits.
+- Correct Solana `VersionedTransaction` signing plus distinct simulated,
+  submitted, landed, and filled execution states.
+
+Missing data is reported as `DATA_BLOCKED`; it is not replaced with a zero or a
+made-up value. Discovery never grants execution authority. A model must first
+pass chronological out-of-sample and forward-shadow promotion gates.
+
+## Safety boundary
+
+The Docker image, Compose stack, system service, and documented commands all
+launch with `--dry-run`. Dry-run stops before swap construction, signing, Jito
+submission, or RPC transaction submission. It uses an ephemeral paper wallet
+and does not need a private key.
+
+The source contains a separately gated live code path for audit/testing. It is
+not enabled or deployed here. Do not add `SOLANA_PRIVATE_KEY` or
+`ALLOW_LIVE_TRADING` to the shadow environment.
+
+## Architecture
+
+```text
+official program streams / confirmed RPC fallback
+                |
+        native transaction decoders
+                |
+ SPL safety + wallet/social/public-chain intelligence
+                |
+       point-in-time launch episode lake
+                |
+ challenger prediction -> net E[log W] -> hard risk gate
+                |
+       dry execution + counterfactual policies
+                |
+ observed outcomes -> chronological promotion evidence
 ```
-GLOBAL INTELLIGENCE (Hourly)
-    ├─ Wallet Discovery & Reranking
-    ├─ X/Social Mining (Multi-language)
-    ├─ Sniper/Competitor Reverse Engineering
-    ├─ Pre-launch Entity Intent Detection
-    └─ Failure Mining & Hypothesis Generation
-           ↓
-POINT-IN-TIME LAUNCH LAKE (Continuous)
-    ├─ Yellowstone gRPC Real-time Streams
-    ├─ Pump.fun / Raydium / Meteora Monitoring
-    ├─ Wallet/Deployer Genealogy Graph
-    ├─ Information Lead Graph
-    └─ Counterfactual Execution Lab
-           ↓
-MULTI-HEAD PREDICTORS
-    ├─ P(2x), P(5x), P(10x), P(50x)
-    ├─ P(Migration)
-    ├─ P(Rug 30s/5m)
-    ├─ Expected Slippage / Liquidity
-    └─ Champion/Challenger Framework
-           ↓
-E[log W] KELLY ENGINE
-    ├─ Robust Expected Log Growth
-    ├─ Capacity-Aware Position Sizing
-    ├─ Dynamic Rug Hazard Exit
-    └─ Right-Tail Preservation
-           ↓
-EXECUTION ENGINE
-    ├─ Jupiter v6 Aggregator
-    ├─ Jito Bundles + MEV Protection
-    ├─ Priority Fee Optimization
-    └─ Real-time Landing Monitor
+
+The MT5 quant should remain a separate service. Share research protocols and
+approved experiment artifacts through a narrow versioned bridge; do not share
+wallet keys, execution code, datasets, processes, or capital.
+
+## Exact local dry-run commands
+
+Windows PowerShell:
+
+```powershell
+py -3.11 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+.venv\Scripts\python.exe -m src.main --dry-run --smoke-test
+.venv\Scripts\python.exe -m src.main --dry-run --run-seconds 60
 ```
 
-## Key Features
-
-- **Hourly Research Factory**: Discovers wallets, X accounts, narratives, sniper mechanisms
-- **Continuous Trading Brain**: Sub-second launch detection, wallet tracking, rug hazard
-- **Point-in-Time Correctness**: No future leakage in backtests or live features
-- **Multi-Head Probabilities**: Separate models for each outcome, not a single "gem score"
-- **Champion/Challenger**: Frozen production models, hourly research mutations
-- **Counterfactual Lab**: Every trade simulated across execution policies
-- **Adversarial Detection**: Auto-downweights fakeable signals
-- **E[log W] Optimization**: Kelly sizing with tail risk, capacity, uncertainty penalties
-
-## Quick Start
-
-### Prerequisites
-- Docker & Docker Compose
-- 4GB+ RAM (Hetzner CX41 or similar)
-- Solana wallet private key (base64 encoded)
-- Helius API key (for Yellowstone gRPC + enhanced APIs)
-- Twitter/X Bearer Token (Elevated/Enterprise for real-time mentions)
-
-### Deployment
+Linux/macOS:
 
 ```bash
-# 1. Clone and configure
-git clone <repo>
-cd memecoin-bot
+python3.11 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m src.main --dry-run --smoke-test
+.venv/bin/python -m src.main --dry-run --run-seconds 60
+```
+
+The networked run can use public Solana RPC. For timely and broader collection,
+copy `.env.example` to `.env` and add data-provider credentials only.
+
+## Isolated Docker shadow run
+
+```bash
 cp .env.example .env
-# Edit .env with your keys
-
-# 2. Deploy (run as root)
-sudo ./deploy.sh
-
-# 3. Start service
-systemctl start memecoin-bot
-
-# 4. Monitor
-journalctl -u memecoin-bot -f
-curl http://localhost:8080/health
+docker compose -p memecoin-shadow build
+docker compose -p memecoin-shadow up -d
+curl http://127.0.0.1:18080/health
+docker compose -p memecoin-shadow logs -f desk
 ```
 
-### Manual Docker Run
+The health port binds only to loopback. Persistent data lives in `data/`,
+`models/`, and `logs/`; the rest of the container filesystem is read-only.
+
+## VPS shadow deployment
+
+`deploy.sh` installs only `/opt/memecoin-shadow` and the distinct
+`memecoin-shadow.service`. It refuses an environment containing a wallet key or
+live acknowledgement and does not stop or replace another quant service.
 
 ```bash
-docker compose build
-docker compose up -d
-docker compose logs -f
+sudo ./deploy.sh
+systemctl status memecoin-shadow
+curl http://127.0.0.1:18080/status
+journalctl -u memecoin-shadow -f
 ```
 
-## Configuration
+## Data credentials and honest blockers
 
-All chain-specific config in `config/chains.yaml`:
-- RPC endpoints with failover
-- Factory/router addresses
-- Base tokens per chain
-- Risk parameters (min liquidity, max tax, etc.)
+- `YELLOWSTONE_GRPC_URL` and token: lowest-latency program stream. Without it,
+  confirmed RPC polling is slower and provider-rate-limited.
+- `HELIUS_API_KEY`: enhanced address transaction history for wallet round trips.
+- `X_BEARER_TOKEN`, `TELEGRAM_BOT_TOKEN`, and `REDDIT_CLIENT_ID`: optional public
+  social sources. Telegram Bot API cannot search arbitrary public channels.
+- `GITHUB_TOKEN`: optional higher public-research API quota. Only repositories
+  with an identified compatible license become research leads; all leads remain
+  challengers pending evidence.
+- A versioned, chronologically validated model bundle is still required before
+  prediction status changes from `DATA_BLOCKED`. No constant-score fallback is
+  used.
+- PumpSwap has exact native parsing. Raydium CPMM/CLMM, Meteora, and Orca require
+  their own official-layout decoders and real fixtures before being marked OK.
 
-Global settings in `config/chains.yaml` under `global:`:
-- `max_position_size_usd`, `max_daily_loss_usd`
-- `min_profit_target_pct`, `stop_loss_pct`
-- `dry_run: true` for testing
+## Tests
 
-## API Endpoints
+The suite covers dry-run non-submission, the independent live lock,
+VersionedTransaction signatures, native mint checks, nested P2/P5/P10/P50 math,
+risk-constrained sizing, partial cost basis, chain-aware RPC health, PumpSwap and
+Raydium layouts, FIFO wallet scoring, point-in-time leakage, counterfactuals,
+public coordination, and rug hazard. A reduced fixture from Solana mainnet slot
+`441417557` exercises the same Pump.fun inner-instruction decoder used live.
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /health` | Basic health check |
-| `GET /metrics` | Portfolio PnL, positions |
-| `GET /status` | Full system status |
+## Upstream specifications
 
-## Monitoring
+- [Pump.fun public IDLs](https://github.com/pump-fun/pump-public-docs)
+- [Yellowstone gRPC protobuf](https://github.com/rpcpool/yellowstone-grpc/tree/master/yellowstone-grpc-proto)
+- [Risk-constrained Kelly gambling](https://arxiv.org/abs/1603.06183)
 
-Key metrics to watch:
-- **Daily PnL vs max_daily_loss**
-- **Win rate** (target > 35% for positive E[log W])
-- **Open positions** (max 10 concurrent)
-- **Rug hazard alerts** (CRITICAL/HIGH)
-- **Execution success rate** per route
-- **Champion model decay scores**
-
-## Research Workflow
-
-1. **Hourly**: Wallet/X/sniper discovery → hypothesis extraction → cheap falsification
-2. **Async**: Historical PIT replay → ML training → chronological OOS
-3. **Promotion**: Challenger → Shadow (168h) → Canary (72h) → Champion
-4. **Decay Monitoring**: Auto-hibernate decaying champions
-5. **Source ROI**: Research budget allocates to high-yield sources
-
-## Safety
-
-- **Dry run mode**: Set `dry_run: true` in config
-- **Daily loss limit**: Hard stop at `max_daily_loss_usd`
-- **Rug hazard**: Auto-exit on CRITICAL/HIGH
-- **Time stop**: Auto-exit after 60 min hold
-- **Position caps**: Max 5% portfolio per position, 10% total risk
-
-## Directory Structure
-
-```
-memecoin-bot/
-├── config/chains.yaml          # Chain & global config
-├── src/
-│   ├── main.py                 # Orchestrator
-│   ├── chains/                 # RPC, Yellowstone gRPC
-│   ├── detection/              # Token detection, rug detection
-│   ├── strategies/             # Intelligence engines, predictors
-│   ├── execution/              # Jupiter, Jito, fee optimizer
-│   └── research/               # PIT dataset builder
-├── data/launch_episodes/       # Compressed JSONL episodes
-├── models/                     # Trained predictors
-├── logs/
-├── Dockerfile
-├── docker-compose.yml
-├── deploy.sh
-├── memecoin-bot.service        # Systemd unit
-└── requirements.txt
-```
-
-## License
-
-Proprietary - All rights reserved.
+Repository licensing has not been specified by the owner. Public research
+mining does not change that and does not authorize copying incompatible code.

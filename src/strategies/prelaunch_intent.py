@@ -86,6 +86,9 @@ class PrelaunchIntentModel:
         self.entities: Dict[str, EntityIntentProfile] = {}
         self.signals: deque = deque(maxlen=10000)
         self.pending_launches: Dict[str, Dict] = {}
+        self.data_status: Dict[str, str] = {}
+        self._external_signals: deque = deque(maxlen=10_000)
+        self._seen_cluster_memberships: Set[Tuple[str, str]] = set()
         
         self._session: Optional[aiohttp.ClientSession] = None
         self._running = False
@@ -155,22 +158,10 @@ class PrelaunchIntentModel:
             await asyncio.sleep(300)
 
     async def _scan_new_funding(self):
-        try:
-            async with self._session.get(
-                f"https://api.helius.xyz/v0/transactions",
-                params={
-                    "api-key": self.helius_key,
-                    "type": "TRANSFER",
-                    "limit": 200,
-                    "commitment": "processed"
-                }
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for tx in data:
-                        await self._process_funding_transfer(tx)
-        except Exception as e:
-            logger.debug(f"Funding scan error: {e}")
+        # Helius enhanced transactions supports address history, not an
+        # unbounded global `/transactions` firehose. Funding signals must come
+        # from an authenticated webhook/stream through `record_external_signal`.
+        await self._consume_external(IntentSignal.FUNDING_ARRIVAL, "funding")
 
     async def _process_funding_transfer(self, tx: Dict):
         try:
@@ -209,13 +200,26 @@ class PrelaunchIntentModel:
             logger.debug(f"Funding transfer process error: {e}")
 
     async def _scan_wallet_clusters(self):
-        pass
+        observed = 0
+        for cluster_id, cluster in self.genealogy.clusters.items():
+            for entity in cluster.deployers:
+                key = (cluster_id, entity)
+                if key in self._seen_cluster_memberships:
+                    continue
+                self._seen_cluster_memberships.add(key)
+                evidence = {"cluster_id": cluster_id, "wallets": sorted(cluster.wallets), "timestamp": time.time()}
+                signal = PrelaunchSignal(entity, IntentSignal.WALLET_CLUSTER_CREATION,
+                                         min(len(cluster.wallets) / 10, 1), evidence["timestamp"], evidence)
+                self.signals.append(signal)
+                await self._update_entity_signal(entity, signal)
+                observed += 1
+        self.data_status["wallet_clusters"] = "OK" if observed or self.genealogy.clusters else "DATA_BLOCKED: no observed clusters"
 
     async def _scan_metadata(self):
-        pass
+        await self._consume_external(IntentSignal.METADATA_CREATION, "metadata")
 
     async def _scan_social_accounts(self):
-        pass
+        await self._consume_external(IntentSignal.SOCIAL_ACCOUNT_CREATION, "social_accounts")
 
     async def _scan_deployer_activation(self):
         for deployer_addr, dp in self.genealogy.deployers.items():
@@ -233,7 +237,37 @@ class PrelaunchIntentModel:
                     self.signals.append(signal)
 
     async def _scan_infrastructure(self):
-        pass
+        await self._consume_external(IntentSignal.INFRASTRUCTURE_INTERACTION, "infrastructure")
+
+    def record_external_signal(self, entity: str, signal_type: IntentSignal, evidence: Dict[str, Any],
+                               strength: float = 0.5, timestamp: Optional[float] = None):
+        self._external_signals.append(PrelaunchSignal(
+            entity=entity, signal_type=signal_type, strength=max(0.0, min(1.0, strength)),
+            timestamp=timestamp or time.time(), evidence=dict(evidence),
+        ))
+
+    def record_metadata_creation(self, entity: str, evidence: Dict[str, Any], timestamp: Optional[float] = None):
+        self.record_external_signal(entity, IntentSignal.METADATA_CREATION, evidence, 0.6, timestamp)
+
+    def record_social_creation(self, entity: str, evidence: Dict[str, Any], timestamp: Optional[float] = None):
+        self.record_external_signal(entity, IntentSignal.SOCIAL_ACCOUNT_CREATION, evidence, 0.5, timestamp)
+
+    def record_infrastructure_interaction(self, entity: str, evidence: Dict[str, Any], timestamp: Optional[float] = None):
+        self.record_external_signal(entity, IntentSignal.INFRASTRUCTURE_INTERACTION, evidence, 0.7, timestamp)
+
+    async def _consume_external(self, signal_type: IntentSignal, status_key: str):
+        matched = [item for item in list(self._external_signals) if item.signal_type == signal_type]
+        if not matched:
+            self.data_status[status_key] = "DATA_BLOCKED: no registered source observations"
+            return
+        for signal in matched:
+            self.signals.append(signal)
+            await self._update_entity_signal(signal.entity, signal)
+            try:
+                self._external_signals.remove(signal)
+            except ValueError:
+                continue
+        self.data_status[status_key] = "OK"
 
     async def _update_entity_signal(self, entity_addr: str, signal: PrelaunchSignal):
         if entity_addr not in self.entities:
@@ -354,7 +388,13 @@ class PrelaunchIntentModel:
         return min(1, base * (0.3 + 0.7 * time_factor))
 
     def _get_narrative_velocity(self, entity: str) -> float:
-        return 0.0
+        cutoff = time.time() - 3600
+        observations = [signal for signal in self.signals
+                        if signal.entity == entity and signal.timestamp >= cutoff
+                        and signal.signal_type in {IntentSignal.METADATA_CREATION,
+                                                   IntentSignal.SOCIAL_ACCOUNT_CREATION,
+                                                   IntentSignal.NARRATIVE_ACCELERATION}]
+        return float(len(observations))
 
     async def _predict_imminent_launches(self):
         high_intent = [
@@ -442,5 +482,7 @@ class PrelaunchIntentModel:
             "medium_intent": medium,
             "pending_launches": len(self.pending_launches),
             "recent_signals": len(self.signals),
-            "model_trained": self._is_trained
+            "model_trained": self._is_trained,
+            "model_status": "OK" if self._is_trained else "DATA_BLOCKED",
+            "data_status": dict(self.data_status),
         }

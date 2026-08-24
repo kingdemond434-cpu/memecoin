@@ -116,7 +116,7 @@ chains:
     rpc_urls:
       - "https://api.mainnet-beta.solana.com"
       - "https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
-      - "https://rpc.helius.xyz/?api-key=${HELIUS_KEY}"
+      - "https://rpc.helius.xyz/?api-key=${HELIUS_API_KEY}"
     ws_urls:
       - "wss://api.mainnet-beta.solana.com"
       - "wss://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
@@ -138,6 +138,7 @@ chains:
     honeypot_check: false
 
 global:
+  enabled_chains: ["solana"]
   max_concurrent_positions: 10
   max_position_size_usd: 500
   max_daily_loss_usd: 1000
@@ -152,3 +153,8 @@ global:
   jito_tip_lamports: 100000
   log_level: "INFO"
   dry_run: true
+  paper_equity_usd: 10000
+  max_total_exposure_pct: 0.30
+  max_liquidity_fraction: 0.01
+  min_liquidity_usd: 5000
+  reject_data_blocked_safety_checks: true

@@ -1,15 +1,46 @@
+"""Validated Yellowstone client plus Pump.fun and Raydium decoders.
+
+The decoders accept both Yellowstone protobuf updates and canonical Solana
+``getTransaction`` JSON. This makes historical-fixture tests use the exact same
+path as the live feed, including inner CPI instructions.
+"""
+
 import asyncio
+import base64
+import hashlib
+import importlib
 import logging
+import struct
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Set
-import base64
+from typing import Any, AsyncIterator, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from urllib.parse import urlparse
 
 import grpc
-from google.protobuf import descriptor_pb2
 
 logger = logging.getLogger(__name__)
+
+B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def b58encode(raw: bytes) -> str:
+    number = int.from_bytes(raw, "big")
+    encoded = bytearray()
+    while number:
+        number, remainder = divmod(number, 58)
+        encoded.append(B58_ALPHABET[remainder])
+    zeros = len(raw) - len(raw.lstrip(b"\0"))
+    return (B58_ALPHABET[:1] * zeros + bytes(reversed(encoded or b""))).decode("ascii")
+
+
+def b58decode(value: str) -> bytes:
+    number = 0
+    for char in value.encode("ascii"):
+        number = number * 58 + B58_ALPHABET.index(char)
+    raw = number.to_bytes((number.bit_length() + 7) // 8, "big") if number else b""
+    zeros = len(value) - len(value.lstrip("1"))
+    return b"\0" * zeros + raw
 
 
 class SolanaCommitment(Enum):
@@ -19,34 +50,17 @@ class SolanaCommitment(Enum):
 
 
 @dataclass
-class AccountFilter:
-    owner: Optional[str] = None
-    memcmp: Optional[Dict] = None
-    data_size: Optional[int] = None
-
-
-@dataclass
 class TransactionFilter:
     accounts_include: List[str] = field(default_factory=list)
     accounts_exclude: List[str] = field(default_factory=list)
+    accounts_required: List[str] = field(default_factory=list)
     vote: bool = False
     failed: bool = False
 
 
 @dataclass
-class BlockFilter:
-    include_transactions: bool = True
-    include_accounts: bool = False
-    include_entries: bool = False
-
-
-@dataclass
 class SubscribeRequest:
-    accounts: Dict[str, AccountFilter] = field(default_factory=dict)
     transactions: Dict[str, TransactionFilter] = field(default_factory=dict)
-    blocks: Dict[str, BlockFilter] = field(default_factory=dict)
-    blocks_meta: bool = False
-    slots: Dict[str, bool] = field(default_factory=dict)
     commitment: SolanaCommitment = SolanaCommitment.PROCESSED
 
 
@@ -55,340 +69,487 @@ class YellowstoneClient:
         self.endpoint = endpoint
         self.x_token = x_token
         self._channel: Optional[grpc.aio.Channel] = None
-        self._stub = None
-        self._stream = None
+        self._stub: Any = None
+        self._proto: Any = None
+        self._stream: Any = None
+        self._stream_task: Optional[asyncio.Task] = None
         self._running = False
         self._handlers: Dict[str, List[Callable]] = {}
         self._subscribe_request: Optional[SubscribeRequest] = None
         self._reconnect_attempts = 0
-        self._max_reconnect_attempts = 10
-        self._base_reconnect_delay = 1.0
+        self.status = "NOT_STARTED"
+        self.status_detail = ""
 
-    async def connect(self):
-        self._channel = grpc.aio.secure_channel(
-            self.endpoint,
-            grpc.ssl_channel_credentials(),
-            options=[
-                ('grpc.max_receive_message_length', 100 * 1024 * 1024),
-                ('grpc.max_send_message_length', 100 * 1024 * 1024),
-                ('grpc.keepalive_time_ms', 30000),
-                ('grpc.keepalive_timeout_ms', 10000),
-                ('grpc.keepalive_permit_without_calls', True),
-                ('grpc.http2.max_pings_without_data', 0),
-            ]
+    @property
+    def available(self) -> bool:
+        return self._stub is not None and self.status not in {"DATA_BLOCKED", "INVALID"}
+
+    def validate_setup(self) -> Dict[str, Any]:
+        parsed = urlparse(self.endpoint)
+        if parsed.scheme not in {"https", "http"} or not parsed.netloc:
+            return {"status": "INVALID", "detail": "YELLOWSTONE_GRPC_URL must be an http(s) URL"}
+        for pb2_name, grpc_name in (
+            ("src.chains.generated.geyser_pb2", "src.chains.generated.geyser_pb2_grpc"),
+            ("geyser_pb2", "geyser_pb2_grpc"),
+            ("yellowstone_grpc.geyser_pb2", "yellowstone_grpc.geyser_pb2_grpc"),
+        ):
+            try:
+                proto = importlib.import_module(pb2_name)
+                proto_grpc = importlib.import_module(grpc_name)
+                return {"status": "OK", "proto": proto, "proto_grpc": proto_grpc}
+            except ImportError:
+                continue
+        return {
+            "status": "DATA_BLOCKED",
+            "detail": "generated Yellowstone geyser_pb2/geyser_pb2_grpc modules are not installed",
+        }
+
+    async def connect(self) -> bool:
+        validation = self.validate_setup()
+        self.status = validation["status"]
+        self.status_detail = validation.get("detail", "")
+        if self.status != "OK":
+            logger.warning("Yellowstone %s: %s", self.status, self.status_detail)
+            return False
+        self._proto = validation["proto"]
+        parsed = urlparse(self.endpoint)
+        target = parsed.netloc or self.endpoint
+        options = [
+            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+            ("grpc.keepalive_time_ms", 30_000),
+            ("grpc.keepalive_timeout_ms", 10_000),
+        ]
+        self._channel = (
+            grpc.aio.secure_channel(target, grpc.ssl_channel_credentials(), options=options)
+            if parsed.scheme == "https"
+            else grpc.aio.insecure_channel(target, options=options)
         )
-        
+        self._stub = validation["proto_grpc"].GeyserStub(self._channel)
+        metadata = (("x-token", self.x_token),) if self.x_token else ()
         try:
-            from geyser_pb2_grpc import GeyserStub
-            from geyser_pb2 import SubscribeRequest as GrpcSubscribeRequest
-            self._stub = GeyserStub(self._channel)
-            self._GrpcSubscribeRequest = GrpcSubscribeRequest
-        except ImportError:
-            logger.warning("geyser_pb2 not installed, using generic gRPC")
+            await asyncio.wait_for(
+                self._stub.GetVersion(self._proto.GetVersionRequest(), metadata=metadata), timeout=10
+            )
+            self.status = "READY"
+            return True
+        except Exception as exc:
+            self.status = "DATA_BLOCKED"
+            self.status_detail = f"Yellowstone handshake failed: {exc}"
+            await self._channel.close()
+            self._channel = None
             self._stub = None
+            return False
 
-    async def subscribe(self, request: SubscribeRequest):
+    async def subscribe(self, request: SubscribeRequest) -> bool:
+        if not self.available:
+            return False
         self._subscribe_request = request
         self._running = True
-        self._reconnect_attempts = 0
-        asyncio.create_task(self._stream_loop())
+        self._stream_task = asyncio.create_task(self._stream_loop())
+        return True
+
+    async def _request_iterator(self) -> AsyncIterator[Any]:
+        yield self._build_grpc_request(self._subscribe_request)
+        while self._running:
+            await asyncio.sleep(15)
+            ping = self._proto.SubscribeRequest()
+            if hasattr(ping, "ping"):
+                ping.ping.id = int(time.time()) & 0x7FFFFFFF
+            yield ping
 
     async def _stream_loop(self):
         while self._running:
             try:
-                await self._establish_stream()
-            except Exception as e:
-                logger.error(f"Yellowstone stream error: {e}")
-                if not await self._handle_reconnect():
-                    break
-
-    async def _establish_stream(self):
-        if not self._stub:
-            raise RuntimeError("Geyser stub not available. Install geyser-proto-py")
-        
-        grpc_request = self._build_grpc_request(self._subscribe_request)
-        
-        metadata = []
-        if self.x_token:
-            metadata.append(('x-token', self.x_token))
-        
-        self._stream = self._stub.Subscribe(grpc_request, metadata=metadata)
-        
-        async for response in self._stream:
-            await self._handle_response(response)
+                metadata = (("x-token", self.x_token),) if self.x_token else ()
+                self._stream = self._stub.Subscribe(self._request_iterator(), metadata=metadata)
+                self.status = "STREAMING"
+                self._reconnect_attempts = 0
+                async for response in self._stream:
+                    await self._handle_response(response)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.status = "DEGRADED"
+                self.status_detail = str(exc)
+                self._reconnect_attempts += 1
+                if self._reconnect_attempts > 10:
+                    self.status = "DATA_BLOCKED"
+                    return
+                await asyncio.sleep(min(30, 2 ** (self._reconnect_attempts - 1)))
 
     def _build_grpc_request(self, request: SubscribeRequest) -> Any:
-        grpc_req = self._GrpcSubscribeRequest()
-        
-        if request.commitment == SolanaCommitment.PROCESSED:
-            grpc_req.commitment = 0
-        elif request.commitment == SolanaCommitment.CONFIRMED:
-            grpc_req.commitment = 1
-        else:
-            grpc_req.commitment = 2
-        
-        for key, acc_filter in request.accounts.items():
-            acc = grpc_req.accounts[key]
-            if acc_filter.owner:
-                acc.owner.append(acc_filter.owner)
-            if acc_filter.memcmp:
-                memcmp = acc.memcmp.add()
-                memcmp.offset = acc_filter.memcmp.get("offset", 0)
-                memcmp.bytes = base64.b64decode(acc_filter.memcmp.get("bytes", ""))
-                if "encoding" in acc_filter.memcmp:
-                    memcmp.encoding = acc_filter.memcmp["encoding"]
-            if acc_filter.data_size:
-                acc.data_size = acc_filter.data_size
-        
-        for key, tx_filter in request.transactions.items():
-            tx = grpc_req.transactions[key]
-            tx.account_include.extend(tx_filter.accounts_include)
-            tx.account_exclude.extend(tx_filter.accounts_exclude)
-            tx.vote = tx_filter.vote
-            tx.failed = tx_filter.failed
-        
-        for key, block_filter in request.blocks.items():
-            block = grpc_req.blocks[key]
-            block.include_transactions = block_filter.include_transactions
-            block.include_accounts = block_filter.include_accounts
-            block.include_entries = block_filter.include_entries
-        
-        grpc_req.blocks_meta = request.blocks_meta
-        
-        for key, enabled in request.slots.items():
-            grpc_req.slots[key] = enabled
-        
-        return grpc_req
+        grpc_request = self._proto.SubscribeRequest()
+        grpc_request.commitment = {
+            SolanaCommitment.PROCESSED: 0,
+            SolanaCommitment.CONFIRMED: 1,
+            SolanaCommitment.FINALIZED: 2,
+        }[request.commitment]
+        for name, tx_filter in request.transactions.items():
+            target = grpc_request.transactions[name]
+            target.vote = tx_filter.vote
+            target.failed = tx_filter.failed
+            target.account_include.extend(tx_filter.accounts_include)
+            target.account_exclude.extend(tx_filter.accounts_exclude)
+            if hasattr(target, "account_required"):
+                target.account_required.extend(tx_filter.accounts_required)
+        return grpc_request
 
     async def _handle_response(self, response: Any):
-        if hasattr(response, 'account') and response.account:
-            await self._dispatch('account', response.account)
-        elif hasattr(response, 'transaction') and response.transaction:
-            await self._dispatch('transaction', response.transaction)
-        elif hasattr(response, 'block') and response.block:
-            await self._dispatch('block', response.block)
-        elif hasattr(response, 'block_meta') and response.block_meta:
-            await self._dispatch('block_meta', response.block_meta)
-        elif hasattr(response, 'slot') and response.slot:
-            await self._dispatch('slot', response.slot)
-        elif hasattr(response, 'entry') and response.entry:
-            await self._dispatch('entry', response.entry)
-        elif hasattr(response, 'ping') and response.ping:
-            await self._dispatch('ping', response.ping)
+        for event_type in ("account", "transaction", "block", "block_meta", "slot", "entry", "ping"):
+            data = getattr(response, event_type, None)
+            if data:
+                await self._dispatch(event_type, data)
+                return
 
     async def _dispatch(self, event_type: str, data: Any):
-        handlers = self._handlers.get(event_type, [])
-        for handler in handlers:
+        for handler in self._handlers.get(event_type, []):
             try:
-                if asyncio.iscoroutinefunction(handler):
-                    await handler(data)
-                else:
-                    handler(data)
-            except Exception as e:
-                logger.error(f"Handler error for {event_type}: {e}")
+                result = handler(data)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:
+                logger.error("Yellowstone %s handler failed: %s", event_type, exc)
 
     def on(self, event_type: str, handler: Callable):
-        if event_type not in self._handlers:
-            self._handlers[event_type] = []
-        self._handlers[event_type].append(handler)
-
-    async def _handle_reconnect(self) -> bool:
-        if self._reconnect_attempts >= self._max_reconnect_attempts:
-            logger.error("Max reconnect attempts reached")
-            return False
-        
-        self._reconnect_attempts += 1
-        delay = self._base_reconnect_delay * (2 ** (self._reconnect_attempts - 1))
-        delay += asyncio.get_event_loop().time() % 1
-        logger.info(f"Reconnecting in {delay:.1f}s (attempt {self._reconnect_attempts})")
-        await asyncio.sleep(delay)
-        return True
+        self._handlers.setdefault(event_type, []).append(handler)
 
     async def close(self):
         self._running = False
+        if self._stream_task:
+            self._stream_task.cancel()
+            try:
+                await self._stream_task
+            except asyncio.CancelledError:
+                pass
         if self._stream:
             self._stream.cancel()
         if self._channel:
             await self._channel.close()
+        self.status = "CLOSED"
+
+    def get_status(self) -> Dict[str, str]:
+        return {"status": self.status, "detail": self.status_detail}
+
+
+class SolanaRpcProgramStream:
+    """Confirmed-transaction fallback using the same decoders as Yellowstone."""
+
+    def __init__(self, rpc: Any, programs: Iterable[str], poll_interval: float = 2.0):
+        self.rpc = rpc
+        self.programs = list(dict.fromkeys(programs))
+        self.poll_interval = poll_interval
+        self._handlers: Dict[str, List[Callable]] = {}
+        self._seen: Set[str] = set()
+        self._primed_programs: Set[str] = set()
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+        self.status = "NOT_STARTED"
+        self.status_detail = ""
+
+    def on(self, event_type: str, handler: Callable):
+        self._handlers.setdefault(event_type, []).append(handler)
+
+    async def start(self):
+        self._running = True
+        self.status = "RPC_FALLBACK"
+        self._task = asyncio.create_task(self._loop())
+
+    async def stop(self):
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                return
+
+    async def _loop(self):
+        while self._running:
+            try:
+                await self.poll_once()
+                self.status = "RPC_FALLBACK"
+                self.status_detail = "confirmed polling; lower timeliness than Yellowstone"
+            except Exception as exc:
+                self.status = "DEGRADED"
+                self.status_detail = str(exc)
+            await asyncio.sleep(self.poll_interval)
+
+    async def poll_once(self):
+        for program in self.programs:
+            signatures = await self.rpc.request(
+                "getSignaturesForAddress", [program, {"limit": 50, "commitment": "confirmed"}]
+            )
+            if program not in self._primed_programs:
+                # Establish a high-water mark without replaying an arbitrary
+                # startup backlog as if it were newly detected point-in-time.
+                self._seen.update(item.get("signature") for item in signatures or [] if item.get("signature"))
+                self._primed_programs.add(program)
+                continue
+            for item in reversed(signatures or []):
+                signature = item.get("signature")
+                if not signature or signature in self._seen or item.get("err") is not None:
+                    continue
+                self._seen.add(signature)
+                transaction = await self.rpc.request(
+                    "getTransaction",
+                    [signature, {"encoding": "json", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}],
+                )
+                if transaction:
+                    for handler in self._handlers.get("transaction", []):
+                        result = handler(transaction)
+                        if asyncio.iscoroutine(result):
+                            await result
+        if len(self._seen) > 100_000:
+            self._seen = set(list(self._seen)[-50_000:])
+
+    def get_status(self) -> Dict[str, str]:
+        return {"status": self.status, "detail": self.status_detail}
+
+
+def _json_transaction_parts(tx_data: Dict[str, Any]) -> Tuple[List[str], List[Dict[str, Any]], str, int]:
+    result = tx_data.get("result", tx_data)
+    transaction = result.get("transaction", {})
+    message = transaction.get("message", {})
+    keys = [item.get("pubkey") if isinstance(item, dict) else item for item in message.get("accountKeys", [])]
+    meta = result.get("meta") or {}
+    loaded = meta.get("loadedAddresses") or {}
+    keys.extend(loaded.get("writable", []))
+    keys.extend(loaded.get("readonly", []))
+    instructions = [dict(item, _inner=False) for item in message.get("instructions", [])]
+    for group in meta.get("innerInstructions", []) or []:
+        instructions.extend(dict(item, _inner=True, _outer_index=group.get("index")) for item in group.get("instructions", []))
+    signatures = transaction.get("signatures", [])
+    return keys, instructions, signatures[0] if signatures else "", int(result.get("slot", 0))
+
+
+def _proto_transaction_parts(tx_data: Any) -> Tuple[List[str], List[Any], str, int]:
+    info = getattr(tx_data, "transaction", tx_data)
+    tx = getattr(info, "transaction", info)
+    message = getattr(tx, "message", tx)
+    keys = [b58encode(bytes(key)) for key in getattr(message, "account_keys", [])]
+    meta = getattr(info, "meta", None)
+    if meta:
+        keys.extend(b58encode(bytes(key)) for key in getattr(meta, "loaded_writable_addresses", []))
+        keys.extend(b58encode(bytes(key)) for key in getattr(meta, "loaded_readonly_addresses", []))
+    instructions: List[Any] = list(getattr(message, "instructions", []))
+    for group in getattr(meta, "inner_instructions", []) if meta else []:
+        instructions.extend(getattr(group, "instructions", []))
+    sig_raw = getattr(info, "signature", b"") or (getattr(tx, "signatures", [b""])[0])
+    signature = b58encode(bytes(sig_raw)) if sig_raw else ""
+    return keys, instructions, signature, int(getattr(tx_data, "slot", 0))
+
+
+def transaction_parts(tx_data: Any) -> Tuple[List[str], List[Any], str, int]:
+    return _json_transaction_parts(tx_data) if isinstance(tx_data, dict) else _proto_transaction_parts(tx_data)
+
+
+def instruction_fields(instruction: Any) -> Tuple[int, List[int], bytes]:
+    if isinstance(instruction, dict):
+        data = instruction.get("data", "")
+        return int(instruction.get("programIdIndex", -1)), list(instruction.get("accounts", [])), b58decode(data) if data else b""
+    return int(instruction.program_id_index), list(instruction.accounts), bytes(instruction.data)
 
 
 class PumpFunMonitor:
     PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
     PUMP_AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
-    
-    CREATE_IX_DISCRIMINATOR = bytes.fromhex("1c7c2c7c8c8c8c8c")
-    BUY_IX_DISCRIMINATOR = bytes.fromhex("66063d1201daebea")
-    SELL_IX_DISCRIMINATOR = bytes.fromhex("33e685a4017f83ad")
-    MIGRATE_IX_DISCRIMINATOR = bytes.fromhex("9c9c9c9c9c9c9c9c")
+    DISCRIMINATORS = {
+        hashlib.sha256(f"global:{name}".encode()).digest()[:8]: name
+        for name in ("create", "create_v2", "buy", "buy_v2", "sell", "sell_v2", "migrate")
+    }
 
     def __init__(self, yellowstone: YellowstoneClient, callback: Callable):
         self.yellowstone = yellowstone
         self.callback = callback
-        self._seen_signatures: Set[str] = set()
-        self._setup_handlers()
-
-    def _setup_handlers(self):
-        self.yellowstone.on('transaction', self._on_transaction)
+        self._seen: Set[Tuple[str, str]] = set()
+        yellowstone.on("transaction", self._on_transaction)
 
     async def _on_transaction(self, tx_data: Any):
-        try:
-            tx = tx_data.transaction.transaction
-            message = tx.message
-            
-            for ix in message.instructions:
-                program_id = message.account_keys[ix.program_id_index]
-                
-                if str(program_id) == self.PUMP_FUN_PROGRAM:
-                    await self._process_pump_fun_ix(tx_data, ix, message)
-                elif str(program_id) == self.PUMP_AMM_PROGRAM:
-                    await self._process_pump_amm_ix(tx_data, ix, message)
-                    
-        except Exception as e:
-            logger.debug(f"TX process error: {e}")
+        keys, instructions, signature, slot = transaction_parts(tx_data)
+        for instruction_index, instruction in enumerate(instructions):
+            try:
+                program_index, accounts, data = instruction_fields(instruction)
+                if program_index < 0 or program_index >= len(keys) or len(data) < 8:
+                    continue
+                program = keys[program_index]
+                name = self.DISCRIMINATORS.get(data[:8])
+                if not name or program != self.PUMP_FUN_PROGRAM:
+                    continue
+                dedupe = (signature, instruction_index)
+                if dedupe in self._seen:
+                    continue
+                self._seen.add(dedupe)
+                if len(self._seen) > 100_000:
+                    self._seen = set(list(self._seen)[-50_000:])
+                event = self._decode_instruction(name, keys, accounts, data[8:], signature, slot)
+                if event:
+                    result = self.callback(event)
+                    if asyncio.iscoroutine(result):
+                        await result
+            except (ValueError, IndexError, struct.error) as exc:
+                logger.debug("Pump instruction parse rejected: %s", exc)
 
-    async def _process_pump_fun_ix(self, tx_data: Any, ix: Any, message: Any):
-        data = bytes(ix.data) if hasattr(ix, 'data') else b''
-        if not data:
-            return
-        
-        discriminator = data[:8]
-        sig = self._get_signature(tx_data)
-        
-        if sig in self._seen_signatures:
-            return
-        self._seen_signatures.add(sig)
-        if len(self._seen_signatures) > 100000:
-            self._seen_signatures.clear()
-        
-        if discriminator == self.CREATE_IX_DISCRIMINATOR:
-            await self._handle_create(tx_data, ix, message, data)
-        elif discriminator == self.BUY_IX_DISCRIMINATOR:
-            await self._handle_buy(tx_data, ix, message, data)
-        elif discriminator == self.SELL_IX_DISCRIMINATOR:
-            await self._handle_sell(tx_data, ix, message, data)
-
-    async def _process_pump_amm_ix(self, tx_data: Any, ix: Any, message: Any):
-        data = bytes(ix.data) if hasattr(ix, 'data') else b''
-        if not data:
-            return
-        
-        discriminator = data[:8]
-        if discriminator == self.MIGRATE_IX_DISCRIMINATOR:
-            await self._handle_migrate(tx_data, ix, message, data)
-
-    def _get_signature(self, tx_data: Any) -> str:
-        if hasattr(tx_data, 'signature'):
-            return str(tx_data.signature)
-        return ""
-
-    def _get_account(self, message: Any, index: int) -> str:
-        if hasattr(message, 'account_keys') and index < len(message.account_keys):
-            return str(message.account_keys[index])
-        return ""
-
-    async def _handle_create(self, tx_data: Any, ix: Any, message: Any, data: bytes):
-        try:
-            mint = self._get_account(message, ix.accounts[0]) if ix.accounts else ""
-            bonding_curve = self._get_account(message, ix.accounts[1]) if len(ix.accounts) > 1 else ""
-            creator = self._get_account(message, ix.accounts[2]) if len(ix.accounts) > 2 else ""
-            
-            name, symbol, uri = self._parse_create_data(data[8:])
-            
-            await self.callback({
+    def _decode_instruction(
+        self, name: str, keys: List[str], accounts: List[int], payload: bytes, signature: str, slot: int
+    ) -> Optional[Dict[str, Any]]:
+        account = lambda index: keys[accounts[index]] if index < len(accounts) and accounts[index] < len(keys) else ""
+        base = {"chain": "solana", "program": self.PUMP_FUN_PROGRAM, "timestamp": time.time(),
+                "signature": signature, "slot": slot, "instruction": name}
+        if name in {"create", "create_v2"}:
+            token_name, symbol, uri, offset = self._parse_create_strings(payload)
+            creator = b58encode(payload[offset:offset + 32]) if len(payload) >= offset + 32 else ""
+            mint_index, curve_index = (0, 2) if name == "create" else (0, 2)
+            return {
+                **base,
                 "type": "token_created",
-                "chain": "solana",
-                "token": mint,
+                "token": account(mint_index),
+                "bonding_curve": account(curve_index),
                 "creator": creator,
-                "bonding_curve": bonding_curve,
-                "name": name,
+                "name": token_name,
                 "symbol": symbol,
                 "uri": uri,
-                "timestamp": time.time(),
-                "signature": self._get_signature(tx_data),
-                "slot": getattr(tx_data, 'slot', 0)
-            })
-        except Exception as e:
-            logger.error(f"Create parse error: {e}")
-
-    async def _handle_buy(self, tx_data: Any, ix: Any, message: Any, data: bytes):
-        try:
-            mint = self._get_account(message, ix.accounts[0]) if ix.accounts else ""
-            buyer = self._get_account(message, ix.accounts[1]) if len(ix.accounts) > 1 else ""
-            amount = int.from_bytes(data[8:16], 'little') if len(data) >= 16 else 0
-            sol_amount = int.from_bytes(data[16:24], 'little') if len(data) >= 24 else 0
-            
-            await self.callback({
+                "data_status": "OK" if creator else "DATA_BLOCKED",
+            }
+        if name in {"buy", "sell", "buy_v2", "sell_v2"}:
+            v2 = name.endswith("_v2")
+            mint = account(1 if v2 else 2)
+            wallet = account(13 if v2 else 6)
+            amount, limit_amount = struct.unpack_from("<QQ", payload, 0) if len(payload) >= 16 else (0, 0)
+            return {
+                **base,
                 "type": "token_trade",
-                "chain": "solana",
                 "token": mint,
-                "wallet": buyer,
-                "side": "buy",
+                "wallet": wallet,
+                "side": "buy" if name.startswith("buy") else "sell",
                 "token_amount": amount,
-                "sol_amount": sol_amount,
-                "timestamp": time.time(),
-                "signature": self._get_signature(tx_data),
-                "slot": getattr(tx_data, 'slot', 0)
-            })
-        except Exception as e:
-            logger.error(f"Buy parse error: {e}")
-
-    async def _handle_sell(self, tx_data: Any, ix: Any, message: Any, data: bytes):
-        try:
-            mint = self._get_account(message, ix.accounts[0]) if ix.accounts else ""
-            seller = self._get_account(message, ix.accounts[1]) if len(ix.accounts) > 1 else ""
-            amount = int.from_bytes(data[8:16], 'little') if len(data) >= 16 else 0
-            sol_amount = int.from_bytes(data[16:24], 'little') if len(data) >= 24 else 0
-            
-            await self.callback({
-                "type": "token_trade",
-                "chain": "solana",
-                "token": mint,
-                "wallet": seller,
-                "side": "sell",
-                "token_amount": amount,
-                "sol_amount": sol_amount,
-                "timestamp": time.time(),
-                "signature": self._get_signature(tx_data),
-                "slot": getattr(tx_data, 'slot', 0)
-            })
-        except Exception as e:
-            logger.error(f"Sell parse error: {e}")
-
-    async def _handle_migrate(self, tx_data: Any, ix: Any, message: Any, data: bytes):
-        try:
-            mint = self._get_account(message, ix.accounts[0]) if ix.accounts else ""
-            
-            await self.callback({
+                "quote_limit_amount": limit_amount,
+                "data_status": "OK" if mint and wallet and amount else "DATA_BLOCKED",
+            }
+        if name == "migrate":
+            token = account(2)
+            return {
+                **base,
                 "type": "token_migrated",
-                "chain": "solana",
-                "token": mint,
-                "timestamp": time.time(),
-                "signature": self._get_signature(tx_data),
-                "slot": getattr(tx_data, 'slot', 0)
-            })
-        except Exception as e:
-            logger.error(f"Migrate parse error: {e}")
+                "token": token,
+                "pool": account(9),
+                "wallet": account(5),
+                "data_status": "OK" if token else "DATA_BLOCKED",
+            }
+        return None
 
-    def _parse_create_data(self, data: bytes) -> Tuple[str, str, str]:
-        try:
-            offset = 0
-            name_len = int.from_bytes(data[offset:offset+4], 'little')
+    @staticmethod
+    def _parse_create_strings(data: bytes) -> Tuple[str, str, str, int]:
+        values: List[str] = []
+        offset = 0
+        for _ in range(3):
+            if offset + 4 > len(data):
+                raise ValueError("truncated Pump create string")
+            length = struct.unpack_from("<I", data, offset)[0]
             offset += 4
-            name = data[offset:offset+name_len].decode('utf-8', errors='ignore')
-            offset += name_len
-            
-            symbol_len = int.from_bytes(data[offset:offset+4], 'little')
-            offset += 4
-            symbol = data[offset:offset+symbol_len].decode('utf-8', errors='ignore')
-            offset += symbol_len
-            
-            uri_len = int.from_bytes(data[offset:offset+4], 'little')
-            offset += 4
-            uri = data[offset:offset+uri_len].decode('utf-8', errors='ignore')
-            
-            return name, symbol, uri
-        except Exception:
-            return "", "", ""
+            if length > 4_096 or offset + length > len(data):
+                raise ValueError("invalid Pump create string length")
+            values.append(data[offset:offset + length].decode("utf-8", errors="replace"))
+            offset += length
+        return values[0], values[1], values[2], offset
+
+
+class PumpSwapMonitor:
+    """Decoder for the official PumpSwap AMM IDL.
+
+    PumpSwap deliberately has its own account layouts even though its buy and
+    sell discriminators match the legacy bonding-curve program. Keeping the
+    decoders separate prevents a valid transaction from being assigned the
+    wrong mint or wallet.
+    """
+
+    PUMP_AMM_PROGRAM = PumpFunMonitor.PUMP_AMM_PROGRAM
+    DISCRIMINATORS = {
+        bytes((233, 146, 209, 142, 207, 104, 64, 188)): "create_pool",
+        bytes((102, 6, 61, 18, 1, 218, 235, 234)): "buy",
+        bytes((51, 230, 133, 164, 1, 127, 131, 173)): "sell",
+    }
+
+    def __init__(self, yellowstone: YellowstoneClient, callback: Callable):
+        self.yellowstone = yellowstone
+        self.callback = callback
+        self._seen: Set[Tuple[str, int]] = set()
+        yellowstone.on("transaction", self._on_transaction)
+
+    async def _on_transaction(self, tx_data: Any):
+        keys, instructions, signature, slot = transaction_parts(tx_data)
+        for instruction_index, instruction in enumerate(instructions):
+            try:
+                program_index, accounts, data = instruction_fields(instruction)
+                if program_index < 0 or program_index >= len(keys) or len(data) < 8:
+                    continue
+                if keys[program_index] != self.PUMP_AMM_PROGRAM:
+                    continue
+                name = self.DISCRIMINATORS.get(data[:8])
+                if not name:
+                    continue
+                dedupe = (signature, instruction_index)
+                if dedupe in self._seen:
+                    continue
+                self._seen.add(dedupe)
+                if len(self._seen) > 100_000:
+                    self._seen = set(list(self._seen)[-50_000:])
+                event = self._decode_instruction(name, keys, accounts, data[8:], signature, slot)
+                if event:
+                    result = self.callback(event)
+                    if asyncio.iscoroutine(result):
+                        await result
+            except (ValueError, IndexError, struct.error) as exc:
+                logger.debug("PumpSwap instruction parse rejected: %s", exc)
+
+    @staticmethod
+    def _decode_instruction(
+        name: str, keys: List[str], accounts: List[int], payload: bytes, signature: str, slot: int
+    ) -> Optional[Dict[str, Any]]:
+        account = lambda index: keys[accounts[index]] if index < len(accounts) and accounts[index] < len(keys) else ""
+        base = {
+            "chain": "solana",
+            "program": PumpSwapMonitor.PUMP_AMM_PROGRAM,
+            "timestamp": time.time(),
+            "signature": signature,
+            "slot": slot,
+            "instruction": name,
+        }
+        if name == "create_pool":
+            if len(payload) < 18:
+                raise ValueError("truncated PumpSwap create_pool payload")
+            index, base_amount, quote_amount = struct.unpack_from("<HQQ", payload, 0)
+            token = account(3)
+            return {
+                **base,
+                "type": "pool_created",
+                "pool": account(0),
+                "creator": account(2),
+                "token": token,
+                "base_mint": token,
+                "quote_mint": account(4),
+                "pool_index": index,
+                "initial_base_amount": base_amount,
+                "initial_quote_amount": quote_amount,
+                "data_status": "OK" if token and account(0) else "DATA_BLOCKED",
+            }
+        if name in {"buy", "sell"}:
+            if len(payload) < 16:
+                raise ValueError(f"truncated PumpSwap {name} payload")
+            amount, quote_limit = struct.unpack_from("<QQ", payload, 0)
+            token, wallet = account(3), account(1)
+            return {
+                **base,
+                "type": "token_trade",
+                "pool": account(0),
+                "token": token,
+                "quote_mint": account(4),
+                "wallet": wallet,
+                "side": name,
+                "token_amount": amount,
+                "quote_limit_amount": quote_limit,
+                "data_status": "OK" if token and wallet and amount else "DATA_BLOCKED",
+            }
+        return None
 
 
 class RaydiumMonitor:
@@ -399,117 +560,78 @@ class RaydiumMonitor:
     def __init__(self, yellowstone: YellowstoneClient, callback: Callable):
         self.yellowstone = yellowstone
         self.callback = callback
-        self._seen_pools: Set[str] = set()
-        self.yellowstone.on('transaction', self._on_transaction)
+        self._seen: Set[Tuple[str, int]] = set()
+        yellowstone.on("transaction", self._on_transaction)
 
     async def _on_transaction(self, tx_data: Any):
-        try:
-            tx = tx_data.transaction.transaction
-            message = tx.message
-            
-            for ix in message.instructions:
-                program_id = str(message.account_keys[ix.program_id_index])
-                
-                if program_id in [self.RAYDIUM_AMM_V4, self.RAYDIUM_CPMM, self.RAYDIUM_CLMM]:
-                    await self._process_raydium_ix(tx_data, ix, message, program_id)
-        except Exception as e:
-            logger.debug(f"Raydium TX error: {e}")
+        keys, instructions, signature, slot = transaction_parts(tx_data)
+        for instruction in instructions:
+            try:
+                program_index, accounts, data = instruction_fields(instruction)
+                if program_index < 0 or program_index >= len(keys) or not data:
+                    continue
+                program = keys[program_index]
+                if program != self.RAYDIUM_AMM_V4:
+                    continue  # CPMM/CLMM layouts are intentionally not guessed.
+                tag = data[0]
+                dedupe = (signature, tag)
+                if dedupe in self._seen:
+                    continue
+                self._seen.add(dedupe)
+                event = self._decode_v4(tag, keys, accounts, data[1:], signature, slot)
+                if event:
+                    result = self.callback(event)
+                    if asyncio.iscoroutine(result):
+                        await result
+            except (IndexError, struct.error):
+                continue
 
-    async def _process_raydium_ix(self, tx_data: Any, ix: Any, message: Any, program_id: str):
-        data = bytes(ix.data) if hasattr(ix, 'data') else b''
-        if len(data) < 8:
-            return
-        
-        discriminator = data[:8]
-        
-        if discriminator == bytes.fromhex("09d5a4e6c5a4c5a4"):
-            await self._handle_initialize_pool(tx_data, ix, message, data, program_id)
-        elif discriminator == bytes.fromhex("a5a5a5a5a5a5a5a5"):
-            await self._handle_swap(tx_data, ix, message, data, program_id)
-
-    async def _handle_initialize_pool(self, tx_data: Any, ix: Any, message: Any, data: bytes, program_id: str):
-        try:
-            pool = self._get_account(message, ix.accounts[0]) if ix.accounts else ""
-            mint_a = self._get_account(message, ix.accounts[1]) if len(ix.accounts) > 1 else ""
-            mint_b = self._get_account(message, ix.accounts[2]) if len(ix.accounts) > 2 else ""
-            creator = self._get_account(message, ix.accounts[3]) if len(ix.accounts) > 3 else ""
-            
-            if pool in self._seen_pools:
-                return
-            self._seen_pools.add(pool)
-            
-            await self.callback({
+    @staticmethod
+    def _decode_v4(
+        tag: int, keys: List[str], accounts: List[int], payload: bytes, signature: str, slot: int
+    ) -> Optional[Dict[str, Any]]:
+        account = lambda index: keys[accounts[index]] if index < len(accounts) and accounts[index] < len(keys) else ""
+        base = {"chain": "solana", "program": RaydiumMonitor.RAYDIUM_AMM_V4,
+                "signature": signature, "slot": slot, "timestamp": time.time(), "data_status": "OK"}
+        if tag == 1 and len(payload) >= 25:  # Initialize2
+            nonce, open_time, quote_amount, base_amount = struct.unpack_from("<BQQQ", payload, 0)
+            return {
+                **base,
                 "type": "pool_created",
-                "chain": "solana",
-                "pool": pool,
-                "program": program_id,
-                "mint_a": mint_a,
-                "mint_b": mint_b,
-                "creator": creator,
-                "timestamp": time.time(),
-                "signature": self._get_signature(tx_data),
-                "slot": getattr(tx_data, 'slot', 0)
-            })
-        except Exception as e:
-            logger.error(f"Pool init parse error: {e}")
-
-    async def _handle_swap(self, tx_data: Any, ix: Any, message: Any, data: bytes, program_id: str):
-        pass
-
-    def _get_account(self, message: Any, index: int) -> str:
-        if hasattr(message, 'account_keys') and index < len(message.account_keys):
-            return str(message.account_keys[index])
-        return ""
-
-    def _get_signature(self, tx_data: Any) -> str:
-        if hasattr(tx_data, 'signature'):
-            return str(tx_data.signature)
-        return ""
-
-
-def create_pump_fun_subscription() -> SubscribeRequest:
-    return SubscribeRequest(
-        transactions={
-            "pump_fun": TransactionFilter(
-                accounts_include=[PumpFunMonitor.PUMP_FUN_PROGRAM],
-                vote=False,
-                failed=False
-            ),
-            "pump_amm": TransactionFilter(
-                accounts_include=[PumpFunMonitor.PUMP_AMM_PROGRAM],
-                vote=False,
-                failed=False
-            )
-        },
-        commitment=SolanaCommitment.PROCESSED
-    )
-
-
-def create_raydium_subscription() -> SubscribeRequest:
-    return SubscribeRequest(
-        transactions={
-            "raydium_v4": TransactionFilter(
-                accounts_include=[RaydiumMonitor.RAYDIUM_AMM_V4],
-                vote=False,
-                failed=False
-            ),
-            "raydium_cpmm": TransactionFilter(
-                accounts_include=[RaydiumMonitor.RAYDIUM_CPMM],
-                vote=False,
-                failed=False
-            ),
-            "raydium_clmm": TransactionFilter(
-                accounts_include=[RaydiumMonitor.RAYDIUM_CLMM],
-                vote=False,
-                failed=False
-            )
-        },
-        commitment=SolanaCommitment.PROCESSED
-    )
+                "pool": account(4),
+                "mint_a": account(8),
+                "mint_b": account(9),
+                "creator": account(17),
+                "nonce": nonce,
+                "open_time": open_time,
+                "initial_quote_amount": quote_amount,
+                "initial_base_amount": base_amount,
+            }
+        if tag in {9, 11} and len(payload) >= 16:  # SwapBaseIn / SwapBaseOut
+            amount_a, amount_b = struct.unpack_from("<QQ", payload, 0)
+            return {
+                **base,
+                "type": "pool_swap",
+                "pool": account(1),
+                "wallet": account(17),
+                "swap_mode": "base_in" if tag == 9 else "base_out",
+                "amount_specified": amount_a,
+                "limit_amount": amount_b,
+            }
+        return None
 
 
 def create_combined_subscription() -> SubscribeRequest:
-    req = SubscribeRequest(commitment=SolanaCommitment.PROCESSED)
-    req.transactions.update(create_pump_fun_subscription().transactions)
-    req.transactions.update(create_raydium_subscription().transactions)
-    return req
+    programs = [
+        PumpFunMonitor.PUMP_FUN_PROGRAM,
+        PumpSwapMonitor.PUMP_AMM_PROGRAM,
+        RaydiumMonitor.RAYDIUM_AMM_V4,
+        RaydiumMonitor.RAYDIUM_CPMM,
+        RaydiumMonitor.RAYDIUM_CLMM,
+    ]
+    return SubscribeRequest(
+        transactions={
+            "memecoin_programs": TransactionFilter(accounts_include=programs, vote=False, failed=False)
+        },
+        commitment=SolanaCommitment.PROCESSED,
+    )

@@ -130,7 +130,23 @@ class ChampionChallengerFramework:
             return "duplicate"
         
         self.hypotheses[hypothesis.hypothesis_id] = hypothesis
+        self.challengers[hypothesis.hypothesis_id] = {
+            "hypothesis": hypothesis,
+            "submitted_at": time.time(),
+            "status": ModelStatus.DISCOVERED.value,
+        }
         return "accepted"
+
+    def mark_data_blocked(self, hypothesis_id: str, reason: str):
+        if hypothesis_id not in self.hypotheses:
+            return
+        challenger = self.challengers.setdefault(hypothesis_id, {"hypothesis": self.hypotheses[hypothesis_id]})
+        challenger["status"] = ModelStatus.DATA_BLOCKED.value
+        challenger["reason"] = reason
+
+    def is_live(self, hypothesis_id: str) -> bool:
+        champion = self.champions.get(hypothesis_id)
+        return bool(champion and champion.status == "LIVE")
 
     def freeze_hypothesis(self, hypothesis_id: str) -> bool:
         if hypothesis_id not in self.hypotheses:
@@ -276,6 +292,7 @@ class ChampionChallengerFramework:
         return {
             "total_hypotheses": len(self.hypotheses),
             "challengers": len(self.challengers),
+            "data_blocked": len([c for c in self.challengers.values() if c.get("status") == ModelStatus.DATA_BLOCKED.value]),
             "shadow_models": len(self.shadow_models),
             "canary_models": len(self.canary_models),
             "live_champions": len(self.get_live_champions()),
