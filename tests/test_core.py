@@ -54,6 +54,10 @@ from src.strategies.distribution import (
     DISTRIBUTION_FEATURE_NAMES, DISTRIBUTION_HORIZONS, DistributionDetector,
     distribution_features,
 )
+from src.strategies.source_genealogy import (
+    PostOutcome, SourceGenealogy, SourcePost, build_source_dna, rank_sources,
+    source_value,
+)
 from src.strategies.mega_event import (
     ESCALATION_LADDER, AudienceTier, MegaEventReserve, plan_capacity_escalation,
     remaining_audience,
@@ -726,6 +730,7 @@ class TestPartialExitAccounting(unittest.IsolatedAsyncioTestCase):
         desk._record_ops_event = (
             lambda stream, payload: desk.ops_events.append((stream, payload)))
         desk._closed_pnl = {}
+        desk._mechanism_growth = {}
         return desk
 
     @staticmethod
@@ -2794,6 +2799,7 @@ class TestPositionPredictionRefresh(unittest.IsolatedAsyncioTestCase):
         desk._record_ops_event = (
             lambda stream, payload: desk.ops_events.append((stream, payload)))
         desk._closed_pnl = {}
+        desk._mechanism_growth = {}
         desk._exit_capacity = (
             lambda token, pos: MemecoinQuantDesk._exit_capacity(desk, token, pos))
         desk.min_escape_probability = 0.05
@@ -3464,6 +3470,7 @@ class TestDistributionExitWiring(unittest.IsolatedAsyncioTestCase):
         desk._record_ops_event = (
             lambda stream, payload: desk.ops_events.append((stream, payload)))
         desk._closed_pnl = {}
+        desk._mechanism_growth = {}
         desk._exit_capacity = (
             lambda token, pos: MemecoinQuantDesk._exit_capacity(desk, token, pos))
         desk.min_escape_probability = 0.05
@@ -3780,6 +3787,7 @@ class TestMonsterHoldWiring(unittest.IsolatedAsyncioTestCase):
         desk._record_ops_event = (
             lambda stream, payload: desk.ops_events.append((stream, payload)))
         desk._closed_pnl = {}
+        desk._mechanism_growth = {}
         desk._exit_capacity = (
             lambda token, pos: MemecoinQuantDesk._exit_capacity(desk, token, pos))
         desk.min_escape_probability = 0.05
@@ -5654,3 +5662,164 @@ class TestMegaEventReserveWiring(unittest.IsolatedAsyncioTestCase):
         # An unmeasured event must not silently tax the book every week.
         self.assertEqual(desk.mega_event_reserve_state["fraction"], 0.0)
         self.assertAlmostEqual(desk.elogw_engine.portfolio_value, desk.wallet_equity_usd)
+
+
+class TestSourceDNA(unittest.TestCase):
+    """"Does following it pay" and "does it predict the crowd" are different questions."""
+
+    @staticmethod
+    def _post_outcome(source="grp", token="t", posted=0.0, lag=0.5, returns=None,
+                 flow=None, pre=None, sell=None, rugged=None, feasible=None,
+                 edited=False, deleted=False):
+        post = SourcePost(source_id=source, token=token, posted_at=posted,
+                          observed_at=posted + lag, edited=edited, deleted=deleted)
+        return PostOutcome(post=post, executable_returns=returns or {},
+                           flow_acceleration=flow, pre_post_accumulation_usd=pre,
+                           post_sell_usd=sell, rugged=rugged,
+                           max_feasible_multiple=feasible)
+
+    def test_a_thin_history_is_measuring_not_scored(self):
+        dna = build_source_dna("grp", [self._post_outcome(returns={1.0: 0.5})
+                                       for _ in range(6)])
+        # A rate from six calls is noise, and promoting on it is how a lucky
+        # channel gets capital.
+        self.assertEqual(dna.status, "MEASURING")
+        self.assertIsNone(dna.best_horizon_return)
+        self.assertFalse(dna.tradeable_directly)
+
+    def test_no_posts_at_all_is_blocked(self):
+        self.assertEqual(build_source_dna("grp", []).status, "DATA_BLOCKED")
+
+    def test_a_source_with_bad_calls_can_still_predict_flow(self):
+        """The whole reason the two questions are kept apart."""
+        outcomes = [self._post_outcome(returns={1.0: -0.20}, flow=3.0) for _ in range(30)]
+        dna = build_source_dna("pump_group", outcomes)
+        self.assertEqual(dna.status, "MEASURED")
+        self.assertFalse(dna.tradeable_directly)
+        self.assertTrue(dna.useful_as_flow_signal)
+
+    def test_a_distributor_is_identified_by_its_shape(self):
+        outcomes = [self._post_outcome(returns={1.0: -0.3}, flow=2.5,
+                                  pre=5_000.0, sell=6_000.0) for _ in range(30)]
+        dna = build_source_dna("insider_group", outcomes)
+        # Linked wallets long beforehand and selling afterwards: excellent at
+        # predicting flow, terrible to hold alongside.
+        self.assertTrue(dna.is_distributor)
+        self.assertTrue(dna.useful_as_flow_signal)
+        self.assertFalse(dna.tradeable_directly)
+
+    def test_accumulation_without_selling_is_not_distribution(self):
+        outcomes = [self._post_outcome(returns={1.0: 0.4}, pre=5_000.0, sell=0.0)
+                    for _ in range(30)]
+        self.assertFalse(build_source_dna("early_group", outcomes).is_distributor)
+
+    def test_the_best_horizon_is_the_one_measured_as_best(self):
+        outcomes = [self._post_outcome(returns={0.5: 0.02, 3.0: 0.31, 30.0: 0.05})
+                    for _ in range(30)]
+        dna = build_source_dna("grp", outcomes)
+        self.assertEqual(dna.best_horizon, 3.0)
+        self.assertAlmostEqual(dna.best_horizon_return, 0.31)
+        self.assertTrue(dna.tradeable_directly)
+
+    def test_edit_and_delete_behaviour_is_recorded(self):
+        outcomes = ([self._post_outcome(deleted=True) for _ in range(10)]
+                    + [self._post_outcome() for _ in range(10)])
+        self.assertAlmostEqual(build_source_dna("grp", outcomes).edit_delete_rate, 0.5)
+
+    def test_a_slow_source_scores_below_a_fast_mediocre_one(self):
+        excellent_but_late = build_source_dna(
+            "late", [self._post_outcome(lag=30.0, returns={1.0: 0.50}) for _ in range(30)])
+        mediocre_but_instant = build_source_dna(
+            "fast", [self._post_outcome(lag=0.05, returns={1.0: 0.08}) for _ in range(30)])
+        # A signal that reaches us after the move is not actionable however
+        # accurate it was.
+        self.assertLess(source_value(excellent_but_late),
+                        source_value(mediocre_but_instant))
+
+    def test_an_unmeasured_source_has_no_value_number(self):
+        self.assertIsNone(source_value(build_source_dna("grp", [self._post_outcome()])))
+
+    def test_ranking_separates_tradeable_from_flow_only(self):
+        good = build_source_dna("good", [self._post_outcome(returns={1.0: 0.3}, flow=1.1)
+                                         for _ in range(30)])
+        flow = build_source_dna("flow", [self._post_outcome(returns={1.0: -0.2}, flow=3.0,
+                                                       pre=100.0, sell=200.0)
+                                         for _ in range(30)])
+        thin = build_source_dna("thin", [self._post_outcome()])
+        ranked = rank_sources([good, flow, thin])
+        self.assertEqual([e["source"] for e in ranked["tradeable"]], ["good"])
+        self.assertEqual([e["source"] for e in ranked["flow_signal_only"]], ["flow"])
+        self.assertEqual(ranked["distributors"], ["flow"])
+        self.assertEqual(ranked["measuring"], ["thin"])
+
+
+class TestSourceGenealogy(unittest.TestCase):
+    """Ranking sources by audience finds the repeaters."""
+
+    @staticmethod
+    def _post(source, token, at):
+        return SourcePost(source_id=source, token=token, posted_at=at, observed_at=at)
+
+    def _graph(self, launches=8):
+        graph = SourceGenealogy(min_shared_tokens=5)
+        for index in range(launches):
+            base = index * 10_000.0
+            # An obscure regional account, then the channel everyone watches.
+            graph.record(self._post("regional", f"t{index}", base))
+            graph.record(self._post("big_channel", f"t{index}", base + 45.0))
+            graph.record(self._post("aggregator", f"t{index}", base + 120.0))
+        return graph
+
+    def test_the_first_publisher_is_identified_as_the_leader(self):
+        pairs = self._graph().lead_lag()
+        self.assertTrue(all(pair.leader != "aggregator" for pair in pairs))
+        direct = next(pair for pair in pairs
+                      if (pair.leader, pair.follower) == ("regional", "big_channel"))
+        self.assertAlmostEqual(direct.median_lead_seconds, 45.0)
+        self.assertEqual(direct.lead_rate, 1.0)
+
+    def test_upstream_recursion_finds_the_earliest_node(self):
+        graph = self._graph()
+        upstream_of_big = graph.upstream_of("big_channel")
+        self.assertEqual([item.leader for item in upstream_of_big], ["regional"])
+        # Recurse: nothing publishes before the regional account, so it is the
+        # earliest lawfully observable node.
+        self.assertEqual(graph.upstream_of("regional"), [])
+
+    def test_a_thin_overlap_is_not_a_lead_relationship(self):
+        graph = SourceGenealogy(min_shared_tokens=5)
+        graph.record(self._post("a", "t0", 0.0))
+        graph.record(self._post("b", "t0", 10.0))
+        self.assertEqual(graph.lead_lag(), [])
+
+    def test_posts_far_apart_are_not_the_same_information_event(self):
+        graph = SourceGenealogy(min_shared_tokens=3, max_lead_seconds=60.0)
+        for index in range(6):
+            base = index * 100_000.0
+            graph.record(self._post("a", f"t{index}", base))
+            graph.record(self._post("b", f"t{index}", base + 3_600.0))
+        # Crediting an hour-later post as "following" would credit a
+        # coincidence.
+        self.assertEqual(graph.lead_lag(), [])
+
+    def test_only_the_first_post_per_source_per_token_counts(self):
+        graph = SourceGenealogy(min_shared_tokens=3)
+        for index in range(5):
+            base = index * 10_000.0
+            graph.record(self._post("a", f"t{index}", base))
+            graph.record(self._post("a", f"t{index}", base + 5.0))
+            graph.record(self._post("b", f"t{index}", base + 20.0))
+        pairs = graph.lead_lag()
+        self.assertTrue(pairs)
+        self.assertAlmostEqual(pairs[0].median_lead_seconds, 20.0)
+
+
+class TestObservationLag(unittest.TestCase):
+    def test_the_lag_is_publication_to_observation(self):
+        post = SourcePost("s", "t", posted_at=100.0, observed_at=106.5)
+        # The source's own delivery latency, which no local speed recovers.
+        self.assertAlmostEqual(post.observation_lag, 6.5)
+
+    def test_an_out_of_order_timestamp_never_reports_a_negative_lag(self):
+        post = SourcePost("s", "t", posted_at=100.0, observed_at=99.0)
+        self.assertEqual(post.observation_lag, 0.0)

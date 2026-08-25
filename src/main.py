@@ -973,6 +973,88 @@ class MemecoinQuantDesk:
             acceptable_impact=float(self.global_config.get("acceptable_exit_impact", 0.10)),
         )
 
+    def _publish_attribution(self) -> None:
+        """Write the edge-decay and ledger state the weekly audit pack reads.
+
+        Computed here rather than in the pack builder so the numbers come from
+        the same process that made the trades, and so a pack built on a node
+        whose research package is unavailable still gets them. Failures are
+        swallowed: reporting must never be able to halt trading.
+        """
+        if time.time() - self._attribution_published_at < self._attribution_interval:
+            return
+        self._attribution_published_at = time.time()
+        try:
+            root = Path(self.global_config.get("ops_state_dir", "data/state"))
+            root.mkdir(parents=True, exist_ok=True)
+            for mechanism, growth in self._mechanism_growth.items():
+                for value in growth:
+                    self.edge_decay.record(mechanism, value)
+                growth.clear()
+            (root / "edge_decay.json").write_text(
+                json.dumps(self.edge_decay.report(), default=str))
+        except (OSError, ValueError) as exc:
+            logger.debug("attribution publish failed: %s", exc)
+
+    def _record_actor_entry(self, token: str, event: Dict[str, Any],
+                            observation: Dict[str, Any]) -> None:
+        """Feed one buy into the independence graph and bound the hot state.
+
+        Only buys, and only the FIRST buy per wallet per token: the graph asks
+        who chose to enter and in what order, and a wallet adding to its own
+        position is not further evidence about anyone else's decision.
+
+        Wallet skill is attached where the intelligence engine already has a
+        score. Where it does not, the field is left None rather than zero --
+        the distinction between "scored at zero" and "never seen" is what
+        stops a wave of unknown wallets reading as a wave of bad ones.
+        """
+        wallet = event.get("wallet")
+        if not wallet or event.get("side") != "buy":
+            return
+        seen = self._actor_seen.setdefault(token, set())
+        if wallet in seen:
+            return
+        seen.add(wallet)
+        self.hot_state.touch_token(token)
+        # The per-token wallet sets are unbounded otherwise: a day of launches
+        # would accumulate every buyer of every token that ever traded.
+        for stale in [key for key in self._actor_seen
+                      if key not in self.hot_state.active_tokens]:
+            self._actor_seen.pop(stale, None)
+
+        score = None
+        if self.wallet_intel is not None:
+            try:
+                score = self.wallet_intel.get_wallet_score(wallet)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("wallet score unavailable for %s: %s", wallet, exc)
+        notional = observation.get("notional_sol")
+        self.wallet_independence.record_entries([Entry(
+            token=token, wallet=str(wallet),
+            timestamp=float(observation.get("timestamp", time.time())),
+            skill=(float(getattr(score, "overall_score", 0.0)) if score is not None else None),
+            capital_usd=((float(notional) * self.sol_price_usd)
+                         if notional and self.sol_price_usd > 0 else None),
+        )])
+
+    def _refresh_independence(self) -> None:
+        """Recompute the independence matrix on a cadence, not per trade.
+
+        Pair statistics are quadratic in the wallets sharing a launch, so this
+        deliberately does not run on the hot path. Independence changes over
+        launches rather than over individual trades, so a periodic recompute
+        loses nothing a per-trade one would have caught.
+        """
+        if time.time() - self._independence_computed_at < self._independence_interval:
+            return
+        self._independence_computed_at = time.time()
+        self.independence_report = self.wallet_independence.compute()
+        logger.info("INDEPENDENCE status=%s pairs=%d wallets=%d",
+                    self.independence_report.status,
+                    self.independence_report.observed_pairs,
+                    len(self.independence_report.scores))
+
     def _estimate_escape(self, token: str, position: Dict[str, Any], hazard: Any):
         """P(this position gets out before the event), at its current size.
 
@@ -1343,6 +1425,9 @@ class MemecoinQuantDesk:
             # attributed. Partial exits are deliberately not recorded here:
             # attributing a trade that is still open would count the same
             # capital twice in the ledger.
+            mechanism = str(position.get("sleeve", "t0_sniper"))
+            self._mechanism_growth.setdefault(mechanism, []).append(
+                math.log(max(1e-9, 1.0 + pnl / max(self.wallet_equity_usd, 1e-9))))
             self._record_ops_event("trade_outcomes", {
                 "token": token, "entered": True, "attempted": True,
                 "realized_pnl_usd": self._closed_pnl.pop(token, 0.0) + pnl,
@@ -1410,6 +1495,8 @@ class MemecoinQuantDesk:
         self.last_intelligence_update = time.time()
         await self._refresh_portfolio_state()
         await self.genealogy.build_clusters()
+        self._refresh_independence()
+        self._publish_attribution()
         if self.dry_run:
             latest_mtime = self._latest_model_mtime()
             if latest_mtime > self._model_artifact_mtime:
@@ -1479,6 +1566,7 @@ class MemecoinQuantDesk:
                            "quote_limit_amount": event.get("quote_limit_amount", 0),
                            "timestamp": event.get("timestamp", time.time()), "slot": event.get("slot"),
                            "signature": event.get("signature"), "program": event.get("program")}
+            self._record_actor_entry(token, event, observation)
             self.rug_hazard.record_observation(token, observation)
             self.public_coordination.record_trade(token, observation)
             self.dataset_builder.record_market_observation(token, observation)
