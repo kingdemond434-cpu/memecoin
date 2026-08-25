@@ -20,6 +20,8 @@ from solders.keypair import Keypair
 from solders.message import to_bytes_versioned
 from solders.transaction import VersionedTransaction
 
+from src.chains.pump_curve import quote_buy, quote_sell
+from src.chains.pump_route import NativePumpRoute, PreparedInstruction, WSOL_MINT
 from src.chains.rpc_manager import ChainConfig, RPCManager
 
 logger = logging.getLogger(__name__)
@@ -29,6 +31,7 @@ USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 
 class RouteType(Enum):
+    PUMP_NATIVE = "pump_native"
     JUPITER_V1 = "jupiter_v1"
     RAYDIUM_DIRECT = "raydium_direct"
     ORCA_DIRECT = "orca_direct"
@@ -504,6 +507,7 @@ class ExecutionEngine:
         *,
         dry_run: bool = True,
         confirmation_timeout: float = 45.0,
+        pump_route: Optional[NativePumpRoute] = None,
     ):
         self.chain_config = chain_config
         self.rpc = rpc
@@ -513,6 +517,18 @@ class ExecutionEngine:
         self.counterfactual_lab = counterfactual_lab
         self.dry_run = bool(dry_run)
         self.confirmation_timeout = confirmation_timeout
+        # The canonical T0 route: built locally from streamed curve state, with
+        # no quote round trip. Jupiter keeps routing after migration, an
+        # independent cross-check on our own pricing, and the fallback when the
+        # curve state is stale -- and loses the job it should never have had,
+        # which is being a mandatory dependency of a sub-second decision.
+        self.pump_route = pump_route
+        # Supplied by the desk, which owns the streamed curve state. The
+        # engine does not subscribe to anything itself -- an execution
+        # path that maintains its own view of the curve is a second
+        # source of truth about the price we are about to trade at.
+        self.curve_state_provider: Optional[Any] = None
+        self.native_route_attempts: Dict[str, int] = defaultdict(int)
         self.execution_history: deque = deque(maxlen=10_000)
         self.route_performance: Dict[RouteType, Dict[str, float]] = defaultdict(
             lambda: {"total": 0, "landed": 0, "filled": 0, "failed": 0, "avg_latency": 0}
@@ -525,6 +541,67 @@ class ExecutionEngine:
     async def stop(self):
         await self.jupiter.stop()
         await self.jito.stop()
+
+    def prepare_native_route(self, input_mint: str, output_mint: str, amount: int,
+                             slippage_bps: int) -> Optional[PreparedInstruction]:
+        """Build the Pump instruction locally, or say why it could not be built.
+
+        Returns None when this trade is not a Pump curve trade at all -- a
+        post-migration swap belongs to a router, and pretending otherwise
+        would build an instruction against a curve that has already graduated.
+
+        The protective bound is derived from the caller's slippage here rather
+        than invented: the sizing decision already chose the risk limit, and
+        this only expresses it in the units the instruction takes.
+        """
+        if self.pump_route is None:
+            return None
+        curve = self.curve_state_provider(output_mint if input_mint == WSOL_MINT
+                                          else input_mint) if self.curve_state_provider else None
+        if curve is None:
+            return None
+        buying = input_mint == WSOL_MINT
+        mint = output_mint if buying else input_mint
+        creator = getattr(curve, "creator", "")
+        if not creator:
+            return PreparedInstruction(
+                status="DATA_BLOCKED",
+                detail="curve state carries no creator; creator_vault underivable")
+        user = self.tx_builder.public_key
+        if buying:
+            quote = quote_buy(curve, amount)
+            if quote.data_status != "OK" or quote.output_amount <= 0:
+                return PreparedInstruction(status="DATA_BLOCKED",
+                                           detail=f"local buy quote: {quote.reason}")
+            # amount is the token amount bought; max_sol_cost bounds the spend.
+            return self.pump_route.build_buy(
+                mint, creator, user, quote.output_amount,
+                int(amount * (1 + slippage_bps / 10_000)))
+        quote = quote_sell(curve, amount)
+        if quote.data_status != "OK" or quote.output_amount <= 0:
+            return PreparedInstruction(status="DATA_BLOCKED",
+                                       detail=f"local sell quote: {quote.reason}")
+        return self.pump_route.build_sell(
+            mint, creator, user, amount,
+            int(quote.output_amount * (1 - slippage_bps / 10_000)))
+
+    def native_route_report(self) -> Dict[str, Any]:
+        """Whether the entry path is actually taking the local route.
+
+        A native builder that exists and is never used is the same defect as
+        one that was never written, and the only difference is that this one
+        looks finished.
+        """
+        total = sum(self.native_route_attempts.values())
+        prepared = self.native_route_attempts.get("prepared", 0)
+        return {
+            "status": "OK" if total else "DATA_BLOCKED",
+            "attempts": total, "prepared": prepared,
+            "prepared_share": (prepared / total) if total else None,
+            "outcomes": dict(self.native_route_attempts),
+            "route": self.pump_route.report() if self.pump_route else {
+                "status": "DATA_BLOCKED", "detail": "no native route configured"},
+        }
 
     async def execute_swap(
         self,
@@ -540,6 +617,15 @@ class ExecutionEngine:
         started = time.time()
         if amount <= 0 or slippage_bps <= 0 or slippage_bps > 2_000:
             return ExecutionResult(False, TransactionStatus.REJECTED, error="hard execution invariant failed")
+        native = self.prepare_native_route(input_mint, output_mint, amount, slippage_bps)
+        if native is not None and native.ok:
+            self.native_route_attempts["prepared"] += 1
+        elif native is not None:
+            # Recorded rather than swallowed: a native route that is blocked on
+            # every trade means the entry path is still paying two round trips
+            # it was supposed to have stopped paying, and nothing else would
+            # say so.
+            self.native_route_attempts[f"blocked:{native.status}"] += 1
         quote = await self.jupiter.get_quote(input_mint, output_mint, amount, slippage_bps)
         if not quote or quote.output_amount <= 0:
             return ExecutionResult(False, TransactionStatus.REJECTED, error="no executable quote")

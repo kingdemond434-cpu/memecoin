@@ -10,7 +10,7 @@ import os
 import struct
 import tempfile
 import time
-from collections import deque
+from collections import defaultdict, deque
 import unittest
 from dataclasses import asdict
 from pathlib import Path
@@ -117,6 +117,11 @@ from src.research.dataset_builder import (
 )
 from src.research.shadow_trainer import (
     SNAPSHOT_ORDER, chronological_episode_split, train_age_bands, train_shadow,
+)
+from src.chains.pump_route import (
+    PUBLISHED_GLOBAL, PUMP_PROGRAM, ROUTE_STATUS, SEED_GLOBAL, TOKEN_2022_PROGRAM,
+    TOKEN_PROGRAM, NativePumpRoute, PumpRouteConfig, associated_token_address,
+    derive, encode_args, instruction_discriminator,
 )
 from src.chains.pump_curve import (
     BONDING_CURVE_DISCRIMINATOR, observation_from_state, parse_bonding_curve,
@@ -9099,3 +9104,178 @@ class TestDecisionContribution(unittest.TestCase):
         called = {node.func.id for node in ast.walk(scorer)
                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
         self.assertIn("action_value_contributions", called)
+
+
+class TestNativePumpRoute(unittest.TestCase):
+    """Entry required two Jupiter round trips before a byte of the transaction existed.
+
+    On the one path where latency is the entire product. Both were avoidable:
+    the curve state already arrives on the stream, the pricing already runs
+    locally with Rust parity, and every account buy_v2 and sell_v2 need is a
+    fixed program, a published PDA, or an associated token account.
+    """
+
+    MINT = "So11111111111111111111111111111111111111112"
+    OTHER = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+
+    def _route(self):
+        return NativePumpRoute(PumpRouteConfig(
+            fee_program=self.OTHER, fee_recipient=self.MINT,
+            buyback_fee_recipient=self.MINT))
+
+    def test_the_derivation_reproduces_an_address_the_docs_state_outright(self):
+        """The one check that says the seeds were read correctly.
+
+        pump-public-docs states the global config is
+        4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf and separately that it is
+        PDA-derived from ["global"]. Deriving one and getting the other is an
+        independent confirmation of both the seed and the program id.
+        """
+        self.assertEqual(ROUTE_STATUS, "OK")
+        self.assertEqual(derive([SEED_GLOBAL], PUMP_PROGRAM), PUBLISHED_GLOBAL)
+
+    def test_discriminators_are_recomputed_not_transcribed(self):
+        for name in ("buy_v2", "sell_v2"):
+            expected = hashlib.sha256(f"global:{name}".encode()).digest()[:8]
+            self.assertEqual(instruction_discriminator(name), expected)
+        self.assertNotEqual(instruction_discriminator("buy_v2"),
+                            instruction_discriminator("sell_v2"))
+
+    def test_buy_and_sell_take_the_documented_number_of_accounts(self):
+        route = self._route()
+        buy = route.build_buy(self.MINT, self.MINT, self.MINT, 1_000, 5_000)
+        sell = route.build_sell(self.MINT, self.MINT, self.MINT, 1_000, 500)
+        self.assertEqual(buy.status, "OK")
+        self.assertEqual(len(buy.accounts), 27)
+        self.assertEqual(sell.status, "OK")
+        self.assertEqual(len(sell.accounts), 26)
+
+    def test_the_two_lists_differ_in_more_than_length(self):
+        """Copying one to the other is the obvious mistake."""
+        route = self._route()
+        buy = route.build_buy(self.MINT, self.MINT, self.OTHER, 1_000, 5_000)
+        sell = route.build_sell(self.MINT, self.MINT, self.OTHER, 1_000, 500)
+        # `user` is writable and signer on a buy, signer but NOT writable on a sell.
+        self.assertTrue(buy.accounts[13].is_signer and buy.accounts[13].is_writable)
+        self.assertTrue(sell.accounts[13].is_signer)
+        self.assertFalse(sell.accounts[13].is_writable)
+        # buy_v2 includes global_volume_accumulator; sell_v2 omits it.
+        accumulator = route.global_volume_accumulator
+        self.assertIn(accumulator, [meta.pubkey for meta in buy.accounts])
+        self.assertNotIn(accumulator, [meta.pubkey for meta in sell.accounts])
+
+    def test_exactly_one_signer_and_it_is_the_user(self):
+        route = self._route()
+        for prepared in (route.build_buy(self.MINT, self.MINT, self.OTHER, 10, 20),
+                         route.build_sell(self.MINT, self.MINT, self.OTHER, 10, 5)):
+            signers = [meta for meta in prepared.accounts if meta.is_signer]
+            self.assertEqual(len(signers), 1)
+            self.assertEqual(signers[0].pubkey, self.OTHER)
+
+    def test_instruction_data_is_discriminator_then_two_little_endian_u64(self):
+        route = self._route()
+        buy = route.build_buy(self.MINT, self.MINT, self.MINT, 1_234, 5_678)
+        self.assertEqual(buy.data[:8], instruction_discriminator("buy_v2"))
+        self.assertEqual(int.from_bytes(buy.data[8:16], "little"), 1_234)
+        self.assertEqual(int.from_bytes(buy.data[16:24], "little"), 5_678)
+        self.assertEqual(len(buy.data), 24)
+
+    def test_an_unsupplied_fee_program_blocks_rather_than_guesses(self):
+        """A guessed program id does not fail loudly; it builds a bad transaction."""
+        blocked = NativePumpRoute().build_buy(self.MINT, self.MINT, self.MINT, 1, 1)
+        self.assertEqual(blocked.status, "DATA_BLOCKED")
+        self.assertIn("fee_program", blocked.detail)
+        self.assertIn("not published", blocked.detail)
+
+    def test_an_unbounded_trade_is_refused(self):
+        route = self._route()
+        self.assertEqual(route.build_buy(self.MINT, self.MINT, self.MINT, 100, 0).status,
+                         "REJECTED")
+        self.assertEqual(route.build_sell(self.MINT, self.MINT, self.MINT, 100, 0).status,
+                         "REJECTED")
+        self.assertEqual(route.build_buy(self.MINT, self.MINT, self.MINT, 0, 100).status,
+                         "REJECTED")
+
+    def test_the_token_program_is_part_of_the_ata_seed(self):
+        """A Token-2022 base and an SPL quote give the same owner different ATAs."""
+        base = associated_token_address(self.MINT, self.MINT, TOKEN_2022_PROGRAM)
+        quote = associated_token_address(self.MINT, self.MINT, TOKEN_PROGRAM)
+        self.assertNotEqual(base, quote)
+
+    def test_arguments_that_cannot_fit_a_u64_are_refused(self):
+        with self.assertRaises(ValueError):
+            encode_args("buy_v2", 2 ** 64, 1)
+        with self.assertRaises(ValueError):
+            encode_args("buy_v2", 1, -1)
+
+    def test_the_report_says_why_it_is_blocked(self):
+        report = NativePumpRoute().report()
+        json.dumps(report)
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertEqual(report["global"], PUBLISHED_GLOBAL)
+        self.assertEqual(self._route().report()["status"], "OK")
+
+
+class TestNativeRouteIsTheCanonicalPath(unittest.TestCase):
+    MINT = "So11111111111111111111111111111111111111112"
+    OTHER = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+
+    def _engine(self, route=None, curve=None):
+        engine = ExecutionEngine.__new__(ExecutionEngine)
+        engine.pump_route = route
+        engine.curve_state_provider = (lambda token: curve) if curve else None
+        engine.tx_builder = SimpleNamespace(public_key=self.OTHER)
+        engine.native_route_attempts = defaultdict(int)
+        return engine
+
+    @staticmethod
+    def _curve(creator=""):
+        return BondingCurveState(
+            virtual_token_reserves=1_000_000_000_000,
+            virtual_sol_reserves=30_000_000_000,
+            real_token_reserves=800_000_000_000,
+            real_sol_reserves=0, token_total_supply=1_000_000_000_000_000,
+            complete=False, creator=creator)
+
+    def test_a_post_migration_swap_is_not_forced_down_the_curve_route(self):
+        """Building against a curve that has graduated is worse than routing."""
+        engine = self._engine(route=NativePumpRoute(), curve=None)
+        self.assertIsNone(engine.prepare_native_route(self.MINT, self.OTHER, 100, 100))
+
+    def test_a_curve_without_a_creator_blocks_rather_than_deriving_a_wrong_vault(self):
+        engine = self._engine(route=NativePumpRoute(), curve=self._curve(creator=""))
+        prepared = engine.prepare_native_route(self.MINT, self.OTHER, 1_000_000, 100)
+        self.assertEqual(prepared.status, "DATA_BLOCKED")
+        self.assertIn("creator", prepared.detail)
+
+    def test_a_buy_is_built_from_the_streamed_curve_with_no_quote_call(self):
+        route = NativePumpRoute(PumpRouteConfig(
+            fee_program=self.OTHER, fee_recipient=self.MINT,
+            buyback_fee_recipient=self.MINT))
+        engine = self._engine(route=route, curve=self._curve(creator=self.MINT))
+        prepared = engine.prepare_native_route(self.MINT, self.OTHER, 1_000_000_000, 100)
+        self.assertEqual(prepared.status, "OK")
+        self.assertEqual(len(prepared.accounts), 27)
+        self.assertEqual(prepared.data[:8], instruction_discriminator("buy_v2"))
+
+    def test_a_sell_carries_a_protective_floor_derived_from_the_local_quote(self):
+        route = NativePumpRoute(PumpRouteConfig(
+            fee_program=self.OTHER, fee_recipient=self.MINT,
+            buyback_fee_recipient=self.MINT))
+        engine = self._engine(route=route, curve=self._curve(creator=self.MINT))
+        prepared = engine.prepare_native_route(self.OTHER, self.MINT, 1_000_000_000, 500)
+        self.assertEqual(prepared.status, "OK")
+        self.assertEqual(len(prepared.accounts), 26)
+        floor = int.from_bytes(prepared.data[16:24], "little")
+        self.assertGreater(floor, 0)
+
+    def test_a_native_route_that_never_runs_is_visible_rather_than_silent(self):
+        """A builder that exists and is never used looks finished and is not."""
+        engine = self._engine(route=None)
+        report = engine.native_route_report()
+        json.dumps(report)
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertIsNone(report["prepared_share"])
+        engine.native_route_attempts["prepared"] = 3
+        engine.native_route_attempts["blocked:DATA_BLOCKED"] = 1
+        self.assertAlmostEqual(engine.native_route_report()["prepared_share"], 0.75)

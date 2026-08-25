@@ -72,6 +72,7 @@ from src.strategies.information_graph import (
 from src.strategies.age_banded import AgeBandedPredictor
 from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPredictor, PredictionFeatures
 from src.chains.pump_curve import BondingCurveState, quote_buy, quote_sell
+from src.chains.pump_route import NativePumpRoute, PumpRouteConfig
 from src.execution.pump_fees import (
     DEFAULT_SCHEDULE as PUMP_FEE_SCHEDULE, VENUE_BONDING_CURVE,
 )
@@ -556,8 +557,25 @@ class MemecoinQuantDesk:
         self.jupiter = JupiterClient()
         self.jito = JitoClient()
         builder = SolanaTransactionBuilder(self.solana_rpc, self.keypair)
+        # The native route needs three addresses the published docs do not
+        # give: the Pump Fees program, and the two fee recipients that live in
+        # the on-chain Global config. Supplied by the operator or left empty,
+        # in which case the route reports DATA_BLOCKED and the desk keeps
+        # using Jupiter -- which is the correct degradation, because a guessed
+        # program id builds a transaction that fails at best.
+        self.pump_route = NativePumpRoute(PumpRouteConfig(
+            fee_program=str(self.global_config.get("pump_fee_program", "") or ""),
+            fee_recipient=str(self.global_config.get("pump_fee_recipient", "") or ""),
+            buyback_fee_recipient=str(
+                self.global_config.get("pump_buyback_fee_recipient", "") or ""),
+        ))
         self.execution_engine = ExecutionEngine(self.solana_config, self.solana_rpc, self.jupiter, self.jito,
-                                                builder, self.counterfactual_lab, dry_run=self.dry_run)
+                                                builder, self.counterfactual_lab, dry_run=self.dry_run,
+                                                pump_route=self.pump_route)
+        # The desk owns the streamed curve state; the engine reads it through
+        # this rather than keeping its own, because two views of the price we
+        # are about to trade at is one view too many.
+        self.execution_engine.curve_state_provider = self._latest_curve_state.get
         self.fee_optimizer = PriorityFeeOptimizer()
         if not self.offline:
             await self.execution_engine.start()
@@ -2515,6 +2533,8 @@ class MemecoinQuantDesk:
                        "sol_price_usd": self.sol_price_usd},
             "execution": {"dry_run": self.execution_engine.dry_run if self.execution_engine else True},
             "native_fastpath": NATIVE_FASTPATH_STATUS,
+            "native_route": (self.execution_engine.native_route_report()
+                             if self.execution_engine else {"status": "DATA_BLOCKED"}),
             "action_policy": {"trained": self.action_policy.is_trained,
                               "min_edge": self.action_policy.min_edge},
             "source_mesh": {**self.source_mesh.health(),
