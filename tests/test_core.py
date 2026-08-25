@@ -35,6 +35,10 @@ from src.execution.jupiter_jito import (
 from src.main import CAPACITY_REJECTIONS, MemecoinQuantDesk, _jsonable
 from src.strategies.information_graph import CounterfactualExecutionLab
 from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPrediction, MultiHeadPredictor, PredictionFeatures
+from src.strategies.actor_graph import (
+    BuyerDNA, BuyerFingerprint, Entry, IndependenceReport, SwarmPredictor,
+    WalletIndependence, aggregate_smart_flow, build_fingerprint,
+)
 from src.strategies.authenticity import (
     AuthenticityResolver, AuthenticityVerdict, EntityRegistry, ProofLevel,
     SourceSignal, WatchedEntity, extract_mints, host_matches, looks_like_mint,
@@ -4323,3 +4327,233 @@ class TestSmallAccountMode(unittest.TestCase):
         self.assertEqual(engine.max_total_exposure_pct, 0.30)
         self.assertEqual(engine.max_portfolio_risk, 0.10)
         self.assertEqual(engine.max_position_pct, 0.05)
+
+
+class TestWalletIndependence(unittest.TestCase):
+    """Twelve wallets buying is not twelve pieces of evidence."""
+
+    @staticmethod
+    def _entry(token, wallet, timestamp, skill=0.8, capital=100.0):
+        return Entry(token=token, wallet=wallet, timestamp=timestamp,
+                     skill=skill, capital_usd=capital)
+
+    def _copycat_history(self, launches=10):
+        """LEADER decides; FOLLOWER copies a second later, every time."""
+        graph = WalletIndependence(min_observations=4)
+        for index in range(launches):
+            base = index * 1_000.0
+            graph.record_entries([
+                self._entry(f"t{index}", "LEADER", base),
+                self._entry(f"t{index}", "FOLLOWER", base + 1.0),
+                self._entry(f"t{index}", "SOLO", base + 400.0),
+            ])
+        return graph
+
+    def test_a_consistent_follower_is_scored_as_dependent(self):
+        report = self._copycat_history().compute()
+        self.assertEqual(report.status, "OK")
+        self.assertAlmostEqual(report.scores["FOLLOWER"], 0.0)
+        self.assertAlmostEqual(report.scores["LEADER"], 1.0)
+        self.assertAlmostEqual(report.scores["SOLO"], 1.0)
+        self.assertEqual(report.followers["FOLLOWER"][0][0], "LEADER")
+
+    def test_a_thin_history_blocks_rather_than_guessing(self):
+        graph = WalletIndependence(min_observations=4)
+        graph.record_entries([self._entry("t0", "A", 0.0), self._entry("t0", "B", 1.0)])
+        report = graph.compute()
+        # A follow ratio from two observations is noise with a decimal point.
+        self.assertEqual(report.status, "DATA_BLOCKED")
+        self.assertIsNone(graph.score_of("B", report))
+
+    def test_entering_the_same_token_far_apart_is_not_following(self):
+        graph = WalletIndependence(min_observations=4, follow_window=3.0)
+        for index in range(8):
+            base = index * 1_000.0
+            graph.record_entries([self._entry(f"t{index}", "A", base),
+                                  self._entry(f"t{index}", "B", base + 60.0)])
+        report = graph.compute()
+        # Two people reacting to the same public event minutes apart are two
+        # actors, not one.
+        self.assertAlmostEqual(report.scores["B"], 1.0)
+
+    def test_a_wallet_buying_twice_is_not_evidence_about_anyone(self):
+        graph = WalletIndependence(min_observations=2)
+        for index in range(4):
+            base = index * 1_000.0
+            graph.record_entries([
+                self._entry(f"t{index}", "A", base),
+                self._entry(f"t{index}", "A", base + 0.5),
+                self._entry(f"t{index}", "A", base + 1.0),
+                self._entry(f"t{index}", "B", base + 500.0),
+            ])
+        report = graph.compute()
+        self.assertAlmostEqual(report.scores["B"], 1.0)
+
+
+class TestSmartFlowAggregation(unittest.TestCase):
+    """Collapsing wallets to actors can only ever discount the signal."""
+
+    @staticmethod
+    def _entry(wallet, skill=0.8, capital=100.0, timestamp=0.0):
+        return Entry(token="t", wallet=wallet, timestamp=timestamp,
+                     skill=skill, capital_usd=capital)
+
+    def test_a_sybil_cluster_scores_far_below_its_wallet_count(self):
+        report = IndependenceReport(status="OK", scores={f"S{i}": 0.0 for i in range(10)})
+        flow = aggregate_smart_flow([self._entry(f"S{i}") for i in range(10)], report)
+        self.assertEqual(flow.status, "OK")
+        self.assertAlmostEqual(flow.evidence, 0.0)
+        self.assertAlmostEqual(flow.naive_evidence, 10 * 0.8 * 100.0)
+        self.assertAlmostEqual(flow.discount, 0.0)
+
+    def test_three_independent_wallets_outweigh_ten_linked_ones(self):
+        sybil_report = IndependenceReport(status="OK", scores={f"S{i}": 0.05 for i in range(10)})
+        clean_report = IndependenceReport(status="OK", scores={f"I{i}": 1.0 for i in range(3)})
+        sybil = aggregate_smart_flow([self._entry(f"S{i}") for i in range(10)], sybil_report)
+        clean = aggregate_smart_flow([self._entry(f"I{i}") for i in range(3)], clean_report)
+        # A counter of buyers ranks these the other way round.
+        self.assertGreater(clean.evidence, sybil.evidence)
+
+    def test_independence_can_never_inflate_the_signal(self):
+        report = IndependenceReport(status="OK", scores={"A": 1.0, "B": 1.0})
+        flow = aggregate_smart_flow([self._entry("A"), self._entry("B")], report)
+        self.assertLessEqual(flow.evidence, flow.naive_evidence + 1e-9)
+        self.assertLessEqual(flow.discount, 1.0)
+
+    def test_an_unmeasured_wallet_is_not_treated_as_independent(self):
+        blocked = IndependenceReport(status="DATA_BLOCKED")
+        flow = aggregate_smart_flow([self._entry("NEW")], blocked)
+        # A brand-new wallet appearing beside a known cluster is what a Sybil
+        # looks like, so unknown must not be the most persuasive state.
+        self.assertLess(flow.discount, 1.0)
+        self.assertGreater(flow.discount, 0.0)
+        self.assertEqual(flow.unmeasured_wallets, 1)
+
+    def test_buyers_without_a_skill_or_size_are_not_counted(self):
+        report = IndependenceReport(status="OK", scores={"A": 1.0})
+        flow = aggregate_smart_flow(
+            [Entry("t", "A", 0.0, skill=None, capital_usd=100.0)], report)
+        self.assertEqual(flow.status, "DATA_BLOCKED")
+
+
+class TestBuyerDNA(unittest.TestCase):
+    """Order matters: the same aggregate statistics mean opposite things."""
+
+    @staticmethod
+    def _fingerprint(token, skills, independence=None, linked=None):
+        count = len(skills)
+        return BuyerFingerprint(
+            token=token, skills=list(skills),
+            independence=list(independence or [1.0] * count),
+            creator_linked=list(linked or [False] * count),
+            sizes=[100.0] * count,
+        )
+
+    def _corpus(self, dna):
+        for index in range(30):
+            dna.add(self._fingerprint(f"monster-{index}", [0.2, 0.85, 0.9, 0.95]), "monster")
+        for index in range(30):
+            dna.add(self._fingerprint(f"dump-{index}", [0.9, 0.85, 0.2, 0.1],
+                                      independence=[0.0] * 4,
+                                      linked=[True] * 4), "dump_vehicle")
+        return dna
+
+    def test_a_thin_corpus_refuses_to_be_a_prior(self):
+        dna = BuyerDNA(min_corpus=50)
+        dna.add(self._fingerprint("only", [0.9, 0.9]), "monster")
+        match = dna.match(self._fingerprint("query", [0.9, 0.9]))
+        # 1-NN against three launches is a coincidence with a confidence
+        # interval, not a prior.
+        self.assertEqual(match.status, "DATA_BLOCKED")
+        self.assertIn("below", match.detail)
+
+    def test_improving_buyer_quality_matches_monsters(self):
+        dna = self._corpus(BuyerDNA(min_corpus=50))
+        match = dna.match(self._fingerprint("query", [0.25, 0.8, 0.88, 0.92]))
+        self.assertEqual(match.status, "OK")
+        self.assertEqual(match.label, "monster")
+
+    def test_the_reversed_sequence_matches_dump_vehicles(self):
+        """Same four skill values, opposite order, opposite conclusion."""
+        dna = self._corpus(BuyerDNA(min_corpus=50))
+        match = dna.match(self._fingerprint("query", [0.9, 0.85, 0.2, 0.1],
+                                            independence=[0.0] * 4, linked=[True] * 4))
+        self.assertEqual(match.label, "dump_vehicle")
+
+    def test_padding_is_distinguishable_from_a_real_zero(self):
+        short = self._fingerprint("short", [0.5, 0.5])
+        vector = short.vector(4)
+        # "only two buyers" and "the third buyer scored zero" must not collapse
+        # into the same state.
+        self.assertEqual(list(vector[:4]), [0.5, 0.5, -1.0, -1.0])
+
+    def test_no_buyers_yet_blocks(self):
+        dna = self._corpus(BuyerDNA(min_corpus=50))
+        self.assertEqual(dna.match(self._fingerprint("query", [])).status, "DATA_BLOCKED")
+
+    def test_the_fingerprint_keeps_the_first_unique_buyers_in_order(self):
+        report = IndependenceReport(status="OK", scores={"A": 1.0, "B": 0.2})
+        entries = [
+            Entry("t", "B", 2.0, skill=0.3, capital_usd=10.0),
+            Entry("t", "A", 1.0, skill=0.9, capital_usd=50.0),
+            Entry("t", "A", 3.0, skill=0.9, capital_usd=70.0),
+        ]
+        fingerprint = build_fingerprint("t", entries, report, depth=25)
+        self.assertEqual(fingerprint.skills, [0.9, 0.3])
+        self.assertEqual(fingerprint.independence, [1.0, 0.2])
+
+
+class TestSwarmPredictor(unittest.TestCase):
+    """The forward question, not the backward one."""
+
+    NOW = 1_000.0
+
+    def _entries(self, count, skill=0.9, spread=1.0, start=9.0):
+        return [Entry("t", f"W{i}", self.NOW - start + i * spread,
+                      skill=skill, capital_usd=100.0) for i in range(count)]
+
+    def _report(self, count, independence=1.0):
+        return IndependenceReport(status="OK",
+                                  scores={f"W{i}": independence for i in range(count)})
+
+    def test_independent_skilled_arrivals_produce_evidence(self):
+        reading = SwarmPredictor().evaluate(self._entries(6), self._report(6), self.NOW)
+        self.assertGreater(reading.evidence, 0)
+        self.assertEqual(reading.independent_skilled_so_far, 6)
+
+    def test_a_linked_cluster_produces_none(self):
+        reading = SwarmPredictor().evaluate(
+            self._entries(6), self._report(6, independence=0.0), self.NOW)
+        self.assertEqual(reading.independent_skilled_so_far, 0)
+        self.assertEqual(reading.evidence, 0.0)
+
+    def test_unskilled_arrivals_produce_none(self):
+        reading = SwarmPredictor().evaluate(
+            self._entries(6, skill=0.1), self._report(6), self.NOW)
+        self.assertEqual(reading.independent_skilled_so_far, 0)
+
+    def test_an_untrained_predictor_gives_no_probability(self):
+        reading = SwarmPredictor().evaluate(self._entries(6), self._report(6), self.NOW)
+        self.assertEqual(reading.status, "DATA_BLOCKED")
+        self.assertIsNone(reading.probability)
+
+    def test_a_trained_predictor_reports_one(self):
+        class FakeModel:
+            def predict_proba(self, matrix):
+                return np.asarray([[0.3, 0.7]])
+
+        predictor = SwarmPredictor()
+        self.assertTrue(predictor.load_model(FakeModel()))
+        reading = predictor.evaluate(self._entries(6), self._report(6), self.NOW)
+        self.assertEqual(reading.status, "OK")
+        self.assertAlmostEqual(reading.probability, 0.7)
+
+    def test_a_model_without_predict_proba_is_refused_at_load(self):
+        predictor = SwarmPredictor()
+        self.assertFalse(predictor.load_model(object()))
+        self.assertFalse(predictor.is_trained)
+
+    def test_an_empty_window_blocks(self):
+        reading = SwarmPredictor().evaluate(self._entries(3), self._report(3),
+                                            self.NOW + 10_000)
+        self.assertEqual(reading.status, "DATA_BLOCKED")
