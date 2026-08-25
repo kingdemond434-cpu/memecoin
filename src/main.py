@@ -52,6 +52,9 @@ from src.strategies.information_graph import (
 )
 from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPredictor, PredictionFeatures
 from src.strategies.distribution import DistributionDetector
+from src.strategies.monster import (
+    MonsterEvidence, MonsterState, MonsterStateMachine, hold_versus_exit,
+)
 from src.strategies.opportunity_allocator import Opportunity, OpportunityAllocator
 from src.strategies.prelaunch_intent import PrelaunchIntentModel
 from src.strategies.public_coordination import PublicCoordinationMiner
@@ -309,6 +312,18 @@ class MemecoinQuantDesk:
                                 if self.global_config.get("daily_giveback_pct") is not None else None),
             daily_giveback_arm_pct=float(self.global_config.get("daily_giveback_arm_pct", 0.5)),
             max_liquidity_fraction=float(self.global_config.get("max_liquidity_fraction", 0.01)),
+        )
+        self.monster_machine = MonsterStateMachine(
+            monster_probability_threshold=float(
+                self.global_config.get("monster_probability_threshold", 0.15)),
+            candidate_probability_threshold=float(
+                self.global_config.get("monster_candidate_threshold", 0.06)),
+            degrade_confirmations=int(self.global_config.get("monster_degrade_confirmations", 3)),
+            min_degrade_dimensions=int(self.global_config.get("monster_degrade_dimensions", 2)),
+            bank_fractions={
+                state: float(self.global_config.get(f"monster_bank_{state.value}", default))
+                for state, default in MonsterStateMachine.DEFAULT_BANK_FRACTIONS.items()
+            },
         )
         self.distribution_detector = DistributionDetector(
             min_coverage=float(self.global_config.get("distribution_min_coverage", 0.3)))
@@ -733,21 +748,34 @@ class MemecoinQuantDesk:
                 "drivers": dict(DistributionDetector.top_contributors(distribution)),
                 "probabilities": {str(k): v for k, v in distribution.probabilities.items()},
             }
+            monster = self._update_monster_state(token, position, distribution, multiple)
+            if monster.action == "emergency_exit":
+                await self._execute_exit(token, position, 1.0, f"monster_{monster.reason}")
+                continue
+            if monster.action == "bank" and monster.bank_fraction > 0:
+                await self._execute_exit(token, position, monster.bank_fraction,
+                                         f"monster_{monster.reason}")
+                continue
+
             decision = evaluate_exit(
                 self.exit_policy, multiple, float(position["high_water_multiple"]), continuation,
                 set(stages), time.time() - float(position["entry_time"]),
             )
-            if not decision and distribution.calibrated:
-                # Only a calibrated reading may pull an exit forward. The
-                # uncalibrated evidence score is recorded on the position for
-                # research either way, but it never moves capital: an
-                # unvalidated number with a position attached is exactly the
-                # fabrication this repository is meant not to contain.
-                p_3s = distribution.probability(3.0) or 0.0
-                threshold = float(self.global_config.get("distribution_exit_p3s", 0.60))
-                if p_3s >= threshold:
-                    decision = ("distribution_detected", float(
-                        self.global_config.get("distribution_exit_fraction", 0.60)))
+            if decision and self.monster_machine.overrides_ordinary_exit(token):
+                # A ratchet banks harder the higher a position goes, which is
+                # right for ordinary winners and exactly wrong for the rare one
+                # that would carry the account: it sells that one first and
+                # hardest. Inside a monster state -- reachable only from a
+                # CALIBRATED monster probability -- the ratchet and trail stand
+                # down. The hazard exit above is not stood down, and never is.
+                logger.info("MONSTER_HOLD %s suppressing %s at %.2fx", token, decision[0], multiple)
+                position.setdefault("suppressed_exits", []).append(
+                    {"reason": decision[0], "multiple": multiple, "at": time.time()})
+                decision = None
+            # A calibrated distribution reading reaches the exit through the
+            # monster machine above, which is the single path that owns
+            # conviction state. Two independent branches deciding the same
+            # thing on the same input is how they end up disagreeing.
             if not decision:
                 await self._consider_scale_in(token, position, multiple)
                 continue
@@ -854,6 +882,55 @@ class MemecoinQuantDesk:
                 held_multiple=multiple,
             ))
         return opportunities
+
+    def _update_monster_state(self, token: str, position: Dict[str, Any],
+                              distribution: Any, multiple: float):
+        """Advance this position's conviction state on currently observed evidence.
+
+        Monster probability is supplied only when a calibrated source exists.
+        Without one the machine stays in NORMAL, `overrides_ordinary_exit` is
+        False, and every ordinary exit rule applies unchanged -- an override
+        that lets a position ignore its stop, granted on an unvalidated number,
+        is the most expensive fabrication available.
+        """
+        hazard = self.rug_hazard.get_hazard(token)
+        prediction = position.get("prediction_object")
+        catastrophic = bool(hazard and getattr(hazard, "urgency", "") == "critical")
+        evidence = MonsterEvidence(
+            monster_probability=None,
+            monster_probability_calibrated=False,
+            distribution_probability=distribution.probability(3.0),
+            distribution_calibrated=distribution.calibrated,
+            rug_probability=(float(getattr(hazard, "hazard_5m", 0.0)) if hazard else None),
+            catastrophic_hazard=catastrophic,
+        )
+        features = distribution.features or {}
+        if distribution.coverage > 0:
+            # Sign-flipped distribution features are the same observations read
+            # as continuation evidence; they are not a second opinion.
+            evidence.smart_wallet_net_accumulation = 0.5 - features.get("smart_wallet_exit_rate", 0.5)
+            evidence.buyer_quality_trend = -features.get("buyer_quality_decline", 0.0)
+            evidence.independent_buyer_acceleration = -features.get("buy_acceleration_rollover", 0.0)
+            evidence.sell_absorption = 1.0 - features.get("sell_absorption_failure", 0.0)
+            evidence.audience_penetration = features.get("new_buyer_saturation", None)
+
+        value = None
+        if prediction is not None and prediction.expected_feasible_multiple > 0:
+            value = hold_versus_exit(
+                remaining_upside_multiple=max(1e-9, float(prediction.expected_feasible_multiple)),
+                distribution_probability=float(distribution.probability(10.0) or 0.0),
+                rug_probability=float(getattr(hazard, "hazard_5m", 0.0) or 0.0) if hazard else 0.0,
+                exit_capacity_ratio=float(position.get("exit_capacity_ratio", 1.0) or 0.0),
+                alternative_growth_per_second=float(
+                    (self.last_slate_report or {}).get("best_score") or 0.0)
+                * float(position.get("remaining_cost_usd", 0.0) or 0.0),
+                expected_remaining_seconds=max(
+                    1.0, float(getattr(prediction, "expected_hold_time", 0.0) or 0.0)),
+            )
+        decision = self.monster_machine.update(token, evidence, value)
+        position["monster_state"] = decision.state.value
+        position["monster_action"] = decision.action
+        return decision
 
     def _read_distribution(self, token: str):
         """Evaluate the distribution detector on this token's observed flow."""

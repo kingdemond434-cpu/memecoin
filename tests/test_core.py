@@ -39,6 +39,10 @@ from src.strategies.distribution import (
     DISTRIBUTION_FEATURE_NAMES, DISTRIBUTION_HORIZONS, DistributionDetector,
     distribution_features,
 )
+from src.strategies.monster import (
+    MONSTER_STATES, MonsterEvidence, MonsterState, MonsterStateMachine,
+    hold_versus_exit, premature_exit_rates, tail_capture_ratio,
+)
 from src.strategies.opportunity_allocator import Opportunity, OpportunityAllocator
 from src.strategies.public_coordination import PublicCoordinationMiner
 from src.strategies.wallet_intelligence import WalletIntelligenceEngine, WalletRegime
@@ -2739,9 +2743,14 @@ class TestPositionPredictionRefresh(unittest.IsolatedAsyncioTestCase):
         desk._refresh_position_prediction = (
             lambda token, pos: MemecoinQuantDesk._refresh_position_prediction(desk, token, pos))
         desk.rug_hazard = SimpleNamespace(should_exit=lambda t, p: (False, "", 0.0),
-                                          observations={})
+                                          observations={}, get_hazard=lambda t: None)
         desk.distribution_detector = DistributionDetector()
+        desk.monster_machine = MonsterStateMachine()
+        desk.last_slate_report = {}
         desk._read_distribution = lambda token: MemecoinQuantDesk._read_distribution(desk, token)
+        desk._update_monster_state = (
+            lambda token, pos, dist, mult:
+            MemecoinQuantDesk._update_monster_state(desk, token, pos, dist, mult))
         desk.elogw_engine = SimpleNamespace(open_positions={"mint": position})
         desk._mark_position = mark
         desk.exit_policy = ExitPolicy.default()
@@ -3385,14 +3394,20 @@ class TestDistributionExitWiring(unittest.IsolatedAsyncioTestCase):
         desk = SimpleNamespace(
             elogw_engine=SimpleNamespace(open_positions={"mint": position}),
             rug_hazard=SimpleNamespace(should_exit=lambda t, p: (False, "", 0.0),
-                                       observations={"mint": observations}),
+                                       observations={"mint": observations},
+                                       get_hazard=lambda t: None),
             distribution_detector=detector,
+            monster_machine=MonsterStateMachine(),
+            last_slate_report={},
             exit_policy=ExitPolicy.default(),
             predictor=SimpleNamespace(_is_trained=False),
-            global_config={"distribution_exit_p3s": 0.60, "distribution_exit_fraction": 0.6},
+            global_config={},
             position=position, exits=exits,
         )
         desk._read_distribution = lambda token: MemecoinQuantDesk._read_distribution(desk, token)
+        desk._update_monster_state = (
+            lambda token, pos, dist, mult:
+            MemecoinQuantDesk._update_monster_state(desk, token, pos, dist, mult))
         desk._refresh_position_prediction = (
             lambda token, pos: MemecoinQuantDesk._refresh_position_prediction(desk, token, pos))
         desk._mark_position = lambda token, pos: _async_value((2.9, 290.0))
@@ -3440,8 +3455,9 @@ class TestDistributionExitWiring(unittest.IsolatedAsyncioTestCase):
         await MemecoinQuantDesk._manage_positions(desk)
 
         self.assertEqual(len(desk.exits), 1)
-        self.assertEqual(desk.exits[0][0], "distribution_detected")
-        self.assertAlmostEqual(desk.exits[0][1], 0.6)
+        self.assertEqual(desk.exits[0][0], "monster_distribution")
+        self.assertAlmostEqual(desk.exits[0][1],
+                               MonsterStateMachine.DEFAULT_BANK_FRACTIONS[MonsterState.DISTRIBUTION])
 
     async def test_an_uncalibrated_reading_never_moves_capital(self):
         """Identical flow, identical evidence, no trained model: no exit."""
@@ -3467,3 +3483,296 @@ class TestDistributionExitWiring(unittest.IsolatedAsyncioTestCase):
 
 async def _async_value(value):
     return value
+
+
+class TestMonsterHold(unittest.TestCase):
+    """Large unrealised profit is not evidence a move is over.
+
+    Every threshold-based exit in this repository banks harder the higher a
+    position goes, which is optimal for ordinary winners and catastrophic for
+    the rare launch that would carry the account: it is guaranteed to sell
+    that one first and hardest.
+    """
+
+    @staticmethod
+    def _monster(**kwargs):
+        base = dict(monster_probability=0.30, monster_probability_calibrated=True,
+                    independent_buyer_acceleration=0.5, smart_wallet_net_accumulation=0.4,
+                    buyer_quality_trend=0.2, sell_absorption=0.9, liquidity_expansion=0.3,
+                    new_source_discovery_rate=0.2, audience_penetration=0.2)
+        base.update(kwargs)
+        return MonsterEvidence(**base)
+
+    def test_an_uncalibrated_monster_probability_never_grants_an_override(self):
+        machine = MonsterStateMachine()
+        decision = machine.update("mint", self._monster(monster_probability=0.99,
+                                                        monster_probability_calibrated=False))
+        self.assertEqual(decision.state, MonsterState.NORMAL)
+        self.assertFalse(machine.overrides_ordinary_exit("mint"))
+
+    def test_a_calibrated_monster_reaches_hold_and_stands_the_ratchet_down(self):
+        machine = MonsterStateMachine()
+        decision = machine.update("mint", self._monster())
+        self.assertEqual(decision.state, MonsterState.MONSTER_HOLD)
+        self.assertEqual(decision.action, "add")
+        self.assertTrue(machine.overrides_ordinary_exit("mint"))
+
+    def test_state_tracks_evidence_not_price(self):
+        """A 1.4x can be MONSTER_HOLD and an 8x can be merely PUMP_DETECTED."""
+        machine = MonsterStateMachine()
+        machine.update("early", self._monster())
+        machine.update("stale", MonsterEvidence(monster_probability=0.01,
+                                                monster_probability_calibrated=True,
+                                                independent_buyer_acceleration=0.1))
+        self.assertEqual(machine.state_of("early"), MonsterState.MONSTER_HOLD)
+        self.assertEqual(machine.state_of("stale"), MonsterState.PUMP_DETECTED)
+
+    def test_one_whale_selling_does_not_eject_a_monster(self):
+        """The exact failure this machine exists to prevent."""
+        machine = MonsterStateMachine(degrade_confirmations=3, min_degrade_dimensions=2)
+        machine.update("mint", self._monster())
+
+        transient = self._monster(monster_probability=0.02,
+                                  smart_wallet_net_accumulation=-0.6,
+                                  independent_buyer_acceleration=-0.2)
+        decision = machine.update("mint", transient)
+        self.assertEqual(decision.state, MonsterState.MONSTER_HOLD)
+        self.assertEqual(decision.action, "hold")
+        self.assertEqual(decision.degrade_streak, 1)
+
+        # Evidence recovers on the next tick: the streak resets, so an earlier
+        # wobble cannot be banked toward a later ejection.
+        machine.update("mint", self._monster())
+        self.assertEqual(machine.state_of("mint"), MonsterState.MONSTER_HOLD)
+        self.assertEqual(machine.update("mint", transient).degrade_streak, 1)
+
+    def test_persistent_broad_evidence_does_eject(self):
+        machine = MonsterStateMachine(degrade_confirmations=3, min_degrade_dimensions=2)
+        machine.update("mint", self._monster())
+        turning = self._monster(monster_probability=0.01,
+                                smart_wallet_net_accumulation=-0.6,
+                                buyer_quality_trend=-0.4,
+                                independent_buyer_acceleration=-0.3,
+                                sell_absorption=0.1)
+        states = [machine.update("mint", turning).state for _ in range(3)]
+        self.assertEqual(states[:2], [MonsterState.MONSTER_HOLD, MonsterState.MONSTER_HOLD])
+        self.assertNotIn(states[2], MONSTER_STATES)
+        self.assertFalse(machine.overrides_ordinary_exit("mint"))
+
+    def test_a_single_dimension_never_accumulates_a_streak(self):
+        machine = MonsterStateMachine(degrade_confirmations=3, min_degrade_dimensions=2)
+        machine.update("mint", self._monster())
+        one_signal = self._monster(monster_probability=0.01,
+                                   smart_wallet_net_accumulation=-0.6)
+        for _ in range(10):
+            decision = machine.update("mint", one_signal)
+        self.assertEqual(decision.state, MonsterState.MONSTER_HOLD)
+        self.assertEqual(decision.degrade_streak, 0)
+
+    def test_catastrophic_hazard_bypasses_hysteresis_entirely(self):
+        """Patience about a rug is not patience."""
+        machine = MonsterStateMachine(degrade_confirmations=99)
+        machine.update("mint", self._monster())
+        decision = machine.update("mint", self._monster(catastrophic_hazard=True))
+        self.assertEqual(decision.state, MonsterState.DISTRIBUTION)
+        self.assertEqual(decision.action, "emergency_exit")
+        self.assertEqual(decision.bank_fraction, 1.0)
+
+    def test_calibrated_distribution_forces_the_distribution_state(self):
+        machine = MonsterStateMachine()
+        machine.update("mint", self._monster())
+        decision = machine.update("mint", self._monster(distribution_probability=0.8,
+                                                        distribution_calibrated=True))
+        self.assertEqual(decision.state, MonsterState.DISTRIBUTION)
+        self.assertEqual(decision.action, "bank")
+        self.assertGreater(decision.bank_fraction, 0.5)
+
+    def test_uncalibrated_distribution_does_not_force_it(self):
+        machine = MonsterStateMachine()
+        machine.update("mint", self._monster())
+        decision = machine.update("mint", self._monster(distribution_probability=0.99,
+                                                        distribution_calibrated=False))
+        self.assertEqual(decision.state, MonsterState.MONSTER_HOLD)
+
+    def test_staged_banking_fires_once_per_state(self):
+        machine = MonsterStateMachine()
+        machine.update("mint", self._monster())
+        fomo = self._monster(new_source_discovery_rate=0.9, audience_penetration=0.6)
+        first = machine.update("mint", fomo)
+        second = machine.update("mint", fomo)
+        self.assertEqual((first.action, first.state), ("bank", MonsterState.MASS_FOMO))
+        self.assertAlmostEqual(first.bank_fraction, 0.15)
+        # A staged bank is a one-off, not a per-tick tax on the runner.
+        self.assertEqual(second.action, "hold")
+
+    def test_saturation_banks_harder_than_mass_fomo(self):
+        machine = MonsterStateMachine()
+        self.assertLess(machine.bank_fractions[MonsterState.MASS_FOMO],
+                        machine.bank_fractions[MonsterState.SATURATION])
+        self.assertLess(machine.bank_fractions[MonsterState.SATURATION],
+                        machine.bank_fractions[MonsterState.DISTRIBUTION])
+
+
+class TestHoldVersusExitValue(unittest.TestCase):
+    """The exit comparison must not contain the price level."""
+
+    def _value(self, **kwargs):
+        base = dict(remaining_upside_multiple=3.0, distribution_probability=0.1,
+                    rug_probability=0.02, exit_capacity_ratio=1.0,
+                    alternative_growth_per_second=1e-5, expected_remaining_seconds=120.0)
+        base.update(kwargs)
+        return hold_versus_exit(**base)
+
+    def test_large_remaining_upside_holds(self):
+        value = self._value()
+        self.assertEqual(value.status, "OK")
+        self.assertFalse(value.should_exit)
+        self.assertGreater(value.v_hold, value.v_exit)
+
+    def test_exhausted_upside_exits_even_at_a_huge_multiple(self):
+        # The position is up 50x; that number appears nowhere. What decides it
+        # is that there is no upside left and the capital has somewhere better.
+        value = self._value(remaining_upside_multiple=1.01,
+                            alternative_growth_per_second=1e-3)
+        self.assertTrue(value.should_exit)
+
+    def test_a_better_alternative_can_take_the_capital(self):
+        patient = self._value(alternative_growth_per_second=1e-6)
+        contested = self._value(alternative_growth_per_second=1e-2)
+        self.assertFalse(patient.should_exit)
+        self.assertTrue(contested.should_exit)
+        # Only the redeploy term moved.
+        self.assertAlmostEqual(patient.v_hold, contested.v_hold)
+
+    def test_upside_that_cannot_be_sold_is_not_upside(self):
+        liquid = self._value(exit_capacity_ratio=1.0)
+        illiquid = self._value(exit_capacity_ratio=0.05)
+        self.assertGreater(liquid.v_hold, illiquid.v_hold)
+
+    def test_rug_risk_dominates_the_hold_branch(self):
+        safe = self._value(rug_probability=0.01)
+        dangerous = self._value(rug_probability=0.5)
+        self.assertGreater(safe.v_hold, dangerous.v_hold)
+        self.assertTrue(dangerous.should_exit)
+
+    def test_missing_inputs_block(self):
+        self.assertEqual(self._value(remaining_upside_multiple=0).status, "DATA_BLOCKED")
+        self.assertEqual(self._value(exit_capacity_ratio=0).status, "DATA_BLOCKED")
+        self.assertEqual(self._value(expected_remaining_seconds=0).status, "DATA_BLOCKED")
+        self.assertEqual(self._value(rug_probability=1.5).status, "DATA_BLOCKED")
+
+
+class TestTailCaptureMetrics(unittest.TestCase):
+    """The number that catches an exit policy quietly killing monsters."""
+
+    def test_tail_capture_ratio_credits_only_feasible_return(self):
+        self.assertAlmostEqual(tail_capture_ratio(5.0, 20.0), 0.25)
+        self.assertAlmostEqual(tail_capture_ratio(20.0, 20.0), 1.0)
+        self.assertIsNone(tail_capture_ratio(5.0, 0.0))
+
+    def test_premature_exit_rates_expose_a_win_rate_improvement_that_loses_wealth(self):
+        # Every trade a winner; every 20x sold at 2.5x.
+        greedy_ratchet = [{"realized_multiple": 2.5, "max_feasible_multiple": 25.0}
+                          for _ in range(10)]
+        report = premature_exit_rates(greedy_ratchet)
+        self.assertEqual(report["exited_20x_below_10x"], 1.0)
+        self.assertAlmostEqual(report["tail_capture_ratio"], 0.1)
+
+        patient = [{"realized_multiple": 18.0, "max_feasible_multiple": 25.0}
+                   for _ in range(10)]
+        self.assertEqual(premature_exit_rates(patient)["exited_20x_below_10x"], 0.0)
+
+    def test_a_threshold_with_no_eligible_trades_reports_none_not_zero(self):
+        report = premature_exit_rates([{"realized_multiple": 1.5,
+                                        "max_feasible_multiple": 2.0}])
+        # Zero would read as "we never sold a 50x too early", which is a claim
+        # about a population that contains no 50x opportunities.
+        self.assertIsNone(report["exited_50x_below_20x"])
+
+
+class TestMonsterHoldWiring(unittest.IsolatedAsyncioTestCase):
+    """The ratchet must stand down inside a monster state, and only there."""
+
+    def _desk(self, machine, hazard=None):
+        position = {
+            "size_tokens": 1_000, "remaining_cost_usd": 100.0, "entry_time": time.time() - 60,
+            "high_water_multiple": 6.0, "ratchet_stages": [],
+            "prediction": {"p_5x": 0.9, "p_10x": 0.8}, "candidate": None, "risk_object": None,
+        }
+        exits = []
+        desk = SimpleNamespace(
+            elogw_engine=SimpleNamespace(open_positions={"mint": position}),
+            rug_hazard=SimpleNamespace(should_exit=lambda t, p: (False, "", 0.0),
+                                       observations={}, get_hazard=lambda t: hazard),
+            distribution_detector=DistributionDetector(),
+            monster_machine=machine, last_slate_report={}, exit_policy=ExitPolicy.default(),
+            predictor=SimpleNamespace(_is_trained=False),
+            global_config={}, position=position, exits=exits,
+        )
+        desk._read_distribution = lambda token: MemecoinQuantDesk._read_distribution(desk, token)
+        desk._update_monster_state = (
+            lambda token, pos, dist, mult:
+            MemecoinQuantDesk._update_monster_state(desk, token, pos, dist, mult))
+        desk._refresh_position_prediction = (
+            lambda token, pos: MemecoinQuantDesk._refresh_position_prediction(desk, token, pos))
+        # 6x high water, currently 5.5x: the cost-recovery ratchet is due.
+        desk._mark_position = lambda token, pos: _async_value((5.5, 550.0))
+        desk._execute_exit = lambda token, pos, pct, reason: (
+            exits.append((reason, pct)) or _async_none())
+        desk._consider_scale_in = lambda token, pos, mult: _async_none()
+        return desk
+
+    async def test_without_a_calibrated_model_the_ratchet_still_fires(self):
+        """Nothing is suppressed by default; the override has to be earned."""
+        desk = self._desk(MonsterStateMachine())
+        await MemecoinQuantDesk._manage_positions(desk)
+        self.assertEqual(len(desk.exits), 1)
+        self.assertIn("profit_ratchet", desk.exits[0][0])
+        self.assertEqual(desk.position["monster_state"], "normal")
+
+    async def test_inside_a_monster_state_the_ratchet_is_suppressed(self):
+        machine = MonsterStateMachine()
+        # Stand the machine in MONSTER_HOLD the only way it can be reached:
+        # from a calibrated monster probability.
+        machine.update("mint", MonsterEvidence(
+            monster_probability=0.4, monster_probability_calibrated=True,
+            independent_buyer_acceleration=0.4, smart_wallet_net_accumulation=0.3))
+        self.assertTrue(machine.overrides_ordinary_exit("mint"))
+
+        desk = self._desk(machine)
+        await MemecoinQuantDesk._manage_positions(desk)
+
+        self.assertEqual(desk.exits, [])
+        suppressed = desk.position["suppressed_exits"]
+        self.assertEqual(len(suppressed), 1)
+        self.assertIn("profit_ratchet", suppressed[0]["reason"])
+        self.assertAlmostEqual(suppressed[0]["multiple"], 5.5)
+
+    async def test_a_critical_hazard_exits_a_monster_immediately(self):
+        """Patience about a rug is not patience."""
+        machine = MonsterStateMachine(degrade_confirmations=99)
+        machine.update("mint", MonsterEvidence(
+            monster_probability=0.4, monster_probability_calibrated=True,
+            independent_buyer_acceleration=0.4, smart_wallet_net_accumulation=0.3))
+        hazard = SimpleNamespace(urgency="critical", hazard_5m=0.9)
+
+        desk = self._desk(machine, hazard=hazard)
+        await MemecoinQuantDesk._manage_positions(desk)
+
+        self.assertEqual(len(desk.exits), 1)
+        reason, fraction = desk.exits[0]
+        self.assertEqual(reason, "monster_catastrophic_hazard")
+        self.assertEqual(fraction, 1.0)
+
+    async def test_the_separate_hazard_exit_is_never_suppressed(self):
+        machine = MonsterStateMachine()
+        machine.update("mint", MonsterEvidence(
+            monster_probability=0.4, monster_probability_calibrated=True,
+            independent_buyer_acceleration=0.4, smart_wallet_net_accumulation=0.3))
+        desk = self._desk(machine)
+        desk.rug_hazard.should_exit = lambda t, p: (True, "high", 0.75)
+
+        await MemecoinQuantDesk._manage_positions(desk)
+
+        self.assertEqual(len(desk.exits), 1)
+        self.assertEqual(desk.exits[0], ("rug_hazard_high", 0.75))
