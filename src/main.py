@@ -318,6 +318,10 @@ class MemecoinQuantDesk:
                                 if self.global_config.get("daily_giveback_pct") is not None else None),
             daily_giveback_arm_pct=float(self.global_config.get("daily_giveback_arm_pct", 0.5)),
             max_liquidity_fraction=float(self.global_config.get("max_liquidity_fraction", 0.01)),
+            harvest_trigger_ratio=float(setting("harvest_trigger_ratio", 1.5)),
+            harvest_slope=float(setting("harvest_slope", 0.5)),
+            small_account_mode=bool(setting("small_account_mode", False)),
+            small_account_negligible_share=float(setting("small_account_negligible_share", 0.002)),
         )
         self.monster_machine = MonsterStateMachine(
             monster_probability_threshold=float(
@@ -830,6 +834,7 @@ class MemecoinQuantDesk:
         incumbents = await self._incumbent_opportunities()
         slate = self.opportunity_allocator.rank(incumbents + [challenger])
         self.last_slate_report = slate.report()
+        self._feed_opportunity_quality(slate)
 
         move = next((item for item in slate.displacements
                      if item.challenger.token == token), None)
@@ -888,6 +893,32 @@ class MemecoinQuantDesk:
                 held_multiple=multiple,
             ))
         return opportunities
+
+    def _feed_opportunity_quality(self, slate: Any) -> None:
+        """Tell the risk engine how good today's remaining opportunities look.
+
+        The giveback allowance and the harvest hurdle both need this, and the
+        allocator has already measured it. Deriving it a second time would be
+        a second opinion that can disagree with the one actually allocating
+        capital.
+
+        Quality is the best available edge over the engine's own hurdle;
+        uncertainty is the share of the slate it could not rank at all, since
+        a universe we mostly cannot measure is not a universe we should be
+        tolerating extra drawdown for.
+        """
+        best = getattr(slate, "best", None)
+        ranked = len(getattr(slate, "ranked", ()) or ())
+        blocked = len(getattr(slate, "blocked", ()) or ())
+        total = ranked + blocked
+        if best is None or total == 0:
+            self.elogw_engine.observe_opportunity_set(None)
+            return
+        hurdle = max(self.elogw_engine.min_edge_bps / 10_000.0, 1e-9)
+        self.elogw_engine.observe_opportunity_set(
+            quality=float(best.elogw) / hurdle,
+            uncertainty=float(blocked) / float(total),
+        )
 
     def _exit_capacity(self, token: str, position: Dict[str, Any]) -> Tuple[str, float]:
         """What share of this position is actually liquidatable right now.

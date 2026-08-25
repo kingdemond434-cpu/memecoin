@@ -2970,6 +2970,8 @@ class TestCapitalContestWiring(unittest.IsolatedAsyncioTestCase):
         )
         desk._incumbent_opportunities = (
             lambda: MemecoinQuantDesk._incumbent_opportunities(desk))
+        desk._feed_opportunity_quality = (
+            lambda slate: MemecoinQuantDesk._feed_opportunity_quality(desk, slate))
         return desk
 
     async def _contest(self, desk, prediction, liquidity=200_000.0, reason="max_concurrent_positions"):
@@ -4148,3 +4150,176 @@ class TestCurveStateFromTradeStream(unittest.TestCase):
         decoded = self._decode(payload)
         self.assertIsNone(decoded["virtual_sol_reserves"])
         self.assertIsNone(decoded["virtual_token_reserves"])
+
+
+class TestAdaptiveGivebackAndHarvest(unittest.TestCase):
+    """A fixed giveback percentage is wrong in both directions.
+
+    On a day where the remaining opportunity set is exceptional, refusing
+    normal volatility halts the book in front of the trades worth taking. On a
+    day where edge has collapsed, the same number is far more than should be
+    risked to find out that it has.
+    """
+
+    def _engine(self, **kwargs):
+        base = dict(max_daily_loss_usd=1_000.0, daily_giveback_pct=0.35,
+                    daily_giveback_arm_pct=0.5)
+        base.update(kwargs)
+        engine = ElogwEngine(SimpleNamespace(_is_trained=True), **base)
+        engine.portfolio_value = 10_000.0
+        engine._day_start_equity = 10_000.0
+        return engine
+
+    def test_an_unmeasured_opportunity_set_falls_back_to_the_configured_base(self):
+        engine = self._engine()
+        self.assertAlmostEqual(engine.giveback_allowance(), 0.35)
+        engine.observe_opportunity_set(None)
+        self.assertAlmostEqual(engine.giveback_allowance(), 0.35)
+
+    def test_an_exceptional_slate_tolerates_more_giveback(self):
+        engine = self._engine()
+        engine.observe_opportunity_set(quality=2.0, uncertainty=0.0)
+        self.assertGreater(engine.giveback_allowance(), 0.35)
+
+    def test_a_collapsed_slate_locks_harder(self):
+        engine = self._engine()
+        engine.observe_opportunity_set(quality=0.0, uncertainty=0.0)
+        self.assertLess(engine.giveback_allowance(), 0.35)
+
+    def test_uncertainty_tightens_an_otherwise_attractive_slate(self):
+        """A wide estimate is not the same as a genuinely good one."""
+        engine = self._engine()
+        engine.observe_opportunity_set(quality=2.0, uncertainty=0.0)
+        confident = engine.giveback_allowance()
+        engine.observe_opportunity_set(quality=2.0, uncertainty=0.9)
+        self.assertLess(engine.giveback_allowance(), confident)
+
+    def test_the_allowance_stays_inside_a_band(self):
+        engine = self._engine()
+        for quality, uncertainty in [(0.0, 1.0), (99.0, 0.0), (-5.0, 0.0), (2.0, -1.0)]:
+            engine.observe_opportunity_set(quality=quality, uncertainty=uncertainty)
+            allowance = engine.giveback_allowance()
+            # A rule that can reach zero is a hair trigger; one that can reach
+            # 1.0 is not a guard at all.
+            self.assertGreaterEqual(allowance, 0.35 * ElogwEngine.GIVEBACK_FLOOR_SCALE)
+            self.assertLessEqual(allowance, ElogwEngine.MAX_GIVEBACK_PCT)
+
+    def test_the_floor_still_rises_with_the_peak(self):
+        engine = self._engine()
+        engine.update_pnl(2_000.0)
+        floor = engine.giveback_floor()
+        self.assertIsNotNone(floor)
+        self.assertAlmostEqual(floor, 2_000.0 * (1 - 0.35))
+        self.assertFalse(engine.kill_switch_active)
+
+    def test_the_guard_still_fires_when_the_floor_is_breached(self):
+        engine = self._engine()
+        engine.update_pnl(2_000.0)
+        engine.update_pnl(-800.0)
+        self.assertTrue(engine.kill_switch_active)
+
+    def test_a_better_slate_can_keep_the_book_open_through_the_same_dip(self):
+        """The whole point: the same drawdown, two different verdicts."""
+        strict = self._engine()
+        strict.update_pnl(2_000.0)
+        strict.update_pnl(-750.0)
+
+        lenient = self._engine()
+        lenient.observe_opportunity_set(quality=2.0, uncertainty=0.0)
+        lenient.update_pnl(2_000.0)
+        lenient.update_pnl(-750.0)
+
+        self.assertTrue(strict.kill_switch_active)
+        self.assertFalse(lenient.kill_switch_active)
+
+    def test_the_loss_kill_switch_is_never_softened_by_a_good_slate(self):
+        engine = self._engine()
+        engine.observe_opportunity_set(quality=2.0, uncertainty=0.0)
+        engine.update_pnl(-1_100.0)
+        # The daily-loss limit is not negotiable against opportunity quality.
+        self.assertTrue(engine.kill_switch_active)
+        self.assertAlmostEqual(engine.daily_loss_limit(), 1_000.0)
+
+
+class TestHarvestHurdle(unittest.TestCase):
+    """After an exceptional run, ordinary risk gets more expensive -- not banned."""
+
+    def _engine(self):
+        engine = ElogwEngine(SimpleNamespace(_is_trained=True), min_edge_bps=50,
+                             max_daily_loss_usd=1_000.0, harvest_trigger_ratio=1.5,
+                             harvest_slope=0.5)
+        engine.portfolio_value = 10_000.0
+        engine._day_start_equity = 10_000.0
+        return engine
+
+    def test_an_ordinary_day_uses_the_ordinary_hurdle(self):
+        engine = self._engine()
+        self.assertEqual(engine.harvest_hurdle_bps(), 50)
+        engine.update_pnl(500.0)
+        self.assertEqual(engine.harvest_hurdle_bps(), 50)
+
+    def test_an_exceptional_day_raises_the_hurdle(self):
+        engine = self._engine()
+        engine.update_pnl(3_000.0)
+        self.assertGreater(engine.harvest_hurdle_bps(), 50)
+
+    def test_the_hurdle_rises_but_never_becomes_a_cap(self):
+        engine = self._engine()
+        engine.update_pnl(1_000_000.0)
+        hurdle = engine.harvest_hurdle_bps()
+        # The book never stops trading; an extraordinary opportunity still
+        # clears an extraordinary hurdle.
+        self.assertTrue(math.isfinite(hurdle))
+        self.assertLessEqual(hurdle, 50 * ElogwEngine.MAX_HARVEST_MULTIPLE)
+        self.assertFalse(engine.kill_switch_active)
+
+    def test_a_losing_day_never_raises_the_hurdle(self):
+        engine = self._engine()
+        engine.update_pnl(-400.0)
+        self.assertEqual(engine.harvest_hurdle_bps(), 50)
+
+
+class TestSmallAccountMode(unittest.TestCase):
+    """A small account's structural advantage is that its size is negligible."""
+
+    def _engine(self, equity, **kwargs):
+        base = dict(max_position_pct=0.05, small_account_mode=True,
+                    small_account_negligible_share=0.002)
+        base.update(kwargs)
+        engine = ElogwEngine(SimpleNamespace(_is_trained=True), **base)
+        engine.portfolio_value = equity
+        return engine
+
+    def test_a_tiny_account_may_concentrate_harder(self):
+        engine = self._engine(500.0)
+        widened = engine.small_account_concentration(liquidity_usd=5_000_000.0)
+        self.assertGreater(widened, 0.05)
+        self.assertLessEqual(widened, ElogwEngine.MAX_SMALL_ACCOUNT_POSITION_PCT)
+
+    def test_the_ceiling_tightens_automatically_as_equity_grows(self):
+        thin_pool = 100_000.0
+        small = self._engine(500.0).small_account_concentration(thin_pool)
+        large = self._engine(5_000_000.0).small_account_concentration(thin_pool)
+        # The same trade stops being negligible, so the widening withdraws
+        # itself rather than needing to be switched off.
+        self.assertGreater(small, large)
+        self.assertEqual(large, 0.05)
+
+    def test_the_mode_is_off_by_default(self):
+        engine = ElogwEngine(SimpleNamespace(_is_trained=True), max_position_pct=0.05)
+        engine.portfolio_value = 100.0
+        self.assertEqual(engine.small_account_concentration(10_000_000.0), 0.05)
+
+    def test_unobservable_liquidity_never_widens_anything(self):
+        engine = self._engine(500.0)
+        self.assertEqual(engine.small_account_concentration(0.0), 0.05)
+        self.assertEqual(engine.small_account_concentration(-1.0), 0.05)
+
+    def test_only_the_position_ceiling_moves(self):
+        engine = self._engine(500.0)
+        engine.small_account_concentration(5_000_000.0)
+        # Exposure, portfolio risk and the daily-loss switch bound ruin, and
+        # this widens none of them.
+        self.assertEqual(engine.max_total_exposure_pct, 0.30)
+        self.assertEqual(engine.max_portfolio_risk, 0.10)
+        self.assertEqual(engine.max_position_pct, 0.05)

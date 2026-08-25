@@ -437,6 +437,17 @@ class MultiHeadPredictor:
 class ElogwEngine:
     """Portfolio decision engine using disjoint tail-probability bins."""
 
+    # Bounds on the state-dependent giveback allowance. A rule that can reach
+    # zero is a hair trigger; one that can reach 1.0 is not a guard.
+    GIVEBACK_FLOOR_SCALE = 0.5
+    GIVEBACK_CEILING_SCALE = 1.6
+    MAX_GIVEBACK_PCT = 0.60
+    # The harvest hurdle rises; it never becomes a cap on the day.
+    MAX_HARVEST_MULTIPLE = 4.0
+    # Small-account concentration is widened, and still bounded.
+    SMALL_ACCOUNT_MAX_SCALE = 3.0
+    MAX_SMALL_ACCOUNT_POSITION_PCT = 0.20
+
     def __init__(
         self,
         predictor: MultiHeadPredictor,
@@ -454,6 +465,10 @@ class ElogwEngine:
         max_liquidity_fraction: float = 0.01,
         uncertainty_penalty: float = 0.15,
         drawdown_aversion_lambda: float = 3.0,
+        harvest_trigger_ratio: float = 1.5,
+        harvest_slope: float = 0.5,
+        small_account_mode: bool = False,
+        small_account_negligible_share: float = 0.002,
     ):
         self.predictor = predictor
         self.risk_aversion = max(risk_aversion, 0.1)
@@ -468,6 +483,12 @@ class ElogwEngine:
         self.daily_giveback_arm_pct = daily_giveback_arm_pct
         self.min_edge_bps = min_edge_bps
         self.max_liquidity_fraction = max_liquidity_fraction
+        self.harvest_trigger_ratio = max(0.0, harvest_trigger_ratio)
+        self.harvest_slope = max(0.0, harvest_slope)
+        self.small_account_mode = bool(small_account_mode)
+        self.small_account_negligible_share = max(0.0, small_account_negligible_share)
+        self._opportunity_quality: Optional[float] = None
+        self._opportunity_uncertainty: float = 0.0
         self.uncertainty_penalty = uncertainty_penalty
         self.drawdown_aversion_lambda = max(0.0, drawdown_aversion_lambda)
 
@@ -529,7 +550,97 @@ class ElogwEngine:
         arm_at = self.daily_loss_limit() * max(0.0, self.daily_giveback_arm_pct)
         if self._daily_peak_pnl <= 0 or self._daily_peak_pnl < arm_at:
             return None
-        return self._daily_peak_pnl * (1.0 - float(self.daily_giveback_pct))
+        return self._daily_peak_pnl * (1.0 - self.giveback_allowance())
+
+    def giveback_allowance(self) -> float:
+        """How much of the day's peak may be handed back, given today's edge.
+
+        A fixed 35% is the wrong answer in both directions. On a day where the
+        remaining opportunity set is exceptional, refusing to tolerate normal
+        volatility halts the book in front of the trades worth taking. On a
+        day where edge has collapsed, 35% is far more than should be risked to
+        find out that it has.
+
+        So the allowance moves with the quality of what is still available:
+
+            allowance = base * quality_scale
+
+        where quality is the observed edge of the current opportunity slate
+        relative to the hurdle the engine already applies. It is clamped to a
+        band around the configured base, because a state-dependent rule that
+        can reach zero becomes a hair trigger and one that can reach one is
+        not a guard at all.
+
+        Uncertainty tightens it: a slate whose edge estimates are wide is not
+        the same as a slate that is genuinely good, and treating them alike is
+        how a bad day gets financed by a confident-looking model.
+        """
+        base = float(self.daily_giveback_pct or 0.0)
+        if self._opportunity_quality is None:
+            return base
+        quality = float(np.clip(self._opportunity_quality, 0.0, 2.0))
+        confidence = float(np.clip(1.0 - self._opportunity_uncertainty, 0.0, 1.0))
+        scale = 0.5 + 0.5 * quality * confidence
+        return float(np.clip(base * scale, base * self.GIVEBACK_FLOOR_SCALE,
+                             min(base * self.GIVEBACK_CEILING_SCALE, self.MAX_GIVEBACK_PCT)))
+
+    def observe_opportunity_set(self, quality: Optional[float],
+                                uncertainty: float = 0.0) -> None:
+        """Record how good the currently available opportunities look.
+
+        ``quality`` is the best available edge divided by the engine's own
+        hurdle: 1.0 means "exactly at the hurdle", 2.0 means "twice as good as
+        we normally require". None means it was not measured, and the
+        allowance falls back to the configured base rather than to an
+        optimistic guess.
+        """
+        self._opportunity_quality = None if quality is None else float(quality)
+        self._opportunity_uncertainty = float(np.clip(uncertainty, 0.0, 1.0))
+
+    def harvest_hurdle_bps(self) -> float:
+        """The edge a NEW trade must clear, raised after an exceptional run.
+
+        This is not a profit cap and must never become one. The book never
+        stops trading, and an extraordinary opportunity still clears an
+        extraordinary hurdle. What rises is the price of taking ordinary risk
+        once an unusual amount of the day's gain is already banked, because
+        the marginal utility of one more ordinary trade has fallen while the
+        amount it can undo has grown.
+        """
+        limit = self.daily_loss_limit()
+        if limit <= 0 or self.daily_pnl <= 0:
+            return self.min_edge_bps
+        # Measured against the loss budget, which is the natural unit for "how
+        # big is today relative to what we are willing to risk".
+        harvest_ratio = self.daily_pnl / limit
+        if harvest_ratio < self.harvest_trigger_ratio:
+            return self.min_edge_bps
+        excess = harvest_ratio - self.harvest_trigger_ratio
+        return float(self.min_edge_bps * min(self.MAX_HARVEST_MULTIPLE,
+                                             1.0 + excess * self.harvest_slope))
+
+    def small_account_concentration(self, liquidity_usd: float) -> float:
+        """Position ceiling as a fraction of equity, widened while capital is tiny.
+
+        The liquidity-fraction cap exists so a position cannot be a large
+        share of a pool. When equity is small enough that even a maximum
+        position is a negligible share of the pool, that cap is not binding on
+        anything real, and holding the book to the same per-position
+        percentage as a large account gives up the one structural advantage a
+        small account has. The cap tightens automatically as equity grows,
+        because the same trade stops being negligible.
+
+        The exposure ceiling, portfolio risk budget and daily-loss switch are
+        untouched. This widens one ceiling, never the ones that bound ruin.
+        """
+        if not self.small_account_mode or liquidity_usd <= 0 or self.portfolio_value <= 0:
+            return self.max_position_pct
+        max_position_usd = self.portfolio_value * self.max_position_pct
+        pool_share = max_position_usd / liquidity_usd
+        if pool_share >= self.small_account_negligible_share:
+            return self.max_position_pct
+        return float(min(self.max_position_pct * self.SMALL_ACCOUNT_MAX_SCALE,
+                         self.MAX_SMALL_ACCOUNT_POSITION_PCT))
 
     @staticmethod
     def probability_bins(prediction: MultiHeadPrediction) -> List[Tuple[str, float, float]]:
@@ -601,7 +712,7 @@ class ElogwEngine:
         if self.portfolio_value <= 0 or liquidity_usd <= 0:
             return 0.0
         return min(
-            self.max_position_pct,
+            self.small_account_concentration(liquidity_usd),
             self.max_position_usd / self.portfolio_value,
             liquidity_usd * self.max_liquidity_fraction / self.portfolio_value,
         )
@@ -711,11 +822,7 @@ class ElogwEngine:
             return 0.0, 0.0
 
         held_fraction = max(0.0, held_cost_usd) / self.portfolio_value
-        headroom = min(
-            self.max_position_pct,
-            self.max_position_usd / self.portfolio_value,
-            liquidity_usd * self.max_liquidity_fraction / self.portfolio_value,
-        ) - held_fraction
+        headroom = self.exposure_cap(liquidity_usd) - held_fraction
         if headroom <= 0:
             return 0.0, 0.0
 
@@ -761,8 +868,11 @@ class ElogwEngine:
 
         elogw, fraction, size_sol = self.calculate_expected_log_growth(prediction, sol_price_usd, liquidity_usd)
         edge_bps = elogw * 10_000
-        if not np.isfinite(elogw) or edge_bps < self.min_edge_bps:
-            return False, {"reason": "edge_below_threshold", "edge_bps": edge_bps}
+        hurdle = self.harvest_hurdle_bps()
+        if not np.isfinite(elogw) or edge_bps < hurdle:
+            return False, {"reason": "edge_below_threshold", "edge_bps": edge_bps,
+                           "hurdle_bps": hurdle,
+                           "harvesting": hurdle > self.min_edge_bps}
 
         position_value = size_sol * sol_price_usd
         current_exposure = sum(float(pos.get("remaining_cost_usd", pos.get("cost_basis_usd", 0))) for pos in self.open_positions.values())
