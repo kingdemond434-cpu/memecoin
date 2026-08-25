@@ -566,7 +566,9 @@ class MemecoinQuantDesk:
             "risk_contribution": float(trade_info["risk_contribution"]),
             "initial_risk_contribution": float(trade_info["risk_contribution"]),
             "entry_time": time.time(), "entry_sol": float(trade_info["position_size_sol"]),
-            "prediction": _jsonable(prediction), "risk_report": risk_data, "trade_info": trade_info,
+            "prediction": _jsonable(prediction), "prediction_object": prediction,
+            "prediction_at": time.time(), "prediction_status": "OK",
+            "risk_report": risk_data, "trade_info": trade_info,
             "decision_id": decision_id, "paper": self.dry_run, "high_water_multiple": 1.0,
             # Retained so the position can be re-predicted on fresh evidence
             # for marginal-E[log W] scale-in rather than sized once at entry.
@@ -683,8 +685,16 @@ class MemecoinQuantDesk:
             multiple, current_value = marked
             position["high_water_multiple"] = max(float(position.get("high_water_multiple", 1)), multiple)
             stages = position.setdefault("ratchet_stages", [])
-            continuation = max(float(position["prediction"].get("p_5x", 0)),
-                               float(position["prediction"].get("p_10x", 0)))
+            # Refresh before the exit decision, not after it. The continuation
+            # probability decides whether a runner is held through a drawdown;
+            # answering it from the entry-time prediction means holding on
+            # evidence that has since been contradicted by every trade that
+            # arrived after entry -- which is precisely the evidence that
+            # distinguishes a 20x from a distribution phase.
+            await self._refresh_position_prediction(token, position)
+            prediction = position.get("prediction") or {}
+            continuation = max(float(prediction.get("p_5x", 0)),
+                               float(prediction.get("p_10x", 0)))
             decision = evaluate_exit(
                 self.exit_policy, multiple, float(position["high_water_multiple"]), continuation,
                 set(stages), time.time() - float(position["entry_time"]),
@@ -700,6 +710,39 @@ class MemecoinQuantDesk:
                 stages.append(stage_name)
             await self._execute_exit(token, position, exit_pct, reason)
 
+    async def _refresh_position_prediction(self, token: str, position: Dict[str, Any]) -> None:
+        """Re-price the open position on current evidence.
+
+        Both the exit decision and the scale-in decision consume this, so they
+        cannot disagree about what the model currently believes. Liquidity is
+        re-resolved rather than reused: entry-time depth is the one number that
+        is guaranteed to be wrong later, and it is the number that caps how
+        much can actually be added or sold.
+        """
+        if self.predictor is None or not self.predictor._is_trained:
+            return
+        candidate = position.get("candidate")
+        risk = position.get("risk_object")
+        if candidate is None or risk is None:
+            return
+        liquidity = await self._resolve_liquidity(candidate)
+        if liquidity <= 0:
+            # Depth we cannot observe is not depth we may assume. Leave the
+            # previous prediction in place and mark it stale rather than
+            # re-predicting against a fabricated zero.
+            position["prediction_status"] = "DATA_BLOCKED_LIQUIDITY"
+            return
+        position["liquidity_usd"] = liquidity
+        features = await self._build_prediction_features(candidate, risk, liquidity)
+        prediction = self.predictor.predict(features)
+        if prediction is None:
+            position["prediction_status"] = "DATA_BLOCKED_PREDICTION"
+            return
+        position["prediction"] = _jsonable(prediction)
+        position["prediction_object"] = prediction
+        position["prediction_at"] = time.time()
+        position["prediction_status"] = "OK"
+
     async def _consider_scale_in(self, token: str, position: Dict[str, Any], multiple: float):
         """Add to a winner only while the NEXT unit still raises E[log W].
 
@@ -713,14 +756,9 @@ class MemecoinQuantDesk:
         if not self.dry_run and not self.champion_challenger.is_live(MODEL_HYPOTHESIS_ID):
             return
         candidate = position.get("candidate")
-        risk = position.get("risk_object")
+        prediction = position.get("prediction_object")
         liquidity = float(position.get("liquidity_usd", 0) or 0)
-        if candidate is None or risk is None or liquidity <= 0:
-            return
-
-        features = await self._build_prediction_features(candidate, risk, liquidity)
-        prediction = self.predictor.predict(features)
-        if prediction is None:
+        if candidate is None or prediction is None or liquidity <= 0:
             return
         if prediction.p_rug_30s > 0.40 or prediction.p_rug_5m > 0.50:
             return

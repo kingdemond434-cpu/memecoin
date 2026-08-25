@@ -6,6 +6,7 @@ import json
 import math
 import struct
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,7 +32,7 @@ from src.execution.jupiter_jito import (
     ExecutionEngine, ExecutionResult, JitoClient, JupiterClient, RouteType, SolanaTransactionBuilder, SwapQuote,
     SwapTransaction, TransactionStatus,
 )
-from src.main import MemecoinQuantDesk
+from src.main import MemecoinQuantDesk, _jsonable
 from src.strategies.information_graph import CounterfactualExecutionLab
 from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPrediction, MultiHeadPredictor, PredictionFeatures
 from src.strategies.public_coordination import PublicCoordinationMiner
@@ -1419,6 +1420,7 @@ class TestScaleInWiring(unittest.IsolatedAsyncioTestCase):
             "candidate": SimpleNamespace(base_token=None),
             "risk_object": SimpleNamespace(),
             "liquidity_usd": 500_000.0,
+            "prediction_object": TestScaleInWiring._prediction(),
         }
 
     @staticmethod
@@ -1452,6 +1454,7 @@ class TestScaleInWiring(unittest.IsolatedAsyncioTestCase):
                                  quoted_output_amount=500)
         desk = self._desk(result, self._prediction(rug_30s=0.9, rug_5m=0.9))
         position = self._position()
+        position["prediction_object"] = self._prediction(rug_30s=0.9, rug_5m=0.9)
         await MemecoinQuantDesk._consider_scale_in(desk, "mint", position, 3.0)
         self.assertEqual(position["size_tokens"], 1_000)
         self.assertEqual(desk.execution_engine.buys, [])
@@ -2628,3 +2631,118 @@ class TestHazardTracking(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPositionPredictionRefresh(unittest.IsolatedAsyncioTestCase):
+    """The exit decision must read a current prediction, not the entry-time one.
+
+    A position opened at T0 and still open at T+90s has been re-priced by every
+    trade in between. Deciding whether to hold a drawdown from the entry-time
+    continuation probability is deciding on evidence the market has already
+    contradicted.
+    """
+
+    def _desk(self, prediction, liquidity=250_000.0):
+        seen = []
+
+        async def resolve_liquidity(candidate):
+            return liquidity
+
+        async def build_features(candidate, risk, liq):
+            seen.append(liq)
+            return PredictionFeatures("mint", "solana", 0)
+
+        desk = SimpleNamespace(
+            predictor=SimpleNamespace(_is_trained=True, predict=lambda features: prediction),
+            _resolve_liquidity=resolve_liquidity,
+            _build_prediction_features=build_features,
+            liquidity_seen=seen,
+        )
+        return desk
+
+    @staticmethod
+    def _position():
+        stale = MultiHeadPrediction("mint", "solana", 0, p_2x=0.9, p_5x=0.8, p_10x=0.7)
+        return {
+            "candidate": SimpleNamespace(base_token=None), "risk_object": SimpleNamespace(),
+            "liquidity_usd": 500_000.0, "prediction": _jsonable(stale),
+            "prediction_object": stale, "prediction_status": "OK",
+        }
+
+    async def test_refresh_replaces_the_entry_time_prediction_and_liquidity(self):
+        fresh = MultiHeadPrediction("mint", "solana", 0, p_2x=0.2, p_5x=0.05, p_10x=0.01)
+        desk = self._desk(fresh, liquidity=120_000.0)
+        position = self._position()
+
+        await MemecoinQuantDesk._refresh_position_prediction(desk, "mint", position)
+
+        self.assertEqual(position["prediction_status"], "OK")
+        self.assertIs(position["prediction_object"], fresh)
+        self.assertAlmostEqual(position["prediction"]["p_5x"], 0.05)
+        # Depth is re-resolved, not carried from entry, and the fresh number is
+        # what the feature vector is actually built against.
+        self.assertEqual(position["liquidity_usd"], 120_000.0)
+        self.assertEqual(desk.liquidity_seen, [120_000.0])
+
+    async def test_unobservable_liquidity_blocks_rather_than_predicting_on_zero(self):
+        desk = self._desk(MultiHeadPrediction("mint", "solana", 0, p_5x=0.05), liquidity=0.0)
+        position = self._position()
+
+        await MemecoinQuantDesk._refresh_position_prediction(desk, "mint", position)
+
+        self.assertEqual(position["prediction_status"], "DATA_BLOCKED_LIQUIDITY")
+        # The stale prediction survives untouched: a known-old number beats a
+        # fresh one computed against depth of zero that nobody observed.
+        self.assertAlmostEqual(position["prediction"]["p_5x"], 0.8)
+        self.assertEqual(position["liquidity_usd"], 500_000.0)
+        self.assertEqual(desk.liquidity_seen, [])
+
+    async def test_untrained_predictor_leaves_the_position_alone(self):
+        desk = self._desk(MultiHeadPrediction("mint", "solana", 0))
+        desk.predictor = SimpleNamespace(_is_trained=False, predict=lambda f: None)
+        position = self._position()
+
+        await MemecoinQuantDesk._refresh_position_prediction(desk, "mint", position)
+
+        self.assertEqual(position["prediction_status"], "OK")
+        self.assertAlmostEqual(position["prediction"]["p_5x"], 0.8)
+
+    async def test_manage_positions_exits_on_the_refreshed_continuation(self):
+        """Entry said 'monster, hold the drawdown'; now it says 'get out'."""
+        collapsed = MultiHeadPrediction("mint", "solana", 0, p_2x=0.05, p_5x=0.01, p_10x=0.0)
+        desk = self._desk(collapsed)
+        exits = []
+        position = self._position()
+        position.update({"entry_time": time.time() - 120, "high_water_multiple": 4.0,
+                         "size_tokens": 1_000, "remaining_cost_usd": 100.0,
+                         "ratchet_stages": ["cost_recovery"]})
+
+        # The entry-time prediction would have held this position: continuation
+        # 0.8 buys the mid trail (floor 2.32) and 2.6x sits above it. That is
+        # the bug -- the same state exits only once the prediction is refreshed.
+        self.assertIsNone(evaluate_exit(
+            ExitPolicy.default(), 2.6, 4.0, 0.8, {"cost_recovery"}, 120.0))
+
+        async def mark(token, pos):
+            return 2.6, 260.0
+
+        desk._refresh_position_prediction = (
+            lambda token, pos: MemecoinQuantDesk._refresh_position_prediction(desk, token, pos))
+        desk.elogw_engine = SimpleNamespace(open_positions={"mint": position})
+        desk.rug_hazard = SimpleNamespace(should_exit=lambda t, p: (False, "", 0.0))
+        desk._mark_position = mark
+        desk.exit_policy = ExitPolicy.default()
+        desk._execute_exit = lambda token, pos, pct, reason: exits.append((reason, pct)) or _async_none()
+        desk._consider_scale_in = lambda token, pos, mult: _async_none()
+
+        await MemecoinQuantDesk._manage_positions(desk)
+
+        self.assertIs(position["prediction_object"], collapsed)
+        # A 35% drawdown off a 4x high water with continuation collapsed to 1%
+        # is a trailing stop, not a dip to be held.
+        self.assertTrue(exits, "collapsed continuation must be able to fire the trailing stop")
+        self.assertIn("trailing_stop", exits[0][0])
+
+
+async def _async_none():
+    return None
