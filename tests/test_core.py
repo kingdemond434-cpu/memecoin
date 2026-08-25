@@ -2936,6 +2936,9 @@ class TestPositionPredictionRefresh(unittest.IsolatedAsyncioTestCase):
         desk.monster_machine = MonsterStateMachine()
         desk.last_slate_report = {}
         _attach_manifest(desk)
+        desk._priced_holds = 0
+        desk._unpriced_cycles = 0
+        desk._suppressed_monster_banks = 0
         desk._read_distribution = lambda token: MemecoinQuantDesk._read_distribution(desk, token)
         desk._latest_curve_state = getattr(desk, "_latest_curve_state", {})
         desk.ops_events = []
@@ -3617,6 +3620,9 @@ class TestDistributionExitWiring(unittest.IsolatedAsyncioTestCase):
             position=position, exits=exits,
         )
         _attach_manifest(desk)
+        desk._priced_holds = 0
+        desk._unpriced_cycles = 0
+        desk._suppressed_monster_banks = 0
         desk._read_distribution = lambda token: MemecoinQuantDesk._read_distribution(desk, token)
         desk._latest_curve_state = getattr(desk, "_latest_curve_state", {})
         desk.ops_events = []
@@ -3676,7 +3682,19 @@ class TestDistributionExitWiring(unittest.IsolatedAsyncioTestCase):
         def predict_proba(self, matrix):
             return np.asarray([[1 - self.probability, self.probability]])
 
-    async def test_a_calibrated_high_reading_banks_before_the_trail_would(self):
+    async def test_a_calibrated_high_reading_is_recorded_not_executed(self):
+        """Banking is an opinion about expected growth, and Q owns those.
+
+        This used to sell here, BEFORE the action-value engine was consulted,
+        which meant the component that owns the objective was routinely told
+        what had already been done. The reading is real evidence and Q prices
+        the same forward distribution it was derived from, so acting on it
+        separately counts that evidence twice.
+
+        It is recorded rather than dropped: if these accumulate while Q keeps
+        choosing HOLD, that is a disagreement worth investigating, and it is
+        only investigable because it is written down.
+        """
         detector = DistributionDetector()
         detector.load_model(self._Model(0.75), DISTRIBUTION_FEATURE_NAMES, "v1")
         desk = self._desk(detector, self._turning_flow())
@@ -3688,10 +3706,40 @@ class TestDistributionExitWiring(unittest.IsolatedAsyncioTestCase):
 
         await MemecoinQuantDesk._manage_positions(desk)
 
+        self.assertEqual([exit_call[0] for exit_call in desk.exits], [])
+        suppressed = desk.position.get("suppressed_monster_banks") or []
+        self.assertEqual(len(suppressed), 1)
+        self.assertEqual(suppressed[0]["reason"], "distribution")
+        self.assertAlmostEqual(
+            suppressed[0]["fraction"],
+            MonsterStateMachine.DEFAULT_BANK_FRACTIONS[MonsterState.DISTRIBUTION])
+        self.assertEqual(desk._suppressed_monster_banks, 1)
+
+    async def test_a_catastrophic_reading_still_bypasses_the_objective(self):
+        """The one bypass, and it is a bypass of the objective, not a second opinion.
+
+        A catastrophic reading says the position is about to stop being
+        sellable, and a policy that prices forward returns cannot represent
+        "there will be no forward".
+        """
+        detector = DistributionDetector()
+        detector.load_model(self._Model(0.99), DISTRIBUTION_FEATURE_NAMES, "v1")
+        desk = self._desk(detector, self._turning_flow())
+        desk.monster_machine = MonsterStateMachine()
+        # The evidence is rebuilt from live inputs each cycle, so the
+        # catastrophic flag has to come from the hazard the desk actually
+        # reads rather than from a pre-seeded machine state.
+        desk.rug_hazard.get_hazard = lambda token: SimpleNamespace(
+            urgency="critical", exit_urgency="critical", hazard_30s=0.95,
+            hazard_5m=0.99, data_status="OK", blocked_reason="", signals=[])
+
+        await MemecoinQuantDesk._manage_positions(desk)
+
         self.assertEqual(len(desk.exits), 1)
-        self.assertEqual(desk.exits[0][0], "monster_distribution")
-        self.assertAlmostEqual(desk.exits[0][1],
-                               MonsterStateMachine.DEFAULT_BANK_FRACTIONS[MonsterState.DISTRIBUTION])
+        self.assertTrue(desk.exits[0][0].startswith("monster_"))
+        self.assertAlmostEqual(desk.exits[0][1], 1.0)
+        # And it did NOT go through the suppression path.
+        self.assertEqual(desk._suppressed_monster_banks, 0)
 
     async def test_an_uncalibrated_reading_never_moves_capital(self):
         """Identical flow, identical evidence, no trained model: no exit."""
@@ -3944,6 +3992,9 @@ class TestMonsterHoldWiring(unittest.IsolatedAsyncioTestCase):
             global_config={}, position=position, exits=exits,
         )
         _attach_manifest(desk)
+        desk._priced_holds = 0
+        desk._unpriced_cycles = 0
+        desk._suppressed_monster_banks = 0
         desk._read_distribution = lambda token: MemecoinQuantDesk._read_distribution(desk, token)
         desk._latest_curve_state = getattr(desk, "_latest_curve_state", {})
         desk.ops_events = []
@@ -6275,7 +6326,10 @@ class TestActionValuePolicy(unittest.TestCase):
             held_fraction=0.0, current_multiple=1.0, add_fraction=0.02,
             forward_bins=((1.0, 0.0),),
             reentry_bins=((0.90, -0.50), (0.10, 0.30))))
-        self.assertEqual(flat.action, Action.HOLD)
+        # A flat book does nothing by IGNORING, which is the same decision as
+        # HOLD seen from zero exposure -- and recording which one it was is
+        # what makes a rejected launch scoreable against what it went on to do.
+        self.assertEqual(flat.action, Action.IGNORE)
 
     def test_hold_wins_ties_and_anything_inside_the_noise_margin(self):
         policy = self._policy(min_edge=0.01)
@@ -9785,3 +9839,127 @@ class TestEventDrivenRuntime(unittest.IsolatedAsyncioTestCase):
         self.assertNotIsInstance(dispatch, ast.AsyncFunctionDef)
         self.assertEqual([], [node for node in ast.walk(dispatch)
                               if isinstance(node, ast.Await)])
+
+
+class TestActionValueIsAuthoritative(unittest.TestCase):
+    """One Q function owns ordinary actions, or three components disagree.
+
+    Monster banking used to execute BEFORE the action-value engine was
+    consulted, so the component that owns the objective was routinely told
+    what had already been done. Worse, when Q explicitly chose HOLD, the
+    ratchet could subsequently sell and scale-in could subsequently add -- a
+    position the objective had just decided to leave alone got traded anyway,
+    by two components reasoning from different quantities.
+    """
+
+    def test_the_action_set_covers_entry_as_well_as_exit(self):
+        values = {action.value for action in Action}
+        self.assertIn("ignore", values)
+        self.assertIn("probe", values)
+        self.assertTrue(Action.IGNORE.is_entry and Action.PROBE.is_entry)
+        self.assertFalse(Action.HOLD.is_entry or Action.ADD.is_entry)
+
+    def test_a_flat_book_ignores_rather_than_holds(self):
+        """Recording which 'nothing' it was makes a rejection scoreable."""
+        policy = ActionValuePolicy()
+        weak = ActionState(
+            held_fraction=0.0, current_multiple=1.0,
+            forward_bins=((0.2, 1.0), (0.8, -0.6)),
+            exit_capacity_ratio=1.0, escape_probability=0.9,
+            probe_fraction=0.02, entry_cost=0.02, exit_cost=0.02)
+        decision = policy.score(weak)
+        self.assertIs(decision.action, Action.IGNORE)
+        self.assertEqual(decision.q, 0.0)
+
+    def test_a_worthwhile_flat_book_probes(self):
+        policy = ActionValuePolicy()
+        strong = ActionState(
+            held_fraction=0.0, current_multiple=1.0,
+            forward_bins=((0.45, 3.0), (0.55, -0.5)),
+            exit_capacity_ratio=1.0, escape_probability=0.9,
+            probe_fraction=0.02, entry_cost=0.02, exit_cost=0.02)
+        decision = policy.score(strong)
+        self.assertIs(decision.action, Action.PROBE)
+        self.assertGreater(decision.q, 0.0)
+
+    def test_probing_is_unavailable_once_a_position_is_open(self):
+        policy = ActionValuePolicy()
+        held = ActionState(
+            held_fraction=0.3, current_multiple=2.0,
+            forward_bins=((0.5, 2.0), (0.5, -0.5)),
+            exit_capacity_ratio=1.0, escape_probability=0.9,
+            probe_fraction=0.02, entry_cost=0.02, exit_cost=0.02)
+        decision = policy.score(held)
+        probe = next(score for score in decision.scores if score.action is Action.PROBE)
+        ignore = next(score for score in decision.scores if score.action is Action.IGNORE)
+        self.assertFalse(probe.feasible)
+        self.assertFalse(ignore.feasible)
+
+    def test_a_probe_is_not_credited_with_the_information_it_buys(self):
+        """Crediting an unmeasured benefit justifies any speculative position."""
+        policy = ActionValuePolicy()
+        state = ActionState(
+            held_fraction=0.0, current_multiple=1.0,
+            forward_bins=((0.5, 1.0), (0.5, -1.0)),
+            exit_capacity_ratio=1.0, escape_probability=1.0,
+            probe_fraction=0.05, entry_cost=0.0, exit_cost=0.0)
+        decision = policy.score(state)
+        # A coin flip that can lose everything is never worth probing, however
+        # much watching our own fill would teach us.
+        self.assertIs(decision.action, Action.IGNORE)
+
+    def test_a_priced_hold_ends_the_cycle(self):
+        """The ratchet and scale-in used to run after a chosen HOLD."""
+        source = Path("src/main.py").read_text()
+        tree = ast.parse(source)
+        body = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.AsyncFunctionDef)
+                    and node.name == "_manage_one_position")
+        text = ast.unparse(body)
+        # The HOLD branch returns rather than falling through.
+        self.assertIn("action-value priced this state and chose HOLD", text)
+        hold_index = text.index("action-value priced this state and chose HOLD")
+        ratchet_index = text.index("evaluate_exit")
+        self.assertLess(hold_index, ratchet_index)
+
+    def test_only_a_catastrophic_reading_bypasses_the_objective(self):
+        source = Path("src/main.py").read_text()
+        tree = ast.parse(source)
+        body = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.AsyncFunctionDef)
+                    and node.name == "_manage_one_position")
+        text = ast.unparse(body)
+        # The bank branch records; only the emergency branch executes.
+        self.assertIn("suppressed_monster_banks", text)
+        bank_index = text.index("monster.action == 'bank'")
+        emergency_index = text.index("monster.action == 'emergency_exit'")
+        self.assertLess(emergency_index, bank_index)
+        after_bank = text[bank_index:bank_index + 700]
+        self.assertNotIn("_execute_exit", after_bank)
+
+    def test_the_entry_path_prices_ignore_against_probe(self):
+        source = Path("src/main.py").read_text()
+        tree = ast.parse(source)
+        evaluate = next(node for node in ast.walk(tree)
+                        if isinstance(node, ast.AsyncFunctionDef)
+                        and node.name == "_evaluate_candidate")
+        called = {node.func.attr for node in ast.walk(evaluate)
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+        self.assertIn("_score_entry", called)
+        self.assertIn("entry_action", ast.unparse(evaluate))
+
+    def test_an_unmeasurable_exit_capacity_blocks_entry_rather_than_assuming_liquid(self):
+        """An entry we do not know how to leave is not an entry."""
+        policy = ActionValuePolicy()
+        blocked = ActionState(
+            held_fraction=0.0, current_multiple=1.0,
+            forward_bins=((0.5, 3.0), (0.5, -0.5)),
+            exit_capacity_ratio=None, escape_probability=1.0,
+            probe_fraction=0.02)
+        self.assertEqual(policy.score(blocked).status, "DATA_BLOCKED")
+
+    def test_authority_counters_reach_readiness(self):
+        source = Path("src/main.py").read_text()
+        for key in ("priced_holds", "unpriced_cycles", "suppressed_monster_banks"):
+            self.assertIn(f'"{key}"', source)
+        self.assertIn('"action_authority"', source)

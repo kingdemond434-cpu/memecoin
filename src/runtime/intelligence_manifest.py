@@ -117,6 +117,9 @@ ENTRY_CONTRIBUTORS: Tuple[Contributor, ...] = (
                 "Whether capital is being withheld for a rare authenticated event."),
     Contributor("strategies.champion_challenger", "authority",
                 "Which model holds trading authority, and at what promotion stage."),
+    Contributor("strategies.action_value", "entry_action",
+                "Whether committing this size to this distribution beats doing "
+                "nothing, on the same objective every later action is judged on."),
     Contributor("strategies.elogw_engine", "sizing",
                 "The size, and the risk-constrained Kelly reasoning behind it."),
 )

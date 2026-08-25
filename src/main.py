@@ -205,6 +205,13 @@ class MemecoinQuantDesk:
         self._redecide_pending: set = set()
         self._redecision_drops = 0
         self._candidate_drops = 0
+        # How often the objective actually owned the decision. A fallback that
+        # quietly becomes the main path is the failure this counts: if
+        # unpriced cycles dominate, the desk is being run by the threshold
+        # policy while the readiness surface says otherwise.
+        self._priced_holds = 0
+        self._unpriced_cycles = 0
+        self._suppressed_monster_banks = 0
         self._redecision_tasks: List[asyncio.Task] = []
         self._safety_task: Optional[asyncio.Task] = None
         self._intelligence_task: Optional[asyncio.Task] = None
@@ -933,6 +940,25 @@ class MemecoinQuantDesk:
         # trip costs an exit and an entry. The premium is charged here, on the
         # fresh prediction, so a re-entry can never be admitted on the
         # conviction that existed before the exit.
+        # Entry priced on the same objective as every other action. Advisory
+        # only where it cannot price the state: a DATA_BLOCKED entry score is
+        # the capacity measurement missing, not a verdict on the trade.
+        if should_trade:
+            entry = self._score_entry(token, prediction, liquidity, trade_info)
+            if entry is not None:
+                decision["entry_action"] = {
+                    "status": entry.status, "action": entry.action.value,
+                    "q": entry.q, "detail": entry.detail,
+                }
+                intelligence["entry_action"] = decision["entry_action"]
+                if entry.status == "OK" and entry.action is ActionValue.IGNORE:
+                    self.contribution_ledger.record_gate(GateFlip(
+                        gate="entry_action_value", token=token, before=True,
+                        after=False, reason=entry.detail))
+                    should_trade = False
+                    trade_info = {**trade_info, "reason": "action_value_ignore",
+                                  "entry_detail": entry.detail}
+                    decision.update({"should_trade": False, "trade_info": trade_info})
         if should_trade and self.reentry_book.get(token) is not None:
             verdict = self._price_reentry(token, prediction, liquidity, trade_info)
             decision["reentry"] = intelligence["reentry"] = verdict.as_dict()
@@ -1197,30 +1223,60 @@ class MemecoinQuantDesk:
             "probabilities": {str(k): v for k, v in distribution.probabilities.items()},
         }
         monster = self._update_monster_state(token, position, distribution, multiple)
+        # ONE bypass, and it is a bypass of the objective rather than a
+        # second opinion about it: a catastrophic reading says the position is
+        # about to stop being sellable, and a policy that prices forward
+        # returns cannot represent "there will be no forward". Everything
+        # else the monster machine wants -- including banking a runner -- is
+        # an opinion about expected growth, and opinions about expected growth
+        # go through Q or they do not happen. Banking used to execute here,
+        # BEFORE the action-value engine was consulted, which meant the
+        # component that owns the objective was routinely told what had
+        # already been done.
         if monster.action == "emergency_exit":
             await self._execute_exit(token, position, 1.0, f"monster_{monster.reason}")
             return
         if monster.action == "bank" and monster.bank_fraction > 0:
-            await self._execute_exit(token, position, monster.bank_fraction,
-                                     f"monster_{monster.reason}")
-            return
+            # Recorded rather than executed, and recorded rather than dropped.
+            # The reading is real evidence and Q prices the same forward
+            # distribution it was derived from, so acting on it here would be
+            # counting that evidence twice. If these accumulate while Q keeps
+            # choosing HOLD, that is a disagreement worth investigating -- and
+            # it is only investigable because it is written down.
+            position.setdefault("suppressed_monster_banks", []).append(
+                {"reason": monster.reason, "fraction": monster.bank_fraction,
+                 "multiple": multiple, "at": time.time()})
+            self._suppressed_monster_banks += 1
 
-        # The action-value policy is asked first, because it is the only
-        # component that prices every move against one forward
-        # distribution. The threshold policy below remains the fallback for
-        # states it cannot price -- an unmeasured capacity, a missing
-        # distribution -- rather than being deleted while nothing validated
-        # has replaced it.
+        # Everything else is priced against one forward distribution. The
+        # threshold policy below remains ONLY for states this cannot price --
+        # an unmeasured capacity, a missing distribution -- because deleting a
+        # working fallback while nothing validated has replaced it is how a
+        # desk ends up with no exit rule at all.
         action_decision = self._score_actions(token, position, multiple, distribution)
         position["action_value"] = {
             "status": action_decision.status, "action": action_decision.action.value,
             "q": action_decision.q, "detail": action_decision.detail,
         }
-        if action_decision.status == "OK" and action_decision.action is not ActionValue.HOLD:
-            handled = await self._apply_action(token, position, action_decision, multiple)
-            if handled:
+        if action_decision.status == "OK":
+            if action_decision.action is not ActionValue.HOLD:
+                handled = await self._apply_action(token, position, action_decision, multiple)
+                if handled:
+                    return
+            else:
+                # A priced HOLD is a decision, not a gap to be filled. The
+                # ratchet used to sell after this and scale-in used to add
+                # after it, so a position the objective had just decided to
+                # leave alone got traded anyway by two components reasoning
+                # from different quantities. If Q says hold, the cycle is over.
+                position["ratchet"] = {
+                    "status": "NOT_CONSULTED",
+                    "reason": "action-value priced this state and chose HOLD"}
+                self._priced_holds += 1
                 return
 
+        # Only unpriceable states reach here.
+        self._unpriced_cycles += 1
         decision = evaluate_exit(
             self.exit_policy, multiple, float(position["high_water_multiple"]), continuation,
             set(stages), time.time() - float(position["entry_time"]),
@@ -1426,6 +1482,12 @@ class MemecoinQuantDesk:
                            or {"status": "DATA_BLOCKED", "reason": "equity not refreshed yet"}),
             "authority": {"status": "OK" if self.champion_challenger.is_live(MODEL_HYPOTHESIS_ID)
                           else "SHADOW", **self.champion_challenger.get_stats()},
+            # Seeded here so the slot exists on every decision; overwritten
+            # with the real score once the sizing engine has produced a size
+            # to price. A candidate the hurdle already refused was genuinely
+            # never priced on this axis, and saying so is accurate.
+            "entry_action": {"status": "DATA_BLOCKED",
+                             "reason": "no size to price; sizing refused first"},
             "sizing": {"status": "OK" if trade_info.get("position_size_sol") else "DATA_BLOCKED",
                        **{key: value for key, value in trade_info.items()
                           if key in ("position_size_sol", "position_value_usd",
@@ -1576,6 +1638,47 @@ class MemecoinQuantDesk:
             "any_distributor": any(profile["is_distributor"] for profile in measured),
             "any_tradeable": any(profile["tradeable_directly"] for profile in measured),
         }
+
+    def _score_entry(self, token: str, prediction: Any, liquidity: float,
+                     trade_info: Dict[str, Any]):
+        """Price IGNORE against PROBE on the same objective as every other action.
+
+        Entry used to be decided by `should_trade` alone -- a per-token hurdle
+        reasoning from its own quantities -- while every subsequent action was
+        priced by Q. A desk whose entry test and exit policy are different
+        objects will, sooner or later, buy something its own exit policy would
+        immediately sell, and both components will be individually defensible
+        while it happens.
+
+        This does not replace the sizing engine: `should_trade` still chooses
+        the size and still owns the hard limits. It adds the question the
+        hurdle cannot ask, which is whether committing this size to this
+        distribution beats doing nothing on the one axis everything else is
+        measured on.
+        """
+        equity = max(self.wallet_equity_usd, 1e-9)
+        size_usd = float(trade_info.get("position_value_usd", 0.0) or 0.0)
+        bins = [(probability, gross) for _, probability, gross
+                in self.elogw_engine.probability_bins(prediction)]
+        if not bins or size_usd <= 0:
+            return None
+        capacity_status, capacity = self._exit_capacity(token, {
+            "size_tokens": int(trade_info.get("expected_tokens", 0) or 0)})
+        escape = position_escape = None
+        state = ActionState(
+            held_fraction=0.0,
+            current_multiple=1.0,
+            forward_bins=tuple(bins),
+            exit_cost=float(self._cost_model(token).get("exit_cost", 0.02)),
+            entry_cost=float(self._cost_model(token).get("entry_cost", 0.02)),
+            # An entry whose exit capacity cannot be measured is an entry into
+            # something we do not know how to leave. Blocked rather than
+            # assumed liquid, which is the flattering direction.
+            exit_capacity_ratio=(capacity if str(capacity_status).startswith("OK") else None),
+            escape_probability=float(self.global_config.get("entry_escape_prior", 1.0)),
+            probe_fraction=min(1.0, size_usd / equity),
+        )
+        return self.action_policy.score(state)
 
     def _price_reentry(self, token: str, prediction: Any, liquidity: float,
                        trade_info: Dict[str, Any]):
@@ -2709,6 +2812,13 @@ class MemecoinQuantDesk:
                 "candidate_drops": self._candidate_drops,
                 "candidate_pipelines": len(self._candidate_pipelines),
                 "redecision_workers": len(self._redecision_tasks),
+            },
+            # Whether the objective actually owns the decisions. A fallback
+            # that quietly becomes the main path is the failure this catches.
+            "action_authority": {
+                "priced_holds": self._priced_holds,
+                "unpriced_cycles": self._unpriced_cycles,
+                "suppressed_monster_banks": self._suppressed_monster_banks,
             },
             "exit_latency": self.landing_latency.estimate().report(),
             "decision_contribution": self.contribution_ledger.report(),

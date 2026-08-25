@@ -53,6 +53,12 @@ ACTION_VALUE_SCHEMA_VERSION = "v1"
 
 
 class Action(Enum):
+    # Entry is part of the same decision, not a separate one. A desk whose
+    # entry hurdle and exit policy are different objects will, sooner or
+    # later, buy something its own exit policy would sell -- and the two will
+    # both be individually defensible while doing it.
+    IGNORE = "ignore"
+    PROBE = "probe"
     HOLD = "hold"
     ADD = "add"
     BANK_10 = "bank_10"
@@ -71,6 +77,11 @@ class Action(Enum):
             Action.BANK_50: 0.50, Action.BANK_75: 0.75,
             Action.EXIT: 1.00, Action.REPLACE: 1.00,
         }.get(self, 0.0)
+
+    @property
+    def is_entry(self) -> bool:
+        """Actions only available when nothing is held."""
+        return self in {Action.IGNORE, Action.PROBE}
 
     @property
     def frees_capital(self) -> bool:
@@ -106,6 +117,11 @@ class PositionState:
     alternative_growth_per_second: Optional[float] = None
     add_fraction: Optional[float] = None
     add_capacity_fraction: Optional[float] = None
+    # The small first commitment a flat book can make. Distinct from ADD,
+    # which prices adding to something already held: a probe buys the right
+    # to observe the position's own fills, which is information no amount of
+    # watching from outside produces.
+    probe_fraction: Optional[float] = None
     reentry_bins: Optional[Sequence[Tuple[float, float]]] = None
     # A specific better candidate this position could be swapped into, with
     # its own forward distribution and size. Supplied by the allocator.
@@ -368,6 +384,37 @@ class ActionValuePolicy:
         value = _expected_log(state.replacement_bins, wealth)
         return value, "ok"
 
+    def _probe_value(self, state: PositionState) -> Tuple[float, str]:
+        """E[log W] of a small first commitment from a flat book.
+
+        Priced on the same forward distribution as everything else, so a probe
+        cannot be justified by a number nothing else can see. It is a separate
+        action from ADD because ADD prices adding to a position that already
+        exists, and the two have different capital bases and different
+        capacity ceilings.
+
+        Deliberately NOT credited with the information a probe buys. Our own
+        fills reveal real depth, real latency and real fee incidence, and that
+        is worth something -- but it is worth an amount nobody here has
+        measured, and crediting an unmeasured benefit is how every speculative
+        position gets justified.
+        """
+        if state.held_fraction > 0:
+            return -float("inf"), "position is open; probing is not the question"
+        size = state.probe_fraction
+        if size is None or size <= 0:
+            return -float("inf"), "no probe size supplied"
+        added = float(size)
+        cash = 1.0 - added
+        if cash < 0:
+            return -float("inf"), "probe exceeds available cash"
+
+        def wealth(gross: float) -> float:
+            return (cash + added * (1.0 + self._capture(state, gross))
+                    - added * state.entry_cost)
+
+        return _expected_log(state.forward_bins, wealth), "ok"
+
     def _reenter_value(self, state: PositionState) -> Tuple[float, str]:
         """Re-entry is a new trade and competes as one.
 
@@ -446,12 +493,34 @@ class ActionValuePolicy:
             status="OK" if math.isfinite(reenter_value) else "DATA_BLOCKED",
             detail=reenter_detail))
 
+        probe_value, probe_detail = self._probe_value(state)
+        scores.append(ActionScore(
+            Action.PROBE, probe_value - baseline,
+            status="OK" if math.isfinite(probe_value) else "DATA_BLOCKED",
+            detail=probe_detail))
+
+        # IGNORE is HOLD seen from a flat book, and scores exactly zero for
+        # the same reason: doing nothing is the baseline. It exists as a named
+        # action so that a decision not to enter is recorded as a decision
+        # rather than as an absence, which is what makes the missed-winner
+        # ledger possible at all.
+        scores.append(ActionScore(
+            Action.IGNORE, 0.0 if state.held_fraction <= 0 else -float("inf"),
+            status="OK" if state.held_fraction <= 0 else "DATA_BLOCKED",
+            detail="flat" if state.held_fraction <= 0 else "position is open"))
+
         feasible = [score for score in scores if score.feasible]
         best = max(feasible, key=lambda score: score.q)
         # Hold wins ties and wins anything inside the noise margin, so a policy
         # that cannot tell two actions apart does not churn the book.
+        # Doing nothing wins ties and wins anything inside the noise margin, so
+        # a policy that cannot tell two actions apart does not churn the book.
+        # Which "nothing" it is depends on whether anything is held: a flat
+        # book IGNOREs, an open one HOLDs, and recording the difference is
+        # what lets a rejected launch be scored against what it went on to do.
+        idle = Action.IGNORE if state.held_fraction <= 0 else Action.HOLD
         if best.q <= self.min_edge:
-            return Decision(status="OK", action=Action.HOLD, q=0.0, scores=scores,
+            return Decision(status="OK", action=idle, q=0.0, scores=scores,
                             detail=f"no action clears the {self.min_edge:g} margin")
         return Decision(status="OK", action=best.action, q=best.q, scores=scores,
                         detail=f"{best.action.value} beats holding by {best.q:.6f}")
