@@ -107,6 +107,10 @@ class PositionState:
     add_fraction: Optional[float] = None
     add_capacity_fraction: Optional[float] = None
     reentry_bins: Optional[Sequence[Tuple[float, float]]] = None
+    # A specific better candidate this position could be swapped into, with
+    # its own forward distribution and size. Supplied by the allocator.
+    replacement_bins: Optional[Sequence[Tuple[float, float]]] = None
+    replacement_fraction: Optional[float] = None
 
     def blocked_reason(self) -> Optional[str]:
         if not self.forward_bins:
@@ -120,6 +124,8 @@ class PositionState:
             return "negative multiple"
         if self.exit_capacity_ratio is None:
             return "exit capacity not measured"
+        if self.escape_probability is None:
+            return "escape probability not measured"
         return None
 
 
@@ -184,11 +190,46 @@ class ActionValuePolicy:
         return self._model is not None
 
     def load_model(self, model: Any, version: str) -> bool:
+        """Adopt a trained action-value model.
+
+        A model marked loaded but never consulted is worse than none: the
+        readiness surface reports `trained: true` while every decision is
+        still analytic, so the promotion ladder can advance on a model that
+        has never priced a trade. `score` consults it whenever it is present.
+        """
         if not hasattr(model, "predict"):
             logger.warning("action-value model rejected: no predict")
             return False
         self._model, self._model_version = model, str(version)
         return True
+
+    def _model_scores(self, state: PositionState) -> Optional[Dict[Action, float]]:
+        """Q per action from the loaded model, or None when it cannot answer.
+
+        A model that raises, or returns a shape that does not cover the action
+        set, falls back to the analytic scoring rather than to a partial
+        answer -- a Q table missing EXIT would silently make exiting
+        impossible.
+        """
+        if self._model is None:
+            return None
+        try:
+            raw = self._model.predict(state)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("action-value model inference failed: %s", exc)
+            return None
+        if not isinstance(raw, dict):
+            logger.warning("action-value model returned %s, not a Q map", type(raw))
+            return None
+        scores: Dict[Action, float] = {}
+        for action in Action:
+            value = raw.get(action, raw.get(action.value))
+            if value is None or not math.isfinite(float(value)):
+                logger.warning("action-value model omitted %s; falling back to analytic",
+                               action.value)
+                return None
+            scores[action] = float(value)
+        return scores
 
     # -- component values --------------------------------------------------
 
@@ -212,13 +253,18 @@ class ActionValuePolicy:
         get out of before a collapse is not upside either. Applying both here
         rather than at one action means no action can be priced on a return the
         position could not have realised.
+
+        Neither input has a permissive default. `blocked_reason` refuses the
+        whole state when either is unmeasured, because reading unknown escape
+        as "fully escapable" is the single most flattering assumption
+        available here: it makes every trapped position look liquid, and it
+        does so most strongly on exactly the tokens where escape is hardest to
+        measure.
         """
         if gross <= 0:
             return gross
-        capacity = state.exit_capacity_ratio
-        capacity = 1.0 if capacity is None else float(np.clip(capacity, 0.0, 1.0))
-        escape = state.escape_probability
-        escape = 1.0 if escape is None else float(np.clip(escape, 0.0, 1.0))
+        capacity = float(np.clip(state.exit_capacity_ratio, 0.0, 1.0))
+        escape = float(np.clip(state.escape_probability, 0.0, 1.0))
         return gross * capacity * escape
 
     def _bank_value(self, state: PositionState, fraction: float) -> float:
@@ -289,6 +335,39 @@ class ActionValuePolicy:
         freed = state.held_fraction * max(0.0, state.current_multiple)
         return float(rate * seconds * freed)
 
+    def _replace_value(self, state: PositionState,
+                       exit_value: float) -> Tuple[float, str]:
+        """Exit and immediately fund a specific named alternative.
+
+        Distinct from EXIT: exiting credits the generic best-alternative rate,
+        while replacing commits to one candidate whose own distribution is
+        supplied. Charging the entry cost of that candidate is what stops
+        REPLACE from looking like a free upgrade over EXIT.
+        """
+        if state.replacement_bins is None:
+            return -float("inf"), "no replacement candidate supplied"
+        if state.replacement_fraction is None or state.replacement_fraction <= 0:
+            return -float("inf"), "no replacement size supplied"
+        added = float(state.replacement_fraction)
+        freed = state.held_fraction * max(0.0, state.current_multiple)
+        if added > freed + (1.0 - state.held_fraction):
+            return -float("inf"), "replacement exceeds capital the exit would free"
+
+        capacity = float(np.clip(state.exit_capacity_ratio, 0.0, 1.0))
+        sold = state.held_fraction * capacity
+        proceeds = sold * max(0.0, state.current_multiple) * (1.0 - state.exit_cost)
+        cash = (1.0 - state.held_fraction) + proceeds - added
+        if cash < 0:
+            return -float("inf"), "replacement exceeds realised proceeds"
+        stranded = (state.held_fraction - sold) * max(0.0, state.current_multiple)
+
+        def wealth(gross: float) -> float:
+            return (cash + stranded + added * (1.0 + gross)
+                    - added * state.entry_cost)
+
+        value = _expected_log(state.replacement_bins, wealth)
+        return value, "ok"
+
     def _reenter_value(self, state: PositionState) -> Tuple[float, str]:
         """Re-entry is a new trade and competes as one.
 
@@ -320,6 +399,18 @@ class ActionValuePolicy:
         if blocked:
             return Decision(status="DATA_BLOCKED", detail=blocked)
 
+        model_scores = self._model_scores(state)
+        if model_scores is not None:
+            scores = [ActionScore(action, model_scores[action] - model_scores[Action.HOLD])
+                      for action in Action]
+            best = max(scores, key=lambda item: item.q)
+            if best.q <= self.min_edge:
+                return Decision(status="OK", action=Action.HOLD, q=0.0, scores=scores,
+                                detail=f"model {self._model_version}: no action clears "
+                                       f"the {self.min_edge:g} margin")
+            return Decision(status="OK", action=best.action, q=best.q, scores=scores,
+                            detail=f"model {self._model_version} chose {best.action.value}")
+
         baseline = self._hold_value(state)
         if not math.isfinite(baseline):
             return Decision(status="DATA_BLOCKED",
@@ -333,6 +424,16 @@ class ActionValuePolicy:
 
         exit_value = self._bank_value(state, 1.0) + self._redeploy_bonus(state)
         scores.append(ActionScore(Action.EXIT, exit_value - baseline))
+
+        # REPLACE is EXIT plus immediately funding a NAMED better candidate.
+        # It was in the enum and never scored, which meant the allocator's
+        # displacement path and this policy could reach opposite conclusions
+        # about the same pair of tokens.
+        replace_value, replace_detail = self._replace_value(state, exit_value)
+        scores.append(ActionScore(
+            Action.REPLACE, replace_value - baseline,
+            status="OK" if math.isfinite(replace_value) else "DATA_BLOCKED",
+            detail=replace_detail))
 
         add_value, add_detail = self._add_value(state)
         scores.append(ActionScore(

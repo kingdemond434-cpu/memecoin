@@ -1,4 +1,5 @@
 import ast
+import dataclasses
 import asyncio
 import base64
 import gzip
@@ -87,7 +88,10 @@ from src.strategies.monster import (
 )
 from src.strategies.opportunity_allocator import Opportunity, OpportunityAllocator
 from src.strategies.public_coordination import PublicCoordinationMiner
-from src.strategies.wallet_intelligence import WalletIntelligenceEngine, WalletRegime
+from src.strategies.genealogy_graph import WalletProfile
+from src.strategies.wallet_intelligence import (
+    WalletIntelligenceEngine, WalletRegime, WalletScore,
+)
 from src.research.dataset_builder import LaunchEpisode, PointInTimeDatasetBuilder, SnapshotTimepoint
 from src.research.shadow_trainer import chronological_episode_split, train_shadow
 from src.chains.pump_curve import (
@@ -5957,6 +5961,9 @@ class TestActionValuePolicy(unittest.TestCase):
             held_fraction=0.05, current_multiple=3.0,
             forward_bins=((0.55, -0.40), (0.30, 1.00), (0.15, 6.00)),
             exit_cost=0.02, entry_cost=0.02, exit_capacity_ratio=1.0,
+            # Explicitly measured as fully escapable. Both this and capacity
+            # are required inputs -- there is no permissive default.
+            escape_probability=1.0,
         )
         base.update(kwargs)
         return PositionState(**base)
@@ -6025,6 +6032,84 @@ class TestActionValuePolicy(unittest.TestCase):
         safe = self._policy()._hold_value(self._state(escape_probability=0.95))
         trapped = self._policy()._hold_value(self._state(escape_probability=0.02))
         self.assertGreater(safe, trapped)
+
+    def test_unmeasured_escape_blocks_rather_than_reading_as_fully_escapable(self):
+        """The most flattering assumption available in this module."""
+        decision = self._policy().score(self._state(escape_probability=None))
+        # Reading unknown escape as 1.0 makes every trapped position look
+        # liquid, most strongly on the tokens where escape is hardest to
+        # measure -- which is exactly where it matters.
+        self.assertEqual(decision.status, "DATA_BLOCKED")
+        self.assertIn("escape", decision.detail)
+
+    def test_replace_is_scored_when_a_candidate_is_named(self):
+        unnamed = self._policy().score(self._state())
+        self.assertIsNone(unnamed.score_of(Action.REPLACE))
+
+        named = self._policy().score(self._state(
+            forward_bins=((0.85, -0.50), (0.15, 0.20)),
+            replacement_fraction=0.05,
+            replacement_bins=((0.20, -0.30), (0.40, 2.00), (0.40, 9.00))))
+        # REPLACE existed in the enum and was never scored, so the allocator's
+        # displacement path and this policy could disagree about one pair.
+        self.assertIsNotNone(named.score_of(Action.REPLACE))
+        self.assertEqual(named.action, Action.REPLACE)
+
+    def test_replace_pays_the_new_candidates_entry_cost(self):
+        cheap = self._policy().score(self._state(
+            entry_cost=0.0, replacement_fraction=0.05,
+            replacement_bins=((0.30, -0.30), (0.70, 3.00))))
+        dear = self._policy().score(self._state(
+            entry_cost=0.10, replacement_fraction=0.05,
+            replacement_bins=((0.30, -0.30), (0.70, 3.00))))
+        # Otherwise REPLACE is a free upgrade over EXIT.
+        self.assertGreater(cheap.score_of(Action.REPLACE), dear.score_of(Action.REPLACE))
+
+    def test_a_replacement_beyond_available_capital_is_refused(self):
+        # Nearly all capital is in the position and it is down: the exit frees
+        # 0.45 and only 0.10 cash exists beside it, so a 0.99 replacement is
+        # not fundable at any price.
+        decision = self._policy().score(self._state(
+            held_fraction=0.90, current_multiple=0.5, replacement_fraction=0.99,
+            replacement_bins=((1.0, 5.0),)))
+        self.assertIsNone(decision.score_of(Action.REPLACE))
+
+    def test_a_loaded_model_is_actually_consulted(self):
+        class Model:
+            def predict(self, state):
+                return {action: 0.0 for action in Action} | {Action.BANK_50: 5.0}
+
+        policy = self._policy()
+        self.assertTrue(policy.load_model(Model(), "v7"))
+        decision = policy.score(self._state())
+        # A model marked loaded but never consulted reports trained: true
+        # while every decision stays analytic, so the promotion ladder can
+        # advance on a model that has never priced a trade.
+        self.assertEqual(decision.action, Action.BANK_50)
+        self.assertIn("v7", decision.detail)
+
+    def test_a_model_that_omits_an_action_falls_back_rather_than_half_answering(self):
+        class Partial:
+            def predict(self, state):
+                return {Action.HOLD: 0.0, Action.ADD: 1.0}
+
+        policy = self._policy()
+        policy.load_model(Partial(), "v8")
+        decision = policy.score(self._state())
+        # A Q table missing EXIT would silently make exiting impossible.
+        self.assertNotIn("v8", decision.detail)
+        self.assertEqual(decision.score_of(Action.HOLD), 0.0)
+
+    def test_a_model_that_raises_falls_back_to_analytic_scoring(self):
+        class Broken:
+            def predict(self, state):
+                raise RuntimeError("model is corrupt")
+
+        policy = self._policy()
+        policy.load_model(Broken(), "v9")
+        decision = policy.score(self._state())
+        self.assertEqual(decision.status, "OK")
+        self.assertNotIn("v9", decision.detail)
 
     def test_adding_needs_a_size_and_respects_the_capacity_ceiling(self):
         no_size = self._policy().score(self._state())
@@ -7185,3 +7270,61 @@ class TestPromotionLedger(unittest.TestCase):
         # instruction to trade, and this module has no path to becoming one.
         self.assertNotIn("ALLOW_LIVE_TRADING =", source)
         self.assertNotIn("os.environ[", source)
+
+
+class TestSnapshotCaptureIsolation(unittest.IsolatedAsyncioTestCase):
+    """One broken feature group must not cost a whole point-in-time row.
+
+    A snapshot is unrecoverable once its instant has passed, so losing one to
+    an AttributeError in a single feature is the most expensive way this
+    repository can lose data -- and it was silent.
+    """
+
+    def test_wallet_score_has_no_is_insider_field(self):
+        """The bug, pinned as a contract.
+
+        Insider status lives on the genealogy WalletProfile. Reading it off
+        WalletScore raised inside the capture handler and abandoned the entire
+        snapshot, wherever a scored buyer appeared.
+        """
+        fields = {field.name for field in dataclasses.fields(WalletScore)}
+        self.assertNotIn("is_insider", fields)
+        self.assertIn("is_insider",
+                      {field.name for field in dataclasses.fields(WalletProfile)})
+
+    def test_insider_count_is_read_from_the_genealogy_profile(self):
+        source = (Path(__file__).resolve().parents[1] / "src" / "research"
+                  / "dataset_builder.py").read_text()
+        self.assertNotIn("ws.is_insider", source)
+        self.assertIn("self.genealogy.get_wallet_profile", source)
+
+    async def test_a_failing_group_is_data_blocked_and_the_rest_still_land(self):
+        builder = PointInTimeDatasetBuilder.__new__(PointInTimeDatasetBuilder)
+        builder.chain_config = SimpleNamespace(name="solana")
+        builder.active_episodes = {}
+        builder._snapshot_inflight = set()
+
+        async def ok(episode, as_of):
+            return {"status": "OK"}
+
+        async def boom(episode, as_of):
+            raise AttributeError("'WalletScore' object has no attribute 'is_insider'")
+
+        builder._capture_deployer_features = ok
+        builder._capture_wallet_features = boom
+        for name in ("flow", "liquidity", "social", "token", "market", "entity_graph"):
+            setattr(builder, f"_capture_{name}_features", ok)
+
+        episode = LaunchEpisode(token="mint", chain="solana", created_at=1.0,
+                                deployer="dev", factory="", pair="", base_token="")
+        builder.active_episodes["mint"] = episode
+        await PointInTimeDatasetBuilder._capture_snapshot(
+            builder, "mint", SnapshotTimepoint.T0)
+
+        snapshot = episode.snapshots[SnapshotTimepoint.T0]
+        # The broken group says why, and the other seven survive.
+        self.assertEqual(snapshot.wallet_features["status"], "DATA_BLOCKED")
+        self.assertIn("is_insider", snapshot.wallet_features["reason"])
+        self.assertEqual(snapshot.deployer_features["status"], "OK")
+        self.assertEqual(snapshot.flow_features["status"], "OK")
+        self.assertEqual(snapshot.entity_graph_features["status"], "OK")

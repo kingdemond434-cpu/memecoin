@@ -260,17 +260,32 @@ class PointInTimeDatasetBuilder:
                 timestamp=as_of,
             )
             
-            snapshot.deployer_features = await self._capture_deployer_features(episode, as_of)
-            snapshot.wallet_features = await self._capture_wallet_features(episode, as_of)
-            snapshot.flow_features = await self._capture_flow_features(episode, as_of)
-            snapshot.liquidity_features = await self._capture_liquidity_features(episode, as_of)
-            snapshot.social_features = await self._capture_social_features(episode, as_of)
-            snapshot.token_features = await self._capture_token_features(episode, as_of)
-            snapshot.market_features = await self._capture_market_features(episode, as_of)
-            snapshot.entity_graph_features = await self._capture_entity_graph_features(episode, as_of)
-            
+            # Each group is isolated. A single failing capture used to abandon
+            # the whole snapshot, so one wrong attribute in one feature cost a
+            # complete point-in-time row -- the most expensive possible way to
+            # lose data, because the loss is silent and the row is
+            # unrecoverable once the instant has passed. A broken group is now
+            # DATA_BLOCKED with its reason and the other seven still land.
+            for name, capture in (
+                ("deployer_features", self._capture_deployer_features),
+                ("wallet_features", self._capture_wallet_features),
+                ("flow_features", self._capture_flow_features),
+                ("liquidity_features", self._capture_liquidity_features),
+                ("social_features", self._capture_social_features),
+                ("token_features", self._capture_token_features),
+                ("market_features", self._capture_market_features),
+                ("entity_graph_features", self._capture_entity_graph_features),
+            ):
+                try:
+                    setattr(snapshot, name, await capture(episode, as_of))
+                except Exception as exc:
+                    logger.error("Snapshot group %s failed for %s %s: %s",
+                                 name, token, snapshot_time, exc)
+                    setattr(snapshot, name,
+                            {"status": "DATA_BLOCKED", "reason": f"capture failed: {exc}"})
+
             episode.snapshots[snapshot_time] = snapshot
-            
+
         except Exception as e:
             logger.error(f"Snapshot capture failed for {token} {snapshot_time}: {e}")
         finally:
@@ -310,7 +325,14 @@ class PointInTimeDatasetBuilder:
                 ws = self.wallet_intel.get_wallet_score(buy["wallet"])
                 if ws and ws.overall_score > 0.7:
                     smart_buyers += 1
-                if ws and ws.is_insider:
+                # Insider status lives on the genealogy WalletProfile, not on
+                # WalletScore. Reading it off the score raised AttributeError
+                # inside the capture handler below, which does not skip one
+                # feature -- it abandons the entire snapshot. A whole
+                # point-in-time row was being lost per launch, silently,
+                # wherever a scored buyer appeared.
+                profile = self.genealogy.get_wallet_profile(buy["wallet"])
+                if profile is not None and getattr(profile, "is_insider", False):
                     insider_buyers += 1
         
         return {
