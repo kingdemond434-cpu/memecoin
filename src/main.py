@@ -51,6 +51,8 @@ from src.strategies.information_graph import (
     LeadEventType,
 )
 from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPredictor, PredictionFeatures
+from src.chains.pump_curve import BondingCurveState, quote_buy, quote_sell
+from src.execution.tradeability import curve_tradeability, exit_capacity_ratio
 from src.strategies.distribution import DistributionDetector
 from src.strategies.monster import (
     MonsterEvidence, MonsterState, MonsterStateMachine, hold_versus_exit,
@@ -151,6 +153,10 @@ class MemecoinQuantDesk:
         self._market_entry_price: Dict[str, float] = {}
         self._curve_entry_price: Dict[str, float] = {}
         self._latest_stream_mark: Dict[str, Dict[str, float]] = {}
+        # Latest bonding-curve reserves decoded straight off the trade
+        # stream, so exit capacity is answerable locally in the window a
+        # decision actually has, with no RPC round trip.
+        self._latest_curve_state: Dict[str, Any] = {}
         self._market_cursor = 0
         self._model_artifact_mtime = 0.0
 
@@ -883,6 +889,24 @@ class MemecoinQuantDesk:
             ))
         return opportunities
 
+    def _exit_capacity(self, token: str, position: Dict[str, Any]) -> Tuple[str, float]:
+        """What share of this position is actually liquidatable right now.
+
+        Read from the streamed bonding-curve state when one is available, which
+        needs no RPC round trip and is therefore answerable inside the window
+        the decision has to be made in. There is no permissive fallback: an
+        unmeasurable capacity is DATA_BLOCKED, never 1.0.
+        """
+        state = self._latest_curve_state.get(token)
+        if state is None:
+            return "DATA_BLOCKED_NO_CURVE_STATE", 0.0
+        report = curve_tradeability(state, quote_buy, quote_sell)
+        position["tradeability"] = report.report()
+        return exit_capacity_ratio(
+            int(position.get("size_tokens", 0) or 0), report.exit,
+            acceptable_impact=float(self.global_config.get("acceptable_exit_impact", 0.10)),
+        )
+
     def _update_monster_state(self, token: str, position: Dict[str, Any],
                               distribution: Any, multiple: float):
         """Advance this position's conviction state on currently observed evidence.
@@ -915,12 +939,20 @@ class MemecoinQuantDesk:
             evidence.audience_penetration = features.get("new_buyer_saturation", None)
 
         value = None
-        if prediction is not None and prediction.expected_feasible_multiple > 0:
+        capacity_status, capacity = self._exit_capacity(token, position)
+        position["exit_capacity_status"] = capacity_status
+        position["exit_capacity_ratio"] = capacity
+        if (prediction is not None and prediction.expected_feasible_multiple > 0
+                and capacity_status.startswith("OK")):
+            # No value comparison without a measured exit capacity. Assuming a
+            # position is fully sellable is how a theoretical return becomes a
+            # real loss, and it is the assumption that would be doing the most
+            # work here if it were allowed.
             value = hold_versus_exit(
                 remaining_upside_multiple=max(1e-9, float(prediction.expected_feasible_multiple)),
                 distribution_probability=float(distribution.probability(10.0) or 0.0),
                 rug_probability=float(getattr(hazard, "hazard_5m", 0.0) or 0.0) if hazard else 0.0,
-                exit_capacity_ratio=float(position.get("exit_capacity_ratio", 1.0) or 0.0),
+                exit_capacity_ratio=capacity,
                 alternative_growth_per_second=float(
                     (self.last_slate_report or {}).get("best_score") or 0.0)
                 * float(position.get("remaining_cost_usd", 0.0) or 0.0),
@@ -1253,6 +1285,17 @@ class MemecoinQuantDesk:
             ))
         elif event.get("type") == "token_trade":
             curve_price = float(event.get("curve_price_raw", 0) or 0)
+            virtual_sol = int(event.get("virtual_sol_reserves") or 0)
+            virtual_token = int(event.get("virtual_token_reserves") or 0)
+            if virtual_sol > 0 and virtual_token > 0:
+                self._latest_curve_state[token] = BondingCurveState(
+                    virtual_token_reserves=virtual_token, virtual_sol_reserves=virtual_sol,
+                    # The TradeEvent carries no real reserves. Leaving these at
+                    # zero is what marks every frontier derived from this state
+                    # as an upper bound rather than a measurement.
+                    real_token_reserves=0, real_sol_reserves=0, token_total_supply=0,
+                    complete=False, creator="",
+                )
             curve_multiple = None
             if curve_price > 0:
                 curve_entry = self._curve_entry_price.setdefault(token, curve_price)

@@ -719,6 +719,14 @@ class PumpFunMonitor:
                 "actual_token_delta_raw": token_amount if is_buy else -token_amount,
                 "notional_sol": sol_amount / 1_000_000_000, "timestamp": float(timestamp),
                 "curve_price_raw": virtual_sol / virtual_token if virtual_token else None,
+                # The reserves were already decoded to derive the price above;
+                # carrying them forward lets capacity be computed locally from
+                # the curve rather than round-tripping an RPC for depth that
+                # this event already contains. Real reserves are NOT in the
+                # TradeEvent, so anything derived from these alone is an upper
+                # bound on executable size, and is labelled as one downstream.
+                "virtual_sol_reserves": virtual_sol or None,
+                "virtual_token_reserves": virtual_token or None,
                 "fill_data_status": "OBSERVED_PROGRAM_EVENT", "data_status": "OK",
             }
         if data.startswith(self.COMPLETE_EVENT):

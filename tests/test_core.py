@@ -57,11 +57,17 @@ from src.chains.pump_curve import (
     BONDING_CURVE_DISCRIMINATOR, observation_from_state, parse_bonding_curve,
     quote_buy, quote_sell, sell_capacity_lamports,
 )
+from src.execution.tradeability import (
+    Frontier, TradeabilityReport, build_frontier, curve_tradeability,
+    exit_capacity_ratio,
+)
 from src.execution.pump_fees import (
     DYNAMIC_FEE_ACTIVATION_UTC, LEGACY_TOTAL_FEE_BPS, PumpFeeSchedule,
     VENUE_BONDING_CURVE, VENUE_PUMPSWAP_CANONICAL,
 )
-from src.chains.pump_curve import DEFAULT_FEE_BPS, resolve_fee_bps
+from src.chains.pump_curve import (
+    DEFAULT_FEE_BPS, BondingCurveState, quote_buy, quote_sell, resolve_fee_bps,
+)
 from src.research.feature_engine import build_features
 from src.research import hazard_trainer
 from src.research.exit_policy_trainer import simulate, train_exit_policy
@@ -2753,6 +2759,9 @@ class TestPositionPredictionRefresh(unittest.IsolatedAsyncioTestCase):
         desk.monster_machine = MonsterStateMachine()
         desk.last_slate_report = {}
         desk._read_distribution = lambda token: MemecoinQuantDesk._read_distribution(desk, token)
+        desk._latest_curve_state = getattr(desk, "_latest_curve_state", {})
+        desk._exit_capacity = (
+            lambda token, pos: MemecoinQuantDesk._exit_capacity(desk, token, pos))
         desk._update_monster_state = (
             lambda token, pos, dist, mult:
             MemecoinQuantDesk._update_monster_state(desk, token, pos, dist, mult))
@@ -3410,6 +3419,9 @@ class TestDistributionExitWiring(unittest.IsolatedAsyncioTestCase):
             position=position, exits=exits,
         )
         desk._read_distribution = lambda token: MemecoinQuantDesk._read_distribution(desk, token)
+        desk._latest_curve_state = getattr(desk, "_latest_curve_state", {})
+        desk._exit_capacity = (
+            lambda token, pos: MemecoinQuantDesk._exit_capacity(desk, token, pos))
         desk._update_monster_state = (
             lambda token, pos, dist, mult:
             MemecoinQuantDesk._update_monster_state(desk, token, pos, dist, mult))
@@ -3715,6 +3727,9 @@ class TestMonsterHoldWiring(unittest.IsolatedAsyncioTestCase):
             global_config={}, position=position, exits=exits,
         )
         desk._read_distribution = lambda token: MemecoinQuantDesk._read_distribution(desk, token)
+        desk._latest_curve_state = getattr(desk, "_latest_curve_state", {})
+        desk._exit_capacity = (
+            lambda token, pos: MemecoinQuantDesk._exit_capacity(desk, token, pos))
         desk._update_monster_state = (
             lambda token, pos, dist, mult:
             MemecoinQuantDesk._update_monster_state(desk, token, pos, dist, mult))
@@ -3992,3 +4007,144 @@ class TestAuthenticityResolver(unittest.TestCase):
         # nor the best-named.
         self.assertEqual([item["mint"] for item in ranked], ["later", "first"])
         self.assertNotIn("unmeasured", [item["mint"] for item in ranked])
+
+
+class TestTradeabilityFrontier(unittest.TestCase):
+    """"Liquidity is $X" is not a tradeable fact.
+
+    It does not say how much can be bought without moving the price, it does
+    not say how much can be sold, and on a bonding curve those are not close
+    to each other. A position marked at 20x that can only exit 4% of itself
+    inside an acceptable impact is a 20x on 4% of the size.
+    """
+
+    @staticmethod
+    def _linear_quote(slope):
+        """Impact rises linearly with size -- monotone, as the search requires."""
+        return lambda size: (True, size * slope)
+
+    def test_the_frontier_finds_the_largest_size_inside_each_bound(self):
+        frontier = build_frontier(self._linear_quote(1e-6), 1_000_000, "exit")
+        self.assertTrue(frontier.ok)
+        self.assertEqual(frontier.size_at(0.01), 10_000)
+        self.assertEqual(frontier.size_at(0.05), 50_000)
+        self.assertEqual(frontier.size_at(0.10), 100_000)
+
+    def test_capacity_is_monotone_in_the_bound(self):
+        frontier = build_frontier(self._linear_quote(3e-7), 10_000_000, "exit")
+        sizes = [frontier.size_at(bound) for bound in sorted(frontier.sizes)]
+        self.assertEqual(sizes, sorted(sizes))
+
+    def test_a_venue_that_will_not_quote_blocks_rather_than_reading_as_deep(self):
+        frontier = build_frontier(lambda size: (False, 0.0), 1_000_000, "exit")
+        self.assertFalse(frontier.ok)
+        self.assertEqual(frontier.status, "DATA_BLOCKED")
+        # A refused quote is not zero impact, which is what an unguarded
+        # implementation would conclude from (False, 0.0).
+        self.assertEqual(frontier.sizes, {})
+
+    def test_zero_capacity_everywhere_is_a_measurement_not_a_block(self):
+        frontier = build_frontier(lambda size: (True, 5.0), 1_000_000, "exit")
+        self.assertTrue(frontier.ok)
+        self.assertEqual(frontier.size_at(0.10), 0)
+
+    def test_exit_capacity_never_defaults_to_fully_sellable(self):
+        blocked = Frontier(status="DATA_BLOCKED", side="exit")
+        self.assertEqual(exit_capacity_ratio(1_000, blocked), ("DATA_BLOCKED", 0.0))
+        # Assuming a position is fully sellable until proven otherwise is how
+        # a theoretical return becomes a real loss.
+        self.assertNotEqual(exit_capacity_ratio(1_000, blocked)[1], 1.0)
+
+    def test_exit_capacity_is_the_sellable_share_of_the_position(self):
+        frontier = build_frontier(self._linear_quote(1e-6), 10_000_000, "exit")
+        status, ratio = exit_capacity_ratio(1_000_000, frontier, acceptable_impact=0.10)
+        self.assertEqual(status, "OK")
+        self.assertAlmostEqual(ratio, 0.1)
+        # A position smaller than capacity is fully sellable, never more.
+        self.assertEqual(exit_capacity_ratio(10_000, frontier, 0.10)[1], 1.0)
+
+    def test_an_unmeasured_bound_blocks_rather_than_using_a_neighbour(self):
+        frontier = build_frontier(self._linear_quote(1e-6), 1_000_000, "exit",
+                                  bounds=(0.01, 0.05))
+        self.assertEqual(exit_capacity_ratio(1_000, frontier, 0.10)[0], "DATA_BLOCKED")
+
+    def test_virtual_only_capacity_is_labelled_an_upper_bound(self):
+        """Real reserves cap what the curve can physically pay out."""
+        virtual_only = BondingCurveState(
+            virtual_token_reserves=1_000_000_000_000, virtual_sol_reserves=30_000_000_000,
+            real_token_reserves=0, real_sol_reserves=0, token_total_supply=0,
+            complete=False, creator="")
+        report = curve_tradeability(virtual_only, quote_buy, quote_sell)
+        self.assertTrue(report.exit.upper_bound_only)
+        status, ratio = exit_capacity_ratio(1_000_000, report.exit)
+        self.assertEqual(status, "OK_UPPER_BOUND")
+        self.assertGreater(ratio, 0)
+
+        measured = BondingCurveState(
+            virtual_token_reserves=1_000_000_000_000, virtual_sol_reserves=30_000_000_000,
+            real_token_reserves=800_000_000_000, real_sol_reserves=5_000_000_000,
+            token_total_supply=1_000_000_000_000, complete=False, creator="")
+        self.assertFalse(curve_tradeability(measured, quote_buy, quote_sell).exit.upper_bound_only)
+
+    def test_a_completed_curve_has_no_frontier(self):
+        done = BondingCurveState(
+            virtual_token_reserves=1_000_000_000_000, virtual_sol_reserves=30_000_000_000,
+            real_token_reserves=0, real_sol_reserves=0, token_total_supply=0,
+            complete=True, creator="")
+        report = curve_tradeability(done, quote_buy, quote_sell)
+        self.assertFalse(report.ok)
+
+    def test_round_trip_size_is_bound_by_the_exit_side(self):
+        report = TradeabilityReport(
+            entry=build_frontier(self._linear_quote(1e-7), 10_000_000, "entry"),
+            exit=build_frontier(self._linear_quote(1e-5), 10_000_000, "exit"),
+        )
+        # Sizing to the entry frontier is how a position gets opened that
+        # cannot be closed.
+        self.assertEqual(report.round_trip_size(0.05), report.exit.size_at(0.05))
+        self.assertLess(report.asymmetry(0.05), 1.0)
+
+    def test_impact_for_reports_the_tightest_bound_a_size_fits(self):
+        frontier = build_frontier(self._linear_quote(1e-6), 10_000_000, "exit")
+        self.assertEqual(frontier.impact_for(5_000), 0.01)
+        self.assertEqual(frontier.impact_for(40_000), 0.05)
+        # None means "worse than every bound measured", not "no impact".
+        self.assertIsNone(frontier.impact_for(9_000_000))
+
+
+class TestCurveStateFromTradeStream(unittest.TestCase):
+    """The reserves are already in the TradeEvent; they were being discarded."""
+
+    @staticmethod
+    def _decode(payload):
+        monitor = PumpFunMonitor(SimpleNamespace(on=lambda *a, **k: None),
+                                 callback=lambda event: None)
+        return monitor._decode_program_event(payload, "sig", 1)
+
+    def test_the_pump_trade_event_now_carries_its_reserves(self):
+        payload = (
+            PumpFunMonitor.TRADE_EVENT
+            + bytes(32)                                    # mint
+            + struct.pack("<QQ", 1_000_000_000, 500_000)   # sol, token amounts
+            + bytes([1])                                   # is_buy
+            + bytes(32)                                    # user
+            + struct.pack("<q", 1_700_000_000)             # timestamp
+            + struct.pack("<QQ", 31_000_000_000, 1_070_000_000_000)
+        )
+        decoded = self._decode(payload)
+        self.assertEqual(decoded["type"], "token_trade")
+        self.assertEqual(decoded["virtual_sol_reserves"], 31_000_000_000)
+        self.assertEqual(decoded["virtual_token_reserves"], 1_070_000_000_000)
+        # The price it was already deriving stays consistent with them.
+        self.assertAlmostEqual(decoded["curve_price_raw"],
+                               31_000_000_000 / 1_070_000_000_000)
+
+    def test_a_truncated_event_reports_no_reserves_rather_than_zero(self):
+        payload = (
+            PumpFunMonitor.TRADE_EVENT + bytes(32)
+            + struct.pack("<QQ", 1_000_000_000, 500_000) + bytes([1]) + bytes(32)
+            + struct.pack("<q", 1_700_000_000)
+        )
+        decoded = self._decode(payload)
+        self.assertIsNone(decoded["virtual_sol_reserves"])
+        self.assertIsNone(decoded["virtual_token_reserves"])
