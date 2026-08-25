@@ -1,0 +1,191 @@
+# The source universe, declared rather than coded.
+#
+# Adding the 47th Korean regional outlet is an edit here, not a pull request.
+# `requires_env` names the environment variable holding a credential; the
+# registry checks PRESENCE only and never reads or logs a value. A declaration
+# whose credential is absent is reported UNCONFIGURED rather than silently
+# dropped, because a source that vanishes for a missing key is a coverage hole
+# nobody sees.
+#
+# `tier` is intended lead value, not trust: 1 = expected to lead, 3 = context.
+# It orders polling effort. What a source is actually worth is measured by
+# src/strategies/source_genealogy.py from observed lead time and executable
+# return, and that measurement overrides this number.
+#
+# This file is a SEED. Real coverage is several hundred entries across the
+# regions and languages below; the shape is here and the breadth is an
+# operator task, since only the operator can decide what to subscribe to.
+
+schema_version: v1
+
+sources:
+  # ---- chain-adjacent and highest tier -------------------------------------
+  - id: metadata:pump-ipfs
+    kind: metadata
+    tier: 1
+    region: global
+  - id: code:pump-public-docs
+    kind: code_repo
+    tier: 2
+    region: global
+
+  # ---- Telegram: crypto-native, where a CA usually appears first -----------
+  - id: telegram:calls-en-1
+    kind: telegram
+    tier: 1
+    language: en
+    region: global
+    requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
+    options: {channel: example_calls_en}
+  - id: telegram:calls-zh-1
+    kind: telegram
+    tier: 1
+    language: zh
+    region: cn
+    requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
+    options: {channel: example_calls_zh}
+  - id: telegram:calls-ru-1
+    kind: telegram
+    tier: 1
+    language: ru
+    region: cis
+    requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
+    options: {channel: example_calls_ru}
+  - id: telegram:calls-tr-1
+    kind: telegram
+    tier: 1
+    language: tr
+    region: tr
+    requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
+    options: {channel: example_calls_tr}
+  - id: telegram:calls-ko-1
+    kind: telegram
+    tier: 1
+    language: ko
+    region: kr
+    requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
+    options: {channel: example_calls_ko}
+
+  # ---- open social firehoses: free, filtered locally -----------------------
+  - id: bluesky:jetstream
+    kind: bluesky
+    tier: 2
+    language: en
+    region: global
+  - id: nostr:relay-damus
+    kind: nostr
+    tier: 2
+    region: global
+  - id: farcaster:casts
+    kind: farcaster
+    tier: 2
+    region: global
+    requires_env: [NEYNAR_API_KEY]
+  - id: mastodon:mastodon-social
+    kind: mastodon
+    tier: 3
+    region: global
+
+  # ---- live video and audio: spoken before written ------------------------
+  - id: youtube:websub-watchlist
+    kind: youtube
+    tier: 2
+    region: global
+    requires_env: [YOUTUBE_WEBSUB_CALLBACK]
+  - id: twitch:eventsub-watchlist
+    kind: twitch
+    tier: 3
+    region: global
+    requires_env: [TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET]
+
+  # ---- regional and local-language press ----------------------------------
+  # The local outlet breaking a story before global media is the case worth
+  # catching, and it is served by exactly the same RSS parser.
+  - id: rss:kr-local
+    kind: rss
+    tier: 1
+    language: ko
+    region: kr
+    options: {language: ko}
+  - id: rss:jp-local
+    kind: rss
+    tier: 2
+    language: ja
+    region: jp
+    options: {language: ja}
+  - id: rss:cn-local
+    kind: rss
+    tier: 2
+    language: zh
+    region: cn
+    options: {language: zh}
+  - id: rss:br-local
+    kind: rss
+    tier: 2
+    language: pt
+    region: br
+    options: {language: pt}
+  - id: rss:tr-local
+    kind: rss
+    tier: 2
+    language: tr
+    region: tr
+    options: {language: tr}
+  - id: rss:mena-local
+    kind: rss
+    tier: 2
+    language: ar
+    region: mena
+    options: {language: ar}
+  - id: rss:in-local
+    kind: rss
+    tier: 3
+    language: hi
+    region: in
+    options: {language: hi}
+  - id: rss:latam-local
+    kind: rss
+    tier: 3
+    language: es
+    region: latam
+    options: {language: es}
+  - id: rss:id-local
+    kind: rss
+    tier: 3
+    language: id
+    region: sea
+    options: {language: id}
+  - id: rss:fr-local
+    kind: rss
+    tier: 3
+    language: fr
+    region: eu
+    options: {language: fr}
+  - id: rss:de-local
+    kind: rss
+    tier: 3
+    language: de
+    region: eu
+    options: {language: de}
+
+  # ---- official feeds: the strongest non-chain authenticity proof ----------
+  - id: rss:gov-press
+    kind: rss
+    tier: 1
+    language: en
+    region: global
+  - id: rss:exchange-announcements
+    kind: rss
+    tier: 1
+    language: en
+    region: global
+  - id: rss:sports-official
+    kind: rss
+    tier: 3
+    language: en
+    region: global
+  - id: rss:entertainment-official
+    kind: rss
+    tier: 3
+    language: en
+    region: global

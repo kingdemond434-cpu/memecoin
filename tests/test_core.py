@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import yaml
 from solders.hash import Hash
 from solders.keypair import Keypair
 from solders.message import MessageV0
@@ -38,6 +39,10 @@ from src.execution.jupiter_jito import (
 from src.main import CAPACITY_REJECTIONS, MemecoinQuantDesk, _jsonable
 from src.strategies.information_graph import CounterfactualExecutionLab
 from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPrediction, MultiHeadPredictor, PredictionFeatures
+from src.collectors.registry import (
+    ADAPTER_KINDS, SourceDeclaration, SourceDiscovery, build_sources,
+    load_declarations,
+)
 from src.collectors.adapters import (
     bluesky_source, code_repository_source, coverage_report, discord_gateway_source,
     farcaster_source, mastodon_source, metadata_artifact_source, nostr_source,
@@ -6852,3 +6857,166 @@ class TestSourceAdapters(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(event, Event)
             self.assertIn("schema_version", event.to_dict())
             self.assertGreaterEqual(event.observation_lag, 0.0)
+
+
+class TestSourceRegistry(unittest.TestCase):
+    """Adapters are not coverage. Twelve adapters and four feeds is blindness."""
+
+    def _declaration(self, **kwargs):
+        base = dict(source_id="rss:kr", kind="rss", language="ko", region="kr")
+        base.update(kwargs)
+        return SourceDeclaration(**base)
+
+    async def _fetch(self):
+        return []
+
+    def _fetchers(self, *ids):
+        async def fetch():
+            return []
+        return {source_id: fetch for source_id in ids}
+
+    def test_a_declaration_is_instantiated_when_ready(self):
+        declaration = self._declaration()
+        sources, report = build_sources([declaration], self._fetchers("rss:kr"))
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(report.ready, 1)
+        self.assertEqual(report.by_state["READY"], 1)
+
+    def test_a_missing_credential_is_named_not_silently_skipped(self):
+        declaration = self._declaration(source_id="tg:a", kind="telegram",
+                                        requires_env=("NO_SUCH_KEY_12345",))
+        _, report = build_sources([declaration], self._fetchers("tg:a"))
+        payload = report.to_dict()
+        # A source that vanishes for a missing key is a coverage hole nobody
+        # sees.
+        self.assertEqual(payload["unconfigured"], ["tg:a"])
+        self.assertEqual(payload["ready"], 0)
+
+    def test_credentials_are_checked_by_presence_never_by_value(self):
+        with patch.dict("os.environ", {"SECRET_TOKEN_X": "hunter2"}, clear=False):
+            declaration = self._declaration(source_id="tg:b", kind="telegram",
+                                            requires_env=("SECRET_TOKEN_X",))
+            self.assertEqual(declaration.missing_credentials(), [])
+            _, report = build_sources([declaration], self._fetchers("tg:b"))
+            # Nothing in the report can carry the value.
+            self.assertNotIn("hunter2", json.dumps(report.to_dict()))
+
+    def test_an_unknown_kind_is_a_reported_problem(self):
+        _, report = build_sources([self._declaration(kind="carrier_pigeon")],
+                                  self._fetchers("rss:kr"))
+        self.assertEqual(report.by_state["UNKNOWN_KIND"], 1)
+        self.assertIn("carrier_pigeon", report.problems[0][1])
+
+    def test_a_declaration_with_no_fetcher_is_reported_not_dropped(self):
+        _, report = build_sources([self._declaration()], {})
+        self.assertEqual(report.by_state["NO_FETCHER"], 1)
+        self.assertEqual(report.ready, 0)
+
+    def test_the_report_breaks_coverage_down_by_language_and_region(self):
+        declarations = [
+            self._declaration(source_id="rss:kr", language="ko", region="kr"),
+            self._declaration(source_id="rss:jp", language="ja", region="jp"),
+            self._declaration(source_id="rss:kr2", language="ko", region="kr"),
+        ]
+        _, report = build_sources(declarations, self._fetchers("rss:kr", "rss:jp", "rss:kr2"))
+        payload = report.to_dict()
+        self.assertEqual(payload["by_language"], {"ja": 1, "ko": 2})
+        self.assertEqual(payload["by_region"], {"jp": 1, "kr": 2})
+        self.assertAlmostEqual(payload["ready_share"], 1.0)
+
+    def test_nothing_declared_reports_no_share_rather_than_zero(self):
+        _, report = build_sources([], {})
+        self.assertIsNone(report.to_dict()["ready_share"])
+
+    def test_the_shipped_registry_parses_and_covers_many_languages(self):
+        path = Path(__file__).resolve().parents[1] / "config" / "sources.yaml"
+        declarations = load_declarations(str(path))
+        self.assertGreater(len(declarations), 20)
+        languages = {item.language for item in declarations if item.language}
+        regions = {item.region for item in declarations if item.region}
+        # Native-language detection, not English-first: a Korean story should
+        # not wait for its English repost.
+        for expected in ("ko", "ja", "zh", "ru", "tr", "ar", "pt", "es"):
+            self.assertIn(expected, languages)
+        self.assertGreaterEqual(len(regions), 10)
+
+    def test_every_declared_kind_has_an_adapter(self):
+        path = Path(__file__).resolve().parents[1] / "config" / "sources.yaml"
+        for declaration in load_declarations(str(path)):
+            self.assertIn(declaration.kind, ADAPTER_KINDS, declaration.source_id)
+
+    def test_one_malformed_entry_does_not_take_the_file_offline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sources.yaml"
+            path.write_text(yaml.safe_dump({"sources": [
+                {"id": "good", "kind": "rss"},
+                {"kind": "rss"},
+                {"id": "also_good", "kind": "rss"},
+            ]}))
+            declarations = load_declarations(str(path))
+            # One bad line in a 400-source file must not lose the other 399.
+            self.assertEqual([item.source_id for item in declarations],
+                             ["good", "also_good"])
+
+    def test_an_unreadable_registry_yields_nothing_rather_than_raising(self):
+        self.assertEqual(load_declarations("/nonexistent/sources.yaml"), [])
+
+
+class TestSourceDiscovery(unittest.TestCase):
+    """Promoting on two coincidences fills the mesh with noise."""
+
+    KNOWN = ("big_channel", "aggregator", "other_known")
+
+    def _discovery(self, **kwargs):
+        base = dict(min_observations=8, min_lead_rate=0.6, min_distinct_followers=2)
+        base.update(kwargs)
+        return SourceDiscovery(**base)
+
+    def test_a_consistent_upstream_source_is_promoted(self):
+        discovery = self._discovery()
+        for _ in range(10):
+            discovery.observe(["regional", "big_channel", "aggregator"], self.KNOWN)
+        promotable = discovery.promotable()
+        self.assertEqual([item.source_id for item in promotable], ["regional"])
+        self.assertAlmostEqual(promotable[0].lead_rate, 1.0)
+
+    def test_a_thin_history_is_not_promoted(self):
+        discovery = self._discovery()
+        for _ in range(3):
+            discovery.observe(["lucky", "big_channel", "aggregator"], self.KNOWN)
+        self.assertEqual(discovery.promotable(), [])
+
+    def test_leading_one_channel_repeatedly_is_one_relationship(self):
+        discovery = self._discovery(min_distinct_followers=2)
+        for _ in range(30):
+            discovery.observe(["echo", "big_channel"], self.KNOWN)
+        # Leading the same channel thirty times is one relationship, not
+        # thirty, and a mirror of one feed is not an upstream source.
+        self.assertEqual(discovery.promotable(), [])
+
+    def test_a_source_already_in_the_mesh_is_not_a_discovery(self):
+        discovery = self._discovery()
+        for _ in range(20):
+            discovery.observe(["big_channel", "aggregator"], self.KNOWN)
+        self.assertEqual(discovery.report()["tracked"], 0)
+
+    def test_a_source_that_usually_follows_is_not_promoted(self):
+        discovery = self._discovery()
+        for _ in range(3):
+            discovery.observe(["sometimes", "big_channel", "aggregator"], self.KNOWN)
+        for _ in range(17):
+            discovery.observe(["sometimes"], self.KNOWN)
+            discovery.observe(["sometimes", "unknown_other"], self.KNOWN)
+        candidates = {item.source_id for item in discovery.promotable()}
+        self.assertNotIn("sometimes", candidates)
+
+    def test_a_single_source_observation_teaches_nothing(self):
+        discovery = self._discovery()
+        for _ in range(20):
+            discovery.observe(["alone"], self.KNOWN)
+        self.assertEqual(discovery.report()["tracked"], 0)
+
+    def test_the_report_states_the_gate_it_applied(self):
+        report = self._discovery().report()
+        self.assertEqual(report["gate"]["min_observations"], 8)
+        self.assertEqual(report["gate"]["min_distinct_followers"], 2)
