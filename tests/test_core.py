@@ -5700,8 +5700,12 @@ class TestAuditPack(unittest.TestCase):
                                         "swarm": "SHADOW", "new_thing": "KEEP"})
 
     def test_recent_changes_reads_the_repository_history(self):
-        pack = build_audit_pack(Path("/home/user/memecoin"), period_days=3650,
-                                run_tests=False)
+        # Resolved from this file rather than hardcoded: the absolute path
+        # this test used to name exists on one machine, so on CI `git log` ran
+        # with a cwd that did not exist and the pack correctly reported
+        # DATA_BLOCKED. The pack was right and the test was wrong.
+        pack = build_audit_pack(Path(__file__).resolve().parents[1],
+                                period_days=3650, run_tests=False)
         section = pack.to_dict()["sections"]["recent_changes"]
         self.assertEqual(section["status"], "OK")
         self.assertIn("commits", section["summary"])
@@ -10557,3 +10561,34 @@ class TestAccountPrewarming(unittest.TestCase):
                        if isinstance(node, ast.AsyncFunctionDef)
                        and node.name == "_on_pump_event")
         self.assertIn("pump_route.warm", ast.unparse(handler))
+
+
+class TestNoTestDependsOnOneMachine(unittest.TestCase):
+    """A suite green on the author's box and red on CI is not a green suite.
+
+    Every commit for the life of the workflow failed on one test that named an
+    absolute path existing only on the machine it was written on. The product
+    was correct throughout; the test was asserting against a directory the
+    runner does not have.
+    """
+
+    def test_no_absolute_home_paths_are_hardcoded(self):
+        root = Path(__file__).resolve().parents[1]
+        offenders = []
+        for path in list(root.glob("tests/*.py")) + list(root.rglob("src/**/*.py")) \
+                + list(root.glob("ops/*.py")) + list(root.glob("tools/*.py")):
+            text = path.read_text(encoding="utf-8")
+            for number, line in enumerate(text.splitlines(), 1):
+                # Assembled rather than written out, so this check does not
+                # match its own source and report itself.
+                if any(("/" + part + "/") in line
+                       for part in ("home" + "/user", "Users")):
+                    offenders.append(f"{path.relative_to(root)}:{number}")
+        self.assertEqual(offenders, [], f"machine-specific paths: {offenders}")
+
+    def test_the_repo_root_is_derived_from_the_module(self):
+        """So the pack reports on the repository it is actually inside."""
+        from ops.audit_pack import changes_section
+
+        section = changes_section(Path(__file__).resolve().parents[1], since_days=3650)
+        self.assertEqual(section.status, "OK")
