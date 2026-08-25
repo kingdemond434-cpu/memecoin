@@ -580,6 +580,15 @@ class ExecutionEngine:
         # that runs out of compute in the middle of an init_if_needed is a
         # lost fill, and headroom is cheaper than the fill.
         self.native_compute_unit_limit = 400_000
+        # Stream-first reconciliation. The waiters are futures our own decode
+        # path resolves when it sees one of our signatures; the intervals
+        # govern the polling backstop, which starts tight and backs off rather
+        # than sitting at a fixed half second.
+        self._signature_waiters: Dict[str, Any] = {}
+        self.reconcile_min_interval = 0.025
+        self.reconcile_max_interval = 0.5
+        self.stream_confirmations = 0
+        self.poll_confirmations = 0
         self.execution_history: deque = deque(maxlen=10_000)
         self.route_performance: Dict[RouteType, Dict[str, float]] = defaultdict(
             lambda: {"total": 0, "landed": 0, "filled": 0, "failed": 0, "avg_latency": 0}
@@ -650,6 +659,12 @@ class ExecutionEngine:
             "attempts": total, "prepared": prepared,
             "prepared_share": (prepared / total) if total else None,
             "outcomes": dict(self.native_route_attempts),
+            "reconciliation": {
+                "stream_confirmations": self.stream_confirmations,
+                "poll_confirmations": self.poll_confirmations,
+                "watching": len(self._signature_waiters),
+                "min_interval_s": self.reconcile_min_interval,
+            },
             "route": self.pump_route.report() if self.pump_route else {
                 "status": "DATA_BLOCKED", "detail": "no native route configured"},
         }
@@ -921,8 +936,92 @@ class ExecutionEngine:
             logger.error("Send transaction failed: %s", exc)
             return None
 
+    def observe_signature(self, signature: str, slot: Optional[int] = None) -> bool:
+        """Our own transaction has been seen on the stream.
+
+        Called from the decode path, which already carries every signature on
+        the programs we subscribe to. If one of them is ours, the transaction
+        has landed and we know it at stream latency rather than at the next
+        poll -- which is the difference between reconciling a fill in tens of
+        milliseconds and reconciling it up to half a second late, on the one
+        path where a stale position is the expensive kind.
+
+        Synchronous and non-blocking, because a decode handler that awaits is
+        a handler that drops the next event.
+        """
+        waiter = self._signature_waiters.get(signature)
+        if waiter is None or waiter.done():
+            return False
+        waiter.set_result(slot)
+        self.stream_confirmations += 1
+        return True
+
+    def _watch_signature(self, signature: str) -> "asyncio.Future":
+        loop = asyncio.get_event_loop()
+        waiter = loop.create_future()
+        self._signature_waiters[signature] = waiter
+        return waiter
+
+    async def _await_landing(self, signature: str, deadline: float) -> bool:
+        """Race the stream against a backing-off poll.
+
+        The stream is the fast path and the poll is the backstop, not the
+        other way round: a fixed 500ms poll detects a fill that landed at
+        400ms somewhere between 100 and 500ms late, every time. The poll's
+        first interval is short and then backs off, so the case where the
+        stream misses it -- a route we do not subscribe to, a dropped
+        connection -- still reconciles quickly rather than being punished for
+        the stream's absence.
+        """
+        waiter = self._watch_signature(signature)
+        interval = self.reconcile_min_interval
+        try:
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                try:
+                    await asyncio.wait_for(asyncio.shield(waiter),
+                                           timeout=min(interval, remaining))
+                    return True
+                except asyncio.TimeoutError:
+                    pass
+                if await self._signature_landed(signature):
+                    self.poll_confirmations += 1
+                    return True
+                interval = min(interval * 2, self.reconcile_max_interval)
+            return False
+        finally:
+            self._signature_waiters.pop(signature, None)
+
+    async def _signature_landed(self, signature: str) -> bool:
+        """Has it landed? Cheapest question first, then the definitive one.
+
+        `getSignatureStatuses` is a small call and answers directly. Where a
+        node does not serve it, the presence of the transaction itself is the
+        same answer arrived at more expensively -- and falling back rather
+        than reporting "not landed" matters, because a missing status endpoint
+        would otherwise look identical to a transaction that never landed.
+        """
+        try:
+            response = await self.rpc.request(
+                "getSignatureStatuses", [[signature], {"searchTransactionHistory": False}])
+            values = ((response or {}).get("value") or [])
+            status = values[0] if values else None
+            if status:
+                return str(status.get("confirmationStatus") or "") in {"confirmed", "finalized"}
+        except Exception:
+            pass
+        try:
+            tx = await self.rpc.request(
+                "getTransaction",
+                [signature, {"encoding": "jsonParsed", "commitment": "confirmed",
+                             "maxSupportedTransactionVersion": 0}])
+            return bool(tx)
+        except Exception:
+            return False
+
     async def _wait_for_bundle(self, bundle_id: str) -> Optional[str]:
         deadline = time.monotonic() + self.confirmation_timeout
+        interval = self.reconcile_min_interval
         while time.monotonic() < deadline:
             status = await self.jito.get_bundle_status(bundle_id)
             values = (status or {}).get("value") or []
@@ -934,11 +1033,25 @@ class ExecutionEngine:
                 transactions = item.get("transactions") or []
                 if confirmation in {"confirmed", "finalized"} and transactions:
                     return transactions[0]
-            await asyncio.sleep(0.5)
+            # Backing off rather than fixed: a bundle usually resolves in the
+            # first few hundred milliseconds, and a fixed half-second cadence
+            # finds that out up to half a second late every single time.
+            await asyncio.sleep(interval)
+            interval = min(interval * 2, self.reconcile_max_interval)
         return None
 
     async def _wait_for_fill(self, signature: str, input_mint: str, output_mint: str) -> Dict[str, Any]:
+        """Reconcile what actually landed.
+
+        Landing is detected by the stream where possible; the balance deltas
+        still come from `getTransaction`, because knowing a transaction landed
+        is not the same as knowing what it filled, and a position sized from
+        an assumed fill is a position whose cost basis is fiction.
+        """
         deadline = time.monotonic() + self.confirmation_timeout
+        landed = await self._await_landing(signature, deadline)
+        if not landed:
+            return {"landed": False, "filled": False}
         while time.monotonic() < deadline:
             try:
                 tx = await self.rpc.request(
@@ -963,8 +1076,11 @@ class ExecutionEngine:
                     }
             except Exception:
                 pass
-            await asyncio.sleep(0.5)
-        return {"landed": False, "filled": False}
+            # It landed; the details just have not propagated yet. Short waits,
+            # because this is the window in which a position is open and
+            # unaccounted for.
+            await asyncio.sleep(self.reconcile_min_interval)
+        return {"landed": True, "filled": False}
 
     @staticmethod
     def _token_balance_delta(meta: Dict[str, Any], mint: str, owner: str) -> int:

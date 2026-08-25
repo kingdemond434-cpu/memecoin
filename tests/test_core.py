@@ -9348,6 +9348,10 @@ class TestNativeRouteIsTheCanonicalPath(unittest.TestCase):
         engine.curve_state_provider = (lambda token: curve) if curve else None
         engine.tx_builder = SimpleNamespace(public_key=self.OTHER)
         engine.native_route_attempts = defaultdict(int)
+        engine.stream_confirmations = 0
+        engine.poll_confirmations = 0
+        engine._signature_waiters = {}
+        engine.reconcile_min_interval = 0.005
         return engine
 
     @staticmethod
@@ -9994,6 +9998,11 @@ class TestNativeRouteIsActuallyTaken(unittest.IsolatedAsyncioTestCase):
         engine.tx_builder = SimpleNamespace(public_key=self.OTHER)
         engine.native_route_attempts = defaultdict(int)
         engine.native_compute_unit_limit = 400_000
+        engine.stream_confirmations = 0
+        engine.poll_confirmations = 0
+        engine._signature_waiters = {}
+        engine.reconcile_min_interval = 0.005
+        engine.reconcile_max_interval = 0.05
         engine.dry_run = True
         engine.execution_history = deque(maxlen=16)
         engine.route_performance = defaultdict(
@@ -10090,3 +10099,195 @@ class TestStreamedCurveStateIsBuildable(unittest.TestCase):
         dropped = MemecoinQuantDesk._prune_curve_static(desk)
         self.assertEqual(dropped, 1)
         self.assertEqual(set(desk._curve_static), {"live"})
+
+
+class TestSourceMeshStreams(unittest.IsolatedAsyncioTestCase):
+    """A gather barrier makes every source as slow as the slowest one.
+
+    `collect()` waited for all polls before returning anything, so a source
+    taking four seconds held the 5ms chat event behind it -- on every cycle,
+    not just slow ones. The docstring even claimed completion order, which
+    gather does not do.
+    """
+
+    class _Fake(EventSource):
+        def __init__(self, source_id, events, delay=0.0, interval=0.01):
+            super().__init__(source_id, SourceClass.CHAT,
+                             poll_interval_seconds=interval)
+            self._events = list(events)
+            self._delay = delay
+            self.polls = 0
+
+        async def poll(self):
+            self.polls += 1
+            if self._delay:
+                await asyncio.sleep(self._delay)
+            return [self._events.pop(0)] if self._events else []
+
+    @staticmethod
+    def _event(source_id, text, at=100.0):
+        return Event(source_id=source_id, source_class=SourceClass.CHAT,
+                     source_at=at, observed_at=at + 0.1, text=text,
+                     token_addresses=("mint",))
+
+    async def test_a_fast_source_is_not_held_behind_a_slow_one(self):
+        fast = self._Fake("fast", [self._event("fast", "quick")], delay=0.0)
+        slow = self._Fake("slow", [self._event("slow", "eventually")], delay=5.0)
+        mesh = SourceMesh([fast, slow])
+        await mesh.start()
+        try:
+            event = await asyncio.wait_for(mesh.next_event(), timeout=1.0)
+        finally:
+            await mesh.stop()
+        # Under the old barrier this took five seconds.
+        self.assertEqual(event.source_id, "fast")
+
+    async def test_each_source_keeps_its_own_cadence(self):
+        """A chat channel and a daily regulatory feed do not share a clock."""
+        brisk = self._Fake("brisk", [], interval=0.01)
+        languid = self._Fake("languid", [], interval=5.0)
+        mesh = SourceMesh([brisk, languid])
+        await mesh.start()
+        await asyncio.sleep(0.1)
+        await mesh.stop()
+        self.assertGreater(brisk.polls, 2)
+        self.assertLessEqual(languid.polls, 1)
+
+    async def test_a_repeat_is_suppressed_but_its_source_is_recorded(self):
+        """Dropping the repeat would throw away the lead-lag evidence."""
+        first = self._Fake("first", [self._event("first", "same")])
+        second = self._Fake("second", [self._event("second", "same")])
+        mesh = SourceMesh([first, second])
+        await mesh.start()
+        await asyncio.sleep(0.1)
+        await mesh.stop()
+        events = mesh.drain()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(len(mesh.repeaters_of(events[0].content_hash)), 2)
+
+    async def test_the_fan_in_is_bounded_and_drops_the_oldest(self):
+        mesh = SourceMesh([], max_queue=3)
+        for index in range(6):
+            mesh._publish(self._event("s", f"text{index}"), 100.0)
+        self.assertEqual(mesh.pending, 3)
+        self.assertEqual(mesh.dropped, 3)
+        # The newest survive, because they are what a decision might still need.
+        texts = [event.text for event in mesh.drain()]
+        self.assertEqual(texts, ["text3", "text4", "text5"])
+
+    async def test_a_dead_source_does_not_stop_the_others(self):
+        class _Broken(EventSource):
+            def __init__(self):
+                super().__init__("broken", SourceClass.CHAT, poll_interval_seconds=0.01)
+
+            async def poll(self):
+                raise RuntimeError("upstream is down")
+
+        alive = self._Fake("alive", [self._event("alive", "still here")])
+        mesh = SourceMesh([_Broken(), alive])
+        await mesh.start()
+        try:
+            event = await asyncio.wait_for(mesh.next_event(), timeout=1.0)
+        finally:
+            await mesh.stop()
+        self.assertEqual(event.source_id, "alive")
+
+    async def test_health_reports_that_it_is_streaming(self):
+        mesh = SourceMesh([self._Fake("a", [])])
+        await mesh.start()
+        health = mesh.health()
+        await mesh.stop()
+        json.dumps(health)
+        self.assertTrue(health["streaming"])
+        self.assertEqual(health["producers"], 1)
+
+    def test_the_runtime_consumes_the_mesh(self):
+        """The architecture existed and the runtime never called it."""
+        source = Path("src/main.py").read_text()
+        tree = ast.parse(source)
+        names = {node.name for node in ast.walk(tree)
+                 if isinstance(node, ast.AsyncFunctionDef)}
+        self.assertIn("_source_consumer_loop", names)
+        loop = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.AsyncFunctionDef)
+                    and node.name == "_source_consumer_loop")
+        text = ast.unparse(loop)
+        self.assertIn("source_mesh.start", text)
+        self.assertIn("next_event", text)
+
+
+class TestStreamFillReconciliation(unittest.IsolatedAsyncioTestCase):
+    """A fixed 500ms poll finds a 400ms fill somewhere between 100 and 500ms late.
+
+    Every time, on the one path where a position open and unaccounted for is
+    the expensive kind.
+    """
+
+    def _engine(self, statuses=None):
+        engine = ExecutionEngine.__new__(ExecutionEngine)
+        engine._signature_waiters = {}
+        engine.stream_confirmations = 0
+        engine.poll_confirmations = 0
+        engine.reconcile_min_interval = 0.01
+        engine.reconcile_max_interval = 0.05
+        engine.confirmation_timeout = 1.0
+        calls = []
+
+        async def request(method, params):
+            calls.append(method)
+            return (statuses or {}).get(method)
+
+        engine.rpc = SimpleNamespace(request=request)
+        engine.rpc_calls = calls
+        return engine
+
+    async def test_the_stream_resolves_a_landing_without_any_polling(self):
+        engine = self._engine()
+        deadline = time.monotonic() + 1.0
+        task = asyncio.create_task(
+            ExecutionEngine._await_landing(engine, "sig", deadline))
+        for _ in range(200):
+            if "sig" in engine._signature_waiters:
+                break
+            await asyncio.sleep(0.001)
+        self.assertTrue(ExecutionEngine.observe_signature(engine, "sig", 42))
+        self.assertTrue(await task)
+        self.assertEqual(engine.stream_confirmations, 1)
+        self.assertEqual(engine.poll_confirmations, 0)
+
+    async def test_the_poll_is_the_backstop_when_the_stream_misses_it(self):
+        engine = self._engine(statuses={"getSignatureStatuses": {
+            "value": [{"confirmationStatus": "confirmed"}]}})
+        landed = await ExecutionEngine._await_landing(
+            engine, "sig", time.monotonic() + 1.0)
+        self.assertTrue(landed)
+        self.assertEqual(engine.poll_confirmations, 1)
+        self.assertEqual(engine.stream_confirmations, 0)
+
+    async def test_a_missing_status_endpoint_falls_back_rather_than_denying(self):
+        """Otherwise a node that does not serve statuses looks like a lost fill."""
+        engine = self._engine(statuses={"getTransaction": {"slot": 7}})
+        self.assertTrue(await ExecutionEngine._signature_landed(engine, "sig"))
+        self.assertIn("getTransaction", engine.rpc_calls)
+
+    async def test_an_unlanded_signature_times_out_rather_than_hanging(self):
+        engine = self._engine()
+        engine.confirmation_timeout = 0.05
+        landed = await ExecutionEngine._await_landing(
+            engine, "sig", time.monotonic() + 0.05)
+        self.assertFalse(landed)
+        # And the waiter is cleaned up, so a long run does not accumulate them.
+        self.assertEqual(engine._signature_waiters, {})
+
+    async def test_observing_an_unknown_signature_is_harmless(self):
+        engine = self._engine()
+        self.assertFalse(ExecutionEngine.observe_signature(engine, "someone-elses"))
+        self.assertEqual(engine.stream_confirmations, 0)
+
+    def test_the_decode_path_reports_our_signatures(self):
+        source = Path("src/main.py").read_text()
+        tree = ast.parse(source)
+        handler = next(node for node in ast.walk(tree)
+                       if isinstance(node, ast.AsyncFunctionDef)
+                       and node.name == "_on_pump_event")
+        self.assertIn("observe_signature", ast.unparse(handler))

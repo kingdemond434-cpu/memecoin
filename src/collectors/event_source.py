@@ -132,12 +132,24 @@ class EventSource(ABC):
     #: the healthy feed dead or lets the dead one look healthy.
     dead_after_seconds: float = 900.0
     degraded_after_seconds: float = 300.0
+    #: How often this source is worth asking. A property of the source, not of
+    #: the mesh: a chat channel that pushes and a daily regulatory feed do not
+    #: belong on one shared cadence, and a single polling loop forces exactly
+    #: that.
+    poll_interval_seconds: float = 1.0
 
     def __init__(self, source_id: str, source_class: SourceClass,
                  degraded_after_seconds: Optional[float] = None,
-                 dead_after_seconds: Optional[float] = None):
+                 dead_after_seconds: Optional[float] = None,
+                 poll_interval_seconds: Optional[float] = None):
         self.source_id = source_id
         self.source_class = source_class
+        # How often this source is worth asking, which is a property of the
+        # source and not of the mesh. A chat channel that pushes and a daily
+        # regulatory feed do not belong on one shared cadence, and putting
+        # them on one is what a single polling loop forces.
+        if poll_interval_seconds is not None:
+            self.poll_interval_seconds = max(0.01, float(poll_interval_seconds))
         if degraded_after_seconds is not None:
             self.degraded_after_seconds = float(degraded_after_seconds)
         if dead_after_seconds is not None:
@@ -238,6 +250,12 @@ class SourceMesh:
         # content_hash -> (first_seen_at, [source_ids in arrival order]).
         # Kept rather than discarded, because who saw it FIRST is the signal.
         self._seen: Dict[str, Any] = {}
+        # Bounded fan-in. Every producer writes here and the consumer reads
+        # here, so no source can hold another's events and no source can grow
+        # the memory footprint without bound.
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=self.max_queue)
+        self._producers: List[asyncio.Task] = []
+        self._running = False
 
     def add(self, source: EventSource) -> None:
         self.sources.append(source)
@@ -262,17 +280,104 @@ class SourceMesh:
                            source.source_id, exc)
             return []
 
+    def _admit(self, event: Event, now: float) -> bool:
+        """First observation, or a repeat recorded against the original.
+
+        Dropping a repeat outright would throw away exactly the lead-lag
+        evidence that says which source is upstream of which, so the repeat's
+        source is appended to the original's list and only the event itself
+        is suppressed.
+        """
+        key = event.content_hash
+        if key in self._seen:
+            self._seen[key][1].append(event.source_id)
+            return False
+        self._seen[key] = (now, [event.source_id])
+        return True
+
+    async def _producer(self, source: "EventSource") -> None:
+        """One source, polled on its own cadence, forever.
+
+        This is the whole point of the change. Under `gather` a source that
+        takes four seconds held every event behind it for four seconds,
+        including the 5ms one from the chat channel that saw the launch
+        first -- and the barrier applied on every cycle, not just slow ones.
+        A producer per source means a slow source is slow by itself.
+        """
+        interval = max(0.01, float(getattr(source, "poll_interval_seconds", 1.0)))
+        while self._running:
+            started = time.time()
+            events = await self._collect_one(source, started)
+            for event in events:
+                self._publish(event, time.time())
+            elapsed = time.time() - started
+            await asyncio.sleep(max(0.0, interval - elapsed))
+
+    def _publish(self, event: Event, now: float) -> None:
+        """Put one event on the fan-in queue, dropping the oldest when full.
+
+        Oldest first, because the newest observation is the one a decision
+        might still depend on -- and dropping is counted, since a queue
+        silently shedding events looks exactly like a quiet forest.
+        """
+        if not self._admit(event, now):
+            return
+        while True:
+            try:
+                self._queue.put_nowait(event)
+                return
+            except asyncio.QueueFull:
+                try:
+                    self._queue.get_nowait()
+                    self.dropped += 1
+                except asyncio.QueueEmpty:  # pragma: no cover - racing drain
+                    return
+
+    async def start(self) -> int:
+        """Spawn one persistent producer per source. Returns how many started."""
+        if self._running:
+            return len(self._producers)
+        self._running = True
+        self._producers = [asyncio.create_task(self._producer(source))
+                           for source in self.sources]
+        return len(self._producers)
+
+    async def stop(self) -> None:
+        self._running = False
+        for task in self._producers:
+            task.cancel()
+        for task in self._producers:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # pragma: no cover
+                pass
+        self._producers = []
+
+    async def next_event(self) -> Event:
+        """Await the next event from any source. The consumer's entry point."""
+        return await self._queue.get()
+
+    def drain(self, limit: Optional[int] = None) -> List[Event]:
+        """Everything available right now, without waiting for any source."""
+        events: List[Event] = []
+        while limit is None or len(events) < limit:
+            try:
+                events.append(self._queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        return events
+
+    @property
+    def pending(self) -> int:
+        return self._queue.qsize()
+
     async def collect(self, now: Optional[float] = None) -> List[Event]:
-        """Poll every source concurrently, returning first-observations only.
+        """Poll every source once and return the first observations.
 
-        A repeat of content already seen is not returned as a new event, but
-        its source IS recorded against the original. Dropping the repeat
-        outright would throw away exactly the lead-lag evidence that says
-        which source is upstream of which.
-
-        Results are merged in completion order, so a source that answered in
-        5ms is not held behind one that took 4 seconds -- and the arrival
-        order recorded for lead-lag is the order things actually arrived.
+        The BATCH path, kept for backfill and for tests that want a single
+        deterministic sweep. It still waits for every source, which is exactly
+        why it is not the live path any more: a four-second source held a
+        five-millisecond one behind it on every cycle.
         """
         now = time.time() if now is None else now
         self._expire(now)
@@ -285,16 +390,11 @@ class SourceMesh:
         fresh: List[Event] = []
         for batch in batches:
             for event in batch:
-                key = event.content_hash
-                if key in self._seen:
-                    self._seen[key][1].append(event.source_id)
+                if not self._admit(event, now):
                     continue
                 if len(fresh) >= self.max_queue:
-                    # Oldest first: the newest observation is the one a
-                    # decision might still depend on.
                     fresh.pop(0)
                     self.dropped += 1
-                self._seen[key] = (now, [event.source_id])
                 fresh.append(event)
         return fresh
 
@@ -318,5 +418,8 @@ class SourceMesh:
             # while the dashboard stays green, so the silent ones are named.
             "unhealthy": unhealthy,
             "dropped_events": self.dropped,
+            "streaming": self._running,
+            "producers": len(self._producers),
+            "pending_events": self._queue.qsize(),
             "coverage": (by_state.get("OK", 0) / len(reports)) if reports else None,
         }

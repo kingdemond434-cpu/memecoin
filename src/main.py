@@ -221,6 +221,7 @@ class MemecoinQuantDesk:
         self._redecision_tasks: List[asyncio.Task] = []
         self._safety_task: Optional[asyncio.Task] = None
         self._intelligence_task: Optional[asyncio.Task] = None
+        self._source_task: Optional[asyncio.Task] = None
         # Coverage says a module was consulted; this says whether it mattered.
         # A component that is disconnected and one that is connected but inert
         # both look like trades that would have happened anyway, and only one
@@ -654,15 +655,22 @@ class MemecoinQuantDesk:
         self._intelligence_task = asyncio.create_task(self._intelligence_loop())
         self._health_task = asyncio.create_task(self._health_loop())
         self._market_task = asyncio.create_task(self._market_observer_loop())
+        self._source_task = asyncio.create_task(self._source_consumer_loop())
 
     async def stop(self):
         self._running = False
+        # Producers first: they hold sockets, and cancelling the consumer
+        # while producers keep publishing fills a queue nobody drains.
+        try:
+            await self.source_mesh.stop()
+        except Exception as exc:  # pragma: no cover - shutdown only
+            logger.warning("source mesh shutdown: %s", exc)
         for task in list(self._background_tasks):
             task.cancel()
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
         for task in (self._main_task, self._health_task, self._market_task,
-                     self._safety_task, self._intelligence_task,
+                     self._safety_task, self._intelligence_task, self._source_task,
                      *self._redecision_tasks):
             if task:
                 task.cancel()
@@ -1986,6 +1994,47 @@ class MemecoinQuantDesk:
                       if key not in self.hot_state.active_tokens]:
             self._actor_entries.pop(stale, None)
 
+    async def _source_consumer_loop(self):
+        """Index every source event the instant it arrives.
+
+        The mesh used to be polled in a batch, on a cadence, by nobody -- the
+        beautiful source architecture existed and the runtime never called it.
+        Now producers run per source and this consumer awaits the fan-in
+        queue, so a chat channel that saw a launch first reaches the decision
+        without waiting for the slowest feed in the forest to finish its
+        request.
+        """
+        started = await self.source_mesh.start()
+        logger.info("SOURCE_MESH started %d producers", started)
+        while self._running:
+            try:
+                event = await self.source_mesh.next_event()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("source consumer error: %s", exc)
+                await asyncio.sleep(0.01)
+                continue
+            try:
+                self._index_source_event(event)
+            except Exception as exc:
+                logger.warning("source event indexing failed: %s", exc)
+
+    def _index_source_event(self, event: Any) -> None:
+        """One event into the per-token index and the lead-lag graph."""
+        for token in event.token_addresses:
+            observations = self._source_events.setdefault(token, [])
+            observations.append(event)
+            # Bounded per token: a viral mint attracts thousands of posts and
+            # only the earliest few carry lead information.
+            if len(observations) > 50:
+                observations.pop(0)
+            self.source_genealogy.record(SourcePost(
+                source_id=event.source_id, token=token,
+                posted_at=event.source_at, observed_at=event.observed_at))
+            # A source naming a token we hold is new evidence about it.
+            self.request_redecision(token)
+
     async def _poll_sources(self) -> int:
         """Collect from every declared source and index events by token.
 
@@ -2723,6 +2772,12 @@ class MemecoinQuantDesk:
                            "quote_limit_amount": event.get("quote_limit_amount", 0),
                            "timestamp": event.get("timestamp", time.time()), "slot": event.get("slot"),
                            "signature": event.get("signature"), "program": event.get("program")}
+            # Our own transactions come back on this same stream. Telling the
+            # execution engine the moment one appears is what turns fill
+            # reconciliation from a poll into a notification.
+            if self.execution_engine is not None and event.get("signature"):
+                self.execution_engine.observe_signature(
+                    str(event["signature"]), event.get("slot"))
             self._record_actor_entry(token, event, observation)
             self.rug_hazard.record_observation(token, observation)
             # The event that changes a position's world is the one that should
