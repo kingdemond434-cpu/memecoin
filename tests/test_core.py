@@ -10735,3 +10735,233 @@ class TestForwardEvidence(unittest.TestCase):
         desk.global_research = SimpleNamespace(get_stats=lambda: {
             "meme_launch_rate_1h": 10, "sol_change_24h": -5.0})
         self.assertEqual(MemecoinQuantDesk.current_regime.fget(desk), "bear")
+
+
+def _fastpath():
+    """The compiled extension, or None when it has not been built here.
+
+    Skipped rather than failed when absent: the Python path is the reference
+    implementation and must work without Rust, which is the whole reason the
+    logic lives behind a feature gate.
+    """
+    try:
+        import solana_fastpath  # noqa: F401
+    except ImportError:
+        return None
+    return solana_fastpath
+
+
+class TestRustPythonPolicyParity(unittest.TestCase):
+    """Two implementations of one objective that disagree are worse than one.
+
+    The disagreement does not show up as an error; it shows up as trades
+    nobody can explain. So the Rust T0 core is a deliberate mirror of
+    `action_value.py`, and this drives both from the same inputs and requires
+    the same answer. Any change to either has to be made to both, and this is
+    what says so.
+    """
+
+    LEVELS = [
+        [0.45, 0.30, 0.20, 0.12, 0.05, 0.00, 0.00, 0.000],
+        [0.90, 0.70, 0.50, 0.30, 0.10, 0.03, 0.01, 0.004],
+        [0.20, 0.02, 0.00, 0.00, 0.00, 0.00, 0.00, 0.000],
+        [0.60, 0.40, 0.25, 0.15, 0.08, 0.04, 0.02, 0.010],
+        [0.05, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.000],
+    ]
+
+    def setUp(self):
+        self.rust = _fastpath()
+        if self.rust is None:
+            self.skipTest("solana_fastpath extension not built in this environment")
+
+    @staticmethod
+    def _prediction(levels, p_rug_30s=0.0, p_rug_5m=0.0, feasible=0.0):
+        return MultiHeadPrediction(
+            "mint", "solana", 0,
+            p_2x=levels[0], p_5x=levels[1], p_10x=levels[2], p_20x=levels[3],
+            p_50x=levels[4], p_100x=levels[5], p_250x=levels[6], p_500x=levels[7],
+            p_rug_30s=p_rug_30s, p_rug_5m=p_rug_5m,
+            expected_feasible_multiple=feasible)
+
+    def test_the_bins_agree_bin_for_bin(self):
+        for levels in self.LEVELS:
+            for rug in (0.0, 0.3):
+                for feasible in (0.0, 3.0):
+                    python = ElogwEngine.probability_bins(
+                        self._prediction(levels, rug, rug, feasible))
+                    native = self.rust.survival_bins(list(levels), rug, rug, feasible)
+                    self.assertEqual(len(python), len(native),
+                                     f"{levels} rug={rug} feasible={feasible}")
+                    for (_, probability, gross), (rust_p, rust_g) in zip(python, native):
+                        self.assertAlmostEqual(probability, rust_p, places=12)
+                        self.assertAlmostEqual(gross, rust_g, places=12)
+
+    def test_the_chosen_action_agrees_across_a_grid(self):
+        checked = 0
+        for levels in self.LEVELS:
+            for held, multiple in ((0.0, 1.0), (0.3, 2.0), (0.5, 8.0)):
+                for capacity, escape in ((1.0, 1.0), (0.5, 0.8), (0.2, 0.3)):
+                    for rug in (0.0, 0.4):
+                        probe = 0.02 if held == 0.0 else None
+                        python_state = ActionState(
+                            held_fraction=held, current_multiple=multiple,
+                            forward_bins=tuple(
+                                (probability, gross) for _, probability, gross
+                                in ElogwEngine.probability_bins(
+                                    self._prediction(levels, rug, rug))),
+                            exit_cost=0.02, entry_cost=0.02,
+                            exit_capacity_ratio=capacity, escape_probability=escape,
+                            probe_fraction=probe)
+                        python = ActionValuePolicy(min_edge=1e-4,
+                                                   max_add_fraction=0.05).score(python_state)
+                        native = self.rust.t0_decide(
+                            0.1, 30_000_000_000, 1_000_000_000_000,
+                            list(levels), rug, rug, 0.0,
+                            held, multiple, 0.02, 0.02, capacity, escape,
+                            None, None, None, probe,
+                            1e-4, 0.05, False, 0.25, 0.05, 0.0005, 0.10, False)
+                        self.assertEqual(python.status, "OK")
+                        self.assertEqual(
+                            python.action.value, native[0],
+                            f"levels={levels} held={held} cap={capacity} "
+                            f"escape={escape} rug={rug}")
+                        self.assertAlmostEqual(python.q, native[1], places=9)
+                        checked += 1
+        self.assertGreater(checked, 50)
+
+    def test_both_block_on_the_same_unmeasured_inputs(self):
+        for capacity, escape in ((None, 0.9), (0.9, None), (None, None)):
+            python = ActionValuePolicy().score(ActionState(
+                held_fraction=0.3, current_multiple=2.0,
+                forward_bins=((0.5, 2.0), (0.5, -0.5)),
+                exit_capacity_ratio=capacity, escape_probability=escape))
+            native = self.rust.t0_decide(
+                0.1, 30_000_000_000, 1_000_000_000_000,
+                [0.5, 0.3, 0.2, 0.1, 0.05, 0.0, 0.0, 0.0], 0.0, 0.0, 0.0,
+                0.3, 2.0, 0.02, 0.02, capacity, escape,
+                None, None, None, None,
+                1e-4, 0.05, False, 0.25, 0.05, 0.0005, 0.10, False)
+            self.assertEqual(python.status, "DATA_BLOCKED")
+            self.assertIsNotNone(native[4])
+
+    def test_the_age_bands_agree(self):
+        for age in (0.0, 0.05, 0.49, 0.5, 4.9, 5.0, 59.9, 60.0, 3_600.0):
+            self.assertEqual(band_for(age), self.rust.t0_age_band(age), f"age={age}")
+
+    def test_the_survival_levels_are_the_same_ladder(self):
+        native = self.rust.survival_bins(
+            [1.0] * 8, 0.0, 0.0, 0.0)
+        # Every rung present, so a level added on one side and not the other
+        # shows up here rather than as a quietly different distribution.
+        grosses = sorted(gross for _, gross in native)
+        expected = sorted([-0.98, -0.35] + [multiple - 1.0 for _, multiple in SURVIVAL_LEVELS])
+        self.assertEqual(len(grosses), len(expected))
+        for observed, want in zip(grosses, expected):
+            self.assertAlmostEqual(observed, want, places=9)
+
+
+class TestRustT0Safety(unittest.TestCase):
+    """The safety layer is arithmetic about the account, not a model of it."""
+
+    def setUp(self):
+        self.rust = _fastpath()
+        if self.rust is None:
+            self.skipTest("solana_fastpath extension not built in this environment")
+
+    def _decide(self, **overrides):
+        args = dict(
+            age_seconds=0.1, virtual_sol=30_000_000_000,
+            virtual_token=1_000_000_000_000,
+            levels=[0.45, 0.30, 0.20, 0.12, 0.05, 0.0, 0.0, 0.0],
+            p_rug_30s=0.0, p_rug_5m=0.0, expected_feasible_multiple=0.0,
+            held_fraction=0.0, current_multiple=1.0, exit_cost=0.02,
+            entry_cost=0.02, exit_capacity_ratio=0.9, escape_probability=0.9,
+            alternative_growth_per_second=None, expected_remaining_seconds=None,
+            add_fraction=None, probe_fraction=0.02, min_edge=1e-4,
+            max_add_fraction=0.05, live=False, max_position_fraction=0.25,
+            max_single_commit_fraction=0.05, min_commit_fraction=0.0005,
+            min_exit_capacity=0.10, live_unlocked=False)
+        args.update(overrides)
+        return self.rust.t0_decide(*[args[name] for name in (
+            "age_seconds", "virtual_sol", "virtual_token", "levels", "p_rug_30s",
+            "p_rug_5m", "expected_feasible_multiple", "held_fraction",
+            "current_multiple", "exit_cost", "entry_cost", "exit_capacity_ratio",
+            "escape_probability", "alternative_growth_per_second",
+            "expected_remaining_seconds", "add_fraction", "probe_fraction",
+            "min_edge", "max_add_fraction", "live", "max_position_fraction",
+            "max_single_commit_fraction", "min_commit_fraction",
+            "min_exit_capacity", "live_unlocked")])
+
+    def test_a_locked_desk_decides_and_then_refuses(self):
+        """Deciding and refusing are different states; only one is a bug."""
+        action, _q, _band, allowed, blocked, refused, _commit, _scores = \
+            self._decide(live=True)
+        self.assertEqual(action, "probe")
+        self.assertFalse(allowed)
+        self.assertIsNone(blocked)
+        self.assertEqual(refused, "live submission is locked")
+
+    def test_the_acknowledgement_unlocks_it(self):
+        _a, _q, _b, allowed, _bl, refused, _c, _s = self._decide(
+            live=True, live_unlocked=True)
+        self.assertTrue(allowed)
+        self.assertIsNone(refused)
+
+    def test_an_untradeable_curve_blocks_before_pricing(self):
+        _a, _q, _b, allowed, blocked, _r, _c, scores = self._decide(
+            virtual_sol=0, virtual_token=0)
+        self.assertFalse(allowed)
+        self.assertEqual(blocked, "curve is not tradeable")
+        self.assertEqual(scores, [])
+
+    def test_an_oversized_commit_is_refused_by_safety(self):
+        action, _q, _b, allowed, _bl, refused, commit, _s = self._decide(
+            probe_fraction=0.4)
+        self.assertEqual(action, "probe")
+        self.assertFalse(allowed)
+        self.assertIn("single-action", refused)
+        self.assertAlmostEqual(commit, 0.4)
+
+    def test_dust_never_reaches_safety_because_the_objective_declines_first(self):
+        """A better outcome than refusal: the objective already knows.
+
+        A commit of 1e-9 cannot clear its own costs, so Q puts IGNORE ahead of
+        PROBE and safety is never asked. Asserting a refusal here would be
+        asserting that the policy chose something it should not have.
+        """
+        action, _q, _b, allowed, _bl, refused, commit, _s = self._decide(
+            probe_fraction=1e-9)
+        self.assertEqual(action, "ignore")
+        self.assertTrue(allowed)
+        self.assertIsNone(refused)
+        self.assertEqual(commit, 0.0)
+
+    def test_a_thin_book_is_refused_when_the_edge_would_otherwise_carry_it(self):
+        """Capacity enters Q as well, so the floor only bites on strong views.
+
+        On an ordinary distribution a thin book makes PROBE unattractive and
+        the objective declines. The floor exists for the case the edge looks
+        good enough to override that -- which is exactly when a hard limit
+        should not be a matter of opinion.
+        """
+        strong = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2]
+        action, _q, _b, allowed, _bl, refused, _c, _s = self._decide(
+            levels=strong, exit_capacity_ratio=0.09)
+        self.assertEqual(action, "probe")
+        self.assertFalse(allowed)
+        self.assertIn("exit capacity", refused)
+
+    def test_an_unmeasured_capacity_blocks_before_safety_is_consulted(self):
+        _a, _q, _b, allowed, blocked, refused, _c, _s = self._decide(
+            exit_capacity_ratio=None)
+        self.assertFalse(allowed)
+        self.assertIsNotNone(blocked)
+        self.assertIsNone(refused)
+
+    def test_selling_is_never_refused_even_live_and_locked(self):
+        action, _q, _b, allowed, _bl, refused, _c, _s = self._decide(
+            held_fraction=0.3, current_multiple=2.0, probe_fraction=None,
+            levels=[0.2, 0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            p_rug_30s=0.5, p_rug_5m=0.6, live=True)
+        self.assertIn(action, {"exit", "bank_75", "bank_50", "bank_25", "bank_10"})
+        self.assertTrue(allowed, f"safety refused an exit: {refused}")

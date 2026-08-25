@@ -27,10 +27,30 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+      - uses: dtolnay/rust-toolchain@stable
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Build the native extension
+        # Built here so the Rust/Python parity tests actually RUN. They skip
+        # when the extension is absent -- correctly, since the Python path is
+        # the reference implementation and must work without Rust -- but a
+        # parity test that always skips is a parity test that proves nothing.
+        run: |
+          cargo build --release --manifest-path native/solana_fastpath/Cargo.toml
+          mkdir -p native-ext
+          cp native/solana_fastpath/target/release/libsolana_fastpath.so \
+             native-ext/solana_fastpath.so
+          echo "PYTHONPATH=$PWD/native-ext" >> "$GITHUB_ENV"
+
+      - name: Assert the parity tests are not silently skipping
+        run: |
+          python - <<'PY'
+          import solana_fastpath
+          print("native extension importable:", solana_fastpath.IMPLEMENTATION)
+          PY
       - name: Run the suite
         # The live-capital acknowledgement is explicitly cleared rather than
         # merely absent, so a runner that inherited it from somewhere cannot

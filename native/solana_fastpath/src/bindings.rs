@@ -242,6 +242,157 @@ fn pumpswap_account_list_status() -> &'static str {
     crate::pumpswap::ACCOUNT_LIST_STATUS
 }
 
+/// Score every action on one forward view, entirely in Rust.
+///
+/// Returns `(action, q, age_band, allowed, blocked, refused, commit_fraction)`
+/// plus the per-action scores, so a caller gets the whole decision from one
+/// call rather than reconstructing it from parts. The probabilities are
+/// handed in because inference belongs to the trained artifact the promotion
+/// gate validated -- reimplementing it here would buy microseconds and
+/// introduce a second model that can disagree with the one under test.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+// Explicit signature because pyo3 cannot infer argument order once an
+// Option precedes a required parameter, and every one of these is
+// deliberately Option where "unmeasured" is a state the policy must see.
+#[pyo3(signature = (
+    age_seconds, virtual_sol, virtual_token, levels, p_rug_30s, p_rug_5m,
+    expected_feasible_multiple, held_fraction, current_multiple, exit_cost,
+    entry_cost, exit_capacity_ratio, escape_probability,
+    alternative_growth_per_second, expected_remaining_seconds, add_fraction,
+    probe_fraction, min_edge, max_add_fraction, live, max_position_fraction,
+    max_single_commit_fraction, min_commit_fraction, min_exit_capacity,
+    live_unlocked
+))]
+fn t0_decide(
+    age_seconds: f64,
+    virtual_sol: u64,
+    virtual_token: u64,
+    levels: Vec<f64>,
+    p_rug_30s: f64,
+    p_rug_5m: f64,
+    expected_feasible_multiple: f64,
+    held_fraction: f64,
+    current_multiple: f64,
+    exit_cost: f64,
+    entry_cost: f64,
+    exit_capacity_ratio: Option<f64>,
+    escape_probability: Option<f64>,
+    alternative_growth_per_second: Option<f64>,
+    expected_remaining_seconds: Option<f64>,
+    add_fraction: Option<f64>,
+    probe_fraction: Option<f64>,
+    min_edge: f64,
+    max_add_fraction: f64,
+    live: bool,
+    max_position_fraction: f64,
+    max_single_commit_fraction: f64,
+    min_commit_fraction: f64,
+    min_exit_capacity: f64,
+    live_unlocked: bool,
+) -> PyResult<(String, f64, String, bool, Option<String>, Option<String>, f64, Vec<(String, f64, bool)>)>
+{
+    if levels.len() != crate::policy::SURVIVAL_MULTIPLES.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "expected {} survival levels, got {}",
+            crate::policy::SURVIVAL_MULTIPLES.len(),
+            levels.len()
+        )));
+    }
+    let mut fixed = [0.0f64; 8];
+    fixed.copy_from_slice(&levels);
+
+    let mut state = crate::state::TokenState::new(0.0);
+    state.update_reserves(
+        crate::state::Reserves {
+            virtual_sol,
+            virtual_token,
+            real_sol: 0,
+            real_token: 0,
+            measured: false,
+        },
+        0.0,
+    );
+
+    let inputs = crate::decide::Inputs {
+        position: crate::policy::Position {
+            held_fraction,
+            current_multiple,
+            exit_cost,
+            entry_cost,
+            exit_capacity_ratio,
+            escape_probability,
+            alternative_growth_per_second,
+            expected_remaining_seconds,
+            add_fraction,
+            probe_fraction,
+        },
+        survival: crate::policy::Survival {
+            levels: fixed,
+            p_rug_30s,
+            p_rug_5m,
+            expected_feasible_multiple,
+        },
+        min_edge,
+        max_add_fraction,
+        live,
+    };
+    let limits = crate::safety::Limits {
+        max_position_fraction,
+        max_single_commit_fraction,
+        min_commit_fraction,
+        min_exit_capacity,
+        live_unlocked,
+    };
+    let decision = crate::decide::decide(&state, age_seconds, &inputs, &limits);
+    Ok((
+        decision.action.as_str().to_string(),
+        decision.q,
+        decision.age_band.to_string(),
+        decision.allowed,
+        decision.blocked.map(str::to_string),
+        decision.refused.map(str::to_string),
+        decision.commit_fraction,
+        decision
+            .scores
+            .iter()
+            .map(|score| (score.action.as_str().to_string(), score.q, score.feasible))
+            .collect(),
+    ))
+}
+
+/// Disjoint executable bins from the cumulative survival curve.
+#[pyfunction]
+fn survival_bins(
+    levels: Vec<f64>,
+    p_rug_30s: f64,
+    p_rug_5m: f64,
+    expected_feasible_multiple: f64,
+) -> PyResult<Vec<(f64, f64)>> {
+    if levels.len() != crate::policy::SURVIVAL_MULTIPLES.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "wrong number of survival levels",
+        ));
+    }
+    let mut fixed = [0.0f64; 8];
+    fixed.copy_from_slice(&levels);
+    Ok(crate::policy::probability_bins(&crate::policy::Survival {
+        levels: fixed,
+        p_rug_30s,
+        p_rug_5m,
+        expected_feasible_multiple,
+    })
+    .into_iter()
+    .map(|bin| (bin.probability, bin.gross))
+    .collect())
+}
+
+/// Which age brain owns a decision at this launch age.
+#[pyfunction]
+fn t0_age_band(age_seconds: f64) -> &'static str {
+    crate::policy::age_band(age_seconds)
+}
+
 #[pymodule]
 fn solana_fastpath(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(quote_buy_from_account, module)?)?;
@@ -262,6 +413,9 @@ fn solana_fastpath(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(b58decode, module)?)?;
     module.add_function(wrap_pyfunction!(anchor_discriminator, module)?)?;
     module.add_function(wrap_pyfunction!(looks_like_pool_creation, module)?)?;
+    module.add_function(wrap_pyfunction!(t0_decide, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_bins, module)?)?;
+    module.add_function(wrap_pyfunction!(t0_age_band, module)?)?;
     module.add("IMPLEMENTATION", "rust-pyo3-abi3")?;
     Ok(())
 }

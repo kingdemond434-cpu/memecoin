@@ -5,11 +5,15 @@
 //! depends on it.
 
 pub mod curve;
+pub mod decide;
 pub mod filter;
 pub mod helpers;
 pub mod generated_flags;
 pub mod instruction;
+pub mod policy;
 pub mod pumpswap;
+pub mod safety;
+pub mod state;
 pub mod telemetry;
 
 #[cfg(feature = "python")]
