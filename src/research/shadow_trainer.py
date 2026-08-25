@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 import numpy as np
 
+from src.research.feature_engine import FEATURE_SCHEMA_VERSION, build_features
 from src.strategies.multihead_predictor import (
     ElogwEngine, MultiHeadPredictor, PredictionFeatures, PredictionTarget,
 )
@@ -24,53 +25,8 @@ def _number(mapping: Dict[str, Any], key: str, default: float = 0.0) -> float:
 
 
 def snapshot_to_features(episode: Dict[str, Any], snapshot: Dict[str, Any]) -> PredictionFeatures:
-    deployer = snapshot.get("deployer_features") or {}
-    wallet = snapshot.get("wallet_features") or {}
-    flow = snapshot.get("flow_features") or {}
-    liquidity = snapshot.get("liquidity_features") or {}
-    social = snapshot.get("social_features") or {}
-    token = snapshot.get("token_features") or {}
-    graph = snapshot.get("entity_graph_features") or {}
-    statuses = [
-        bool(deployer.get("has_profile")), bool(wallet), flow.get("status") == "OK",
-        liquidity.get("status") == "OK", bool(social.get("mention_count")),
-        token.get("status") == "OK", graph.get("status") == "OK",
-    ]
-    return PredictionFeatures(
-        token=str(episode.get("token", "")), chain=str(episode.get("chain", "solana")),
-        timestamp=_number(snapshot, "timestamp", _number(episode, "created_at", 0)),
-        deployer_rug_rate=_number(deployer, "rug_rate"),
-        deployer_success_rate=_number(deployer, "success_rate"),
-        deployer_avg_multiple=_number(deployer, "avg_max_multiple"),
-        deployer_cluster_risk=_number(graph, "deployer_cluster_risk"),
-        funding_wallet_risk=_number(graph, "funding_wallet_risk"),
-        initial_buyers=int(_number(wallet, "initial_buyer_count")),
-        smart_buyers=int(_number(wallet, "smart_buyer_count")),
-        insider_buyers=int(_number(wallet, "insider_buyer_count")),
-        buyer_acceleration=_number(flow, "buy_acceleration"),
-        buy_velocity=_number(flow, "buy_velocity"),
-        sol_volume=_number(wallet, "total_sol_volume"),
-        organic_ratio=_number(flow, "organic_ratio"),
-        bundle_concentration=_number(flow, "bundle_concentration"),
-        liquidity_usd=_number(liquidity, "liquidity_usd"),
-        liquidity_locked=bool(liquidity.get("liquidity_locked")),
-        ownership_renounced=bool(token.get("ownership_renounced")),
-        can_mint=bool(token.get("can_mint")), can_freeze=bool(token.get("can_freeze")),
-        social_velocity=_number(social, "avg_velocity"),
-        social_acceleration=_number(social, "acceleration"),
-        social_credibility=_number(social, "avg_credibility"),
-        chain_before_social=_number(social, "chain_before_pct"),
-        cross_platform=bool(social.get("cross_platform")),
-        holder_concentration=_number(token, "top_10_pct") / 100,
-        top_10_pct=_number(token, "top_10_pct"),
-        data_coverage=sum(statuses) / len(statuses),
-        wallet_history_available=bool(wallet.get("smart_buyer_count") is not None),
-        social_available=bool(social.get("mention_count")),
-        coordination_available=(flow.get("status") == "OK"
-                                and int(flow.get("observed_trade_count", 0) or 0) >= 3),
-        flow_available=flow.get("status") == "OK",
-        time_since_launch=max(0.0, _number(snapshot, "timestamp") - _number(episode, "created_at")),
-    )
+    """Delegates to the shared engine so training cannot drift from serving."""
+    return build_features(episode, snapshot)
 
 
 def snapshot_labels(snapshot: Dict[str, Any]) -> Dict[PredictionTarget, float]:

@@ -37,6 +37,7 @@ from src.execution.jupiter_jito import (
     USDC_MINT,
 )
 from src.research.dataset_builder import PointInTimeDatasetBuilder
+from src.research.feature_engine import build_features
 from src.research.global_research_miner import GlobalResearchMiner
 from src.strategies.champion_challenger import ChampionChallengerFramework, HypothesisSpec, TrialResult
 from src.strategies.exit_policy import ExitPolicy, evaluate_exit, load_latest_exit_policy
@@ -592,58 +593,60 @@ class MemecoinQuantDesk:
         return estimate
 
     async def _build_prediction_features(self, candidate: TokenCandidate, risk: Any, liquidity: float) -> PredictionFeatures:
-        features = PredictionFeatures(token=candidate.address, chain=candidate.chain, timestamp=time.time())
-        deployer = self.genealogy.get_deployer_profile(candidate.deployer or "")
-        if deployer:
-            features.deployer_rug_rate = deployer.rug_rate
-            features.deployer_success_rate = deployer.success_rate
-            features.deployer_avg_multiple = deployer.avg_max_multiple
-        buys = [item for item in self.wallet_intel._recent_buys if item.get("token") == candidate.address]
-        buyer_wallets = {item.get("wallet") for item in buys if item.get("wallet")}
-        graph_risk = self.genealogy.assess_launch_risk(
-            candidate.deployer or "", candidate.metadata.get("funding_wallets", []),
-            [{"address": wallet} for wallet in buyer_wallets],
-        )
-        features.deployer_cluster_risk = graph_risk.get("risk_score", 0)
-        features.initial_buyers = len(buyer_wallets)
-        buyer_scores = [self.wallet_intel.get_wallet_score(item.get("wallet", "")) for item in buys]
-        features.smart_buyers = sum(score is not None and score.overall_score >= 0.7 for score in buyer_scores)
-        features.wallet_history_available = any(score is not None for score in buyer_scores)
-        features.sol_volume = sum(float(item.get("amount", 0) or 0) * float(item.get("price", 0) or 0) for item in buys)
+        """Assemble point-in-time snapshot groups, then call the shared engine.
+
+        Live inference must not compute features its own way. The groups below
+        are produced by the same PointInTimeDatasetBuilder capture functions
+        that write the training episodes, so replay and serving see identical
+        variables rather than same-named different ones.
+        """
+        as_of = time.time()
         episode = self.dataset_builder.active_episodes.get(candidate.address)
-        if episode:
-            flow = await self.dataset_builder._capture_flow_features(episode, features.timestamp)
-            if flow.get("status") == "OK":
-                features.flow_available = True
-                features.buy_velocity = float(flow.get("buy_velocity", 0) or 0)
-                features.buyer_acceleration = float(flow.get("buy_acceleration", 0) or 0)
-                features.sol_volume = float(flow.get("buy_notional_sol_10s", features.sol_volume) or 0)
-        coordination = self.public_coordination.get_features(candidate.address)
-        if coordination.get("status") == "OK":
-            features.bundle_concentration = float(coordination["coordinated_buyer_fraction"])
-            features.organic_ratio = float(coordination["organic_ratio"])
-            features.insider_buyers = len(coordination["coordinated_wallets"])
-            features.coordination_available = True
-        features.liquidity_usd = liquidity
-        features.liquidity_locked = bool(risk.liquidity_locked)
-        features.can_mint = bool(risk.can_mint)
-        features.can_freeze = bool(risk.can_freeze)
-        features.holder_concentration = float(risk.top_10_pct) / 100
-        features.top_10_pct = float(risk.top_10_pct)
-        social = self.social_intel.get_token_social_signal(candidate.address)
-        features.social_velocity = float(social.get("avg_velocity", 0) or 0)
-        features.social_acceleration = float(social.get("acceleration", 0) or 0)
-        features.social_credibility = float(social.get("avg_credibility", 0) or 0)
-        features.chain_before_social = float(social.get("chain_before_pct", 0) or 0)
-        features.cross_platform = bool(social.get("cross_platform", False))
-        features.social_available = bool(social.get("mention_count", 0))
-        coverage_checks = [
-            deployer is not None, risk.data_status == "OK", liquidity > 0,
-            features.wallet_history_available, features.coordination_available, features.social_available,
-            features.flow_available,
-        ]
-        features.data_coverage = sum(coverage_checks) / len(coverage_checks)
-        return features
+        episode_meta = {
+            "token": candidate.address,
+            "chain": candidate.chain,
+            "created_at": float(getattr(episode, "created_at", candidate.timestamp or as_of)),
+        }
+
+        if episode is not None:
+            deployer_features = await self.dataset_builder._capture_deployer_features(episode, as_of)
+            wallet_features = await self.dataset_builder._capture_wallet_features(episode, as_of)
+            flow_features = await self.dataset_builder._capture_flow_features(episode, as_of)
+            graph_features = await self.dataset_builder._capture_entity_graph_features(episode, as_of)
+            social_features = await self.dataset_builder._capture_social_features(episode, as_of)
+        else:
+            # No episode yet: report every group DATA_BLOCKED rather than
+            # substituting zeros that would read as real observations.
+            deployer_features = {"has_profile": False}
+            wallet_features = {}
+            flow_features = {"status": "DATA_BLOCKED", "reason": "episode_not_started"}
+            graph_features = {"status": "DATA_BLOCKED", "reason": "episode_not_started"}
+            social_features = self.social_intel.get_token_social_signal(candidate.address, as_of=as_of)
+
+        liquidity_features = (
+            {"status": "OK", "liquidity_usd": liquidity, "liquidity_locked": bool(risk.liquidity_locked)}
+            if liquidity > 0 else {"status": "DATA_BLOCKED", "reason": "liquidity_not_observed"}
+        )
+        token_features = {
+            "status": risk.data_status,
+            "ownership_renounced": bool(risk.ownership_renounced),
+            "can_mint": bool(risk.can_mint),
+            "can_freeze": bool(risk.can_freeze),
+            "top_10_pct": float(risk.top_10_pct),
+            "sell_route_feasible": risk.sell_route_feasible,
+        }
+
+        snapshot = {
+            "timestamp": as_of,
+            "deployer_features": deployer_features,
+            "wallet_features": wallet_features,
+            "flow_features": flow_features,
+            "liquidity_features": liquidity_features,
+            "social_features": social_features,
+            "token_features": token_features,
+            "entity_graph_features": graph_features,
+        }
+        return build_features(episode_meta, snapshot)
 
     async def _manage_positions(self):
         for token, position in list(self.elogw_engine.open_positions.items()):

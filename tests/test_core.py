@@ -35,6 +35,7 @@ from src.strategies.public_coordination import PublicCoordinationMiner
 from src.strategies.wallet_intelligence import WalletIntelligenceEngine, WalletRegime
 from src.research.dataset_builder import LaunchEpisode, PointInTimeDatasetBuilder, SnapshotTimepoint
 from src.research.shadow_trainer import chronological_episode_split, train_shadow
+from src.research.feature_engine import build_features
 from src.research.hazard_trainer import train_hazard_calibration
 from src.research.exit_policy_trainer import simulate, train_exit_policy
 from src.strategies.exit_policy import ExitPolicy, evaluate_exit, load_latest_exit_policy
@@ -674,6 +675,113 @@ class _FakeAsyncResponse:
 
     async def json(self, **kwargs):
         return self._payload
+
+
+class TestFeatureParity(unittest.IsolatedAsyncioTestCase):
+    """Training and serving must build features from one implementation.
+
+    A model can pass chronological OOS on feature definition A and then be
+    served definition B; the measured edge simply does not transfer, and
+    nothing fails loudly. These lock the two paths together.
+    """
+
+    @staticmethod
+    def _snapshot():
+        return {
+            "timestamp": 1_000.0,
+            "deployer_features": {"has_profile": True, "rug_rate": 0.25, "success_rate": 0.4,
+                                  "avg_max_multiple": 6.0},
+            "wallet_features": {"initial_buyer_count": 12, "smart_buyer_count": 3,
+                                "insider_buyer_count": 1, "total_sol_volume": 42.5},
+            "flow_features": {"status": "OK", "buy_velocity": 1.2, "buy_acceleration": 0.4,
+                              "organic_ratio": 0.8, "bundle_concentration": 0.2,
+                              "observed_trade_count": 9},
+            "liquidity_features": {"status": "OK", "liquidity_usd": 25_000, "liquidity_locked": True},
+            "social_features": {"mention_count": 4, "avg_velocity": 2.0, "acceleration": 0.5,
+                                "avg_credibility": 0.6, "chain_before_pct": 0.3, "cross_platform": True},
+            "token_features": {"status": "OK", "ownership_renounced": True, "can_mint": False,
+                               "can_freeze": False, "top_10_pct": 35.0},
+            "entity_graph_features": {"status": "OK", "deployer_cluster_risk": 0.5,
+                                      "funding_wallet_risk": 0.7},
+        }
+
+    def test_trainer_delegates_to_the_shared_engine(self):
+        from src.research.shadow_trainer import snapshot_to_features
+        episode = {"token": "mint", "chain": "solana", "created_at": 900.0}
+        snapshot = self._snapshot()
+        self.assertEqual(
+            snapshot_to_features(episode, snapshot).to_array().tolist(),
+            build_features(episode, snapshot).to_array().tolist(),
+        )
+
+    def test_entity_graph_supplies_both_risk_features(self):
+        """funding_wallet_risk was trained on but never populated live, and
+        deployer_cluster_risk came from a different function entirely."""
+        episode = {"token": "mint", "chain": "solana", "created_at": 900.0}
+        features = build_features(episode, self._snapshot())
+        self.assertEqual(features.deployer_cluster_risk, 0.5)
+        self.assertEqual(features.funding_wallet_risk, 0.7)
+
+    def test_flow_group_supplies_organic_and_bundle_not_coordination(self):
+        episode = {"token": "mint", "chain": "solana", "created_at": 900.0}
+        features = build_features(episode, self._snapshot())
+        self.assertEqual(features.organic_ratio, 0.8)
+        self.assertEqual(features.bundle_concentration, 0.2)
+        self.assertEqual(features.sol_volume, 42.5)  # wallet group, not flow
+
+    def test_missing_groups_are_blocked_not_silently_zeroed(self):
+        episode = {"token": "mint", "chain": "solana", "created_at": 900.0}
+        features = build_features(episode, {"timestamp": 1_000.0})
+        self.assertFalse(features.flow_available)
+        self.assertFalse(features.social_available)
+        self.assertFalse(features.coordination_available)
+        self.assertFalse(features.wallet_history_available)
+        self.assertEqual(features.data_coverage, 0.0)
+
+    async def test_live_builder_matches_the_trainer_on_the_same_episode(self):
+        """The end-to-end guarantee: one episode, captured live and replayed
+        through the trainer, must yield the same feature vector."""
+        builder = PointInTimeDatasetBuilder(
+            solana_chain(), FakeRpc(), FakeGenealogy(),
+            SimpleNamespace(get_top_wallets=lambda limit=50: [],
+                            get_wallet_score=lambda wallet: None,
+                            _recent_buys=[]),
+            SimpleNamespace(get_token_social_signal=lambda token, as_of=None: {"mention_count": 0}),
+            SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), SimpleNamespace(),
+        )
+        builder.start_episode("mint", "dev", "pump", "curve", "wsol", detected_at=900.0)
+        episode = builder.active_episodes["mint"]
+        episode.market_observations.extend([
+            {"type": "trade", "side": "buy", "wallet": "a", "slot": 1, "timestamp": 995.0,
+             "notional_sol": 2.0},
+            {"type": "trade", "side": "buy", "wallet": "b", "slot": 2, "timestamp": 997.0,
+             "notional_sol": 3.0},
+            {"type": "trade", "side": "buy", "wallet": "c", "slot": 3, "timestamp": 999.0,
+             "notional_sol": 1.0},
+        ])
+        as_of = 1_000.0
+        snapshot = {
+            "timestamp": as_of,
+            "deployer_features": await builder._capture_deployer_features(episode, as_of),
+            "wallet_features": await builder._capture_wallet_features(episode, as_of),
+            "flow_features": await builder._capture_flow_features(episode, as_of),
+            "liquidity_features": {"status": "DATA_BLOCKED"},
+            "social_features": await builder._capture_social_features(episode, as_of),
+            "token_features": {"status": "DATA_BLOCKED"},
+            "entity_graph_features": await builder._capture_entity_graph_features(episode, as_of),
+        }
+        episode_meta = {"token": "mint", "chain": "solana", "created_at": 900.0}
+
+        from src.research.shadow_trainer import snapshot_to_features
+        self.assertEqual(
+            build_features(episode_meta, snapshot).to_array().tolist(),
+            snapshot_to_features(episode_meta, snapshot).to_array().tolist(),
+        )
+        # And the flow group really did drive the model input.
+        live = build_features(episode_meta, snapshot)
+        self.assertTrue(live.flow_available)
+        self.assertTrue(live.coordination_available)
+        self.assertAlmostEqual(live.buy_velocity, 0.3)
 
 
 class TestJitoEndpointRouting(unittest.IsolatedAsyncioTestCase):

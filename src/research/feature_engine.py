@@ -1,0 +1,111 @@
+"""The single feature implementation shared by training and live inference.
+
+Training-serving skew is silent and fatal: a model can pass chronological
+out-of-sample validation on feature definition A and then be handed feature
+definition B in shadow or live, so its measured edge simply does not transfer.
+The repository previously had exactly that, with five features diverging:
+
+    feature                training source          live source
+    organic_ratio          flow_features            public_coordination
+    bundle_concentration   flow_features            public_coordination
+    sol_volume             wallet_features          flow / recent buys
+    deployer_cluster_risk  entity_graph_features    assess_launch_risk()
+    funding_wallet_risk    entity_graph_features    never populated at all
+
+The fix is structural rather than a matter of care: both paths build the same
+point-in-time snapshot groups and then call ``build_features`` here. There is
+no second implementation to drift from.
+
+FEATURE_SCHEMA_VERSION is stamped into every model artifact. A model trained
+under one version must not be served under another, so a bump fails closed
+instead of silently mismatching.
+"""
+
+from typing import Any, Dict
+
+import numpy as np
+
+from src.strategies.multihead_predictor import PredictionFeatures
+
+FEATURE_SCHEMA_VERSION = "v1"
+
+SNAPSHOT_GROUPS = (
+    "deployer_features", "wallet_features", "flow_features", "liquidity_features",
+    "social_features", "token_features", "market_features", "entity_graph_features",
+)
+
+
+def number(mapping: Dict[str, Any], key: str, default: float = 0.0) -> float:
+    """Numeric read that never turns a missing value into a silent zero-by-accident.
+
+    Missingness is reported separately through the *_available indicators, so
+    the model can learn that absence itself carries information.
+    """
+    value = (mapping or {}).get(key)
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)) and np.isfinite(value):
+        return float(value)
+    return default
+
+
+def build_features(episode: Dict[str, Any], snapshot: Dict[str, Any]) -> PredictionFeatures:
+    """Build the model input from point-in-time snapshot groups.
+
+    ``episode`` supplies identity and launch time; ``snapshot`` supplies the
+    feature groups captured at one instant. Both historical replay and live
+    inference call this exact function with the same group shapes.
+    """
+    deployer = snapshot.get("deployer_features") or {}
+    wallet = snapshot.get("wallet_features") or {}
+    flow = snapshot.get("flow_features") or {}
+    liquidity = snapshot.get("liquidity_features") or {}
+    social = snapshot.get("social_features") or {}
+    token = snapshot.get("token_features") or {}
+    graph = snapshot.get("entity_graph_features") or {}
+
+    statuses = [
+        bool(deployer.get("has_profile")), bool(wallet), flow.get("status") == "OK",
+        liquidity.get("status") == "OK", bool(social.get("mention_count")),
+        token.get("status") == "OK", graph.get("status") == "OK",
+    ]
+    created_at = number(episode, "created_at")
+    timestamp = number(snapshot, "timestamp", created_at)
+
+    return PredictionFeatures(
+        token=str(episode.get("token", "")),
+        chain=str(episode.get("chain", "solana")),
+        timestamp=timestamp,
+        deployer_rug_rate=number(deployer, "rug_rate"),
+        deployer_success_rate=number(deployer, "success_rate"),
+        deployer_avg_multiple=number(deployer, "avg_max_multiple"),
+        deployer_cluster_risk=number(graph, "deployer_cluster_risk"),
+        funding_wallet_risk=number(graph, "funding_wallet_risk"),
+        initial_buyers=int(number(wallet, "initial_buyer_count")),
+        smart_buyers=int(number(wallet, "smart_buyer_count")),
+        insider_buyers=int(number(wallet, "insider_buyer_count")),
+        buyer_acceleration=number(flow, "buy_acceleration"),
+        buy_velocity=number(flow, "buy_velocity"),
+        sol_volume=number(wallet, "total_sol_volume"),
+        organic_ratio=number(flow, "organic_ratio"),
+        bundle_concentration=number(flow, "bundle_concentration"),
+        liquidity_usd=number(liquidity, "liquidity_usd"),
+        liquidity_locked=bool(liquidity.get("liquidity_locked")),
+        ownership_renounced=bool(token.get("ownership_renounced")),
+        can_mint=bool(token.get("can_mint")),
+        can_freeze=bool(token.get("can_freeze")),
+        social_velocity=number(social, "avg_velocity"),
+        social_acceleration=number(social, "acceleration"),
+        social_credibility=number(social, "avg_credibility"),
+        chain_before_social=number(social, "chain_before_pct"),
+        cross_platform=bool(social.get("cross_platform")),
+        holder_concentration=number(token, "top_10_pct") / 100,
+        top_10_pct=number(token, "top_10_pct"),
+        data_coverage=sum(statuses) / len(statuses),
+        wallet_history_available=bool(wallet.get("smart_buyer_count") is not None),
+        social_available=bool(social.get("mention_count")),
+        coordination_available=(flow.get("status") == "OK"
+                                and int(number(flow, "observed_trade_count")) >= 3),
+        flow_available=flow.get("status") == "OK",
+        time_since_launch=max(0.0, timestamp - created_at),
+    )
