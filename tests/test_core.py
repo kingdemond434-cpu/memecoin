@@ -8,6 +8,7 @@ import struct
 import tempfile
 import time
 import unittest
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -75,6 +76,9 @@ from src.execution.pump_fees import (
 )
 from src.chains.pump_curve import (
     DEFAULT_FEE_BPS, BondingCurveState, quote_buy, quote_sell, resolve_fee_bps,
+)
+from src.runtime.hot_state import (
+    AsyncArchiveWriter, CompactWalletDNA, EconomicCache, HotState, HotStateBudget,
 )
 from src.research.attribution import (
     EdgeDecayMonitor, Leak, alpha_ledger, execution_miss, find_leaks,
@@ -4954,3 +4958,180 @@ class TestLiquidationLadder(unittest.TestCase):
         ladder = liquidation_ladder(1_000, Frontier(status="DATA_BLOCKED", side="exit"),
                                     curve, 0.25)
         self.assertEqual(ladder["status"], "DATA_BLOCKED")
+
+
+class TestHotStateBudget(unittest.TestCase):
+    """The machine that reacts in milliseconds is not the one holding the moat."""
+
+    @staticmethod
+    def _wallet(name, launches=50, monster_rate=0.0, rug_exposure=0.0, pnl=0.0,
+                cluster=""):
+        return CompactWalletDNA(wallet=name, launches_seen=launches,
+                                monster_rate=monster_rate, rug_exposure=rug_exposure,
+                                pnl_quality=pnl, cluster_id=cluster)
+
+    def test_a_distilled_record_is_small_and_fixed_shape(self):
+        record = self._wallet("W", monster_rate=0.1)
+        # Hundreds of bytes of conclusions, not megabytes of transactions.
+        self.assertLess(len(repr(asdict(record)).encode()), 700)
+        self.assertGreater(record.information_value, 0)
+
+    def test_an_undistillable_wallet_is_unknown_not_average(self):
+        blocked = CompactWalletDNA(wallet="W", status="DATA_BLOCKED", monster_rate=0.9)
+        self.assertEqual(blocked.information_value, 0.0)
+        self.assertEqual(self._wallet("W", launches=0, monster_rate=0.9).information_value,
+                         0.0)
+
+    def test_rug_history_is_worth_as_much_resident_as_monster_history(self):
+        runner = self._wallet("R", monster_rate=0.3)
+        rugger = self._wallet("G", rug_exposure=0.3)
+        # Knowing which wallets show up before collapses is as valuable as
+        # knowing which show up before runs.
+        self.assertAlmostEqual(runner.information_value, rugger.information_value)
+
+    def test_confidence_saturates_with_observations(self):
+        few = self._wallet("A", launches=5, monster_rate=0.3).information_value
+        some = self._wallet("B", launches=20, monster_rate=0.3).information_value
+        many = self._wallet("C", launches=200, monster_rate=0.3).information_value
+        self.assertLess(few, some)
+        self.assertLess(some, many)
+        # The hundredth launch says much less about a wallet than the tenth.
+        self.assertLess(many - some, some - few)
+
+
+class TestEconomicCache(unittest.TestCase):
+    """Plain LRU retires exactly the actors worth keeping."""
+
+    NOW = 1_000_000.0
+
+    @staticmethod
+    def _wallet(name, monster_rate=0.0, launches=50, cluster=""):
+        return CompactWalletDNA(wallet=name, launches_seen=launches,
+                                monster_rate=monster_rate, cluster_id=cluster)
+
+    def test_a_valuable_quiet_actor_outranks_a_worthless_recent_one(self):
+        cache = EconomicCache(capacity=2, half_life_seconds=1_800.0)
+        # A known rugger cluster, quiet for an hour.
+        cache.put("rugger", self._wallet("rugger", monster_rate=0.8),
+                  now=self.NOW - 3_600)
+        # A wallet that has never distinguished itself, traded a second ago.
+        cache.put("noise", self._wallet("noise", monster_rate=0.0), now=self.NOW - 1)
+        cache.put("new", self._wallet("new", monster_rate=0.4), now=self.NOW)
+
+        self.assertIn("rugger", cache)
+        self.assertNotIn("noise", cache)
+        self.assertEqual(cache.evictions, 1)
+
+    def test_recency_still_matters_between_comparable_records(self):
+        cache = EconomicCache(capacity=2, half_life_seconds=600.0)
+        cache.put("old", self._wallet("old", monster_rate=0.5), now=self.NOW - 7_200)
+        cache.put("fresh", self._wallet("fresh", monster_rate=0.5), now=self.NOW)
+        cache.put("newest", self._wallet("newest", monster_rate=0.5), now=self.NOW)
+        self.assertNotIn("old", cache)
+
+    def test_a_burst_of_irrelevant_wallets_cannot_expand_memory(self):
+        cache = EconomicCache(capacity=100)
+        cache.put("keeper", self._wallet("keeper", monster_rate=0.9), now=self.NOW)
+        for index in range(5_000):
+            cache.put(f"junk-{index}", self._wallet(f"junk-{index}"), now=self.NOW)
+        # 200,000 irrelevant wallets becoming active must not grow the node.
+        self.assertLessEqual(len(cache), 100)
+        self.assertIn("keeper", cache)
+
+    def test_pinned_entities_survive_pressure(self):
+        cache = EconomicCache(capacity=2, pin_predicate=lambda r: r.cluster_id == "live")
+        cache.put("pinned", self._wallet("pinned", cluster="live"), now=self.NOW)
+        for index in range(20):
+            cache.put(f"other-{index}", self._wallet(f"other-{index}", monster_rate=0.9),
+                      now=self.NOW)
+        self.assertIn("pinned", cache)
+
+    def test_the_cap_holds_even_when_everything_is_pinned(self):
+        cache = EconomicCache(capacity=3, pin_predicate=lambda r: True)
+        for index in range(50):
+            cache.put(f"w-{index}", self._wallet(f"w-{index}"), now=self.NOW + index)
+        # Growing past the cap is not an option on a fixed-memory node.
+        self.assertLessEqual(len(cache), 3)
+
+    def test_peeking_does_not_skew_eviction(self):
+        cache = EconomicCache(capacity=2)
+        cache.put("a", self._wallet("a"), now=self.NOW - 10_000)
+        cache.put("b", self._wallet("b"), now=self.NOW)
+        cache.peek("a")
+        cache.put("c", self._wallet("c"), now=self.NOW)
+        self.assertNotIn("a", cache)
+
+
+class TestAsyncArchiveWriter(unittest.TestCase):
+    """A queue that blocks on slow storage turns a disk problem into a missed launch."""
+
+    def _writer(self, directory, max_queue=5, quota_gb=5.0):
+        return AsyncArchiveWriter(
+            Path(directory),
+            HotStateBudget(max_archive_queue=max_queue, max_local_archive_gb=quota_gb))
+
+    def test_submit_never_blocks_and_overflow_drops_the_oldest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = self._writer(directory, max_queue=3)
+            for index in range(10):
+                writer.submit({"n": index})
+            report = writer.report()
+            self.assertEqual(report["pending"], 3)
+            self.assertEqual(report["dropped"], 7)
+            # The newest observation is the one a decision might still need.
+            written = writer.drain()
+            self.assertEqual(written, 3)
+
+    def test_drops_are_counted_rather_than_silent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = self._writer(directory, max_queue=2)
+            for index in range(10):
+                writer.submit({"n": index})
+            # Silent loss is what makes a research lake quietly wrong.
+            self.assertGreater(writer.report()["drop_rate"], 0.5)
+
+    def test_records_reach_disk_on_drain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = self._writer(directory)
+            writer.submit({"token": "abc"})
+            self.assertEqual(writer.drain(), 1)
+            files = list(Path(directory).glob("events-*.log"))
+            self.assertEqual(len(files), 1)
+            self.assertIn("abc", files[0].read_text())
+
+    def test_the_local_quota_stops_the_spool_from_filling_the_disk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = self._writer(directory, quota_gb=0.0)
+            writer.submit({"token": "abc"})
+            self.assertEqual(writer.drain(), 0)
+            # A stalled upload must not take the disk the trading process needs.
+            self.assertEqual(writer.report()["quota_stops"], 1)
+            self.assertEqual(writer.report()["dropped"], 1)
+
+    def test_draining_an_empty_queue_is_a_no_op(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(self._writer(directory).drain(), 0)
+
+
+class TestHotState(unittest.TestCase):
+    NOW = 2_000_000.0
+
+    def test_active_tokens_are_capped_and_aged_out(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = HotState(HotStateBudget(max_active_tokens=10, max_event_age_seconds=60),
+                             archive_root=Path(directory))
+            for index in range(500):
+                state.touch_token(f"t{index}", now=self.NOW + index * 0.001)
+            self.assertLessEqual(len(state.active_tokens), 10)
+
+            state.touch_token("recent", now=self.NOW + 10_000)
+            self.assertEqual(len(state.active_tokens), 1)
+
+    def test_the_budget_is_declared_in_the_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = HotState(archive_root=Path(directory))
+            report = state.report()
+            # Exceeding a cap should be a visible condition, not something
+            # discovered when the kernel kills the process.
+            self.assertIn("max_hot_wallets", report["budget"])
+            self.assertEqual(report["archive"]["dropped"], 0)
