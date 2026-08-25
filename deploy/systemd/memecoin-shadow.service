@@ -1,0 +1,49 @@
+[Unit]
+Description=Memecoin shadow desk (DRY RUN, no live capital)
+Documentation=file:%h/.local/opt/memecoin-shadow/RUNBOOK.md
+After=network-online.target
+Wants=network-online.target
+# Not a crash loop. Five failures inside a minute means something restarting
+# will not fix, and hammering it buries the reason. These are [Unit]
+# directives -- under [Service] systemd silently ignores them, which is the
+# same way the health unit's OnFailure was disarmed without anyone noticing.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/opt/memecoin-shadow
+EnvironmentFile=-%h/.config/memecoin-shadow/env
+
+# The two that matter, set AFTER the EnvironmentFile so they cannot be
+# overridden by it. A shadow desk that inherits a live acknowledgement from a
+# stale env file is a live desk nobody decided to start, and the whole point
+# of this unit is that starting it is never that decision.
+Environment=ALLOW_LIVE_TRADING=
+Environment=SOLANA_PRIVATE_KEY=
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.main --dry-run
+
+# Restart, because the ledger that proves forward alpha counts decisions and a
+# desk that stays down stops counting. RestartSec is short: the evidence it
+# accumulates is the scarce thing here, not the CPU.
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/opt/memecoin-shadow/data %h/.local/opt/memecoin-shadow/models
+UMask=0077
+
+# Headroom for the hot state and the model artifacts, and a ceiling so a leak
+# takes the desk down rather than the machine.
+MemoryMax=4G
+CPUQuota=200%
+
+StandardOutput=append:%h/.local/opt/memecoin-shadow/data/state/shadow.log
+StandardError=append:%h/.local/opt/memecoin-shadow/data/state/shadow.log
+
+[Install]
+WantedBy=default.target

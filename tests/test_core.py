@@ -9361,6 +9361,7 @@ class TestNativeRouteIsTheCanonicalPath(unittest.TestCase):
         engine._signature_waiters = {}
         engine.reconcile_min_interval = 0.005
         engine.landing_model = LandingModel()
+        engine.last_bid = {}
         return engine
 
     @staticmethod
@@ -10012,6 +10013,8 @@ class TestNativeRouteIsActuallyTaken(unittest.IsolatedAsyncioTestCase):
         engine._signature_waiters = {}
         engine.reconcile_min_interval = 0.005
         engine.reconcile_max_interval = 0.05
+        engine.landing_model = LandingModel()
+        engine.last_bid = {}
         engine.dry_run = True
         engine.execution_history = deque(maxlen=16)
         engine.route_performance = defaultdict(

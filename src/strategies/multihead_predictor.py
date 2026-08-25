@@ -559,6 +559,10 @@ class ElogwEngine:
         self.max_portfolio_risk = max_portfolio_risk
         self.max_total_exposure_pct = max_total_exposure_pct
         self.max_concurrent_positions = max_concurrent_positions
+        # A capacity floor, not a view on the trade: below this the book
+        # cannot absorb the smallest position the sizing engine produces, so
+        # there is no size at which the question becomes interesting.
+        self.min_liquidity_usd = 5_000.0
         self.max_daily_loss = max_daily_loss_usd
         self.max_daily_loss_pct = max_daily_loss_pct
         self.daily_giveback_pct = daily_giveback_pct
@@ -933,13 +937,36 @@ class ElogwEngine:
                 best_fraction, best_gain = float(candidate), gain - baseline
         return best_fraction, best_gain
 
-    def should_trade(
+    #: Gates that express an OPINION about whether a trade is worth taking.
+    #: Every one of them is a threshold on a quantity the action-value engine
+    #: already prices, so applying them before Q means two components deciding
+    #: the same question from different numbers -- and the threshold always
+    #: wins, because it runs first.
+    ECONOMIC_GATES = frozenset({
+        "rug_risk_too_high", "insufficient_upside", "slippage_too_high",
+        "edge_below_threshold",
+    })
+
+    def admissible(
         self,
         prediction: MultiHeadPrediction,
         sol_price_usd: float,
         liquidity_usd: float,
         portfolio_value: float,
     ) -> Tuple[bool, Dict]:
+        """Hard admissibility. Safety, ruin limits, data integrity, capacity.
+
+        Nothing here is an opinion about whether the trade is good. These are
+        facts about the account and the measurement: a model that is not
+        trained cannot price anything, a book at its exposure ceiling has no
+        room, and a negative slippage reading is a broken instrument rather
+        than a cheap fill. Refusing on any of them is refusing to answer, not
+        answering no.
+
+        Kept OUTSIDE the objective on purpose. A limit the objective can
+        outbid has stopped being a limit, and every one of these is a case
+        where the correct response is refusing rather than resizing.
+        """
         self.portfolio_value = max(0.0, portfolio_value)
         self._roll_day_if_needed()
         if not self.predictor._is_trained:
@@ -951,44 +978,101 @@ class ElogwEngine:
             return False, {"reason": "DATA_BLOCKED", "detail": "wallet equity or SOL/USD unavailable"}
         if len(self.open_positions) >= self.max_concurrent_positions:
             return False, {"reason": "max_concurrent_positions"}
-        if prediction.p_rug_30s > 0.40 or prediction.p_rug_5m > 0.50:
-            return False, {"reason": "rug_risk_too_high"}
-        if prediction.p_2x < 0.10 or prediction.p_5x < 0.05:
-            return False, {"reason": "insufficient_upside"}
-        if prediction.expected_slippage < 0 or prediction.expected_slippage > 0.15:
-            return False, {"reason": "slippage_too_high"}
-        if liquidity_usd < 5_000:
+        if prediction.expected_slippage < 0:
+            # Not a cheap fill. A negative estimate is an instrument reading
+            # something it cannot read, and pricing a trade on it would be
+            # pricing on noise.
+            return False, {"reason": "DATA_BLOCKED", "detail": "negative slippage estimate"}
+        if liquidity_usd < self.min_liquidity_usd:
+            # Capacity, not opinion: below this the book cannot absorb the
+            # smallest position the sizing engine will produce, so there is no
+            # size at which the question becomes interesting.
             return False, {"reason": "liquidity_too_low", "liquidity_usd": liquidity_usd}
+        return True, {"admissible": True}
 
-        elogw, fraction, size_sol = self.calculate_expected_log_growth(prediction, sol_price_usd, liquidity_usd)
-        edge_bps = elogw * 10_000
-        hurdle = self.harvest_hurdle_bps()
-        if not np.isfinite(elogw) or edge_bps < hurdle:
-            return False, {"reason": "edge_below_threshold", "edge_bps": edge_bps,
-                           "hurdle_bps": hurdle,
-                           "harvesting": hurdle > self.min_edge_bps}
+    def size_candidate(
+        self,
+        prediction: MultiHeadPrediction,
+        sol_price_usd: float,
+        liquidity_usd: float,
+    ) -> Dict:
+        """The size a candidate would take, and what that size is worth.
 
+        Separate from admissibility and from Q. Sizing owns how much; Q owns
+        whether. Fusing them is what let a Kelly hurdle quietly become the
+        entry policy.
+        """
+        elogw, fraction, size_sol = self.calculate_expected_log_growth(
+            prediction, sol_price_usd, liquidity_usd)
         position_value = size_sol * sol_price_usd
-        current_exposure = sum(float(pos.get("remaining_cost_usd", pos.get("cost_basis_usd", 0))) for pos in self.open_positions.values())
-        if current_exposure + position_value > self.portfolio_value * self.max_total_exposure_pct:
-            return False, {"reason": "total_exposure_limit"}
-        current_risk = sum(float(pos.get("risk_contribution", 0)) for pos in self.open_positions.values())
         p_rug = max(prediction.p_rug_30s, prediction.p_rug_5m)
-        position_risk = fraction * p_rug
-        if current_risk + position_risk > self.max_portfolio_risk:
-            return False, {"reason": "portfolio_risk_limit"}
-
-        return True, {
+        return {
             "elogw": elogw,
             "kelly_fraction": fraction,
             "position_size_sol": size_sol,
             "position_value_usd": position_value,
-            "risk_contribution": position_risk,
-            "edge_bps": edge_bps,
+            "risk_contribution": fraction * p_rug,
+            "edge_bps": elogw * 10_000,
+            "hurdle_bps": self.harvest_hurdle_bps(),
             "p_rug": p_rug,
             "probability_bins": self.probability_bins(prediction),
             "drawdown_aversion_lambda": self.drawdown_aversion_lambda,
         }
+
+    def portfolio_room(self, sized: Dict) -> Tuple[bool, Dict]:
+        """Whether the book has room for this size. A ruin limit, not a view."""
+        position_value = float(sized.get("position_value_usd", 0.0))
+        current_exposure = sum(
+            float(pos.get("remaining_cost_usd", pos.get("cost_basis_usd", 0)))
+            for pos in self.open_positions.values())
+        if current_exposure + position_value > self.portfolio_value * self.max_total_exposure_pct:
+            return False, {"reason": "total_exposure_limit"}
+        current_risk = sum(float(pos.get("risk_contribution", 0))
+                           for pos in self.open_positions.values())
+        if current_risk + float(sized.get("risk_contribution", 0.0)) > self.max_portfolio_risk:
+            return False, {"reason": "portfolio_risk_limit"}
+        return True, {}
+
+    def should_trade(
+        self,
+        prediction: MultiHeadPrediction,
+        sol_price_usd: float,
+        liquidity_usd: float,
+        portfolio_value: float,
+    ) -> Tuple[bool, Dict]:
+        """Admissibility, the legacy economic gates, then sizing.
+
+        Retained for callers that have no action-value engine to defer to --
+        the shadow trainer, the replay harness, anything scoring a historical
+        decision the way it was actually made. The live desk does NOT use it:
+        it composes `admissible`, `size_candidate` and `portfolio_room` and
+        lets Q answer the economic question, because a threshold on P(2x) and
+        an expected-log-growth objective are two opinions about one thing and
+        the threshold wins by running first.
+        """
+        allowed, detail = self.admissible(
+            prediction, sol_price_usd, liquidity_usd, portfolio_value)
+        if not allowed:
+            return False, detail
+
+        if prediction.p_rug_30s > 0.40 or prediction.p_rug_5m > 0.50:
+            return False, {"reason": "rug_risk_too_high"}
+        if prediction.p_2x < 0.10 or prediction.p_5x < 0.05:
+            return False, {"reason": "insufficient_upside"}
+        if prediction.expected_slippage > 0.15:
+            return False, {"reason": "slippage_too_high"}
+
+        sized = self.size_candidate(prediction, sol_price_usd, liquidity_usd)
+        if not np.isfinite(sized["elogw"]) or sized["edge_bps"] < sized["hurdle_bps"]:
+            return False, {"reason": "edge_below_threshold",
+                           "edge_bps": sized["edge_bps"],
+                           "hurdle_bps": sized["hurdle_bps"],
+                           "harvesting": sized["hurdle_bps"] > self.min_edge_bps}
+
+        has_room, room_detail = self.portfolio_room(sized)
+        if not has_room:
+            return False, room_detail
+        return True, sized
 
     def update_position(self, token: str, position_data: Dict):
         if token in self.open_positions:

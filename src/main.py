@@ -949,9 +949,28 @@ class MemecoinQuantDesk:
             self._record_blocked_decision(token, "champion_not_promoted_for_live_authority", _jsonable(prediction))
             return
         await self._refresh_portfolio_state()
-        should_trade, trade_info = self.elogw_engine.should_trade(
-            prediction, self.sol_price_usd, liquidity, self.wallet_equity_usd,
-        )
+        # Hard admissibility, then a size, then Q. NOT `should_trade`, which
+        # composes all three plus four economic thresholds -- and those
+        # thresholds are opinions about quantities the objective already
+        # prices, so running them first meant the threshold decided and Q
+        # rubber-stamped. A hurdle on P(2x) and an expected-log-growth
+        # objective are two views of one question; only one of them can be
+        # the policy.
+        admitted, admission = self.elogw_engine.admissible(
+            prediction, self.sol_price_usd, liquidity, self.wallet_equity_usd)
+        if not admitted:
+            trade_info = admission
+            should_trade = False
+        else:
+            trade_info = self.elogw_engine.size_candidate(
+                prediction, self.sol_price_usd, liquidity)
+            has_room, room = self.elogw_engine.portfolio_room(trade_info)
+            if not has_room:
+                trade_info = {**trade_info, **room}
+                should_trade = False
+            else:
+                # Q owns the economic question from here.
+                should_trade = True
         intelligence = self._entry_intelligence(
             token, candidate, risk, prediction, trade_info, liquidity)
         coverage = self.entry_coverage.record(intelligence)
@@ -965,25 +984,31 @@ class MemecoinQuantDesk:
         # trip costs an exit and an entry. The premium is charged here, on the
         # fresh prediction, so a re-entry can never be admitted on the
         # conviction that existed before the exit.
-        # Entry priced on the same objective as every other action. Advisory
-        # only where it cannot price the state: a DATA_BLOCKED entry score is
-        # the capacity measurement missing, not a verdict on the trade.
+        # Entry priced on the same objective as every other action. This is
+        # now THE economic decision rather than a second opinion on one
+        # already taken, so a state it cannot price stops the trade: an
+        # unpriceable entry is one whose capacity or escape we failed to
+        # measure, and buying into a book we cannot measure our way out of is
+        # not a trade, it is a hope.
         if should_trade:
             entry = self._score_entry(token, prediction, liquidity, trade_info)
-            if entry is not None:
-                decision["entry_action"] = {
-                    "status": entry.status, "action": entry.action.value,
-                    "q": entry.q, "detail": entry.detail,
-                }
-                intelligence["entry_action"] = decision["entry_action"]
-                if entry.status == "OK" and entry.action is ActionValue.IGNORE:
-                    self.contribution_ledger.record_gate(GateFlip(
-                        gate="entry_action_value", token=token, before=True,
-                        after=False, reason=entry.detail))
-                    should_trade = False
-                    trade_info = {**trade_info, "reason": "action_value_ignore",
-                                  "entry_detail": entry.detail}
-                    decision.update({"should_trade": False, "trade_info": trade_info})
+            decision["entry_action"] = intelligence["entry_action"] = (
+                {"status": entry.status, "action": entry.action.value,
+                 "q": entry.q, "detail": entry.detail}
+                if entry is not None else
+                {"status": "DATA_BLOCKED", "reason": "entry not priceable"})
+            declined = (entry is None or entry.status != "OK"
+                        or entry.action is ActionValue.IGNORE)
+            if declined:
+                reason = ("action_value_ignore" if entry is not None
+                          and entry.status == "OK" else "entry_q_data_blocked")
+                self.contribution_ledger.record_gate(GateFlip(
+                    gate="entry_action_value", token=token, before=True,
+                    after=False, reason=decision["entry_action"].get("detail", "")))
+                should_trade = False
+                trade_info = {**trade_info, "reason": reason,
+                              "entry_detail": decision["entry_action"]}
+                decision.update({"should_trade": False, "trade_info": trade_info})
         if should_trade and self.reentry_book.get(token) is not None:
             verdict = self._price_reentry(token, prediction, liquidity, trade_info)
             decision["reentry"] = intelligence["reentry"] = verdict.as_dict()
@@ -1020,9 +1045,14 @@ class MemecoinQuantDesk:
             priority_fee=self.fee_optimizer.get_optimal_fee(trade_info["position_value_usd"], 0.5),
             jito_tip=self.fee_optimizer.get_jito_tip(trade_info["position_value_usd"], "MEDIUM"),
             use_jito=True, decision_id=decision_id,
-            # What the fill is worth, so the bid can be chosen against it
-            # rather than from a ladder that has never seen this trade.
-            expected_value_usd=float(trade_info.get("position_value_usd", 0.0) or 0.0),
+            # The EDGE landing buys, not the position notional. A $500
+            # position is not $500 of expected value: E[log W] times the book
+            # is what the fill is actually worth, and bidding against the
+            # notional overpays for a marginal trade and underpays for a good
+            # one -- the two errors that matter, in the two directions that
+            # matter.
+            expected_edge_usd=max(0.0, float(trade_info.get("elogw", 0.0) or 0.0)
+                                  * max(self.wallet_equity_usd, 0.0)),
             sol_price_usd=float(self.sol_price_usd or 0.0),
         )
         self.dataset_builder.record_execution_attempt(token, _jsonable(result))
@@ -1758,23 +1788,46 @@ class MemecoinQuantDesk:
                 in self.elogw_engine.probability_bins(prediction)]
         if not bins or size_usd <= 0:
             return None
-        capacity_status, capacity = self._exit_capacity(token, {
-            "size_tokens": int(trade_info.get("expected_tokens", 0) or 0)})
-        escape = position_escape = None
-        state = ActionState(
+        # The size we would actually hold, quoted off the live curve. This
+        # read `trade_info["expected_tokens"]`, which the sizing engine has
+        # never populated -- so capacity was measured at zero tokens, came
+        # back DATA_BLOCKED, and every entry Q was unpriceable. The old
+        # threshold decided every entry while the readiness surface showed an
+        # objective that was in fact never consulted.
+        state = self._latest_curve_state.get(token)
+        if state is None:
+            return None
+        size_sol = float(trade_info.get("position_size_sol", 0.0) or 0.0)
+        if size_sol <= 0:
+            return None
+        quote = quote_buy(state, int(size_sol * 1e9))
+        expected_tokens = int(quote.output_amount or 0)
+        if expected_tokens <= 0 or quote.data_status != "OK":
+            return None
+        probe: Dict[str, Any] = {"size_tokens": expected_tokens}
+        capacity_status, capacity = self._exit_capacity(token, probe)
+        # Escape estimated at the size this entry would hold, not assumed.
+        # `entry_escape_prior` defaulted to 1.0, which told the objective
+        # every prospective position was certain to get out -- the single most
+        # flattering assumption available, and most wrong on exactly the
+        # tokens where escape is hardest.
+        escape = self._estimate_escape(token, probe, self.rug_hazard.get_hazard(token))
+        costs = self._cost_model(token)
+        entry_state = ActionState(
             held_fraction=0.0,
             current_multiple=1.0,
             forward_bins=tuple(bins),
-            exit_cost=float(self._cost_model(token).get("exit_cost", 0.02)),
-            entry_cost=float(self._cost_model(token).get("entry_cost", 0.02)),
+            exit_cost=float(costs.get("exit_cost", 0.02)),
+            entry_cost=float(costs.get("entry_cost", 0.02)),
             # An entry whose exit capacity cannot be measured is an entry into
             # something we do not know how to leave. Blocked rather than
             # assumed liquid, which is the flattering direction.
             exit_capacity_ratio=(capacity if str(capacity_status).startswith("OK") else None),
-            escape_probability=float(self.global_config.get("entry_escape_prior", 1.0)),
+            escape_probability=(float(escape.probability)
+                                if escape.status == "OK" else None),
             probe_fraction=min(1.0, size_usd / equity),
         )
-        return self.action_policy.score(state)
+        return self.action_policy.score(entry_state)
 
     def _price_reentry(self, token: str, prediction: Any, liquidity: float,
                        trade_info: Dict[str, Any]):

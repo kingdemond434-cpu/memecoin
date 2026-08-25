@@ -594,6 +594,9 @@ class ExecutionEngine:
         # landed or not: a model fed only successes learns that everything
         # lands.
         self.landing_model = LandingModel()
+        # What the last bid decision was, and whether it was measured
+        # or fell back. Surfaced so a desk running on the ladder knows.
+        self.last_bid: Dict[str, Any] = {}
         self.execution_history: deque = deque(maxlen=10_000)
         self.route_performance: Dict[RouteType, Dict[str, float]] = defaultdict(
             lambda: {"total": 0, "landed": 0, "filled": 0, "failed": 0, "avg_latency": 0}
@@ -665,6 +668,7 @@ class ExecutionEngine:
             "prepared_share": (prepared / total) if total else None,
             "outcomes": dict(self.native_route_attempts),
             "landing_model": self.landing_model.report(),
+            "last_bid": dict(self.last_bid),
             "reconciliation": {
                 "stream_confirmations": self.stream_confirmations,
                 "poll_confirmations": self.poll_confirmations,
@@ -757,12 +761,35 @@ class ExecutionEngine:
         jito_tip: int = 100_000,
         use_jito: bool = False,
         decision_id: Optional[str] = None,
-        expected_value_usd: float = 0.0,
+        expected_edge_usd: float = 0.0,
         sol_price_usd: float = 0.0,
     ) -> ExecutionResult:
         started = time.time()
         if amount <= 0 or slippage_bps <= 0 or slippage_bps > 2_000:
             return ExecutionResult(False, TransactionStatus.REJECTED, error="hard execution invariant failed")
+        # The bid is chosen BEFORE the route branches, because the native
+        # branch returns first and was therefore never reaching the landing
+        # model at all -- the canonical fastest route was the one still using
+        # the fixed ladder, while the learned bid applied only to the Jupiter
+        # fallback. Exactly backwards.
+        if use_jito:
+            observed_tip = await self.jito.get_tip_floor_lamports(75)
+            if observed_tip:
+                jito_tip = min(max(jito_tip, observed_tip), 5_000_000)
+            chosen = self.choose_bid(
+                # The EDGE, not the notional. A $500 position is not $500 of
+                # expected value, and bidding against the notional overpays
+                # for a marginal trade and underpays for a good one -- the two
+                # errors that matter, in the two directions that matter.
+                expected_value_usd=float(expected_edge_usd or 0.0),
+                sol_price_usd=float(sol_price_usd or 0.0),
+                fallback_lamports=jito_tip)
+            if chosen.get("measured"):
+                # The observed floor says what cleared; the curve says what is
+                # worth paying. Under the floor is not a bid at all.
+                jito_tip = min(max(observed_tip or 0, int(chosen["lamports"])), 5_000_000)
+            self.last_bid = chosen
+
         native = self.prepare_native_route(input_mint, output_mint, amount, slippage_bps)
         if native is not None and native.ok:
             self.native_route_attempts["prepared"] += 1
@@ -813,24 +840,9 @@ class ExecutionEngine:
                 error="live submission is locked; ALLOW_LIVE_TRADING acknowledgement absent",
             )
 
-        if use_jito:
-            # Bid against what actually cleared recently rather than a fixed
-            # constant. One data-driven tip only: a differently signed
-            # escalation ladder could double-fill if an earlier attempt lands
-            # late, so the tip is chosen once, before signing.
-            observed_tip = await self.jito.get_tip_floor_lamports(75)
-            if observed_tip:
-                jito_tip = min(max(jito_tip, observed_tip), 5_000_000)
-            # The observed floor says what cleared; the landing curve says
-            # what is worth paying. Take the larger, because bidding under the
-            # floor is not a bid and bidding under the curve's answer is
-            # leaving expected value on the table.
-            chosen = self.choose_bid(
-                expected_value_usd=float(expected_value_usd or 0.0),
-                sol_price_usd=float(sol_price_usd or 0.0),
-                fallback_lamports=jito_tip)
-            if chosen.get("measured") and chosen["lamports"] > 0:
-                jito_tip = min(max(jito_tip, int(chosen["lamports"])), 5_000_000)
+        # The tip was chosen once, before the route branched and before
+        # signing: a differently signed escalation ladder could double-fill if
+        # an earlier attempt lands late.
         swap_tx = await self.jupiter.get_swap_transaction(
             quote,
             self.tx_builder.public_key,
