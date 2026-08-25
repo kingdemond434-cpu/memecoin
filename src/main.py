@@ -16,6 +16,7 @@ import os
 import time
 from dataclasses import asdict, is_dataclass, replace as dataclasses_replace
 from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
@@ -157,6 +158,9 @@ class MemecoinQuantDesk:
         # stream, so exit capacity is answerable locally in the window a
         # decision actually has, with no RPC round trip.
         self._latest_curve_state: Dict[str, Any] = {}
+        # Partial-exit PnL accumulated per token, banked into the final
+        # outcome row when the position actually closes.
+        self._closed_pnl: Dict[str, float] = {}
         self._market_cursor = 0
         self._model_artifact_mtime = 0.0
 
@@ -599,6 +603,12 @@ class MemecoinQuantDesk:
             use_jito=True, decision_id=decision_id,
         )
         self.dataset_builder.record_execution_attempt(token, _jsonable(result))
+        self._record_ops_event("execution_attempts", {
+            "token": token, "side": "buy", "success": bool(result.success),
+            "status": getattr(result.status, "value", str(result.status)),
+            "error": result.error, "simulated": bool(result.simulated),
+            "decision_id": decision_id,
+        })
         if not result.success:
             return
         intended_cost = float(trade_info["position_value_usd"])
@@ -637,6 +647,13 @@ class MemecoinQuantDesk:
                     trade_info["position_size_sol"], result.status.value)
 
     def _record_blocked_decision(self, token: str, reason: str, evidence: Dict[str, Any]):
+        # Recorded so the weekly audit can ask what the rejected launches went
+        # on to do. A missed monster is invisible unless the rejection was
+        # written down next to the outcome.
+        self._record_ops_event("trade_outcomes", {
+            "token": token, "entered": False, "attempted": False,
+            "rejection_reason": reason,
+        })
         self.counterfactual_lab.record_decision(token, evidence, {"should_trade": False, "reason": reason})
 
     def _prelaunch_context(self, deployer: str, detected_at: float) -> Optional[Dict[str, Any]]:
@@ -1216,6 +1233,12 @@ class MemecoinQuantDesk:
         result = await self.execution_engine.execute_sell(token, sold_tokens, slippage_bps=500, use_jito=True,
                                                           decision_id=position.get("decision_id"))
         attempt = {**_jsonable(result), "exit_reason": reason, "exit_pct": sold_tokens / max(current_tokens, 1)}
+        self._record_ops_event("execution_attempts", {
+            "token": token, "side": "sell", "success": bool(result.success),
+            "status": getattr(result.status, "value", str(result.status)),
+            "error": result.error, "simulated": bool(result.simulated),
+            "exit_reason": reason,
+        })
         if not result.success:
             self.dataset_builder.record_execution_attempt(token, attempt)
             return
@@ -1241,6 +1264,31 @@ class MemecoinQuantDesk:
                         "allocated_cost_usd": allocated_cost,
                         "realized_pnl_usd": pnl})
         self.dataset_builder.record_execution_attempt(token, attempt)
+        remaining = int(position["size_tokens"]) - actual_sold
+        if remaining <= 0:
+            # The position is closed, so its outcome is now final and can be
+            # attributed. Partial exits are deliberately not recorded here:
+            # attributing a trade that is still open would count the same
+            # capital twice in the ledger.
+            self._record_ops_event("trade_outcomes", {
+                "token": token, "entered": True, "attempted": True,
+                "realized_pnl_usd": self._closed_pnl.pop(token, 0.0) + pnl,
+                "realized_multiple": (float(position.get("high_water_multiple", 1.0))
+                                      if pnl > 0 else max(0.0, 1.0 + pnl / max(
+                                          float(position.get("initial_cost_usd", 1.0)), 1e-9))),
+                "max_feasible_multiple": float(position.get("high_water_multiple", 1.0)),
+                "position_fraction": (float(position.get("initial_cost_usd", 0.0))
+                                      / max(self.wallet_equity_usd, 1e-9)),
+                "capacity_usd": position.get("liquidity_usd"),
+                "exit_reason": reason,
+                "mechanism": position.get("sleeve", "t0_sniper"),
+                "monster_state": position.get("monster_state"),
+                "exit_capacity_status": position.get("exit_capacity_status"),
+                "wealth_multiple": 1.0 + pnl / max(self.wallet_equity_usd, 1e-9),
+                "rugged": reason.startswith("rug_hazard") or reason.startswith("monster_catastrophic"),
+            })
+        else:
+            self._closed_pnl[token] = self._closed_pnl.get(token, 0.0) + pnl
         resolved = self.counterfactual_lab.resolve_decision(position.get("decision_id", ""), pnl)
         for counterfactual in resolved:
             self.dataset_builder.record_counterfactual(token, counterfactual)
@@ -1480,8 +1528,51 @@ class MemecoinQuantDesk:
 
     async def _health_loop(self):
         while self._running:
-            logger.info("HEALTH %s", json.dumps(_jsonable(self.readiness()), separators=(",", ":")))
+            snapshot = _jsonable(self.readiness())
+            logger.info("HEALTH %s", json.dumps(snapshot, separators=(",", ":")))
+            self._persist_readiness(snapshot)
             await asyncio.sleep(60)
+
+    def _record_ops_event(self, stream: str, payload: Dict[str, Any]) -> None:
+        """Append one operational telemetry row for the monitor and audit pack.
+
+        Deliberately separate from the research lake. The lake is optimised for
+        point-in-time correctness and completeness; this is optimised for a
+        monitor being able to answer "what is the recent failure rate" in one
+        cheap pass without loading episodes. Failures are swallowed for the
+        same reason readiness persistence is: telemetry must never be able to
+        halt the desk it describes.
+        """
+        try:
+            root = Path(self.global_config.get("ops_state_dir", "data/state"))
+            root.mkdir(parents=True, exist_ok=True)
+            row = {"timestamp": time.time(), **payload}
+            with (root / f"{stream}.jsonl").open("a") as handle:
+                handle.write(json.dumps(row, default=str) + "\n")
+        except OSError as exc:
+            logger.debug("ops telemetry write failed for %s: %s", stream, exc)
+
+    def _persist_readiness(self, snapshot: Dict[str, Any]) -> None:
+        """Write the snapshot the out-of-process monitor reads.
+
+        Logging health is not the same as exposing it. A monitor that has to
+        parse the log stream cannot tell "the desk is fine and quiet" from "the
+        desk stopped writing", whereas the mtime of this file answers that
+        directly and is the first thing the monitor checks.
+
+        Written to a temporary file and renamed, so a reader never catches a
+        half-written snapshot and concludes the node is broken. Failures here
+        are logged and swallowed: a monitor that cannot be updated must never
+        be able to take down the desk it monitors.
+        """
+        path = Path(self.global_config.get("readiness_path", "data/state/readiness.json"))
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(snapshot, default=str))
+            tmp.replace(path)
+        except OSError as exc:
+            logger.warning("could not persist readiness snapshot to %s: %s", path, exc)
 
     async def _setup_health_server(self):
         app = web.Application()

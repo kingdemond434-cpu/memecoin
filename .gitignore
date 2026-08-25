@@ -1,65 +1,59 @@
+
+# Data
+# Docker
+# Environment
+# IDE
+# Jupyter
+# OS
 # Python
-__pycache__/
-*.py[cod]
+# Secrets
+# Testing
+# Virtual environments
 *$py.class
+*.egg
+*.egg-info/
+*.gz
+*.key
+*.p12
+*.pem
+*.py[cod]
 *.so
+*.swo
+*.swp
+.DS_Store
 .Python
+.coverage
+.docker/
+.eggs/
+.env
+.env.*.local
+.env.local
+.idea/
+.installed.cfg
+.ipynb_checkpoints/
+.pytest_cache/
+.tox/
+.venv/
+.vscode/
+ENV/
+Thumbs.db
+__pycache__/
 build/
+data/
+data/audit/latest_pack.json
+data/state/
 develop-eggs/
 dist/
 downloads/
 eggs/
-.eggs/
+env/
+htmlcov/
 lib/
 lib64/
+logs/
+models/
 parts/
 sdist/
 var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Virtual environments
 venv/
-.venv/
-env/
-ENV/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Environment
-.env
-.env.local
-.env.*.local
-
-# Data
-data/
-logs/
-models/
-*.gz
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Docker
-.docker/
-
-# Testing
-.coverage
-htmlcov/
-.pytest_cache/
-.tox/
-
-# Jupyter
-.ipynb_checkpoints/
-
-# Secrets
-*.key
-*.pem
-*.p12
+wheels/

@@ -1,0 +1,12 @@
+[Unit]
+Description=Build the audit pack shortly before the weekly review
+
+[Timer]
+# Monday 16:30 UTC, half an hour ahead of the 17:00 UTC review, so the pack
+# is already on disk and freshly tested when the audit reads it.
+OnCalendar=Mon *-*-* 16:30:00 UTC
+Persistent=true
+Unit=memecoin-audit-pack.service
+
+[Install]
+WantedBy=timers.target

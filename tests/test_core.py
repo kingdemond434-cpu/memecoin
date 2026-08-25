@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import json
 import math
+import os
 import struct
 import tempfile
 import time
@@ -77,6 +78,9 @@ from src.execution.pump_fees import (
 from src.chains.pump_curve import (
     DEFAULT_FEE_BPS, BondingCurveState, quote_buy, quote_sell, resolve_fee_bps,
 )
+from ops.audit_pack import build_audit_pack
+from ops.health import Check, HealthReport, State, run_health_checks
+from ops.monitor import main as monitor_main
 from src.runtime.hot_state import (
     AsyncArchiveWriter, CompactWalletDNA, EconomicCache, HotState, HotStateBudget,
 )
@@ -712,7 +716,12 @@ class TestPartialExitAccounting(unittest.IsolatedAsyncioTestCase):
             counterfactual_lab=FakeCounterfactualLabForExit(),
             elogw_engine=ElogwEngine(None),
             sol_price_usd=150.0, total_pnl=0.0, successful_exits=0, dry_run=True,
+            wallet_equity_usd=10_000.0,
         )
+        desk.ops_events = []
+        desk._record_ops_event = (
+            lambda stream, payload: desk.ops_events.append((stream, payload)))
+        desk._closed_pnl = {}
         return desk
 
     @staticmethod
@@ -2777,6 +2786,10 @@ class TestPositionPredictionRefresh(unittest.IsolatedAsyncioTestCase):
         desk.last_slate_report = {}
         desk._read_distribution = lambda token: MemecoinQuantDesk._read_distribution(desk, token)
         desk._latest_curve_state = getattr(desk, "_latest_curve_state", {})
+        desk.ops_events = []
+        desk._record_ops_event = (
+            lambda stream, payload: desk.ops_events.append((stream, payload)))
+        desk._closed_pnl = {}
         desk._exit_capacity = (
             lambda token, pos: MemecoinQuantDesk._exit_capacity(desk, token, pos))
         desk._update_monster_state = (
@@ -3439,6 +3452,10 @@ class TestDistributionExitWiring(unittest.IsolatedAsyncioTestCase):
         )
         desk._read_distribution = lambda token: MemecoinQuantDesk._read_distribution(desk, token)
         desk._latest_curve_state = getattr(desk, "_latest_curve_state", {})
+        desk.ops_events = []
+        desk._record_ops_event = (
+            lambda stream, payload: desk.ops_events.append((stream, payload)))
+        desk._closed_pnl = {}
         desk._exit_capacity = (
             lambda token, pos: MemecoinQuantDesk._exit_capacity(desk, token, pos))
         desk._update_monster_state = (
@@ -3747,6 +3764,10 @@ class TestMonsterHoldWiring(unittest.IsolatedAsyncioTestCase):
         )
         desk._read_distribution = lambda token: MemecoinQuantDesk._read_distribution(desk, token)
         desk._latest_curve_state = getattr(desk, "_latest_curve_state", {})
+        desk.ops_events = []
+        desk._record_ops_event = (
+            lambda stream, payload: desk.ops_events.append((stream, payload)))
+        desk._closed_pnl = {}
         desk._exit_capacity = (
             lambda token, pos: MemecoinQuantDesk._exit_capacity(desk, token, pos))
         desk._update_monster_state = (
@@ -5135,3 +5156,300 @@ class TestHotState(unittest.TestCase):
             # discovered when the kernel kills the process.
             self.assertIn("max_hot_wallets", report["budget"])
             self.assertEqual(report["archive"]["dropped"], 0)
+
+
+class TestHealthChecks(unittest.TestCase):
+    """A monitor that reports an unrunnable check as OK is worse than no monitor."""
+
+    NOW = 1_800_000_000.0
+
+    def _readiness(self, **overrides):
+        base = {
+            "mode": "DRY_RUN", "live_submission_locked": True,
+            "execution": {"dry_run": True},
+            "portfolio": {"kill_switch_active": False, "daily_pnl": 12.0},
+            "yellowstone": {"status": "STREAMING"},
+            "rpc_program_stream": {"status": "STREAMING"},
+            "prediction": "OK",
+            "rug_hazard": {"model_trained": True, "model_status": "OK"},
+            "exit_policy": {"status": "OK", "detail": "trained"},
+            "dataset": {"market_observed_at": self.NOW - 10, "active_episodes": 12},
+            "social": {"data_status": {"telegram": "OK_PUSH"}},
+            "research": {"leads": 3},
+            "champions": {"live_champions": 1, "shadow_models": 2, "decaying_champions": 0},
+        }
+        base.update(overrides)
+        return base
+
+    def _run(self, readiness=None, directory=None, execution_rows=None, now=None):
+        root = Path(directory)
+        state = root / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        readiness_path = state / "readiness.json"
+        if readiness is not None:
+            readiness_path.write_text(json.dumps(readiness))
+            os.utime(readiness_path, (now or self.NOW, now or self.NOW))
+        execution_log = state / "execution_attempts.jsonl"
+        if execution_rows is not None:
+            execution_log.write_text("".join(json.dumps(row) + "\n" for row in execution_rows))
+        return run_health_checks(readiness_path, root / "models", execution_log, root,
+                                 now=now or self.NOW)
+
+    def _state_of(self, report, name):
+        return next(check.state for check in report.checks if check.name == name)
+
+    def test_a_healthy_node_reports_ok(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = self._run(self._readiness(), directory)
+            self.assertEqual(self._state_of(report, "safety_live_lock"), State.OK)
+            self.assertEqual(self._state_of(report, "feed_yellowstone"), State.OK)
+            self.assertEqual(self._state_of(report, "data_market_observations"), State.OK)
+
+    def test_a_stale_snapshot_is_critical_and_blocks_everything_downstream(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = self._run(self._readiness(), directory, now=self.NOW)
+            # Re-run an hour later without the desk having rewritten the file.
+            report = self._run(None, directory, now=self.NOW + 3_600)
+            self.assertEqual(self._state_of(report, "readiness_freshness"), State.CRITICAL)
+            # Reporting the last known-good values as current would manufacture
+            # confidence exactly where visibility was lost.
+            for name in ("safety_live_lock", "feed_yellowstone", "data_market_observations"):
+                self.assertEqual(self._state_of(report, name), State.DATA_BLOCKED)
+
+    def test_a_stale_but_present_snapshot_escalates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "state").mkdir(parents=True)
+            path = root / "state" / "readiness.json"
+            path.write_text(json.dumps(self._readiness()))
+            os.utime(path, (self.NOW - 3_600, self.NOW - 3_600))
+            report = run_health_checks(path, root / "models",
+                                       root / "state" / "exec.jsonl", root, now=self.NOW)
+            freshness = next(c for c in report.checks if c.name == "readiness_freshness")
+            self.assertEqual(freshness.state, State.CRITICAL)
+            self.assertTrue(freshness.escalate)
+
+    def test_an_unlocked_live_path_is_surfaced_and_escalated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = self._run(
+                self._readiness(live_submission_locked=False,
+                                execution={"dry_run": False}, mode="LIVE"), directory)
+            check = next(c for c in report.checks if c.name == "safety_live_lock")
+            self.assertEqual(check.state, State.WARN)
+            self.assertTrue(check.escalate)
+
+    def test_an_active_kill_switch_is_critical(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = self._run(self._readiness(
+                portfolio={"kill_switch_active": True, "daily_pnl": -900.0,
+                           "max_daily_loss": 1000.0}), directory)
+            check = next(c for c in report.checks if c.name == "safety_kill_switch")
+            self.assertEqual(check.state, State.CRITICAL)
+            self.assertTrue(check.escalate)
+
+    def test_a_dead_feed_is_critical(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = self._run(
+                self._readiness(yellowstone={"status": "DISCONNECTED"}), directory)
+            self.assertEqual(self._state_of(report, "feed_yellowstone"), State.CRITICAL)
+
+    def test_a_feed_that_never_started_is_blocked_not_broken(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = self._run(
+                self._readiness(yellowstone={"status": "NOT_STARTED"}), directory)
+            self.assertEqual(self._state_of(report, "feed_yellowstone"), State.DATA_BLOCKED)
+
+    def test_a_moat_that_stopped_growing_is_critical(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = self._run(self._readiness(
+                dataset={"market_observed_at": self.NOW - 7_200}), directory)
+            check = next(c for c in report.checks if c.name == "data_market_observations")
+            self.assertEqual(check.state, State.CRITICAL)
+            self.assertTrue(check.escalate)
+
+    def test_an_untrained_model_is_blocked_not_failed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = self._run(self._readiness(prediction="DATA_BLOCKED"), directory)
+            # Not yet trained is a known, expected state; it is not a defect.
+            self.assertEqual(self._state_of(report, "model_prediction"), State.DATA_BLOCKED)
+
+    def test_execution_failure_rate_needs_a_minimum_sample(self):
+        with tempfile.TemporaryDirectory() as directory:
+            few = [{"timestamp": self.NOW - 10, "success": False} for _ in range(3)]
+            report = self._run(self._readiness(), directory, execution_rows=few)
+            check = next(c for c in report.checks if c.name == "execution_failure_rate")
+            # Three failures out of four is four observations, not a 75%
+            # failure rate, and acting on it retires a working route on noise.
+            self.assertEqual(check.state, State.DATA_BLOCKED)
+
+    def test_a_sustained_execution_failure_rate_is_critical(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = ([{"timestamp": self.NOW - 10, "success": False,
+                      "error": "bundle_not_landed"} for _ in range(30)]
+                    + [{"timestamp": self.NOW - 10, "success": True} for _ in range(10)])
+            report = self._run(self._readiness(), directory, execution_rows=rows)
+            check = next(c for c in report.checks if c.name == "execution_failure_rate")
+            self.assertEqual(check.state, State.CRITICAL)
+            self.assertEqual(check.evidence["top_reasons"]["bundle_not_landed"], 30)
+
+    def test_old_execution_attempts_fall_outside_the_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = [{"timestamp": self.NOW - 100_000, "success": False} for _ in range(50)]
+            report = self._run(self._readiness(), directory, execution_rows=rows)
+            self.assertEqual(self._state_of(report, "execution_failure_rate"),
+                             State.DATA_BLOCKED)
+
+    def test_degraded_sources_warn_without_halting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = self._run(self._readiness(
+                social={"data_status": {"telegram": "OK_PUSH",
+                                        "youtube": "DATA_BLOCKED: quota"}}), directory)
+            check = next(c for c in report.checks if c.name == "source_social")
+            self.assertEqual(check.state, State.WARN)
+            self.assertIn("youtube", check.evidence["degraded"])
+
+    def test_decaying_champions_with_no_successor_warn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = self._run(self._readiness(
+                champions={"live_champions": 1, "decaying_champions": 2,
+                           "shadow_models": 0}), directory)
+            self.assertEqual(self._state_of(report, "promotion_pipeline"), State.WARN)
+
+    def test_the_report_ranks_worst_state_and_lists_escalations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = self._run(self._readiness(
+                yellowstone={"status": "DISCONNECTED"}), directory)
+            self.assertEqual(report.worst, State.CRITICAL)
+            self.assertIn("feed_yellowstone", [c.name for c in report.escalations])
+            payload = report.to_dict()
+            self.assertEqual(payload["worst_state"], "CRITICAL")
+
+
+class TestMonitorEntryPoint(unittest.TestCase):
+    """Exit codes have to be actionable without parsing anything."""
+
+    def _run(self, directory, readiness=None):
+        root = Path(directory)
+        (root / "data" / "state").mkdir(parents=True, exist_ok=True)
+        if readiness is not None:
+            (root / "data" / "state" / "readiness.json").write_text(json.dumps(readiness))
+        return monitor_main(["--root", str(root), "--quiet"])
+
+    def test_a_missing_snapshot_exits_critical(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(self._run(directory), 2)
+
+    def test_the_snapshot_is_written_atomically_and_history_appended(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._run(directory)
+            root = Path(directory)
+            health = json.loads((root / "data" / "state" / "health.json").read_text())
+            self.assertIn("worst_state", health)
+            # No temporary file is left behind for a reader to trip over.
+            self.assertEqual(list((root / "data" / "state").glob("*.tmp")), [])
+            history = (root / "data" / "state" / "health_history.jsonl").read_text()
+            self.assertEqual(len(history.strip().splitlines()), 1)
+            self._run(directory)
+            history = (root / "data" / "state" / "health_history.jsonl").read_text()
+            self.assertEqual(len(history.strip().splitlines()), 2)
+
+
+class TestAuditPack(unittest.TestCase):
+    """The point of the pack is what it leaves out."""
+
+    def _health(self):
+        return HealthReport(generated_at=1.0, checks=[
+            Check("ok_check", State.OK, "fine"),
+            Check("bad_check", State.CRITICAL, "broken", {"x": 1}, escalate=True),
+        ])
+
+    def test_missing_inputs_produce_stated_sections_not_gaps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pack = build_audit_pack(Path(directory), run_tests=False)
+            sections = pack.to_dict()["sections"]
+            # Silently dropping an empty section makes the pack read as though
+            # what remains is the whole picture.
+            for name in ("wealth_leaks", "rug_defence", "execution", "edge_health",
+                         "moat_growth", "system_integrity"):
+                self.assertEqual(sections[name]["status"], "DATA_BLOCKED", name)
+                self.assertTrue(sections[name]["summary"])
+
+    def test_system_integrity_reports_only_what_is_not_ok(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pack = build_audit_pack(Path(directory), health=self._health(), run_tests=False)
+            section = pack.to_dict()["sections"]["system_integrity"]
+            self.assertEqual(section["status"], "CRITICAL")
+            self.assertEqual([e["check"] for e in section["entries"]], ["bad_check"])
+
+    def test_truncation_is_recorded_rather_than_silent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            leaks = {"total_forgone_log_growth": 5.0,
+                     "worst_tokens": [{"token": f"t{i}", "forgone_log_growth": 1.0}
+                                      for i in range(40)]}
+            pack = build_audit_pack(Path(directory), leak_report=leaks, run_tests=False)
+            section = pack.to_dict()["sections"]["wealth_leaks"]
+            self.assertEqual(len(section["entries"]), 10)
+            # An audit that unknowingly sees the top 10 of 4,000 findings will
+            # confidently rank the wrong work first.
+            self.assertEqual(section["truncated_entries"], 30)
+
+    def test_the_pack_is_capped_and_records_what_it_trimmed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            leaks = {
+                "total_forgone_log_growth": 5.0,
+                "worst_tokens": [{"token": f"t{i}", "forgone_log_growth": 1.0,
+                                  "detail": "y" * 300} for i in range(40)],
+                "by_leak": {f"leak_{i}": float(i) for i in range(200)},
+                "top_causes": [{"leak": "missed_monster", "reason": "z" * 300}
+                               for _ in range(50)],
+            }
+            pack = build_audit_pack(Path(directory), leak_report=leaks, run_tests=False)
+            text = pack.serialise(max_bytes=4_000)
+            self.assertLessEqual(len(text.encode()), 4_000)
+            payload = json.loads(text)
+            # Details go before entries: a finding a reviewer cannot see at all
+            # is worse than one they see without its supporting blob.
+            self.assertTrue(payload["trimmed_to_fit"])
+            self.assertIn("wealth_leaks.detail", payload["trimmed_to_fit"])
+
+    def test_an_uncapped_pack_is_returned_untouched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pack = build_audit_pack(Path(directory), run_tests=False)
+            payload = json.loads(pack.serialise())
+            self.assertNotIn("trimmed_to_fit", payload)
+
+    def test_false_rug_alarms_are_included_alongside_rugs_entered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            events = [
+                {"token": "entered", "entered": True, "rugged": True,
+                 "realized_multiple": 0.05},
+                {"token": "rejected", "entered": False, "rugged": False,
+                 "rejection_reason": "rug_risk_too_high", "max_feasible_multiple": 20.0},
+            ]
+            pack = build_audit_pack(Path(directory), rug_events=events, run_tests=False)
+            section = pack.to_dict()["sections"]["rug_defence"]
+            kinds = {entry["kind"] for entry in section["entries"]}
+            # A detector tightened without a view of what it wrongly rejected
+            # converges on refusing to trade.
+            self.assertEqual(kinds, {"rug_entered", "false_alarm"})
+
+    def test_edge_health_maps_decay_status_to_a_keep_kill_verdict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            decay = {
+                "creator_dna": {"status": "HEALTHY", "sample": 400},
+                "telegram_lead": {"status": "DEGRADED", "sample": 400},
+                "swarm": {"status": "WEAKENING", "sample": 400},
+                "new_thing": {"status": "MEASURING", "sample": 4},
+            }
+            pack = build_audit_pack(Path(directory), decay=decay, run_tests=False)
+            verdicts = {e["mechanism"]: e["verdict"]
+                        for e in pack.to_dict()["sections"]["edge_health"]["entries"]}
+            self.assertEqual(verdicts, {"creator_dna": "EXPAND", "telegram_lead": "HIBERNATE",
+                                        "swarm": "SHADOW", "new_thing": "KEEP"})
+
+    def test_recent_changes_reads_the_repository_history(self):
+        pack = build_audit_pack(Path("/home/user/memecoin"), period_days=3650,
+                                run_tests=False)
+        section = pack.to_dict()["sections"]["recent_changes"]
+        self.assertEqual(section["status"], "OK")
+        self.assertIn("commits", section["summary"])

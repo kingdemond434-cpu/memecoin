@@ -1,0 +1,491 @@
+"""Continuous local health checks. No model, no network, no Claude.
+
+The thing that keeps a trading node alive has to run every few minutes,
+forever, on the node itself. Anything that depends on a person reading logs or
+on a language model being invoked is not a health check -- it is a hope that
+someone looks.
+
+Each check returns one of four states, and the distinction between the last
+two carries most of the value:
+
+    OK            measured, and fine
+    WARN          measured, and heading the wrong way
+    CRITICAL      measured, and broken now
+    DATA_BLOCKED  could not be measured at all
+
+A monitor that reports a check it could not run as OK is worse than having no
+monitor, because it manufactures confidence exactly where visibility was lost.
+A stale readiness file is the canonical case: the desk may be fine, or the
+process may have died twenty minutes ago, and those look identical from the
+file alone. So freshness is checked first and separately, and every check that
+reads a stale snapshot degrades to DATA_BLOCKED rather than reporting the last
+known-good values as current.
+
+Checks are ordered by what they protect. Safety state comes first: a node that
+has quietly lost its live-capital lock is a more urgent finding than one whose
+disk is filling, however much noisier the disk would be.
+"""
+
+import json
+import logging
+import os
+import shutil
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+HEALTH_SCHEMA_VERSION = "v1"
+
+
+class State(Enum):
+    OK = "OK"
+    WARN = "WARN"
+    CRITICAL = "CRITICAL"
+    DATA_BLOCKED = "DATA_BLOCKED"
+
+    @property
+    def rank(self) -> int:
+        return {"OK": 0, "DATA_BLOCKED": 1, "WARN": 2, "CRITICAL": 3}[self.value]
+
+
+@dataclass
+class Check:
+    name: str
+    state: State
+    detail: str
+    # Anything a weekly audit would need to judge the finding without going
+    # back to raw logs.
+    evidence: Dict[str, Any] = field(default_factory=dict)
+    # Set when this finding should wake a human or an audit immediately rather
+    # than waiting for the weekly pack.
+    escalate: bool = False
+
+
+@dataclass
+class HealthThresholds:
+    """Every threshold in one place, so none of them is a magic number inline."""
+
+    readiness_stale_seconds: float = 300.0
+    feed_stale_seconds: float = 120.0
+    market_observation_stale_seconds: float = 900.0
+    disk_warn_pct: float = 80.0
+    disk_critical_pct: float = 92.0
+    memory_warn_pct: float = 80.0
+    memory_critical_pct: float = 92.0
+    max_execution_failure_rate: float = 0.35
+    min_execution_attempts_for_verdict: int = 20
+    training_stale_seconds: float = 172_800.0
+    max_data_blocked_token_share: float = 0.50
+
+
+def _read_json(path: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    try:
+        return json.loads(path.read_text()), None
+    except FileNotFoundError:
+        return None, "file does not exist"
+    except (OSError, ValueError) as exc:
+        return None, f"unreadable: {exc}"
+
+
+def check_readiness_freshness(path: Path, now: float,
+                              thresholds: HealthThresholds) -> Check:
+    """Is the desk still writing? Everything downstream depends on this answer.
+
+    Checked first and separately because a stale snapshot and a healthy one are
+    indistinguishable from their contents alone.
+    """
+    if not path.exists():
+        return Check("readiness_freshness", State.DATA_BLOCKED,
+                     f"no readiness snapshot at {path}",
+                     {"path": str(path)}, escalate=True)
+    age = now - path.stat().st_mtime
+    evidence = {"path": str(path), "age_seconds": round(age, 1),
+                "threshold_seconds": thresholds.readiness_stale_seconds}
+    if age > thresholds.readiness_stale_seconds:
+        return Check("readiness_freshness", State.CRITICAL,
+                     f"readiness snapshot is {age:.0f}s old; the desk may not be running",
+                     evidence, escalate=True)
+    return Check("readiness_freshness", State.OK,
+                 f"readiness snapshot {age:.0f}s old", evidence)
+
+
+def check_safety_state(readiness: Dict[str, Any]) -> List[Check]:
+    """The controls that bound ruin. Reported before anything noisier."""
+    checks: List[Check] = []
+    locked = readiness.get("live_submission_locked")
+    dry_run = (readiness.get("execution") or {}).get("dry_run")
+    mode = readiness.get("mode")
+
+    if locked is None or dry_run is None:
+        checks.append(Check("safety_live_lock", State.DATA_BLOCKED,
+                            "readiness does not report the live-capital lock",
+                            {"mode": mode}, escalate=True))
+    elif not locked and dry_run:
+        # Not an error, but worth stating plainly: the acknowledgement is
+        # present and only the dry-run flag is holding submission back.
+        checks.append(Check("safety_live_lock", State.WARN,
+                            "ALLOW_LIVE_TRADING is acknowledged; only dry_run blocks submission",
+                            {"mode": mode, "dry_run": dry_run}, escalate=True))
+    elif not locked and not dry_run:
+        checks.append(Check("safety_live_lock", State.WARN,
+                            "live submission is UNLOCKED and dry_run is off",
+                            {"mode": mode}, escalate=True))
+    else:
+        checks.append(Check("safety_live_lock", State.OK,
+                            "live submission locked", {"mode": mode}))
+
+    portfolio = readiness.get("portfolio") or {}
+    if "kill_switch_active" not in portfolio:
+        checks.append(Check("safety_kill_switch", State.DATA_BLOCKED,
+                            "portfolio state does not report the kill switch"))
+    elif portfolio.get("kill_switch_active"):
+        checks.append(Check(
+            "safety_kill_switch", State.CRITICAL,
+            "daily-loss or giveback kill switch is active; the book is halted",
+            {"daily_pnl": portfolio.get("daily_pnl"),
+             "max_daily_loss": portfolio.get("max_daily_loss"),
+             "daily_giveback_floor": portfolio.get("daily_giveback_floor"),
+             "daily_peak_pnl": portfolio.get("daily_peak_pnl")},
+            escalate=True))
+    else:
+        checks.append(Check("safety_kill_switch", State.OK, "kill switch not active",
+                            {"daily_pnl": portfolio.get("daily_pnl")}))
+    return checks
+
+
+def check_feeds(readiness: Dict[str, Any], thresholds: HealthThresholds) -> List[Check]:
+    """Streams and their freshness. A silent feed is the most expensive outage."""
+    checks: List[Check] = []
+    yellowstone = readiness.get("yellowstone") or {}
+    status = str(yellowstone.get("status", "UNKNOWN"))
+    if status == "STREAMING":
+        checks.append(Check("feed_yellowstone", State.OK, "streaming",
+                            {"status": status}))
+    elif status in {"NOT_STARTED", "UNKNOWN"}:
+        checks.append(Check("feed_yellowstone", State.DATA_BLOCKED,
+                            f"yellowstone status is {status}", {"status": status}))
+    else:
+        checks.append(Check("feed_yellowstone", State.CRITICAL,
+                            f"yellowstone is not streaming: {status}",
+                            {"status": status, "detail": yellowstone.get("detail")},
+                            escalate=True))
+
+    program_stream = readiness.get("rpc_program_stream")
+    if program_stream is None:
+        checks.append(Check("feed_rpc_program_stream", State.DATA_BLOCKED,
+                            "no RPC program stream configured"))
+    else:
+        stream_status = str(program_stream.get("status", "UNKNOWN"))
+        checks.append(Check(
+            "feed_rpc_program_stream",
+            State.OK if stream_status in {"STREAMING", "OK"} else State.WARN,
+            f"rpc program stream {stream_status}", {"status": stream_status}))
+    return checks
+
+
+def check_data_freshness(readiness: Dict[str, Any], now: float,
+                         thresholds: HealthThresholds) -> Check:
+    """Are market observations still arriving into the research lake?"""
+    dataset = readiness.get("dataset") or {}
+    observed_at = dataset.get("market_observed_at")
+    if not observed_at:
+        return Check("data_market_observations", State.DATA_BLOCKED,
+                     "dataset reports no market observation timestamp",
+                     {"active_episodes": dataset.get("active_episodes")})
+    age = now - float(observed_at)
+    evidence = {"age_seconds": round(age, 1),
+                "active_episodes": dataset.get("active_episodes"),
+                "completed_episodes": dataset.get("completed_episodes"),
+                "indexed_outcomes": dataset.get("indexed_outcomes"),
+                "sources": dataset.get("market_sources")}
+    if age > thresholds.market_observation_stale_seconds:
+        return Check("data_market_observations", State.CRITICAL,
+                     f"no market observation recorded for {age / 60:.0f} minutes; "
+                     "the moat is not growing",
+                     evidence, escalate=True)
+    return Check("data_market_observations", State.OK,
+                 f"last market observation {age:.0f}s ago", evidence)
+
+
+def check_models(readiness: Dict[str, Any], model_dir: Path, now: float,
+                 thresholds: HealthThresholds) -> List[Check]:
+    """Model presence, training recency and artifact integrity.
+
+    A model file that changed without a training run is the finding this
+    exists to catch: it means an artifact was replaced by something other
+    than the promotion path.
+    """
+    checks: List[Check] = []
+    prediction = readiness.get("prediction")
+    checks.append(Check(
+        "model_prediction", State.OK if prediction == "OK" else State.DATA_BLOCKED,
+        f"prediction model {prediction}", {"status": prediction}))
+
+    hazard = readiness.get("rug_hazard") or {}
+    checks.append(Check(
+        "model_rug_hazard",
+        State.OK if hazard.get("model_trained") else State.DATA_BLOCKED,
+        f"rug hazard {hazard.get('model_status', 'UNKNOWN')}",
+        {"status": hazard.get("model_status"),
+         "detail": hazard.get("model_status_detail"),
+         "tracked_tokens": hazard.get("tracked_tokens"),
+         "data_blocked_tokens": hazard.get("data_blocked_tokens")}))
+
+    exit_policy = readiness.get("exit_policy") or {}
+    checks.append(Check(
+        "model_exit_policy",
+        State.OK if exit_policy.get("status") == "OK" else State.DATA_BLOCKED,
+        f"exit policy {exit_policy.get('status', 'UNKNOWN')}",
+        {"detail": exit_policy.get("detail")}))
+
+    for label, filename in (("shadow", "last_training_report.json"),
+                            ("hazard", "last_hazard_training_report.json"),
+                            ("exit_policy", "last_exit_policy_report.json")):
+        path = model_dir / filename
+        report, error = _read_json(path)
+        if report is None:
+            checks.append(Check(f"training_{label}", State.DATA_BLOCKED,
+                                f"{filename} {error}", {"path": str(path)}))
+            continue
+        age = now - path.stat().st_mtime
+        state = State.OK
+        if age > thresholds.training_stale_seconds:
+            state = State.WARN
+        checks.append(Check(
+            f"training_{label}", state,
+            f"last {label} training {age / 3600:.1f}h ago, status "
+            f"{report.get('status', 'UNKNOWN')}",
+            {"age_seconds": round(age, 1), "status": report.get("status"),
+             "detail": report.get("detail") or report.get("reason")}))
+    return checks
+
+
+def check_resources(root: Path, thresholds: HealthThresholds) -> List[Check]:
+    """Disk and memory. Measured, and DATA_BLOCKED where the platform hides them."""
+    checks: List[Check] = []
+    try:
+        usage = shutil.disk_usage(root)
+        used_pct = usage.used / usage.total * 100.0
+        state = State.OK
+        if used_pct >= thresholds.disk_critical_pct:
+            state = State.CRITICAL
+        elif used_pct >= thresholds.disk_warn_pct:
+            state = State.WARN
+        checks.append(Check("resource_disk", state, f"disk {used_pct:.1f}% used",
+                            {"used_pct": round(used_pct, 1),
+                             "free_gb": round(usage.free / 1024 ** 3, 2)},
+                            escalate=state is State.CRITICAL))
+    except OSError as exc:
+        checks.append(Check("resource_disk", State.DATA_BLOCKED, f"disk unreadable: {exc}"))
+
+    meminfo = Path("/proc/meminfo")
+    if not meminfo.exists():
+        checks.append(Check("resource_memory", State.DATA_BLOCKED,
+                            "/proc/meminfo not present on this platform"))
+        return checks
+    try:
+        values = {}
+        for line in meminfo.read_text().splitlines():
+            key, _, rest = line.partition(":")
+            values[key.strip()] = float(rest.strip().split()[0])
+        total = values.get("MemTotal", 0.0)
+        available = values.get("MemAvailable", 0.0)
+        if total <= 0:
+            raise ValueError("MemTotal missing")
+        used_pct = (1.0 - available / total) * 100.0
+        state = State.OK
+        if used_pct >= thresholds.memory_critical_pct:
+            state = State.CRITICAL
+        elif used_pct >= thresholds.memory_warn_pct:
+            state = State.WARN
+        checks.append(Check("resource_memory", state, f"memory {used_pct:.1f}% used",
+                            {"used_pct": round(used_pct, 1),
+                             "available_mb": round(available / 1024, 1),
+                             "total_mb": round(total / 1024, 1)},
+                            escalate=state is State.CRITICAL))
+    except (OSError, ValueError, IndexError) as exc:
+        checks.append(Check("resource_memory", State.DATA_BLOCKED,
+                            f"memory unreadable: {exc}"))
+    return checks
+
+
+def check_execution(execution_log: Path, now: float, window_seconds: float,
+                    thresholds: HealthThresholds) -> Check:
+    """Recent fill quality, from the desk's own execution attempts.
+
+    A failure rate is only a verdict above a minimum attempt count. Three
+    failures out of four is not a 75% failure rate, it is four observations,
+    and acting on it retires a working route on noise.
+    """
+    if not execution_log.exists():
+        return Check("execution_failure_rate", State.DATA_BLOCKED,
+                     f"no execution log at {execution_log}")
+    attempts: List[Dict[str, Any]] = []
+    try:
+        with execution_log.open() as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if now - float(row.get("timestamp", 0) or 0) <= window_seconds:
+                    attempts.append(row)
+    except OSError as exc:
+        return Check("execution_failure_rate", State.DATA_BLOCKED,
+                     f"execution log unreadable: {exc}")
+
+    if len(attempts) < thresholds.min_execution_attempts_for_verdict:
+        return Check("execution_failure_rate", State.DATA_BLOCKED,
+                     f"{len(attempts)} attempts in window, below the "
+                     f"{thresholds.min_execution_attempts_for_verdict} needed for a verdict",
+                     {"attempts": len(attempts)})
+    failures = sum(1 for row in attempts if not row.get("success"))
+    rate = failures / len(attempts)
+    reasons: Dict[str, int] = {}
+    for row in attempts:
+        if not row.get("success"):
+            key = str(row.get("error") or row.get("status") or "unknown")
+            reasons[key] = reasons.get(key, 0) + 1
+    state = State.CRITICAL if rate > thresholds.max_execution_failure_rate else State.OK
+    return Check("execution_failure_rate", state,
+                 f"{rate:.1%} of {len(attempts)} recent attempts failed",
+                 {"attempts": len(attempts), "failures": failures,
+                  "rate": round(rate, 4),
+                  "top_reasons": dict(sorted(reasons.items(),
+                                             key=lambda item: item[1], reverse=True)[:5])},
+                 escalate=state is State.CRITICAL)
+
+
+def check_sources(readiness: Dict[str, Any]) -> List[Check]:
+    """Social and research source health, as the collectors themselves report it."""
+    checks: List[Check] = []
+    social = readiness.get("social") or {}
+    statuses = social.get("data_status") or {}
+    blocked = {name: status for name, status in statuses.items()
+               if not str(status).startswith("OK")}
+    if not statuses:
+        checks.append(Check("source_social", State.DATA_BLOCKED,
+                            "no social collector reported a status"))
+    elif blocked:
+        checks.append(Check("source_social", State.WARN,
+                            f"{len(blocked)} of {len(statuses)} social sources degraded",
+                            {"degraded": blocked}))
+    else:
+        checks.append(Check("source_social", State.OK,
+                            f"all {len(statuses)} social sources OK",
+                            {"tracked_accounts": social.get("tracked_accounts"),
+                             "total_mentions": social.get("total_mentions")}))
+
+    research = readiness.get("research") or {}
+    checks.append(Check(
+        "source_research", State.OK if research else State.DATA_BLOCKED,
+        "research miner reporting" if research else "research miner reported nothing",
+        {k: v for k, v in list(research.items())[:8]}))
+    return checks
+
+
+def check_champions(readiness: Dict[str, Any]) -> Check:
+    """Promotion state. Champions decaying without replacement is a slow failure."""
+    champions = readiness.get("champions") or {}
+    if not champions:
+        return Check("promotion_pipeline", State.DATA_BLOCKED,
+                     "champion framework reported nothing")
+    live = int(champions.get("live_champions", 0) or 0)
+    decaying = int(champions.get("decaying_champions", 0) or 0)
+    hibernated = int(champions.get("hibernated_champions", 0) or 0)
+    shadow = int(champions.get("shadow_models", 0) or 0)
+    evidence = {"live": live, "decaying": decaying, "hibernated": hibernated,
+                "shadow": shadow, "canary": champions.get("canary_models"),
+                "total_hypotheses": champions.get("total_hypotheses")}
+    if decaying and not shadow:
+        return Check("promotion_pipeline", State.WARN,
+                     f"{decaying} champions decaying with no shadow candidates behind them",
+                     evidence)
+    return Check("promotion_pipeline", State.OK,
+                 f"{live} live, {shadow} shadow, {decaying} decaying", evidence)
+
+
+@dataclass
+class HealthReport:
+    generated_at: float
+    checks: List[Check]
+
+    @property
+    def worst(self) -> State:
+        return max((check.state for check in self.checks), key=lambda s: s.rank,
+                   default=State.DATA_BLOCKED)
+
+    @property
+    def escalations(self) -> List[Check]:
+        return [check for check in self.checks if check.escalate]
+
+    def by_state(self, state: State) -> List[Check]:
+        return [check for check in self.checks if check.state is state]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": HEALTH_SCHEMA_VERSION,
+            "generated_at": self.generated_at,
+            "worst_state": self.worst.value,
+            "counts": {state.value: len(self.by_state(state)) for state in State},
+            "escalations": [check.name for check in self.escalations],
+            "checks": [
+                {"name": check.name, "state": check.state.value, "detail": check.detail,
+                 "evidence": check.evidence, "escalate": check.escalate}
+                for check in self.checks
+            ],
+        }
+
+
+def run_health_checks(
+    readiness_path: Path,
+    model_dir: Path,
+    execution_log: Path,
+    root: Path,
+    now: Optional[float] = None,
+    thresholds: Optional[HealthThresholds] = None,
+    execution_window_seconds: float = 3_600.0,
+) -> HealthReport:
+    """Every check, in the order of what it protects."""
+    now = time.time() if now is None else now
+    thresholds = thresholds or HealthThresholds()
+    checks: List[Check] = []
+
+    freshness = check_readiness_freshness(readiness_path, now, thresholds)
+    checks.append(freshness)
+
+    readiness: Dict[str, Any] = {}
+    if freshness.state is State.OK:
+        loaded, error = _read_json(readiness_path)
+        if loaded is None:
+            checks.append(Check("readiness_parse", State.CRITICAL,
+                                f"readiness snapshot {error}", escalate=True))
+        else:
+            readiness = loaded
+
+    if readiness:
+        checks.extend(check_safety_state(readiness))
+        checks.extend(check_feeds(readiness, thresholds))
+        checks.append(check_data_freshness(readiness, now, thresholds))
+        checks.extend(check_models(readiness, model_dir, now, thresholds))
+        checks.extend(check_sources(readiness))
+        checks.append(check_champions(readiness))
+    else:
+        # Everything that reads the snapshot degrades together, and says so.
+        # Reporting these as OK would manufacture confidence exactly where
+        # visibility was lost.
+        for name in ("safety_live_lock", "safety_kill_switch", "feed_yellowstone",
+                     "data_market_observations", "model_prediction", "promotion_pipeline"):
+            checks.append(Check(name, State.DATA_BLOCKED,
+                                "no usable readiness snapshot to check against"))
+
+    checks.extend(check_resources(root, thresholds))
+    checks.append(check_execution(execution_log, now, execution_window_seconds, thresholds))
+    return HealthReport(generated_at=now, checks=checks)
