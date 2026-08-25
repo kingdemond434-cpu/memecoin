@@ -19,7 +19,15 @@ class PredictionTarget(Enum):
     P_2X = "p_2x"
     P_5X = "p_5x"
     P_10X = "p_10x"
+    P_20X = "p_20x"
     P_50X = "p_50x"
+    # The survival curve used to end at 50x, which meant a 500x and an
+    # ordinary 50x were the same number to every consumer -- the sizing, the
+    # monster machine, the allocator. They are not the same event, and the
+    # book is carried by the difference.
+    P_100X = "p_100x"
+    P_250X = "p_250x"
+    P_500X = "p_500x"
     P_MIGRATION = "p_migration"
     P_RUG_30S = "p_rug_30s"
     P_RUG_5M = "p_rug_5m"
@@ -28,8 +36,21 @@ class PredictionTarget(Enum):
     EXPECTED_FEASIBLE_MULTIPLE = "expected_feasible_multiple"
 
 
-CLASSIFICATION_TARGETS = {
-    PredictionTarget.P_2X, PredictionTarget.P_5X, PredictionTarget.P_10X, PredictionTarget.P_50X,
+# The cumulative survival levels, in order. Everything that walks the curve --
+# monotonicity, the disjoint bins, the labels -- reads this one tuple, so a new
+# rung cannot be added to one and forgotten by the others.
+SURVIVAL_LEVELS: Tuple[Tuple[PredictionTarget, float], ...] = (
+    (PredictionTarget.P_2X, 2.0),
+    (PredictionTarget.P_5X, 5.0),
+    (PredictionTarget.P_10X, 10.0),
+    (PredictionTarget.P_20X, 20.0),
+    (PredictionTarget.P_50X, 50.0),
+    (PredictionTarget.P_100X, 100.0),
+    (PredictionTarget.P_250X, 250.0),
+    (PredictionTarget.P_500X, 500.0),
+)
+
+CLASSIFICATION_TARGETS = {target for target, _ in SURVIVAL_LEVELS} | {
     PredictionTarget.P_MIGRATION, PredictionTarget.P_RUG_30S, PredictionTarget.P_RUG_5M,
 }
 
@@ -155,7 +176,11 @@ class MultiHeadPrediction:
     p_2x: float = 0
     p_5x: float = 0
     p_10x: float = 0
+    p_20x: float = 0
     p_50x: float = 0
+    p_100x: float = 0
+    p_250x: float = 0
+    p_500x: float = 0
     p_migration: float = 0
     p_rug_30s: float = 0
     p_rug_5m: float = 0
@@ -418,11 +443,19 @@ class MultiHeadPredictor:
 
     @staticmethod
     def _enforce_nested_monotonicity(prediction: MultiHeadPrediction):
-        levels = np.clip(
-            [prediction.p_2x, prediction.p_5x, prediction.p_10x, prediction.p_50x], 0, 1
-        )
+        """P(>=x) cannot rise as x rises. Heads are trained independently, so it can.
+
+        An untrained tail head reads zero, which the accumulate below turns
+        into "nothing above that rung", and the bins collapse the excess back
+        into the last rung the model can actually see. That is the correct
+        degradation: a model with no evidence about 500x must not be given a
+        500x number, and must not have its 50x conviction deleted either.
+        """
+        names = [target.value for target, _ in SURVIVAL_LEVELS]
+        levels = np.clip([getattr(prediction, name) for name in names], 0, 1)
         levels = np.minimum.accumulate(levels)
-        prediction.p_2x, prediction.p_5x, prediction.p_10x, prediction.p_50x = map(float, levels)
+        for name, value in zip(names, levels):
+            setattr(prediction, name, float(value))
 
     def get_feature_importance(self, target: PredictionTarget) -> Dict[str, float]:
         model = self.models.get(target)
@@ -644,22 +677,34 @@ class ElogwEngine:
 
     @staticmethod
     def probability_bins(prediction: MultiHeadPrediction) -> List[Tuple[str, float, float]]:
-        """Convert cumulative P(2x/5x/10x/50x) into disjoint outcomes.
+        """Convert the cumulative survival curve into disjoint outcomes.
 
-        Returns ``(name, probability, gross return)``. Tail buckets use their
+        Returns ``(name, probability, gross return)``. Every bucket uses its
         conservative lower bound rather than an optimistic midpoint.
+
+        When the tail heads are untrained they read zero, monotonicity pushes
+        every rung above them to zero too, and the mass collapses into the
+        highest rung the model can actually see -- which is exactly the old
+        behaviour, at the old conservative bound. Extending the curve cannot
+        manufacture tail conviction that was never trained.
         """
         MultiHeadPredictor._enforce_nested_monotonicity(prediction)
-        p2, p5, p10, p50 = prediction.p_2x, prediction.p_5x, prediction.p_10x, prediction.p_50x
-        survival = [
-            ("under_2x", max(0.0, 1.0 - p2), -0.35),
-            ("2x_to_5x", max(0.0, p2 - p5), 1.0),
-            ("5x_to_10x", max(0.0, p5 - p10), 4.0),
-            ("10x_to_50x", max(0.0, p10 - p50), 9.0),
-            ("50x_plus", max(0.0, p50), 49.0),
-        ]
+        levels = [(getattr(prediction, target.value), multiple)
+                  for target, multiple in SURVIVAL_LEVELS]
+        # Each bucket pays its own LOWER bound, never a midpoint. A 10x-to-20x
+        # bucket paying 14x would be inventing the shape of the distribution
+        # inside a bucket the model was never asked about; paying 9x cannot be
+        # an overstatement of what the bucket contains.
+        survival = [("under_2x", max(0.0, 1.0 - levels[0][0]), -0.35)]
+        for index, (probability, multiple) in enumerate(levels):
+            higher = levels[index + 1][0] if index + 1 < len(levels) else 0.0
+            upper = levels[index + 1][1] if index + 1 < len(levels) else None
+            name = (f"{multiple:g}x_to_{upper:g}x" if upper is not None
+                    else f"{multiple:g}x_plus")
+            survival.append((name, max(0.0, probability - higher), multiple - 1.0))
         if prediction.expected_feasible_multiple > 0:
-            feasible_return = float(np.clip(prediction.expected_feasible_multiple - 1, -0.98, 49))
+            feasible_return = float(np.clip(prediction.expected_feasible_multiple - 1,
+                                            -0.98, SURVIVAL_LEVELS[-1][1] - 1.0))
             survival = [
                 (name, probability, min(outcome, feasible_return) if outcome > 0 else outcome)
                 for name, probability, outcome in survival

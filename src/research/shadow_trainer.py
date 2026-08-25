@@ -12,11 +12,15 @@ import numpy as np
 
 from src.research.feature_engine import FEATURE_SCHEMA_VERSION, build_features
 from src.strategies.multihead_predictor import (
-    ElogwEngine, MultiHeadPredictor, PredictionFeatures, PredictionTarget,
+    SURVIVAL_LEVELS, ElogwEngine, MultiHeadPredictor, PredictionFeatures, PredictionTarget,
 )
 
 
-SNAPSHOT_ORDER = ("t10s", "t30s", "t1m")
+# The rows a shadow model trains on, earliest first. The sub-second rungs come
+# first because they are the ones a sniper actually decides at: a model trained
+# only from ten seconds out has never seen the state it will be asked about.
+SNAPSHOT_ORDER = ("t50ms", "t100ms", "t250ms", "t500ms", "t1s", "t3s", "t5s",
+                  "t10s", "t30s", "t1m")
 
 
 def _number(mapping: Dict[str, Any], key: str, default: float = 0.0) -> float:
@@ -40,10 +44,10 @@ def snapshot_labels(
     rugged = bool(outcome.get("rugged")) and rug_time is not None and rug_time >= 0
     slippage = _number(snapshot.get("liquidity_features") or {}, "price_impact_pct")
     result = {
-        PredictionTarget.P_2X: float(bool(labels.get("label_2x"))),
-        PredictionTarget.P_5X: float(bool(labels.get("label_5x"))),
-        PredictionTarget.P_10X: float(bool(labels.get("label_10x"))),
-        PredictionTarget.P_50X: float(bool(labels.get("label_50x"))),
+        # Every survival rung, read from one table so a rung added to the
+        # curve cannot be silently left untrained here.
+        **{target: float(bool(labels.get(f"label_{multiple:g}x")))
+           for target, multiple in SURVIVAL_LEVELS},
         PredictionTarget.P_MIGRATION: float(bool(outcome.get("migrated"))),
         PredictionTarget.P_RUG_30S: float(rugged and rug_time is not None and float(rug_time) <= 30),
         PredictionTarget.P_RUG_5M: float(rugged and rug_time is not None and float(rug_time) <= 300),
@@ -52,7 +56,11 @@ def snapshot_labels(
     }
     feasible = labels.get("feasible_exit_multiple")
     if isinstance(feasible, (int, float)) and np.isfinite(feasible) and feasible > 0:
-        result[PredictionTarget.EXPECTED_FEASIBLE_MULTIPLE] = float(np.clip(feasible, 0.02, 50))
+        # Clipped at 50 this target told every consumer that the best
+        # obtainable exit was 50x, which capped the one outcome the whole book
+        # depends on. The bound is now the top of the survival curve.
+        result[PredictionTarget.EXPECTED_FEASIBLE_MULTIPLE] = float(
+            np.clip(feasible, 0.02, SURVIVAL_LEVELS[-1][1]))
     return result
 
 

@@ -39,7 +39,10 @@ from src.execution.jupiter_jito import (
 )
 from src.main import CAPACITY_REJECTIONS, WSOL_MINT, MemecoinQuantDesk, _jsonable
 from src.strategies.information_graph import CounterfactualExecutionLab
-from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPrediction, MultiHeadPredictor, PredictionFeatures
+from src.strategies.multihead_predictor import (
+    SURVIVAL_LEVELS, ElogwEngine, MultiHeadPrediction, MultiHeadPredictor,
+    PredictionFeatures,
+)
 from src.collectors.registry import (
     ADAPTER_KINDS, SourceDeclaration, SourceDiscovery, build_sources,
     load_declarations,
@@ -103,8 +106,13 @@ from src.strategies.genealogy_graph import WalletProfile
 from src.strategies.wallet_intelligence import (
     WalletIntelligenceEngine, WalletRegime, WalletScore,
 )
-from src.research.dataset_builder import LaunchEpisode, PointInTimeDatasetBuilder, SnapshotTimepoint
-from src.research.shadow_trainer import chronological_episode_split, train_shadow
+from src.research.dataset_builder import (
+    SNAPSHOT_OFFSETS_S, TAIL_THRESHOLDS, LaunchEpisode, LaunchSnapshot,
+    PointInTimeDatasetBuilder, SnapshotTimepoint,
+)
+from src.research.shadow_trainer import (
+    SNAPSHOT_ORDER, chronological_episode_split, train_shadow,
+)
 from src.chains.pump_curve import (
     BONDING_CURVE_DISCRIMINATOR, observation_from_state, parse_bonding_curve,
     quote_buy, quote_sell, sell_capacity_lamports,
@@ -687,15 +695,44 @@ class TestNativeMintChecks(unittest.TestCase):
 class TestProbabilityAndAccounting(unittest.TestCase):
     def test_nested_probabilities_become_disjoint_distribution_with_p50(self):
         prediction = MultiHeadPrediction("mint", "solana", 0, p_2x=0.4, p_5x=0.7,
-                                         p_10x=0.2, p_50x=0.05, p_rug_5m=0.1,
-                                         expected_feasible_multiple=3.0)
+                                         p_10x=0.2, p_20x=0.1, p_50x=0.05,
+                                         p_rug_5m=0.1, expected_feasible_multiple=3.0)
         bins = ElogwEngine.probability_bins(prediction)
         self.assertAlmostEqual(sum(probability for _, probability, _ in bins), 1.0)
         self.assertLessEqual(prediction.p_5x, prediction.p_2x)
         self.assertLessEqual(prediction.p_10x, prediction.p_5x)
-        self.assertLessEqual(prediction.p_50x, prediction.p_10x)
-        self.assertAlmostEqual(dict((name, probability) for name, probability, _ in bins)["50x_plus"], 0.045)
+        self.assertLessEqual(prediction.p_50x, prediction.p_20x)
+        by_name = {name: probability for name, probability, _ in bins}
+        # p_100x is untrained, so everything at or above 50x sits in one
+        # bucket rather than being spread across a tail nobody measured.
+        self.assertAlmostEqual(by_name["50x_to_100x"], 0.045)
+        self.assertAlmostEqual(by_name["100x_to_250x"], 0.0)
         self.assertLessEqual(max(outcome for _, _, outcome in bins), 2.0)
+
+    def test_the_tail_no_longer_stops_at_fifty(self):
+        """A 500x priced as a 50x is the single most expensive rounding here."""
+        prediction = MultiHeadPrediction(
+            "mint", "solana", 0, p_2x=0.5, p_5x=0.3, p_10x=0.2, p_20x=0.12,
+            p_50x=0.06, p_100x=0.03, p_250x=0.01, p_500x=0.004)
+        bins = ElogwEngine.probability_bins(prediction)
+        by_name = {name: (probability, outcome) for name, probability, outcome in bins}
+        self.assertIn("500x_plus", by_name)
+        self.assertAlmostEqual(by_name["500x_plus"][0], 0.004)
+        # Each bucket pays its LOWER bound, never a midpoint.
+        self.assertAlmostEqual(by_name["500x_plus"][1], 499.0)
+        self.assertAlmostEqual(by_name["100x_to_250x"][1], 99.0)
+        self.assertAlmostEqual(sum(probability for _, probability, _ in bins), 1.0)
+
+    def test_untrained_tail_heads_collapse_rather_than_invent_conviction(self):
+        """Extending the curve must not manufacture a tail nobody measured."""
+        trained = MultiHeadPrediction("mint", "solana", 0, p_2x=0.5, p_5x=0.3,
+                                      p_10x=0.2, p_20x=0.1)
+        bins = ElogwEngine.probability_bins(trained)
+        by_name = {name: probability for name, probability, _ in bins}
+        self.assertAlmostEqual(by_name["10x_to_20x"], 0.1)
+        self.assertAlmostEqual(by_name["20x_to_50x"], 0.1)
+        for empty in ("50x_to_100x", "100x_to_250x", "250x_to_500x", "500x_plus"):
+            self.assertAlmostEqual(by_name[empty], 0.0, msg=empty)
 
     def test_risk_constrained_elogw_and_partial_cost_basis(self):
         predictor = MultiHeadPredictor()
@@ -8348,3 +8385,136 @@ class TestIntelligenceCoverageHealthCheck(unittest.TestCase):
         checks = check_intelligence_coverage({})
         self.assertEqual(len(checks), 1)
         self.assertIs(checks[0].state, State.DATA_BLOCKED)
+
+
+class TestSubSecondPointInTime(unittest.IsolatedAsyncioTestCase):
+    """A dataset whose first post-launch row is at one second is not a sniper's.
+
+    Everything that decides a launch happens inside the first half-second: the
+    funding burst, the first twenty-five buyers, whether the deployer bought
+    his own mint. Asking "was it better to enter at 100ms than at 500ms" needs
+    rows at 100ms and 500ms, and until now the nearest evidence was a full
+    second later -- by which time the answer has already been decided.
+    """
+
+    def _builder(self):
+        builder = PointInTimeDatasetBuilder.__new__(PointInTimeDatasetBuilder)
+        builder.chain_config = SimpleNamespace(name="solana")
+        builder.active_episodes = {}
+        builder._snapshot_inflight = set()
+        builder.snapshot_times = dict(SNAPSHOT_OFFSETS_S)
+        builder._fast_interval = 0.01
+        builder._slow_interval = 1.0
+        builder._subsecond_horizon = 0.75
+
+        async def ok(episode, as_of):
+            return {"status": "OK", "as_of": as_of}
+
+        for name in ("deployer", "wallet", "flow", "liquidity", "social",
+                     "token", "market", "entity_graph"):
+            setattr(builder, f"_capture_{name}_features", ok)
+        return builder
+
+    def test_the_subsecond_rungs_exist_and_are_ordered(self):
+        offsets = [SNAPSHOT_OFFSETS_S[point] for point in (
+            SnapshotTimepoint.T0, SnapshotTimepoint.T50MS, SnapshotTimepoint.T100MS,
+            SnapshotTimepoint.T250MS, SnapshotTimepoint.T500MS, SnapshotTimepoint.T1S)]
+        self.assertEqual(offsets, [0, 0.05, 0.1, 0.25, 0.5, 1])
+        self.assertEqual(sorted(offsets), offsets)
+
+    async def test_the_cutoff_is_the_instant_the_row_claims_not_the_wall_clock(self):
+        """The leak that made every labelled horizon longer than its label.
+
+        `as_of` used to be `time.time()` at capture. With a loop that woke once
+        a second, a row labelled T1S routinely carried whatever had arrived by
+        1.4s -- and at 50ms that overshoot would be several times the horizon
+        itself, making every sub-second row a fiction.
+        """
+        builder = self._builder()
+        episode = LaunchEpisode(token="mint", chain="solana", created_at=1_000.0,
+                                deployer="dev", factory="", pair="", base_token="")
+        builder.active_episodes["mint"] = episode
+
+        await PointInTimeDatasetBuilder._capture_snapshot(
+            builder, "mint", SnapshotTimepoint.T100MS)
+
+        snapshot = episode.snapshots[SnapshotTimepoint.T100MS]
+        self.assertAlmostEqual(snapshot.timestamp, 1_000.1)
+        # Every feature group was asked for state as of that instant, not now.
+        for group in ("deployer_features", "flow_features", "market_features"):
+            self.assertAlmostEqual(getattr(snapshot, group)["as_of"], 1_000.1)
+
+    async def test_capture_lag_is_recorded_rather_than_hidden(self):
+        builder = self._builder()
+        episode = LaunchEpisode(token="mint", chain="solana", created_at=1_000.0,
+                                deployer="dev", factory="", pair="", base_token="")
+        builder.active_episodes["mint"] = episode
+        await PointInTimeDatasetBuilder._capture_snapshot(
+            builder, "mint", SnapshotTimepoint.T50MS)
+        snapshot = episode.snapshots[SnapshotTimepoint.T50MS]
+        # The row was materialised long after the instant it describes. That
+        # does not corrupt it -- the cutoff protects the contents -- but it is
+        # the number that says whether the loop is keeping up.
+        self.assertIsNotNone(snapshot.capture_lag_s)
+        self.assertGreater(snapshot.capture_lag_s, 0.0)
+
+    def test_the_loop_runs_hot_only_while_a_subsecond_target_is_pending(self):
+        builder = self._builder()
+        now = time.time()
+        builder.active_episodes["young"] = LaunchEpisode(
+            token="young", chain="solana", created_at=now, deployer="d",
+            factory="", pair="", base_token="")
+        self.assertEqual(
+            PointInTimeDatasetBuilder._loop_interval(builder), builder._fast_interval)
+
+        builder.active_episodes["young"].created_at = now - 5.0
+        self.assertEqual(
+            PointInTimeDatasetBuilder._loop_interval(builder), builder._slow_interval)
+
+    def test_a_one_second_sweep_could_never_have_taken_a_fifty_millisecond_row(self):
+        """Why the cadence had to change, stated as an assertion."""
+        builder = self._builder()
+        self.assertLess(builder._fast_interval,
+                        SNAPSHOT_OFFSETS_S[SnapshotTimepoint.T50MS])
+        self.assertGreater(builder._subsecond_horizon,
+                           SNAPSHOT_OFFSETS_S[SnapshotTimepoint.T500MS])
+
+    def test_the_shadow_trainer_reads_the_subsecond_rows(self):
+        for point in ("t50ms", "t100ms", "t250ms", "t500ms"):
+            self.assertIn(point, SNAPSHOT_ORDER)
+        # Earliest first, so a model is trained from the state it will be
+        # asked about rather than from ten seconds after the decision.
+        self.assertEqual(SNAPSHOT_ORDER[0], "t50ms")
+
+
+class TestExtendedTailLabels(unittest.TestCase):
+    def test_every_survival_rung_has_a_label(self):
+        for _, multiple in SURVIVAL_LEVELS:
+            self.assertIn(int(multiple), TAIL_THRESHOLDS)
+
+    def test_labels_are_written_for_the_whole_tail(self):
+        snapshot = LaunchSnapshot(token="mint", chain="solana",
+                                  snapshot_time=SnapshotTimepoint.T0, timestamp=0.0)
+        for threshold in TAIL_THRESHOLDS:
+            self.assertTrue(hasattr(snapshot, f"label_{threshold}x"),
+                            f"no label_{threshold}x field")
+
+    def test_a_freak_outcome_is_distinguishable_from_an_ordinary_good_one(self):
+        snapshot = LaunchSnapshot(token="mint", chain="solana",
+                                  snapshot_time=SnapshotTimepoint.T0, timestamp=0.0)
+        freak = LaunchSnapshot(token="other", chain="solana",
+                               snapshot_time=SnapshotTimepoint.T0, timestamp=0.0)
+        for threshold in TAIL_THRESHOLDS:
+            setattr(snapshot, f"label_{threshold}x", 60 >= threshold)
+            setattr(freak, f"label_{threshold}x", 600 >= threshold)
+        # Under the old label set both were simply "label_50x = True".
+        self.assertTrue(snapshot.label_50x)
+        self.assertTrue(freak.label_50x)
+        self.assertFalse(snapshot.label_500x)
+        self.assertTrue(freak.label_500x)
+
+    def test_the_feasible_multiple_target_is_no_longer_capped_at_fifty(self):
+        source = (Path(__file__).resolve().parents[1] / "src" / "research"
+                  / "shadow_trainer.py").read_text()
+        self.assertNotIn("np.clip(feasible, 0.02, 50)", source)
+        self.assertIn("SURVIVAL_LEVELS[-1][1]", source)

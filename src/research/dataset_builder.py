@@ -24,9 +24,38 @@ from src.strategies.champion_challenger import ChampionChallengerFramework
 logger = logging.getLogger(__name__)
 
 
+# Tail thresholds the dataset labels. Ordered, and used everywhere a label is
+# written or read so a new rung cannot be added in one place and forgotten in
+# the other three.
+TAIL_THRESHOLDS: Tuple[int, ...] = (2, 5, 10, 20, 50, 100, 250, 500)
+
+
+def _tail_label(threshold: int) -> str:
+    return f"label_{threshold}x"
+
+
+# Seconds after launch each row describes. Defined at module level so a
+# fixture and the builder cannot disagree about what "T100MS" means.
+SNAPSHOT_OFFSETS_S: Dict["SnapshotTimepoint", float] = {}
+
+
 class SnapshotTimepoint(Enum):
+    """When a point-in-time row is taken.
+
+    The sub-second rungs are what make this a sniper's dataset rather than a
+    trader's. Everything that decides a launch -- the first buyers, the funding
+    burst, whether the deployer bought his own mint -- happens inside the first
+    half-second, and a dataset whose first post-launch row is at one second
+    cannot answer the only question that matters at T0: was it better to enter
+    at 100ms than at 500ms, and what did the extra 400ms of evidence buy.
+    """
+
     PRELAUNCH = "prelaunch"
     T0 = "t0"
+    T50MS = "t50ms"
+    T100MS = "t100ms"
+    T250MS = "t250ms"
+    T500MS = "t500ms"
     T1S = "t1s"
     T3S = "t3s"
     T5S = "t5s"
@@ -37,6 +66,26 @@ class SnapshotTimepoint(Enum):
     T5M = "t5m"
     T15M = "t15m"
     T1H = "t1h"
+
+
+SNAPSHOT_OFFSETS_S.update({
+    SnapshotTimepoint.PRELAUNCH: -1,
+    SnapshotTimepoint.T0: 0,
+    SnapshotTimepoint.T50MS: 0.05,
+    SnapshotTimepoint.T100MS: 0.1,
+    SnapshotTimepoint.T250MS: 0.25,
+    SnapshotTimepoint.T500MS: 0.5,
+    SnapshotTimepoint.T1S: 1,
+    SnapshotTimepoint.T3S: 3,
+    SnapshotTimepoint.T5S: 5,
+    SnapshotTimepoint.T10S: 10,
+    SnapshotTimepoint.T30S: 30,
+    SnapshotTimepoint.T1M: 60,
+    SnapshotTimepoint.T3M: 180,
+    SnapshotTimepoint.T5M: 300,
+    SnapshotTimepoint.T15M: 900,
+    SnapshotTimepoint.T1H: 3600,
+})
 
 
 @dataclass
@@ -55,10 +104,24 @@ class LaunchSnapshot:
     market_features: Dict[str, Any] = field(default_factory=dict)
     entity_graph_features: Dict[str, Any] = field(default_factory=dict)
     
+    # How late this row was materialised against the instant it describes.
+    # The cutoff protects the row's contents; this says whether the loop is
+    # keeping up, which is what decides whether the sub-second rungs are real.
+    capture_lag_s: Optional[float] = None
+
     label_2x: Optional[bool] = None
     label_5x: Optional[bool] = None
     label_10x: Optional[bool] = None
+    label_20x: Optional[bool] = None
     label_50x: Optional[bool] = None
+    # The tail used to stop at 50x, which made a freak 500x numerically
+    # indistinguishable from an ordinary good outcome -- and the whole book is
+    # carried by the freaks. A 500x is not a bigger 50x; it is a different
+    # event with a different cause, and a label set that cannot see the
+    # difference trains a model that cannot either.
+    label_100x: Optional[bool] = None
+    label_250x: Optional[bool] = None
+    label_500x: Optional[bool] = None
     label_migration: Optional[bool] = None
     label_rug: Optional[bool] = None
     label_rug_time: Optional[float] = None
@@ -117,20 +180,13 @@ class PointInTimeDatasetBuilder:
         self.completed_episodes: Dict[str, LaunchEpisode] = {}
         self.outcome_index: Dict[str, Dict[str, Any]] = {}
         
-        self.snapshot_times = {
-            SnapshotTimepoint.PRELAUNCH: -1,
-            SnapshotTimepoint.T0: 0,
-            SnapshotTimepoint.T1S: 1,
-            SnapshotTimepoint.T3S: 3,
-            SnapshotTimepoint.T5S: 5,
-            SnapshotTimepoint.T10S: 10,
-            SnapshotTimepoint.T30S: 30,
-            SnapshotTimepoint.T1M: 60,
-            SnapshotTimepoint.T3M: 180,
-            SnapshotTimepoint.T5M: 300,
-            SnapshotTimepoint.T15M: 900,
-            SnapshotTimepoint.T1H: 3600,
-        }
+        # The sweep runs at the fast cadence only while a sub-second target is
+        # still pending for some episode. The horizon carries a margin so a
+        # sweep that lands just before the last sub-second rung still catches it.
+        self._fast_interval = 0.01
+        self._slow_interval = 1.0
+        self._subsecond_horizon = 0.75
+        self.snapshot_times = dict(SNAPSHOT_OFFSETS_S)
         
         self._running = False
         self._snapshot_task: Optional[asyncio.Task] = None
@@ -212,6 +268,22 @@ class PointInTimeDatasetBuilder:
             market_features={"status": episode.prelaunch_status},
         )
 
+    def _loop_interval(self) -> float:
+        """How long to sleep before the next snapshot sweep.
+
+        A fixed one-second sleep is fine for the rungs from 1s out and makes
+        the sub-second rungs unreachable: a 50ms row taken by a loop that
+        wakes once a second is not a 50ms row. So the sweep runs hot only
+        while an episode is young enough for a sub-second target to still be
+        pending, and drops back to the cheap cadence the moment none is --
+        which, for a launch, is after half a second.
+        """
+        now = time.time()
+        for episode in self.active_episodes.values():
+            if now - episode.created_at <= self._subsecond_horizon:
+                return self._fast_interval
+        return self._slow_interval
+
     async def _snapshot_loop(self):
         while self._running:
             try:
@@ -240,7 +312,7 @@ class PointInTimeDatasetBuilder:
                         await self._finalize_episode(token)
             except Exception as e:
                 logger.error(f"Snapshot loop error: {e}")
-            await asyncio.sleep(1)
+            await asyncio.sleep(self._loop_interval())
 
     async def _capture_snapshot(self, token: str, snapshot_time: SnapshotTimepoint):
         if token not in self.active_episodes:
@@ -252,13 +324,27 @@ class PointInTimeDatasetBuilder:
         
         key = (token, snapshot_time)
         try:
-            as_of = time.time()
+            # The cutoff is the instant this row CLAIMS to describe, not the
+            # instant the capture happened to run. Using the wall clock let a
+            # row labelled T1S carry whatever had arrived by 1.4s, because the
+            # loop only woke once a second -- a leak that grows as a share of
+            # the horizon the shorter the horizon gets, and at 50ms would have
+            # made every sub-second row a fiction. Each feature group already
+            # takes as_of as a cutoff; it just had to be told the right one.
+            target = float(getattr(self, "snapshot_times", SNAPSHOT_OFFSETS_S)[snapshot_time])
+            as_of = episode.created_at + target
+            captured_at = time.time()
             snapshot = LaunchSnapshot(
                 token=token,
                 chain=self.chain_config.name,
                 snapshot_time=snapshot_time,
                 timestamp=as_of,
             )
+            # How late the row was materialised. Recorded rather than hidden:
+            # a large lag does not corrupt the row -- the cutoff protects it --
+            # but it does say the loop is not keeping up, and a sub-second
+            # dataset built by a loop that wakes every second is not one.
+            snapshot.capture_lag_s = max(0.0, captured_at - as_of)
             
             # Each group is isolated. A single failing capture used to abandon
             # the whole snapshot, so one wrong attribute in one feature cost a
@@ -580,10 +666,9 @@ class PointInTimeDatasetBuilder:
             labels = episode.final_outcome
             if labels.get("status") == "DATA_BLOCKED":
                 continue
-            snapshot.label_2x = labels.get("max_multiple", 0) >= 2
-            snapshot.label_5x = labels.get("max_multiple", 0) >= 5
-            snapshot.label_10x = labels.get("max_multiple", 0) >= 10
-            snapshot.label_50x = labels.get("max_multiple", 0) >= 50
+            peak = labels.get("max_multiple", 0)
+            for threshold in TAIL_THRESHOLDS:
+                setattr(snapshot, _tail_label(threshold), peak >= threshold)
             snapshot.label_migration = labels.get("migrated", False)
             snapshot.label_rug = labels.get("rugged", False)
             snapshot.label_rug_time = labels.get("rug_time")
@@ -811,6 +896,7 @@ class PointInTimeDatasetBuilder:
                     "chain": s.chain,
                     "snapshot_time": s.snapshot_time.value,
                     "timestamp": s.timestamp,
+                    "capture_lag_s": s.capture_lag_s,
                     "deployer_features": s.deployer_features,
                     "wallet_features": s.wallet_features,
                     "flow_features": s.flow_features,
@@ -820,10 +906,8 @@ class PointInTimeDatasetBuilder:
                     "market_features": s.market_features,
                     "entity_graph_features": s.entity_graph_features,
                     "labels": {
-                        "label_2x": s.label_2x,
-                        "label_5x": s.label_5x,
-                        "label_10x": s.label_10x,
-                        "label_50x": s.label_50x,
+                        **{_tail_label(threshold): getattr(s, _tail_label(threshold))
+                           for threshold in TAIL_THRESHOLDS},
                         "label_migration": s.label_migration,
                         "label_rug": s.label_rug,
                         "label_rug_time": s.label_rug_time,
@@ -861,6 +945,7 @@ class PointInTimeDatasetBuilder:
             episode.snapshots[timepoint] = LaunchSnapshot(
                 token=str(raw.get("token", episode.token)), chain=str(raw.get("chain", episode.chain)),
                 snapshot_time=timepoint, timestamp=float(raw.get("timestamp", episode.created_at)),
+                capture_lag_s=raw.get("capture_lag_s"),
                 deployer_features=dict(raw.get("deployer_features") or {}),
                 wallet_features=dict(raw.get("wallet_features") or {}),
                 flow_features=dict(raw.get("flow_features") or {}),
@@ -869,8 +954,8 @@ class PointInTimeDatasetBuilder:
                 token_features=dict(raw.get("token_features") or {}),
                 market_features=dict(raw.get("market_features") or {}),
                 entity_graph_features=dict(raw.get("entity_graph_features") or {}),
-                label_2x=labels.get("label_2x"), label_5x=labels.get("label_5x"),
-                label_10x=labels.get("label_10x"), label_50x=labels.get("label_50x"),
+                **{_tail_label(threshold): labels.get(_tail_label(threshold))
+                   for threshold in TAIL_THRESHOLDS},
                 label_migration=labels.get("label_migration"), label_rug=labels.get("label_rug"),
                 label_rug_time=labels.get("label_rug_time"), max_multiple=labels.get("max_multiple"),
                 time_to_peak=labels.get("time_to_peak"), max_drawdown=labels.get("max_drawdown"),
