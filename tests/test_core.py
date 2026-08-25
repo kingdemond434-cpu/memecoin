@@ -54,6 +54,10 @@ from src.strategies.distribution import (
     DISTRIBUTION_FEATURE_NAMES, DISTRIBUTION_HORIZONS, DistributionDetector,
     distribution_features,
 )
+from src.strategies.mega_event import (
+    ESCALATION_LADDER, AudienceTier, MegaEventReserve, plan_capacity_escalation,
+    remaining_audience,
+)
 from src.strategies.monster import (
     MONSTER_STATES, MonsterEvidence, MonsterState, MonsterStateMachine,
     hold_versus_exit, premature_exit_rates, tail_capture_ratio,
@@ -2792,6 +2796,10 @@ class TestPositionPredictionRefresh(unittest.IsolatedAsyncioTestCase):
         desk._closed_pnl = {}
         desk._exit_capacity = (
             lambda token, pos: MemecoinQuantDesk._exit_capacity(desk, token, pos))
+        desk.min_escape_probability = 0.05
+        desk._estimate_escape = (
+            lambda token, pos, hazard: MemecoinQuantDesk._estimate_escape(
+                desk, token, pos, hazard))
         desk._update_monster_state = (
             lambda token, pos, dist, mult:
             MemecoinQuantDesk._update_monster_state(desk, token, pos, dist, mult))
@@ -3458,6 +3466,10 @@ class TestDistributionExitWiring(unittest.IsolatedAsyncioTestCase):
         desk._closed_pnl = {}
         desk._exit_capacity = (
             lambda token, pos: MemecoinQuantDesk._exit_capacity(desk, token, pos))
+        desk.min_escape_probability = 0.05
+        desk._estimate_escape = (
+            lambda token, pos, hazard: MemecoinQuantDesk._estimate_escape(
+                desk, token, pos, hazard))
         desk._update_monster_state = (
             lambda token, pos, dist, mult:
             MemecoinQuantDesk._update_monster_state(desk, token, pos, dist, mult))
@@ -3770,6 +3782,10 @@ class TestMonsterHoldWiring(unittest.IsolatedAsyncioTestCase):
         desk._closed_pnl = {}
         desk._exit_capacity = (
             lambda token, pos: MemecoinQuantDesk._exit_capacity(desk, token, pos))
+        desk.min_escape_probability = 0.05
+        desk._estimate_escape = (
+            lambda token, pos, hazard: MemecoinQuantDesk._estimate_escape(
+                desk, token, pos, hazard))
         desk._update_monster_state = (
             lambda token, pos, dist, mult:
             MemecoinQuantDesk._update_monster_state(desk, token, pos, dist, mult))
@@ -5453,3 +5469,188 @@ class TestAuditPack(unittest.TestCase):
         section = pack.to_dict()["sections"]["recent_changes"]
         self.assertEqual(section["status"], "OK")
         self.assertIn("commits", section["summary"])
+
+
+class TestMegaEventReserve(unittest.TestCase):
+    """Detection is worthless if every dollar is committed when the event lands."""
+
+    def test_a_quiet_week_withholds_almost_nothing(self):
+        reserve = MegaEventReserve(baseline_fraction=0.0, max_fraction=0.35)
+        decision = reserve.decide(event_probability=0.01)
+        # A fixed cash buffer is a tax paid every week for an event that
+        # happens twice a year.
+        self.assertEqual(decision.reserve_fraction, 0.0)
+        self.assertEqual(reserve.deployable_equity(10_000.0, decision), 10_000.0)
+
+    def test_an_elevated_verified_event_withholds_a_lot(self):
+        reserve = MegaEventReserve(max_fraction=0.35)
+        decision = reserve.decide(event_probability=0.9, authenticated=True)
+        self.assertGreater(decision.reserve_fraction, 0.25)
+        self.assertLessEqual(decision.reserve_fraction, 0.35)
+
+    def test_an_unverified_event_withholds_less_than_a_verified_one(self):
+        reserve = MegaEventReserve(max_fraction=0.35)
+        verified = reserve.decide(0.9, authenticated=True).reserve_fraction
+        rumoured = reserve.decide(0.9, authenticated=False).reserve_fraction
+        # Most viral stories never produce a token worth funding.
+        self.assertLess(rumoured, verified)
+        self.assertGreater(rumoured, 0.0)
+
+    def test_an_unmeasured_probability_holds_only_the_baseline(self):
+        reserve = MegaEventReserve(baseline_fraction=0.05, max_fraction=0.35)
+        decision = reserve.decide(event_probability=None)
+        self.assertEqual(decision.status, "DATA_BLOCKED")
+        self.assertEqual(decision.reserve_fraction, 0.05)
+
+    def test_the_reserve_never_exceeds_its_ceiling(self):
+        reserve = MegaEventReserve(max_fraction=0.20)
+        for probability in (0.5, 0.9, 1.0, 5.0):
+            self.assertLessEqual(
+                reserve.decide(probability, authenticated=True).reserve_fraction, 0.20)
+
+    def test_the_reserve_only_ever_withholds(self):
+        reserve = MegaEventReserve(max_fraction=0.35)
+        for probability in (0.0, 0.3, 1.0):
+            decision = reserve.decide(probability, authenticated=True)
+            # There is no path that frees capital beyond the ordinary limits.
+            self.assertLessEqual(reserve.deployable_equity(10_000.0, decision), 10_000.0)
+
+
+class TestRemainingAudience(unittest.TestCase):
+    """+10x and finished, versus +10x with 95% of the audience still ahead."""
+
+    def test_early_reach_leaves_most_of_the_audience_ahead(self):
+        report = remaining_audience([AudienceTier.TRENCHES])
+        self.assertEqual(report.status, "OK")
+        self.assertGreater(report.remaining_share, 0.9)
+        self.assertFalse(report.exhausted)
+
+    def test_broad_reach_is_exhausted(self):
+        report = remaining_audience(list(AudienceTier))
+        self.assertLess(report.remaining_share, 0.05)
+        self.assertTrue(report.exhausted)
+
+    def test_seeing_nothing_is_blocked_not_untouched(self):
+        report = remaining_audience([])
+        # "Nobody has heard of it" and "we have not looked" justify opposite
+        # position sizes, and only one is knowable from having seen nothing.
+        self.assertEqual(report.status, "DATA_BLOCKED")
+        self.assertFalse(report.exhausted)
+
+    def test_repeated_tiers_are_not_double_counted(self):
+        once = remaining_audience([AudienceTier.TRENCHES]).remaining_share
+        twice = remaining_audience(
+            [AudienceTier.TRENCHES, AudienceTier.TRENCHES]).remaining_share
+        self.assertAlmostEqual(once, twice)
+
+    def test_the_prior_basis_is_stated_rather_than_implied(self):
+        self.assertIn("prior-based", remaining_audience([AudienceTier.TRENCHES]).detail)
+
+
+class TestCapacityEscalation(unittest.TestCase):
+    """The life-changing trade rarely bet maximum size on the first observation."""
+
+    LADDER = {"probe": 0.005, "authenticated": 0.02, "independent_demand": 0.05,
+              "liquidity_expanding": 0.10, "mass_adoption": 0.20}
+
+    def _plan(self, evidence, held=0.0, executable=1.0):
+        return plan_capacity_escalation(evidence, held, self.LADDER, executable)
+
+    def test_size_grows_only_as_evidence_is_proven(self):
+        steps = []
+        evidence = {}
+        for _, requirement in ESCALATION_LADDER:
+            evidence[requirement] = True
+            steps.append(self._plan(dict(evidence)).target_fraction)
+        self.assertEqual(steps, sorted(steps))
+        self.assertAlmostEqual(steps[0], 0.005)
+        self.assertAlmostEqual(steps[-1], 0.20)
+
+    def test_the_ladder_is_strictly_ordered(self):
+        """One impressive signal must not justify a large position."""
+        plan = self._plan({"detected": True, "audience_still_ahead": True})
+        # Skipping to the top rung on a single fact is the failure mode.
+        self.assertEqual(plan.step, "probe")
+        self.assertAlmostEqual(plan.target_fraction, 0.005)
+
+    def test_no_evidence_means_no_position(self):
+        plan = self._plan({})
+        self.assertEqual(plan.step, "none")
+        self.assertEqual(plan.target_fraction, 0.0)
+
+    def test_the_target_is_capped_by_what_the_venue_can_absorb(self):
+        plan = self._plan({req: True for _, req in ESCALATION_LADDER}, executable=0.03)
+        # A size the market cannot fill is not a position, it is a slippage
+        # estimate.
+        self.assertAlmostEqual(plan.target_fraction, 0.03)
+        self.assertTrue(plan.capacity_capped)
+
+    def test_unmeasured_depth_blocks_rather_than_assuming_unlimited(self):
+        plan = self._plan({req: True for _, req in ESCALATION_LADDER}, executable=None)
+        self.assertEqual(plan.status, "DATA_BLOCKED")
+        self.assertEqual(plan.target_fraction, 0.0)
+
+    def test_escalation_never_shrinks_an_existing_position(self):
+        plan = self._plan({"detected": True}, held=0.08)
+        # Banking is the exit policy's decision; letting two components both
+        # move size down is how a runner gets sold twice.
+        self.assertAlmostEqual(plan.target_fraction, 0.08)
+
+
+class TestMegaEventReserveWiring(unittest.IsolatedAsyncioTestCase):
+    """Withheld capital must be invisible to every sizing ceiling at once."""
+
+    def _desk(self, probability=None, authenticated=False):
+        engine = ElogwEngine(SimpleNamespace(_is_trained=True), max_position_pct=0.05,
+                             max_total_exposure_pct=0.30)
+        desk = SimpleNamespace(
+            elogw_engine=engine, dry_run=True, offline=False,
+            wallet_equity_usd=0.0, sol_price_usd=0.0, equity_status="",
+            total_pnl=0.0, global_config={"paper_equity_usd": 10_000.0},
+            mega_event_reserve=MegaEventReserve(baseline_fraction=0.0, max_fraction=0.40),
+            mega_event_probability=probability,
+            mega_event_authenticated=authenticated,
+            mega_event_reserve_state={},
+            jupiter=SimpleNamespace(_session=object(),
+                                    get_quote=lambda *a, **k: _async_value(
+                                        SimpleNamespace(output_amount=150_000_000,
+                                                        price_impact_pct=0.001))),
+        )
+        return desk
+
+    async def test_a_quiet_week_deploys_the_whole_book(self):
+        desk = self._desk(probability=0.0)
+        await MemecoinQuantDesk._refresh_portfolio_state(desk)
+        self.assertAlmostEqual(desk.elogw_engine.portfolio_value, desk.wallet_equity_usd)
+        self.assertEqual(desk.mega_event_reserve_state["fraction"], 0.0)
+
+    async def test_an_elevated_verified_event_shrinks_deployable_capital(self):
+        desk = self._desk(probability=0.9, authenticated=True)
+        await MemecoinQuantDesk._refresh_portfolio_state(desk)
+        self.assertLess(desk.elogw_engine.portfolio_value, desk.wallet_equity_usd)
+        # Reported equity is unchanged: the reserve withholds deployment, it
+        # does not pretend the money is gone.
+        self.assertGreater(desk.wallet_equity_usd, 0.0)
+        self.assertGreater(desk.mega_event_reserve_state["fraction"], 0.25)
+
+    async def test_every_ceiling_shrinks_together(self):
+        """The reserve reaches all limits at once and cannot be forgotten by one."""
+        quiet = self._desk(probability=0.0)
+        armed = self._desk(probability=0.9, authenticated=True)
+        await MemecoinQuantDesk._refresh_portfolio_state(quiet)
+        await MemecoinQuantDesk._refresh_portfolio_state(armed)
+
+        for engine in (quiet.elogw_engine, armed.elogw_engine):
+            engine.max_position_usd = 1e12  # take the USD cap out of the way
+
+        quiet_cap = quiet.elogw_engine.exposure_cap(1e12) * quiet.elogw_engine.portfolio_value
+        armed_cap = armed.elogw_engine.exposure_cap(1e12) * armed.elogw_engine.portfolio_value
+        self.assertLess(armed_cap, quiet_cap)
+
+    async def test_an_unmeasured_event_holds_only_the_baseline(self):
+        desk = self._desk(probability=None)
+        await MemecoinQuantDesk._refresh_portfolio_state(desk)
+        self.assertEqual(desk.mega_event_reserve_state["status"], "DATA_BLOCKED")
+        # An unmeasured event must not silently tax the book every week.
+        self.assertEqual(desk.mega_event_reserve_state["fraction"], 0.0)
+        self.assertAlmostEqual(desk.elogw_engine.portfolio_value, desk.wallet_equity_usd)

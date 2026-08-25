@@ -55,6 +55,11 @@ from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPredictor, 
 from src.chains.pump_curve import BondingCurveState, quote_buy, quote_sell
 from src.execution.tradeability import curve_tradeability, exit_capacity_ratio
 from src.strategies.distribution import DistributionDetector
+from src.strategies.mega_event import MegaEventReserve
+from src.strategies.escape import (
+    EscapeEstimate, HazardMechanism, escape_probability,
+    hazard_curve_from_probabilities,
+)
 from src.strategies.monster import (
     MonsterEvidence, MonsterState, MonsterStateMachine, hold_versus_exit,
 )
@@ -339,6 +344,18 @@ class MemecoinQuantDesk:
                 for state, default in MonsterStateMachine.DEFAULT_BANK_FRACTIONS.items()
             },
         )
+        self.min_escape_probability = float(
+            self.global_config.get("min_escape_probability", 0.05))
+        self.mega_event_reserve = MegaEventReserve(
+            baseline_fraction=float(self.global_config.get("mega_event_baseline_reserve", 0.0)),
+            max_fraction=float(self.global_config.get("mega_event_max_reserve", 0.35)),
+            arm_probability=float(self.global_config.get("mega_event_arm_probability", 0.05)),
+        )
+        # None until an event detector supplies a measured probability. The
+        # reserve then holds only its baseline, which defaults to nothing --
+        # an unmeasured event must not silently withhold capital every week.
+        self.mega_event_probability: Optional[float] = None
+        self.mega_event_authenticated: bool = False
         self.distribution_detector = DistributionDetector(
             min_coverage=float(self.global_config.get("distribution_min_coverage", 0.3)))
         self.opportunity_allocator = OpportunityAllocator(
@@ -349,6 +366,7 @@ class MemecoinQuantDesk:
                 self.global_config.get("max_displacements_per_cycle", 2)),
         )
         self.last_slate_report: Dict[str, Any] = {}
+        self.mega_event_reserve_state: Dict[str, Any] = {}
         self.champion_challenger = ChampionChallengerFramework(
             state_path=os.getenv("CHAMPION_STATE_PATH", "data/research/champion_state.json")
         )
@@ -955,6 +973,50 @@ class MemecoinQuantDesk:
             acceptable_impact=float(self.global_config.get("acceptable_exit_impact", 0.10)),
         )
 
+    def _estimate_escape(self, token: str, position: Dict[str, Any], hazard: Any):
+        """P(this position gets out before the event), at its current size.
+
+        A predicted 5x is worth nothing if the probability of the sell landing
+        before the collapse is near zero, so the two are estimated separately
+        and multiplied rather than one standing in for the other.
+
+        Mechanism matters as much as rate: speed can outrun a seller and
+        cannot outrun a frozen mint, which is why the hazard is decomposed
+        before the race is evaluated rather than after.
+        """
+        if hazard is None:
+            return EscapeEstimate(status="DATA_BLOCKED", detail="no hazard state for this token")
+        mechanisms: Dict[HazardMechanism, Tuple[float, float]] = {}
+        for mechanism, horizon, value in (
+            (HazardMechanism.CREATOR_SELLING, 30.0, getattr(hazard, "hazard_30s", None)),
+            (HazardMechanism.INSIDER_CLUSTER_EXIT, 300.0, getattr(hazard, "hazard_5m", None)),
+        ):
+            if value is not None and 0 <= float(value) < 1.0:
+                mechanisms[mechanism] = (float(value), horizon)
+        route = (self.rug_hazard.observations.get(token) or [])
+        if any(item.get("type") == "route" and item.get("feasible") is False
+               for item in list(route)[-20:]):
+            # A route that has stopped quoting is a sellability signal, and
+            # speed is no answer to it.
+            mechanisms[HazardMechanism.SELLABILITY_LOSS] = (0.5, 30.0)
+        curve = hazard_curve_from_probabilities(mechanisms)
+        position["hazard_curve"] = curve.report()
+        if curve.status != "OK":
+            return EscapeEstimate(status="DATA_BLOCKED", detail="hazard could not be decomposed")
+
+        state = self._latest_curve_state.get(token)
+        sellable = None
+        if state is not None:
+            report = curve_tradeability(state, quote_buy, quote_sell)
+            sellable = report.exit.size_at(
+                float(self.global_config.get("acceptable_exit_impact", 0.10)))
+        return escape_probability(
+            position_size=int(position.get("size_tokens", 0) or 0),
+            sellable_size=sellable,
+            expected_latency_s=float(self.global_config.get("expected_exit_latency_s", 0.4)),
+            hazard=curve,
+        )
+
     def _update_monster_state(self, token: str, position: Dict[str, Any],
                               distribution: Any, multiple: float):
         """Advance this position's conviction state on currently observed evidence.
@@ -968,6 +1030,17 @@ class MemecoinQuantDesk:
         hazard = self.rug_hazard.get_hazard(token)
         prediction = position.get("prediction_object")
         catastrophic = bool(hazard and getattr(hazard, "urgency", "") == "critical")
+        escape = self._estimate_escape(token, position, hazard)
+        position["escape"] = {"status": escape.status, "probability": escape.probability,
+                              "fillable_share": escape.fillable_share,
+                              "detail": escape.detail}
+        if (escape.status == "OK" and escape.probability <= self.min_escape_probability
+                and not self.monster_machine.overrides_ordinary_exit(token)):
+            # A position we are measurably unlikely to get out of is not a
+            # position, whatever its predicted upside. Being early to a 5x we
+            # cannot sell is worse than missing it, because the capital is
+            # still committed when the window closes.
+            catastrophic = True
         evidence = MonsterEvidence(
             monster_probability=None,
             monster_probability_calibrated=False,
@@ -1316,7 +1389,19 @@ class MemecoinQuantDesk:
                 if token_quote:
                     marked_positions += token_quote.output_amount / 1_000_000
             self.wallet_equity_usd = sol * self.sol_price_usd + marked_positions
-        self.elogw_engine.portfolio_value = self.wallet_equity_usd
+        # Capital withheld for a rare event is capital the sizing path must not
+        # see. Reducing the portfolio value the engine reasons about is the
+        # only place to apply it: every ceiling downstream is a fraction of
+        # that number, so the reserve reaches all of them at once and cannot
+        # be forgotten by one.
+        reserve = self.mega_event_reserve.decide(
+            self.mega_event_probability, self.mega_event_authenticated)
+        self.mega_event_reserve_state = {
+            "status": reserve.status, "fraction": reserve.reserve_fraction,
+            "reason": reserve.reason, "event_probability": reserve.event_probability,
+        }
+        self.elogw_engine.portfolio_value = self.mega_event_reserve.deployable_equity(
+            self.wallet_equity_usd, reserve)
         self.equity_status = "OK"
 
     async def _update_intelligence(self):
@@ -1517,6 +1602,7 @@ class MemecoinQuantDesk:
                        "sol_price_usd": self.sol_price_usd},
             "execution": {"dry_run": self.execution_engine.dry_run if self.execution_engine else True},
             "native_fastpath": NATIVE_FASTPATH_STATUS,
+            "mega_event_reserve": self.mega_event_reserve_state,
             "portfolio": self.elogw_engine.get_portfolio_state() if self.elogw_engine else {},
             "rug_hazard": self.rug_hazard.get_stats() if self.rug_hazard else {},
             "dataset": self.dataset_builder.get_stats() if self.dataset_builder else {},
