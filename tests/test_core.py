@@ -44,6 +44,10 @@ from src.strategies.authenticity import (
     SourceSignal, WatchedEntity, extract_mints, host_matches, looks_like_mint,
     rank_copycats,
 )
+from src.strategies.escape import (
+    HAZARD_HORIZONS, HazardCurve, HazardMechanism, escape_probability,
+    hazard_curve_from_probabilities, liquidation_ladder, ride_or_reject,
+)
 from src.strategies.distribution import (
     DISTRIBUTION_FEATURE_NAMES, DISTRIBUTION_HORIZONS, DistributionDetector,
     distribution_features,
@@ -4782,3 +4786,171 @@ class TestEdgeDecay(unittest.TestCase):
         for _ in range(5):
             monitor.record("new", 0.01)
         self.assertEqual(monitor.health("new")["status"], EdgeDecayMonitor.HEALTHY)
+
+
+class TestHazardCurve(unittest.TestCase):
+    """One p_rug conflates two questions that call for opposite actions."""
+
+    def test_probabilities_at_different_horizons_become_combinable_rates(self):
+        curve = hazard_curve_from_probabilities({
+            HazardMechanism.CREATOR_SELLING: (0.5, 300.0),
+            HazardMechanism.LIQUIDITY_REMOVAL: (0.1, 60.0),
+        })
+        self.assertEqual(curve.status, "OK")
+        # Adding a 5-minute probability to a 1-minute one directly is a
+        # category error; converting to rates first is what makes them add.
+        self.assertAlmostEqual(curve.rates[HazardMechanism.CREATOR_SELLING],
+                               -math.log(0.5) / 300.0)
+        self.assertAlmostEqual(curve.rates[HazardMechanism.LIQUIDITY_REMOVAL],
+                               -math.log(0.9) / 60.0)
+
+    def test_eventual_death_and_imminent_collapse_are_different_states(self):
+        doomed_but_slow = hazard_curve_from_probabilities({
+            HazardMechanism.CREATOR_SELLING: (0.80, 1_200.0)})
+        imminent = hazard_curve_from_probabilities({
+            HazardMechanism.CREATOR_SELLING: (0.35, 1.0)})
+        # 80% chance of eventually dying is not a reason to be out right now;
+        # 35% chance of collapse in the next second is.
+        self.assertLess(doomed_but_slow.probability_within(1.0), 0.01)
+        self.assertGreater(imminent.probability_within(1.0), 0.3)
+
+    def test_the_curve_is_monotone_across_horizons(self):
+        curve = hazard_curve_from_probabilities({
+            HazardMechanism.INSIDER_CLUSTER_EXIT: (0.2, 10.0)})
+        values = [curve.probability_within(h) for h in HAZARD_HORIZONS]
+        self.assertEqual(values, sorted(values))
+        self.assertLessEqual(values[-1], 1.0)
+
+    def test_the_dominant_mechanism_is_reported(self):
+        curve = hazard_curve_from_probabilities({
+            HazardMechanism.CREATOR_SELLING: (0.05, 10.0),
+            HazardMechanism.SELLABILITY_LOSS: (0.60, 10.0),
+        })
+        self.assertEqual(curve.dominant(), HazardMechanism.SELLABILITY_LOSS)
+
+    def test_no_usable_mechanism_blocks(self):
+        self.assertEqual(hazard_curve_from_probabilities({}).status, "DATA_BLOCKED")
+        self.assertEqual(
+            hazard_curve_from_probabilities(
+                {HazardMechanism.CREATOR_SELLING: (0.5, 0.0)}).status,
+            "DATA_BLOCKED")
+
+
+class TestEscapeProbability(unittest.TestCase):
+    """A predicted 5x we cannot exit is not a 5x."""
+
+    def _curve(self, mechanism=HazardMechanism.CREATOR_SELLING, probability=0.3,
+               horizon=10.0):
+        return hazard_curve_from_probabilities({mechanism: (probability, horizon)})
+
+    def test_escape_needs_both_speed_and_depth(self):
+        curve = self._curve()
+        deep_fast = escape_probability(1_000, 1_000, 0.2, curve)
+        deep_slow = escape_probability(1_000, 1_000, 30.0, curve)
+        thin_fast = escape_probability(1_000, 100, 0.2, curve)
+        self.assertGreater(deep_fast.probability, deep_slow.probability)
+        self.assertGreater(deep_fast.probability, thin_fast.probability)
+        self.assertAlmostEqual(thin_fast.fillable_share, 0.1)
+
+    def test_either_factor_at_zero_takes_the_whole_thing_to_zero(self):
+        curve = self._curve()
+        # Nothing fillable: a perfectly fast transaction has not escaped.
+        self.assertEqual(escape_probability(1_000, 0, 0.01, curve).probability, 0.0)
+        # Nothing lands: a perfectly sized order has not escaped either.
+        self.assertEqual(
+            escape_probability(1_000, 1_000, 0.01, curve, landing_probability=0.0).probability,
+            0.0)
+
+    def test_speed_does_not_help_against_an_unsellable_token(self):
+        """Once liquidity is gone there is nothing to sell into."""
+        outrunnable = self._curve(HazardMechanism.CREATOR_SELLING, 0.9, 1.0)
+        unescapable = self._curve(HazardMechanism.SELLABILITY_LOSS, 0.9, 1.0)
+        fast_vs_creator = escape_probability(1_000, 1_000, 0.05, outrunnable)
+        slow_vs_creator = escape_probability(1_000, 1_000, 2.0, outrunnable)
+        fast_vs_frozen = escape_probability(1_000, 1_000, 0.05, unescapable)
+        slow_vs_frozen = escape_probability(1_000, 1_000, 2.0, unescapable)
+
+        # Being fast buys a lot against a seller and comparatively little
+        # against a mint that has been frozen.
+        creator_gain = fast_vs_creator.probability - slow_vs_creator.probability
+        frozen_gain = fast_vs_frozen.probability - slow_vs_frozen.probability
+        self.assertGreater(creator_gain, 0)
+        self.assertGreater(creator_gain, frozen_gain)
+
+    def test_unmeasured_capacity_blocks_rather_than_assuming_liquidity(self):
+        estimate = escape_probability(1_000, None, 0.2, self._curve())
+        self.assertEqual(estimate.status, "DATA_BLOCKED")
+        # Unknown depth is not full depth.
+        self.assertEqual(estimate.probability, 0.0)
+
+    def test_a_blocked_hazard_curve_blocks_escape(self):
+        self.assertEqual(
+            escape_probability(1_000, 1_000, 0.2, HazardCurve(status="DATA_BLOCKED")).status,
+            "DATA_BLOCKED")
+
+
+class TestRideOrReject(unittest.TestCase):
+    """'Likely to eventually rug' and 'about to rug' call for opposite actions."""
+
+    def _verdict(self, hazard_probability, hazard_horizon, sellable=1_000,
+                 latency=0.2, upside=3.0, p_up=0.6, mechanism=HazardMechanism.CREATOR_SELLING):
+        curve = hazard_curve_from_probabilities({mechanism: (hazard_probability, hazard_horizon)})
+        escape = escape_probability(1_000, sellable, latency, curve)
+        return ride_or_reject(upside, p_up, curve, escape, position_fraction=0.02,
+                              horizon_s=10.0)
+
+    def test_a_doomed_token_with_a_wide_window_is_still_rideable(self):
+        # 80% chance of eventual death over 20 minutes, 60% chance of another
+        # 3x first, and we can get out in 200ms.
+        verdict = self._verdict(0.80, 1_200.0)
+        self.assertEqual(verdict.status, "OK")
+        self.assertEqual(verdict.action, "ride")
+        self.assertGreater(verdict.e_log_ride, 0)
+
+    def test_an_imminent_collapse_is_rejected_despite_the_same_upside(self):
+        verdict = self._verdict(0.35, 1.0)
+        self.assertEqual(verdict.action, "reject")
+
+    def test_upside_we_cannot_exit_is_not_upside(self):
+        """The whole reason escape is computed separately."""
+        liquid = self._verdict(0.5, 600.0, sellable=1_000, upside=5.0)
+        trapped = self._verdict(0.5, 600.0, sellable=1, upside=5.0)
+        self.assertEqual(liquid.action, "ride")
+        self.assertLess(trapped.e_log_ride, liquid.e_log_ride)
+
+    def test_a_bigger_predicted_move_does_not_rescue_a_frozen_token(self):
+        frozen = self._verdict(0.9, 1.0, upside=50.0, p_up=0.9,
+                               mechanism=HazardMechanism.SELLABILITY_LOSS)
+        self.assertEqual(frozen.action, "reject")
+
+    def test_missing_inputs_are_not_a_tradeable_state(self):
+        curve = hazard_curve_from_probabilities(
+            {HazardMechanism.CREATOR_SELLING: (0.3, 10.0)})
+        blocked_escape = escape_probability(1_000, None, 0.2, curve)
+        verdict = ride_or_reject(3.0, 0.6, curve, blocked_escape, 0.02, 10.0)
+        self.assertEqual(verdict.status, "DATA_BLOCKED")
+        self.assertEqual(verdict.action, "reject")
+
+
+class TestLiquidationLadder(unittest.TestCase):
+    """A chart can look healthy while executable exit liquidity rots."""
+
+    def test_each_slice_reports_its_own_escape(self):
+        frontier = build_frontier(lambda size: (True, size * 1e-6), 10_000_000, "exit")
+        curve = hazard_curve_from_probabilities(
+            {HazardMechanism.CREATOR_SELLING: (0.3, 30.0)})
+        ladder = liquidation_ladder(1_000_000, frontier, curve, expected_latency_s=0.25)
+
+        self.assertEqual(ladder["status"], "OK")
+        shares = [rung["escape_probability"] for rung in ladder["rungs"]]
+        # Smaller slices get out more reliably; asking the question at one size
+        # only is how the deterioration goes unseen.
+        self.assertEqual(shares, sorted(shares, reverse=True))
+        self.assertEqual(ladder["rungs"][0]["share"], 0.10)
+
+    def test_an_unmeasurable_frontier_blocks_the_whole_ladder(self):
+        curve = hazard_curve_from_probabilities(
+            {HazardMechanism.CREATOR_SELLING: (0.3, 30.0)})
+        ladder = liquidation_ladder(1_000, Frontier(status="DATA_BLOCKED", side="exit"),
+                                    curve, 0.25)
+        self.assertEqual(ladder["status"], "DATA_BLOCKED")
