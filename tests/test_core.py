@@ -111,6 +111,10 @@ from ops.monitor import main as monitor_main
 from src.runtime.hot_state import (
     AsyncArchiveWriter, CompactWalletDNA, EconomicCache, HotState, HotStateBudget,
 )
+from src.research.promotion_gate import (
+    DEFAULT_CRITERIA, Evidence, PromotionCriteria, PromotionLedger, Stage,
+    can_advance, evaluate, next_stage,
+)
 from src.research.backfill import (
     BACKFILL_PROVENANCE, PROVENANCE_KEY, Limitation, RawLaunch,
     is_reconstructed, partition_by_provenance, reconstruct, run_backfill,
@@ -7020,3 +7024,164 @@ class TestSourceDiscovery(unittest.TestCase):
         report = self._discovery().report()
         self.assertEqual(report["gate"]["min_observations"], 8)
         self.assertEqual(report["gate"]["min_distinct_followers"], 2)
+
+
+class TestPromotionGate(unittest.TestCase):
+    """The bar has to be written before the numbers arrive.
+
+    Every system reaches the moment where forward results are almost good
+    enough and the bar quietly becomes whatever they are. It never feels like
+    dishonesty; each adjustment is defensible in isolation.
+    """
+
+    def _criteria(self, **kwargs):
+        base = dict(stage=Stage.CANARY, min_decisions=100, min_real_fills=50,
+                    min_launch_cohorts=20, min_regimes=2, min_net_log_growth=0.0,
+                    max_rug_loss_share=0.15, min_monster_enrichment=2.0,
+                    min_execution_success=0.6, max_catastrophic_failures=0)
+        base.update(kwargs)
+        return PromotionCriteria(**base)
+
+    def _evidence(self, **kwargs):
+        base = dict(stage=Stage.CANARY, decisions=500, real_fills=200,
+                    launch_cohorts=60, regimes_covered=3, net_log_growth=0.02,
+                    rug_loss_share=0.10, monster_enrichment=2.4,
+                    execution_success=0.72, catastrophic_failures=0)
+        base.update(kwargs)
+        return Evidence(**base)
+
+    def test_evidence_that_clears_every_bar_passes(self):
+        verdict = evaluate(self._criteria(), self._evidence())
+        self.assertTrue(verdict.passed, verdict.failures)
+
+    def test_an_unmeasured_criterion_fails_rather_than_passing(self):
+        """A gate that treats unmeasured as satisfied is decorative."""
+        verdict = evaluate(self._criteria(), self._evidence(rug_loss_share=None))
+        self.assertFalse(verdict.passed)
+        self.assertIn("rug_loss_share", verdict.unmeasured)
+        # And it fails in the direction that does NOT promote.
+        self.assertTrue(any("not measured" in reason for reason in verdict.failures))
+
+    def test_unmeasured_growth_fails(self):
+        verdict = evaluate(self._criteria(), self._evidence(net_log_growth=None))
+        self.assertFalse(verdict.passed)
+        self.assertIn("net_log_growth", verdict.unmeasured)
+
+    def test_flat_growth_does_not_clear_a_zero_bar(self):
+        # "Did not lose money" is not "made money".
+        self.assertFalse(evaluate(self._criteria(),
+                                  self._evidence(net_log_growth=0.0)).passed)
+
+    def test_each_shortfall_is_reported_individually(self):
+        verdict = evaluate(self._criteria(),
+                           self._evidence(real_fills=1, monster_enrichment=1.0,
+                                          rug_loss_share=0.9))
+        self.assertFalse(verdict.passed)
+        self.assertGreaterEqual(len(verdict.failures), 3)
+
+    def test_one_catastrophic_failure_is_disqualifying(self):
+        self.assertFalse(evaluate(self._criteria(),
+                                  self._evidence(catastrophic_failures=1)).passed)
+
+    def test_evidence_for_the_wrong_stage_is_refused(self):
+        verdict = evaluate(self._criteria(stage=Stage.CANARY),
+                           self._evidence(stage=Stage.FORWARD_SHADOW))
+        self.assertFalse(verdict.passed)
+        self.assertIn("evidence is for", verdict.failures[0])
+
+    def test_a_criterion_set_to_zero_needs_no_measurement(self):
+        criteria = self._criteria(min_real_fills=0)
+        verdict = evaluate(criteria, self._evidence(real_fills=None))
+        self.assertTrue(verdict.passed, verdict.failures)
+
+    def test_the_fingerprint_changes_when_a_threshold_changes(self):
+        strict = self._criteria(min_real_fills=1_000)
+        loose = self._criteria(min_real_fills=10)
+        # Moving a bar produces a NEW bar with a new identity, rather than
+        # silently redefining the old verdict.
+        self.assertNotEqual(strict.fingerprint, loose.fingerprint)
+        self.assertEqual(strict.fingerprint, self._criteria(min_real_fills=1_000).fingerprint)
+
+    def test_the_verdict_records_which_bar_it_was_judged_against(self):
+        criteria = self._criteria()
+        verdict = evaluate(criteria, self._evidence())
+        self.assertEqual(verdict.criteria_fingerprint, criteria.fingerprint)
+
+    def test_a_pass_advances_exactly_one_stage(self):
+        verdict = evaluate(self._criteria(), self._evidence())
+        self.assertTrue(can_advance(Stage.CANARY, verdict))
+        self.assertEqual(next_stage(Stage.CANARY), Stage.LIVE)
+        # Skipping is how a promising backtest reaches real money without ever
+        # producing a real fill.
+        self.assertFalse(can_advance(Stage.FORWARD_SHADOW, verdict))
+        self.assertIsNone(next_stage(Stage.LIVE))
+
+    def test_a_failed_verdict_advances_nothing(self):
+        verdict = evaluate(self._criteria(), self._evidence(real_fills=0))
+        self.assertFalse(can_advance(Stage.CANARY, verdict))
+
+    def test_the_shipped_bars_require_real_fills_before_canary_and_live(self):
+        self.assertEqual(DEFAULT_CRITERIA[Stage.FORWARD_SHADOW].min_real_fills, 0)
+        self.assertGreaterEqual(DEFAULT_CRITERIA[Stage.CANARY].min_real_fills, 1_000)
+        self.assertGreater(DEFAULT_CRITERIA[Stage.LIVE].min_real_fills,
+                           DEFAULT_CRITERIA[Stage.CANARY].min_real_fills)
+
+    def test_the_shipped_bars_tighten_monotonically(self):
+        canary = DEFAULT_CRITERIA[Stage.CANARY]
+        live = DEFAULT_CRITERIA[Stage.LIVE]
+        self.assertGreater(live.min_decisions, canary.min_decisions)
+        self.assertLess(live.max_rug_loss_share, canary.max_rug_loss_share)
+        self.assertGreater(live.min_monster_enrichment, canary.min_monster_enrichment)
+
+
+class TestPromotionLedger(unittest.TestCase):
+    """Rejections are the record that makes a moved bar visible."""
+
+    def _row(self, directory, min_fills):
+        criteria = PromotionCriteria(stage=Stage.CANARY, min_real_fills=min_fills,
+                                     min_net_log_growth=0.0)
+        evidence = Evidence(stage=Stage.CANARY, real_fills=100, net_log_growth=0.01,
+                            rug_loss_share=0.0, catastrophic_failures=0,
+                            regimes_covered=3, monster_enrichment=2.0)
+        verdict = evaluate(criteria, evidence)
+        ledger = PromotionLedger(Path(directory) / "promotions.jsonl")
+        ledger.record(verdict, evidence, criteria)
+        return ledger, verdict
+
+    def test_verdicts_including_failures_are_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, verdict = self._row(directory, min_fills=1_000)
+            self.assertFalse(verdict.passed)
+            history = ledger.history()
+            self.assertEqual(len(history), 1)
+            self.assertFalse(history[0]["verdict"]["passed"])
+
+    def test_a_moved_bar_is_visible_in_the_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, strict = self._row(directory, min_fills=1_000)
+            self.assertFalse(strict.passed)
+            ledger, loose = self._row(directory, min_fills=10)
+            self.assertTrue(loose.passed)
+            # A moved bar and a cleared bar look identical in a verdict alone.
+            self.assertTrue(ledger.bar_moved(Stage.CANARY))
+            self.assertEqual(len(ledger.fingerprints_for(Stage.CANARY)), 2)
+
+    def test_a_stable_bar_does_not_read_as_moved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._row(directory, min_fills=1_000)
+            ledger, _ = self._row(directory, min_fills=1_000)
+            self.assertFalse(ledger.bar_moved(Stage.CANARY))
+
+    def test_an_absent_ledger_reads_as_empty_rather_than_raising(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = PromotionLedger(Path(directory) / "missing.jsonl")
+            self.assertEqual(ledger.history(), [])
+            self.assertFalse(ledger.bar_moved(Stage.LIVE))
+
+    def test_the_gate_does_not_touch_the_live_capital_lock(self):
+        source = (Path(__file__).resolve().parents[1] / "src" / "research"
+                  / "promotion_gate.py").read_text()
+        # A PASS says the evidence cleared a pre-declared bar. It is not an
+        # instruction to trade, and this module has no path to becoming one.
+        self.assertNotIn("ALLOW_LIVE_TRADING =", source)
+        self.assertNotIn("os.environ[", source)

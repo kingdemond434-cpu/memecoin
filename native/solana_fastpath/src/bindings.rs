@@ -5,6 +5,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use crate::curve::{BondingCurve, LEGACY_FEE_BPS};
 use crate::instruction;
+use crate::pumpswap::{Pool, PoolReserves};
 
 #[pyfunction]
 fn b58encode(raw: &[u8]) -> String {
@@ -160,6 +161,87 @@ fn account_flags(instruction_name: &str) -> PyResult<Vec<(bool, bool)>> {
     }
 }
 
+/// Decoded PumpSwap pool fields, or None when the account is not a pool.
+#[pyfunction]
+fn decode_pumpswap_pool(account_data: &[u8]) -> Option<(u8, u16, Vec<u8>, Vec<u8>, u64, bool, bool, i128)> {
+    Pool::decode(account_data).map(|pool| {
+        (
+            pool.pool_bump,
+            pool.index,
+            pool.base_mint.to_vec(),
+            pool.quote_mint.to_vec(),
+            pool.lp_supply,
+            pool.is_mayhem_mode,
+            pool.is_cashback_coin,
+            pool.virtual_quote_reserves,
+        )
+    })
+}
+
+/// Quote a PumpSwap buy from observed vault reserves.
+///
+/// Reserves are passed in rather than read from the pool account: the vault
+/// balances are not in that account, and a quote computed from whichever half
+/// happened to be available would be silently wrong.
+#[pyfunction]
+#[pyo3(signature = (base_reserves, quote_reserves, quote_in, fee_bps = LEGACY_FEE_BPS))]
+fn pumpswap_quote_buy(
+    base_reserves: u64,
+    quote_reserves: u64,
+    quote_in: u64,
+    fee_bps: u64,
+) -> PyResult<(u64, u64, u64)> {
+    let reserves = PoolReserves { base: base_reserves, quote: quote_reserves };
+    let quote = reserves
+        .quote_buy(quote_in, fee_bps)
+        .map_err(|err| PyValueError::new_err(format!("{err:?}")))?;
+    Ok((quote.output_amount, quote.fee_amount, quote.price_impact_bps))
+}
+
+#[pyfunction]
+#[pyo3(signature = (base_reserves, quote_reserves, base_in, fee_bps = LEGACY_FEE_BPS))]
+fn pumpswap_quote_sell(
+    base_reserves: u64,
+    quote_reserves: u64,
+    base_in: u64,
+    fee_bps: u64,
+) -> PyResult<(u64, u64, u64)> {
+    let reserves = PoolReserves { base: base_reserves, quote: quote_reserves };
+    let quote = reserves
+        .quote_sell(base_in, fee_bps)
+        .map_err(|err| PyValueError::new_err(format!("{err:?}")))?;
+    Ok((quote.output_amount, quote.fee_amount, quote.price_impact_bps))
+}
+
+#[pyfunction]
+#[pyo3(signature = (base_reserves, quote_reserves, max_impact_bps, fee_bps = LEGACY_FEE_BPS))]
+fn pumpswap_sell_capacity(
+    base_reserves: u64,
+    quote_reserves: u64,
+    max_impact_bps: u64,
+    fee_bps: u64,
+) -> u64 {
+    PoolReserves { base: base_reserves, quote: quote_reserves }
+        .sell_capacity(max_impact_bps, fee_bps)
+}
+
+/// PumpSwap `buy` / `sell` instruction DATA. Accounts are deliberately absent.
+#[pyfunction]
+fn pumpswap_buy_data(base_out: u64, max_quote_in: u64) -> Vec<u8> {
+    crate::pumpswap::buy_data(base_out, max_quote_in)
+}
+
+#[pyfunction]
+fn pumpswap_sell_data(base_in: u64, min_quote_out: u64) -> Vec<u8> {
+    crate::pumpswap::sell_data(base_in, min_quote_out)
+}
+
+/// Why PumpSwap transaction construction stops at instruction data.
+#[pyfunction]
+fn pumpswap_account_list_status() -> &'static str {
+    crate::pumpswap::ACCOUNT_LIST_STATUS
+}
+
 #[pymodule]
 fn solana_fastpath(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(quote_buy_from_account, module)?)?;
@@ -169,6 +251,13 @@ fn solana_fastpath(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(buy_v2_data, module)?)?;
     module.add_function(wrap_pyfunction!(sell_v2_data, module)?)?;
     module.add_function(wrap_pyfunction!(account_flags, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_pumpswap_pool, module)?)?;
+    module.add_function(wrap_pyfunction!(pumpswap_quote_buy, module)?)?;
+    module.add_function(wrap_pyfunction!(pumpswap_quote_sell, module)?)?;
+    module.add_function(wrap_pyfunction!(pumpswap_sell_capacity, module)?)?;
+    module.add_function(wrap_pyfunction!(pumpswap_buy_data, module)?)?;
+    module.add_function(wrap_pyfunction!(pumpswap_sell_data, module)?)?;
+    module.add_function(wrap_pyfunction!(pumpswap_account_list_status, module)?)?;
     module.add_function(wrap_pyfunction!(b58encode, module)?)?;
     module.add_function(wrap_pyfunction!(b58decode, module)?)?;
     module.add_function(wrap_pyfunction!(anchor_discriminator, module)?)?;
