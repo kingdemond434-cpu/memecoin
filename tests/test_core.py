@@ -18,6 +18,7 @@ from solders.message import MessageV0
 from solders.signature import Signature
 from solders.transaction import VersionedTransaction
 
+from src.chains.provider_credentials import extract_provider_key
 from src.chains.rpc_manager import ChainConfig, ChainRegistry, ChainType, RPCEndpointConfig, RPCHealth, RPCManager
 from src.chains.yellowstone_grpc import (
     SYSTEM_PROGRAM, PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream,
@@ -25,6 +26,7 @@ from src.chains.yellowstone_grpc import (
     extract_system_transfers,
 )
 from src.detection.rug_detector import TOKEN_2022_PROGRAM, TOKEN_PROGRAM, RugDetector
+from src.detection.token_detector import DetectionSource
 from src.execution.jupiter_jito import (
     ExecutionEngine, ExecutionResult, JitoClient, JupiterClient, RouteType, SolanaTransactionBuilder, SwapQuote,
     SwapTransaction, TransactionStatus,
@@ -41,14 +43,13 @@ from src.chains.pump_curve import (
     quote_buy, quote_sell, sell_capacity_lamports,
 )
 from src.research.feature_engine import build_features
-from src.research.hazard_trainer import train_hazard_calibration
+from src.research import hazard_trainer
 from src.research.exit_policy_trainer import simulate, train_exit_policy
 from src.strategies.exit_policy import ExitPolicy, evaluate_exit, load_latest_exit_policy
 from src.research.global_research_miner import GlobalResearchMiner, ResearchLead
 from src.strategies.champion_challenger import ChampionChallengerFramework, HypothesisSpec, ModelStatus, TrialResult
 from src.strategies.rug_hazard import (
-    ContinuousRugHazardModel, DEFAULT_TRIGGER_WEIGHTS, collect_observation_signals,
-    load_latest_hazard_calibration, score_signals,
+    ContinuousRugHazardModel, HAZARD_FEATURE_NAMES,
 )
 from src.strategies.genealogy_graph import GenealogyGraph, RelationshipType
 from src.strategies.social_intelligence import SocialAccount, SocialIntelligenceEngine, SocialPlatform
@@ -61,6 +62,23 @@ def solana_chain():
         native_token="SOL", decimals=9, block_time=0.4, factories={}, routers={}, base_tokens=[],
         min_liquidity_usd=2_000, max_tax=0, honeypot_check=False, programs={},
     )
+
+
+class TestProviderCredentials(unittest.TestCase):
+    def test_extracts_helius_key_from_rpc_url(self):
+        self.assertEqual(
+            extract_provider_key("https://mainnet.helius-rpc.com/?api-key=helius-secret", "helius"),
+            "helius-secret",
+        )
+
+    def test_extracts_alchemy_key_from_rpc_url(self):
+        self.assertEqual(
+            extract_provider_key("https://solana-mainnet.g.alchemy.com/v2/alchemy-secret", "alchemy"),
+            "alchemy-secret",
+        )
+
+    def test_preserves_bare_keys(self):
+        self.assertEqual(extract_provider_key("bare-secret", "helius"), "bare-secret")
 
 
 class DummyYellowstone:
@@ -306,6 +324,26 @@ class TestSolanaParsing(unittest.IsolatedAsyncioTestCase):
         self.assertIn(RaydiumMonitor.METEORA_DYNAMIC_AMM, programs)
         self.assertIn(RaydiumMonitor.ORCA_WHIRLPOOL, programs)
 
+    async def test_real_historical_native_pool_initializers(self):
+        fixtures = {
+            "raydium_cpmm_441464653.json": RaydiumMonitor.RAYDIUM_CPMM,
+            "raydium_clmm_441462011.json": RaydiumMonitor.RAYDIUM_CLMM,
+            "meteora_amm_441464551.json": RaydiumMonitor.METEORA_DYNAMIC_AMM,
+            "orca_441468893.json": RaydiumMonitor.ORCA_WHIRLPOOL,
+        }
+        for filename, program in fixtures.items():
+            with self.subTest(filename=filename):
+                fixture = json.loads((Path(__file__).parent / "fixtures" / filename).read_text())
+                events = []
+                monitor = RaydiumMonitor(DummyYellowstone(), events.append)
+                await monitor._on_transaction(fixture)
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["program"], program)
+                self.assertEqual(events[0]["type"], "pool_created")
+                self.assertEqual(events[0]["data_status"], "OK")
+                self.assertEqual(events[0]["signature"], fixture["signature"])
+                self.assertEqual(events[0]["slot"], fixture["slot"])
+
     async def test_pumpswap_uses_native_amm_account_layout(self):
         keys = [f"key{i}" for i in range(24)] + [PumpSwapMonitor.PUMP_AMM_PROGRAM]
         program_index = len(keys) - 1
@@ -383,6 +421,12 @@ class TestOfficialSocialCollectors(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.mentions[0].engagement["views"], 12)
         self.assertEqual(engine.mentions[0].url, "https://www.youtube.com/watch?v=video1")
 
+    def test_youtube_discovery_rotates_foreign_language_queries(self):
+        queries = " ".join(SocialIntelligenceEngine.YOUTUBE_QUERIES)
+        self.assertIn("模因币", queries)
+        self.assertIn("ミームコイン", queries)
+        self.assertIn("밈코인", queries)
+
     async def test_reddit_stays_blocked_without_approved_credentials(self):
         engine = self.make_engine()
         self.assertIsNone(await engine._reddit_headers())
@@ -426,7 +470,7 @@ class TestOfficialSocialCollectors(unittest.IsolatedAsyncioTestCase):
         fake_client = FakeTelegramClient("path", 123, "hash")
         with patch("src.strategies.social_intelligence.TelegramClient", return_value=fake_client):
             await engine._setup_telegram()
-        self.assertEqual(engine.data_status["telegram"], "OK")
+        self.assertIn(engine.data_status["telegram"], {"OK_PUSH", "OK_POLLING"})
         self.assertTrue(fake_client.connected)
         self.assertEqual(set(engine.accounts), {"telegram:alpha", "telegram:beta", "telegram:gamma"})
         for handle in ("alpha", "beta", "gamma"):
@@ -453,6 +497,53 @@ class TestOfficialSocialCollectors(unittest.IsolatedAsyncioTestCase):
         # exists anywhere on FakeTelegramClient for it to reach).
         await engine._fetch_telegram_posts(account)
         self.assertEqual(len(engine.mentions), 1)
+    async def test_telegram_push_and_polling_share_dedupe_path(self):
+        engine = self.make_engine()
+        account = SocialAccount(SocialPlatform.TELEGRAM, "alerts_bot", "1", "Alerts")
+        mint = "FySyjuXTts9mTz2wjyuSXAz4bEBv6v5qxCTcLAMd4mVX"
+        message = SimpleNamespace(
+            id=42, message=f"new token {mint}",
+            date=SimpleNamespace(timestamp=lambda: 1_700_000_000.0),
+            views=3, forwards=1, replies=None,
+        )
+        await engine._process_telegram_message(account, message)
+        await engine._process_telegram_message(account, message)
+        self.assertEqual(len(engine.mentions), 1)
+        self.assertEqual(engine.mentions[0].token, mint)
+        self.assertEqual(engine.mentions[0].engagement["views"], 3)
+
+    async def test_one_invalid_telegram_channel_does_not_mask_healthy_ingestion(self):
+        engine = self.make_engine()
+
+        class TelegramStub:
+            async def iter_messages(self, handle, limit):
+                if handle == "missing":
+                    raise ValueError("No user has missing as username")
+                if False:
+                    yield None
+
+        engine._telegram_client = TelegramStub()
+        healthy = SocialAccount(SocialPlatform.TELEGRAM, "healthy", "1", "Healthy")
+        missing = SocialAccount(SocialPlatform.TELEGRAM, "missing", "2", "Missing")
+        await engine._fetch_telegram_posts(healthy)
+        await engine._fetch_telegram_posts(missing)
+        self.assertEqual(engine.data_status["telegram"], "OK_PARTIAL: 1 configured channels unavailable")
+
+    async def test_numeric_telegram_entity_is_polled_as_integer(self):
+        engine = self.make_engine()
+
+        class TelegramStub:
+            target = None
+
+            async def iter_messages(self, target, limit):
+                self.target = target
+                if False:
+                    yield None
+
+        engine._telegram_client = TelegramStub()
+        account = SocialAccount(SocialPlatform.TELEGRAM, "-10012345", "-10012345", "Private bot")
+        await engine._fetch_telegram_posts(account)
+        self.assertEqual(engine._telegram_client.target, -10012345)
 
 
 class TestNativeMintChecks(unittest.TestCase):
@@ -531,6 +622,12 @@ class TestProbabilityAndAccounting(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 predictor.save(str(Path(directory) / "unsafe.joblib"), {"status": "REJECTED"})
 
+    def test_model_loader_ignores_other_validated_artifact_families(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "rug-hazard-1.joblib").write_bytes(b"not a multihead artifact")
+            predictor = MultiHeadPredictor(directory)
+            self.assertFalse(predictor.load_latest())
+
 
 class FakeExecutionEngineForExit:
     def __init__(self, result):
@@ -588,6 +685,7 @@ class TestPartialExitAccounting(unittest.IsolatedAsyncioTestCase):
         result = ExecutionResult(
             success=True, status=TransactionStatus.SIMULATED, simulated=True,
             quoted_output_amount=150_000_000, native_balance_delta_lamports=0,
+            actual_input_amount=500,
         )
         desk = self._desk(result)
         position = self._position()
@@ -612,6 +710,7 @@ class TestPartialExitAccounting(unittest.IsolatedAsyncioTestCase):
         result = ExecutionResult(
             success=True, status=TransactionStatus.SIMULATED, simulated=True,
             quoted_output_amount=40_000_000, native_balance_delta_lamports=0,
+            actual_input_amount=1_000,
         )
         desk = self._desk(result)
         position = self._position()
@@ -627,6 +726,7 @@ class TestPartialExitAccounting(unittest.IsolatedAsyncioTestCase):
         result = ExecutionResult(
             success=True, status=TransactionStatus.FILLED, filled=True, landed=True, submitted=True,
             filled_output_amount=150_000_000, native_balance_delta_lamports=-5_000_000,
+            actual_input_amount=500,
         )
         desk = self._desk(result)
         desk.dry_run = False
@@ -1391,23 +1491,44 @@ class TestShadowTrainer(unittest.TestCase):
         self.assertEqual(train_tokens | oos_tokens, {f"token-{index}" for index in range(5)})
 
     def test_snapshot_labels_derive_rug_targets_from_drawdown_based_rug_time(self):
+        """Rug horizons are measured from the snapshot, not from launch.
+
+        ``outcome['rug_time']`` is seconds-since-launch, but a model asked at
+        T+220s is predicting "does this rug in the next 30 seconds?" from where
+        it stands. Labelling it against the launch-relative time would teach the
+        model that a rug 20 seconds away is 240 seconds away, which is exactly
+        backwards at the moment the answer matters most.
+        """
         from src.research.shadow_trainer import snapshot_labels
         from src.strategies.multihead_predictor import PredictionTarget
-        snapshot = {
-            "labels": {"label_rug": True, "label_rug_time": 12},
-            "liquidity_features": {},
-        }
-        labels = snapshot_labels(snapshot)
-        self.assertEqual(labels[PredictionTarget.P_RUG_30S], 1.0)
-        self.assertEqual(labels[PredictionTarget.P_RUG_5M], 1.0)
+        episode = {"token": "mint", "created_at": 1_000.0}
 
-        slow_bleed = {
-            "labels": {"label_rug": True, "label_rug_time": 240},
-            "liquidity_features": {},
-        }
-        slow_labels = snapshot_labels(slow_bleed)
-        self.assertEqual(slow_labels[PredictionTarget.P_RUG_30S], 0.0)
-        self.assertEqual(slow_labels[PredictionTarget.P_RUG_5M], 1.0)
+        at_launch = {"timestamp": 1_000.0, "labels": {}, "liquidity_features": {}}
+        fast = snapshot_labels(at_launch, episode, {"rugged": True, "rug_time": 12.0})
+        self.assertEqual(fast[PredictionTarget.P_RUG_30S], 1.0)
+        self.assertEqual(fast[PredictionTarget.P_RUG_5M], 1.0)
+
+        slow = snapshot_labels(at_launch, episode, {"rugged": True, "rug_time": 240.0})
+        self.assertEqual(slow[PredictionTarget.P_RUG_30S], 0.0)
+        self.assertEqual(slow[PredictionTarget.P_RUG_5M], 1.0)
+
+        # Same 240s rug, but observed at T+220s: now it is 20 seconds away.
+        late = {"timestamp": 1_220.0, "labels": {}, "liquidity_features": {}}
+        imminent = snapshot_labels(late, episode, {"rugged": True, "rug_time": 240.0})
+        self.assertEqual(imminent[PredictionTarget.P_RUG_30S], 1.0)
+        self.assertEqual(imminent[PredictionTarget.P_RUG_5M], 1.0)
+
+        # A snapshot taken after the rug carries a negative horizon and must not
+        # be labelled as a future rug.
+        after = {"timestamp": 1_400.0, "labels": {}, "liquidity_features": {}}
+        stale = snapshot_labels(after, episode, {"rugged": True, "rug_time": 240.0})
+        self.assertEqual(stale[PredictionTarget.P_RUG_30S], 0.0)
+        self.assertEqual(stale[PredictionTarget.P_RUG_5M], 0.0)
+
+        # No rug_time is missing information, never a confident "did not rug".
+        unknown = snapshot_labels(at_launch, episode, {"rugged": True, "rug_time": None})
+        self.assertEqual(unknown[PredictionTarget.P_RUG_30S], 0.0)
+        self.assertEqual(unknown[PredictionTarget.P_RUG_5M], 0.0)
 
     def test_insufficient_history_remains_explicitly_data_blocked(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1425,10 +1546,12 @@ def _write_hazard_episode(storage: Path, token: str, created_at: float, observat
         json.dump({
             "token": token, "chain": "solana", "created_at": created_at,
             "market_observations": observations, "final_outcome": final_outcome,
+            "snapshots": {name: {"timestamp": created_at + offset}
+                          for name, offset in (("t10s", 10), ("t30s", 30), ("t1m", 60))},
         }, handle)
 
 
-def _build_hazard_fixture(storage: Path, count: int = 40):
+def _build_hazard_fixture(storage: Path, count: int = 100):
     """40 episodes interleaved rug/healthy (3-in-8 rug) so both the train
     and the chronologically-last OOS fold contain rug episodes."""
     for index in range(count):
@@ -1454,71 +1577,85 @@ class TestHazardTrainer(unittest.IsolatedAsyncioTestCase):
     def test_insufficient_history_remains_explicitly_data_blocked(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            report = train_hazard_calibration(root / "episodes", root / "models", min_samples=200)
+            report = hazard_trainer.train(root / "episodes", root / "models", min_rows=200)
             self.assertEqual(report["status"], "DATA_BLOCKED")
             persisted = json.loads((root / "models" / "last_hazard_training_report.json").read_text())
             self.assertEqual(persisted["status"], "DATA_BLOCKED")
 
-    def test_calibration_trains_and_separates_rug_from_healthy_checkpoints(self):
+    def test_feature_vector_separates_rug_like_observations_from_clean_ones(self):
+        rug_like = ContinuousRugHazardModel.feature_vector_from_observations(
+            [{"type": "liquidity", "timestamp": 15, "change_pct": -0.5},
+             {"type": "route", "timestamp": 16, "feasible": False}], 20,
+        )
+        healthy = ContinuousRugHazardModel.feature_vector_from_observations(
+            [{"type": "trade", "side": "buy", "timestamp": 1, "notional_usd": 50}], 20,
+        )
+        self.assertEqual(len(rug_like), len(HAZARD_FEATURE_NAMES))
+        route = HAZARD_FEATURE_NAMES.index("route_degradation")
+        liquidity = HAZARD_FEATURE_NAMES.index("liquidity_withdrawal")
+        self.assertGreater(rug_like[route], healthy[route])
+        self.assertGreater(rug_like[liquidity], healthy[liquidity])
+
+    def test_trains_on_chronological_snapshot_rows_and_passes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             storage = root / "episodes"
             _build_hazard_fixture(storage)
-
-            report = train_hazard_calibration(storage, root / "models", min_samples=150, min_positive=10)
+            report = hazard_trainer.train(storage, root / "models", min_rows=200)
             self.assertEqual(report["status"], "PASSED", report)
-            self.assertGreater(report["brier_skill_vs_base_rate"], 0)
             self.assertTrue(Path(report["model_path"]).exists())
+            for key in ("rug_30s", "rug_5m"):
+                self.assertEqual(report["metrics"][key]["status"], "PASSED", report["metrics"])
+                self.assertGreater(report["metrics"][key]["train_positive"], 0)
+                self.assertGreater(report["metrics"][key]["oos_positive"], 0)
 
-            calibrator, loaded_report = load_latest_hazard_calibration(str(root / "models"))
-            self.assertIsNotNone(calibrator)
-            self.assertEqual(loaded_report["status"], "PASSED")
-            # A clearly rug-like raw score must calibrate higher than a clean one.
-            rug_like = collect_observation_signals(
-                [{"type": "liquidity", "timestamp": 15, "change_pct": -0.5},
-                 {"type": "route", "timestamp": 16, "feasible": False}], 20,
-            )
-            healthy = collect_observation_signals(
-                [{"type": "trade", "side": "buy", "timestamp": 1, "notional_usd": 50}], 20,
-            )
-            raw_rug = score_signals(rug_like, DEFAULT_TRIGGER_WEIGHTS)
-            raw_healthy = score_signals(healthy, DEFAULT_TRIGGER_WEIGHTS)
-            self.assertGreater(calibrator.predict([raw_rug])[0], calibrator.predict([raw_healthy])[0])
-
-    async def test_rug_hazard_model_loads_and_applies_a_passed_calibration_artifact(self):
+    async def test_rug_hazard_model_loads_and_applies_a_passed_artifact(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             storage = root / "episodes"
             _build_hazard_fixture(storage)
             model_dir = root / "models"
-            report = train_hazard_calibration(storage, model_dir, min_samples=150, min_positive=10)
+            report = hazard_trainer.train(storage, model_dir, min_rows=200)
             self.assertEqual(report["status"], "PASSED", report)
 
-            with patch.dict("os.environ", {"HAZARD_MODEL_DIR": str(model_dir)}):
+            with patch.dict("os.environ", {"MODEL_DIR": str(model_dir)}):
                 class WalletIntel:
                     def get_top_wallets(self, limit=50):
                         return []
                 class Adversarial:
                     def get_adaptive_weight(self, feature, base):
                         return base
-                model = ContinuousRugHazardModel(solana_chain(), FakeRpc(), FakeGenealogy(), WalletIntel(), Adversarial())
+                model = ContinuousRugHazardModel(solana_chain(), FakeRpc(), FakeGenealogy(),
+                                                 WalletIntel(), Adversarial())
                 await model._load_historical_model()
             self.assertTrue(model.is_trained)
             self.assertEqual(model.data_status, "OK")
-            self.assertIsNotNone(model.hazard_calibrator)
+            self.assertTrue({"rug_30s", "rug_5m"}.issubset(model._historical_models))
 
             model.register_token("token")
             model.record_observation("token", {"type": "liquidity", "change_pct": -0.5})
             model.record_observation("token", {"type": "route", "feasible": False})
             state = await model._compute_hazard("token")
-            self.assertGreater(state.raw_hazard, 0)
-            self.assertAlmostEqual(
-                state.current_hazard,
-                float(np.clip(model.hazard_calibrator.predict([state.raw_hazard])[0], 0, 1)),
-            )
+            self.assertEqual(state.data_status, "OK")
+            self.assertGreaterEqual(state.hazard_30s, 0)
+            self.assertGreaterEqual(state.hazard_5m, 0)
 
 
 class TestApplicationStartup(unittest.IsolatedAsyncioTestCase):
+    def test_market_observation_cohort_is_bounded_and_stable(self):
+        desk = MemecoinQuantDesk()
+        desk.global_config = {"market_observation_cohort_size": 2}
+        desk.dataset_builder = SimpleNamespace(active_episodes={
+            "old": SimpleNamespace(token="old", created_at=1),
+            "middle": SimpleNamespace(token="middle", created_at=2),
+            "new": SimpleNamespace(token="new", created_at=3),
+        })
+        desk._refresh_market_observation_cohort()
+        self.assertEqual(desk._market_observation_cohort, {"middle", "new"})
+        del desk.dataset_builder.active_episodes["middle"]
+        desk._refresh_market_observation_cohort()
+        self.assertEqual(desk._market_observation_cohort, {"old", "new"})
+
     async def test_offline_dry_run_initializes_without_provider_credentials(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             "os.environ", {"CHAMPION_STATE_PATH": str(Path(directory) / "champion.json")}
@@ -1686,6 +1823,17 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(second.leads), 1)
             self.assertEqual(len(second_framework.hypotheses), 1)
 
+    async def test_chinese_rss_lead_maps_to_research_mechanism(self):
+        framework = ChampionChallengerFramework()
+        miner = GlobalResearchMiner(framework)
+        await miner._register_lead(ResearchLead(
+            source_type="publisher_rss", title="聪明钱钱包跟单研究",
+            url="https://example.test/zh-lead", summary="链上钱包行为", language="zh-cn",
+            license_spdx="RSS_SUMMARY_ONLY",
+        ), persist=False)
+        self.assertEqual(miner.leads[0].mechanism, "wallet_copy_policy")
+        self.assertEqual(len(framework.hypotheses), 1)
+
 
 class FakeJupiter:
     def __init__(self):
@@ -1785,6 +1933,13 @@ class FakeTelegramClient:
         self.disconnected = False
         self.authorized = True
         self.messages_by_entity = {}
+        self.event_handlers = []
+
+    def add_event_handler(self, callback, event):
+        # Read-only push subscription: telethon's real signature, recorded so a
+        # test can assert the collector subscribed rather than fell back to
+        # polling. No send/delete/react counterpart exists to be reached.
+        self.event_handlers.append((callback, event))
 
     async def connect(self):
         self.connected = True
@@ -1801,6 +1956,29 @@ class FakeTelegramClient:
 
 
 class TestExecution(unittest.IsolatedAsyncioTestCase):
+    def test_jito_defaults_to_parallel_nearby_regions(self):
+        with patch.dict("os.environ", {"JITO_BLOCK_ENGINE_URLS": ""}, clear=False):
+            client = JitoClient()
+        self.assertGreaterEqual(len(client.jito_urls), 4)
+        self.assertTrue(any("dublin" in url for url in client.jito_urls))
+        self.assertTrue(any("frankfurt" in url for url in client.jito_urls))
+
+    async def test_identical_bundle_is_raced_across_relays(self):
+        client = JitoClient()
+        client.jito_urls = ["relay-a", "relay-b", "relay-c"]
+        called = []
+
+        async def rpc_at(url, method, params):
+            called.append((url, method))
+            await asyncio.sleep(0)
+            return "same-bundle-id"
+
+        client._rpc_at = rpc_at
+        bundle_id = await client.send_bundle(["signed-transaction"])
+        self.assertEqual(bundle_id, "same-bundle-id")
+        self.assertEqual({url for url, _ in called}, set(client.jito_urls))
+        self.assertEqual(len(client._bundle_routes[bundle_id]), 3)
+
     def test_jupiter_uses_current_gateway_and_free_tier_rate_gates(self):
         keyless = JupiterClient()
         keyed = JupiterClient(api_key="test-key")
@@ -1940,6 +2118,33 @@ class TestExecution(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.submitted)
         self.assertFalse(result.landed)
         self.assertFalse(result.filled)
+    async def test_partial_exit_uses_verified_token_debit_for_cost_basis(self):
+        class PartialExecution:
+            async def execute_sell(self, *args, **kwargs):
+                return ExecutionResult(
+                    True, TransactionStatus.FILLED, actual_input_amount=200,
+                    filled_output_amount=40_000_000, filled=True, landed=True, submitted=True,
+                )
+        class Recorder:
+            def __init__(self): self.attempts=[]
+            def record_execution_attempt(self, token, attempt): self.attempts.append(attempt)
+        desk = MemecoinQuantDesk()
+        desk.execution_engine = PartialExecution()
+        desk.dataset_builder = Recorder()
+        desk.elogw_engine = ElogwEngine(MultiHeadPredictor())
+        desk.counterfactual_lab = CounterfactualExecutionLab()
+        desk.sol_price_usd = 100
+        position = {
+            "token": "token", "size_tokens": 1_000, "remaining_cost_usd": 100,
+            "risk_contribution": 0.02, "decision_id": "missing",
+        }
+        desk.elogw_engine.update_position("token", position)
+        await desk._execute_exit("token", position, 0.5, "test_partial")
+        remaining = desk.elogw_engine.open_positions["token"]
+        self.assertEqual(remaining["size_tokens"], 800)
+        self.assertEqual(remaining["remaining_cost_usd"], 80)
+        self.assertEqual(desk.dataset_builder.attempts[-1]["requested_tokens"], 500)
+        self.assertEqual(desk.dataset_builder.attempts[-1]["actual_sold_tokens"], 200)
 
 
 class FakeGenealogy:
@@ -1951,6 +2156,27 @@ class FakeGenealogy:
 
 
 class TestWalletAndCoordination(unittest.IsolatedAsyncioTestCase):
+    def test_standard_solana_transaction_becomes_wallet_swap(self):
+        wallet = "wallet"
+        tx = {
+            "blockTime": 123,
+            "transaction": {"message": {"accountKeys": [{"pubkey": wallet}]}},
+            "meta": {
+                "fee": 5_000, "preBalances": [2_000_005_000], "postBalances": [1_000_000_000],
+                "preTokenBalances": [{"owner": wallet, "mint": "token",
+                                       "uiTokenAmount": {"uiAmountString": "0"}}],
+                "postTokenBalances": [{"owner": wallet, "mint": "token",
+                                        "uiTokenAmount": {"uiAmountString": "100"}}],
+            },
+        }
+        enhanced = WalletIntelligenceEngine._standard_tx_to_enhanced(
+            wallet, {"signature": "sig", "blockTime": 123}, tx,
+        )
+        normalized = WalletIntelligenceEngine._normalize_swap(wallet, enhanced)
+        self.assertEqual(normalized["side"], "buy")
+        self.assertEqual(normalized["amount"], 100)
+        self.assertEqual(normalized["base_value"], 1.0)
+
     def test_wallet_history_uses_fifo_closed_round_trips(self):
         wallet = "wallet"
         engine = WalletIntelligenceEngine(solana_chain(), FakeRpc(), FakeGenealogy(), "")
@@ -1968,7 +2194,10 @@ class TestWalletAndCoordination(unittest.IsolatedAsyncioTestCase):
 
     def test_wallet_regime_is_not_fabricated_from_missing_history(self):
         engine = WalletIntelligenceEngine(solana_chain(), FakeRpc(), FakeGenealogy(), "")
-        self.assertIsNone(engine._classify_regime({"timestamp": 11, "multiple": 5.0}))
+        self.assertEqual(engine._classify_regime({"timestamp": 11, "multiple": 5.0, "data_status": "OK"}),
+                         WalletRegime.GENERAL_HISTORY)
+        self.assertIsNone(engine._classify_regime({"timestamp": 11, "multiple": 5.0,
+                                                   "data_status": "DATA_BLOCKED"}))
         self.assertEqual(engine._classify_regime({"regime": "post_migration"}), WalletRegime.POST_MIGRATION)
 
     async def test_wallet_history_classifies_ultra_early_from_a_real_detected_launch_time(self):
@@ -2016,9 +2245,11 @@ class TestWalletAndCoordination(unittest.IsolatedAsyncioTestCase):
 
         await engine._build_wallet_history(wallet, late_txs)
         # A launch time is known for "late" too, but the entry is well past
-        # both timing buckets, so it must stay unclassified rather than be
-        # forced into a bucket the timing evidence does not support.
-        self.assertEqual(engine.data_status[wallet], "DATA_BLOCKED: closed trades lack PIT regime labels")
+        # both timing buckets. It may be recorded as a verified round trip,
+        # yet must never be promoted into a timing bucket the evidence does
+        # not support, nor into a migration-phase regime with no migration
+        # timestamp on record.
+        self.assertNotIn(WalletRegime.ULTRA_EARLY, engine.regime_performances[wallet])
         self.assertNotIn(WalletRegime.PRE_MIGRATION, engine.regime_performances[wallet])
         self.assertNotIn(WalletRegime.POST_MIGRATION, engine.regime_performances[wallet])
 
@@ -2032,8 +2263,12 @@ class TestWalletAndCoordination(unittest.IsolatedAsyncioTestCase):
              "tokenTransfers": [{"fromUserAccount": wallet, "toUserAccount": "curve", "mint": "token", "tokenAmount": 50}]},
         ]
         await engine._build_wallet_history(wallet, txs)
-        self.assertEqual(engine.regime_performances[wallet], {})
-        self.assertEqual(engine.data_status[wallet], "DATA_BLOCKED: closed trades lack PIT regime labels")
+        # A verified closed round trip is real evidence and may be recorded as
+        # GENERAL_HISTORY, but with no launch or migration timestamp on record
+        # no launch-relative regime may be fabricated from it.
+        for timed in (WalletRegime.ULTRA_EARLY, WalletRegime.EARLY_CURVE,
+                      WalletRegime.PRE_MIGRATION, WalletRegime.POST_MIGRATION):
+            self.assertNotIn(timed, engine.regime_performances[wallet])
 
     def test_public_coordination_requires_evidence_and_detects_same_slot(self):
         class WalletIntel:
@@ -2160,6 +2395,35 @@ class TestRpcFallback(unittest.IsolatedAsyncioTestCase):
 
 
 class TestShadowMarketObservation(unittest.IsolatedAsyncioTestCase):
+    async def test_social_candidate_requires_verified_spl_mint(self):
+        class Rpc:
+            async def request(self, method, params):
+                self.method = method
+                return {"value": {
+                    "owner": TOKEN_PROGRAM,
+                    "data": {"parsed": {"type": "mint", "info": {}}},
+                }}
+
+        class Detector:
+            def __init__(self):
+                self.candidates = []
+
+            async def _on_candidate(self, candidate):
+                self.candidates.append(candidate)
+
+        desk = MemecoinQuantDesk()
+        desk.solana_rpc = Rpc()
+        desk.detection_engine = Detector()
+        await desk._triage_social_candidate({
+            "token": "FySyjuXTts9mTz2wjyuSXAz4bEBv6v5qxCTcLAMd4mVX",
+            "platform": "telegram", "account": "alerts_bot", "credibility": 0.5,
+            "timestamp": 1_700_000_000,
+        })
+        self.assertEqual(len(desk.detection_engine.candidates), 1)
+        candidate = desk.detection_engine.candidates[0]
+        self.assertEqual(candidate.source, DetectionSource.SOCIAL)
+        self.assertTrue(candidate.metadata["mint_verified"])
+
     async def test_candidate_pipeline_rechecks_first_seconds_without_duplicates(self):
         desk = MemecoinQuantDesk()
         desk.global_config = {"candidate_recheck_delays_seconds": [0, 0.001, 0.003]}
@@ -2234,6 +2498,7 @@ class TestPointInTimeResearch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome["feasible_exit_multiple"], 6)
         self.assertTrue(outcome["migrated"])
         self.assertAlmostEqual(outcome["max_drawdown"], 0.95)
+        self.assertEqual(outcome["rug_time"], 20)
         self.assertEqual(outcome["realized_pnl"], 12.5)
         # A drawdown past 90% is the only rug signal any producer in this
         # codebase currently emits (nothing sets "rugged": True on an
@@ -2256,6 +2521,16 @@ class TestPointInTimeResearch(unittest.IsolatedAsyncioTestCase):
         outcome = await builder._determine_final_outcome(episode)
         self.assertTrue(outcome["rugged"])
         self.assertEqual(outcome["rug_time"], 12)
+
+    async def test_pit_outcome_recognizes_native_migration_event(self):
+        episode = LaunchEpisode("token", "solana", 100, "dev", "pump", "curve", "wsol")
+        episode.market_observations.extend([
+            {"timestamp": 100, "price_usd": 1.0},
+            {"timestamp": 110, "price_usd": 1.2, "type": "migration"},
+            {"timestamp": 120, "price_usd": 1.1},
+        ])
+        outcome = await self.builder()._determine_final_outcome(episode)
+        self.assertTrue(outcome["migrated"])
 
     async def test_missing_prices_are_explicitly_data_blocked(self):
         episode = LaunchEpisode("token", "solana", 100, "dev", "pump", "curve", "wsol")
@@ -2315,6 +2590,23 @@ class TestCounterfactuals(unittest.TestCase):
 
 
 class TestHazardTracking(unittest.IsolatedAsyncioTestCase):
+    def test_hazard_feature_vector_is_point_in_time_and_detects_deterioration(self):
+        observations = [
+            {"timestamp": 100, "type": "trade", "side": "buy", "notional_usd": 1000,
+             "price_multiple": 2.0},
+            {"timestamp": 260, "type": "trade", "side": "sell", "notional_usd": 800,
+             "price_multiple": 0.1},
+            {"timestamp": 270, "type": "route", "feasible": False, "price_impact_pct": 0.5},
+            {"timestamp": 280, "type": "liquidity", "change_pct": -0.5},
+            {"timestamp": 400, "type": "trade", "side": "buy", "notional_usd": 10},
+        ]
+        vector = ContinuousRugHazardModel.feature_vector_from_observations(observations, 300)
+        self.assertEqual(len(vector), 8)
+        self.assertEqual(vector[0], 1.0)
+        self.assertGreaterEqual(vector[3], 0.9)
+        self.assertEqual(vector[4], 1.0)
+        self.assertEqual(vector[5], 0.5)
+
     async def test_route_loss_and_sell_pressure_create_actionable_hazard(self):
         class WalletIntel:
             def get_top_wallets(self, limit=50):

@@ -1,3 +1,13 @@
+FROM python:3.11-slim AS native-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl build-essential \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
+    && pip install --no-cache-dir 'maturin>=1.7,<2' \
+    && rm -rf /var/lib/apt/lists/*
+ENV PATH="/root/.cargo/bin:${PATH}"
+COPY native/solana_fastpath /build/solana_fastpath
+RUN maturin build --release --manifest-path /build/solana_fastpath/Cargo.toml --out /wheels
+
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -15,6 +25,8 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+COPY --from=native-builder /wheels /wheels
+RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
 
 COPY src/ ./src/
 COPY config/ ./config/

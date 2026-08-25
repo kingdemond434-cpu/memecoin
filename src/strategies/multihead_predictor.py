@@ -45,6 +45,7 @@ class PredictionFeatures:
     deployer_avg_multiple: float = 0
     deployer_cluster_risk: float = 0
     funding_wallet_risk: float = 0
+    funding_wallet_reuse: float = 0
     
     initial_buyers: int = 0
     smart_buyers: int = 0
@@ -73,8 +74,18 @@ class PredictionFeatures:
     narrative_momentum: float = 0
     
     holder_concentration: float = 0
+    holder_concentration_delta: float = 0
+    holder_concentration_velocity: float = 0
     top_10_pct: float = 0
     deployer_pct: float = 0
+    token_extension_risk: float = 0
+    meme_launch_rate_1h: float = 0
+    sol_change_24h: float = 0
+    btc_change_24h: float = 0
+    sol_btc_beta: float = 0
+    solana_tvl_change: float = 0
+    priority_fee_p90: float = 0
+    fee_pressure: float = 0
     
     regime: str = "unknown"
     time_since_launch: float = 0
@@ -91,6 +102,7 @@ class PredictionFeatures:
             self.deployer_avg_multiple / 100,
             self.deployer_cluster_risk,
             self.funding_wallet_risk,
+            self.funding_wallet_reuse,
             min(self.initial_buyers / 50, 1),
             min(self.smart_buyers / 10, 1),
             min(self.insider_buyers / 10, 1),
@@ -114,8 +126,18 @@ class PredictionFeatures:
             self.narrative_novelty,
             self.narrative_momentum,
             self.holder_concentration,
+            self.holder_concentration_delta,
+            self.holder_concentration_velocity,
             self.top_10_pct / 100,
             self.deployer_pct / 100,
+            self.token_extension_risk,
+            min(self.meme_launch_rate_1h / 500, 1),
+            np.clip(self.sol_change_24h / 100, -1, 1),
+            np.clip(self.btc_change_24h / 100, -1, 1),
+            np.clip(self.sol_btc_beta / 5, -1, 1),
+            np.clip(self.solana_tvl_change, -1, 1),
+            min(self.priority_fee_p90 / 100_000, 1),
+            min(self.fee_pressure / 20, 1),
             self.data_coverage,
             float(self.wallet_history_available),
             float(self.social_available),
@@ -147,7 +169,7 @@ class MultiHeadPrediction:
 
 
 class MultiHeadPredictor:
-    ARTIFACT_VERSION = 3
+    ARTIFACT_VERSION = 4
 
     def __init__(self, model_dir: str = "models"):
         self.model_dir = model_dir
@@ -155,14 +177,18 @@ class MultiHeadPredictor:
         self.calibrators: Dict[PredictionTarget, Any] = {}
         self.feature_names = [
             "deployer_rug_rate", "deployer_success_rate", "deployer_avg_multiple",
-            "deployer_cluster_risk", "funding_wallet_risk", "initial_buyers",
+            "deployer_cluster_risk", "funding_wallet_risk", "funding_wallet_reuse", "initial_buyers",
             "smart_buyers", "insider_buyers", "buyer_acceleration", "buy_velocity",
             "sol_volume", "organic_ratio", "bundle_concentration", "liquidity_usd",
             "liquidity_locked", "buy_tax", "sell_tax", "ownership_renounced",
             "can_mint", "can_freeze", "social_velocity", "social_acceleration",
             "social_credibility", "chain_before_social", "cross_platform",
             "narrative_novelty", "narrative_momentum", "holder_concentration",
-            "top_10_pct", "deployer_pct", "data_coverage", "wallet_history_available",
+            "holder_concentration_delta", "holder_concentration_velocity",
+            "top_10_pct", "deployer_pct", "token_extension_risk", "meme_launch_rate_1h",
+            "sol_change_24h", "btc_change_24h", "sol_btc_beta", "solana_tvl_change",
+            "priority_fee_p90", "fee_pressure",
+            "data_coverage", "wallet_history_available",
             "social_available", "coordination_available", "flow_available"
         ]
         self.model_version = "1.0"
@@ -217,16 +243,22 @@ class MultiHeadPredictor:
                 if target in CLASSIFICATION_TARGETS:
                     split = max(1, int(len(X) * 0.8))
                     X_fit, y_fit, X_cal, y_cal = X[:split], y[:split], X[split:], y[split:]
-                    if len(np.unique(y_fit)) < 2 or len(X_cal) < 10 or len(np.unique(y_cal)) < 2:
-                        raise ValueError("chronological fit/calibration windows require both classes")
+                    if len(np.unique(y_fit)) < 2:
+                        raise ValueError("chronological fit window requires both classes")
                     model.fit(X_fit, y_fit)
-                    iso_reg = IsotonicRegression(out_of_bounds='clip')
-                    iso_reg.fit(model.predict_proba(X_cal)[:, 1], y_cal)
-                    self.calibrators[target] = iso_reg
+                    calibration = "raw_probability"
+                    if len(X_cal) >= 10 and len(np.unique(y_cal)) >= 2:
+                        iso_reg = IsotonicRegression(out_of_bounds='clip')
+                        iso_reg.fit(model.predict_proba(X_cal)[:, 1], y_cal)
+                        self.calibrators[target] = iso_reg
+                        calibration = "isotonic_chronological"
                 else:
                     model.fit(X, y)
+                    calibration = "not_applicable"
                 
-                results[target.value] = {"status": "trained", "samples": len(data)}
+                results[target.value] = {
+                    "status": "trained", "samples": len(data), "calibration": calibration,
+                }
                 logger.info(f"Trained {target.value} on {len(data)} samples")
                 
             except Exception as e:
@@ -367,7 +399,7 @@ class MultiHeadPredictor:
         candidates = [
             os.path.join(self.model_dir, name)
             for name in os.listdir(self.model_dir)
-            if name.endswith((".joblib", ".pkl"))
+            if name.startswith("multihead-shadow-") and name.endswith((".joblib", ".pkl"))
         ]
         if not candidates:
             return False

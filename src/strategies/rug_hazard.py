@@ -1,14 +1,16 @@
 """Continuous, evidence-backed Solana exit hazard tracking."""
 
 import asyncio
-import logging
 import os
+import logging
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Deque, Dict, List, Optional, Tuple
+from pathlib import Path
 
+import joblib
 import numpy as np
 
 from src.chains.rpc_manager import ChainConfig, RPCManager
@@ -17,6 +19,11 @@ from src.strategies.information_graph import AdversarialAdaptationDetector
 from src.strategies.wallet_intelligence import WalletIntelligenceEngine
 
 logger = logging.getLogger(__name__)
+
+HAZARD_FEATURE_NAMES = (
+    "sell_share_60s", "buy_deceleration", "volume_collapse", "drawdown_to_date",
+    "route_degradation", "liquidity_withdrawal", "concentration_increase", "explicit_risk_event",
+)
 
 
 class HazardTrigger(Enum):
@@ -50,7 +57,6 @@ class HazardState:
     token: str
     chain: str
     current_hazard: float = 0.0
-    raw_hazard: float = 0.0
     hazard_30s: float = 0.0
     hazard_5m: float = 0.0
     hazard_30m: float = 0.0
@@ -60,147 +66,6 @@ class HazardState:
     exit_urgency: str = "NONE"
     data_status: str = "DATA_BLOCKED"
     blocked_reason: str = "no_market_observations"
-
-
-HAZARD_ARTIFACT_VERSION = 1
-
-DEFAULT_TRIGGER_WEIGHTS = {
-    HazardTrigger.CREATOR_TRANSFER: 0.38, HazardTrigger.INSIDER_SELL: 0.38,
-    HazardTrigger.SMART_WALLET_EXIT: 0.24, HazardTrigger.LIQUIDITY_WITHDRAWAL: 0.45,
-    HazardTrigger.CONCENTRATION_CHANGE: 0.20, HazardTrigger.BUY_DECELERATION: 0.15,
-    HazardTrigger.SELL_ACCELERATION: 0.22, HazardTrigger.VOLUME_COLLAPSE: 0.20,
-    HazardTrigger.ROUTE_DEGRADATION: 0.45, HazardTrigger.SOCIAL_VELOCITY_COLLAPSE: 0.08,
-    HazardTrigger.FAILED_MIGRATION: 0.30, HazardTrigger.DEV_WALLET_ACTIVATION: 0.25,
-    HazardTrigger.BUNDLE_DETECTION: 0.25,
-}
-
-_TYPE_TRIGGER_MAP = {
-    "creator_transfer": HazardTrigger.CREATOR_TRANSFER,
-    "dev_wallet_activation": HazardTrigger.DEV_WALLET_ACTIVATION,
-    "failed_migration": HazardTrigger.FAILED_MIGRATION,
-    "bundle": HazardTrigger.BUNDLE_DETECTION,
-}
-
-
-def _notional(item: Dict[str, Any]) -> float:
-    if item.get("notional_usd") is not None:
-        return max(0.0, float(item["notional_usd"]))
-    return max(0.0, float(item.get("amount", 0) or 0) * float(item.get("price", 0) or 0))
-
-
-def _latest_by_type(observations: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    latest: Dict[str, Dict[str, Any]] = {}
-    for item in observations:
-        key = str(item.get("type", "unknown"))
-        if key not in latest or float(item.get("timestamp", 0)) >= float(latest[key].get("timestamp", 0)):
-            latest[key] = item
-    return latest
-
-
-def _make_signal(trigger: HazardTrigger, strength: Any, confidence: Any, metadata: Dict[str, Any]) -> HazardSignal:
-    return HazardSignal(trigger, float(np.clip(float(strength or 0), 0, 1)),
-                        float(np.clip(float(confidence or 0), 0, 1)),
-                        float(metadata.get("timestamp", time.time())), dict(metadata))
-
-
-def collect_observation_signals(observations: List[Dict[str, Any]], now: float) -> List[HazardSignal]:
-    """Signals derivable purely from a token's own observation timeline.
-
-    Deliberately excludes anything that depends on live, non-point-in-time
-    state (wallet reputation, adversarial adaptive weights) so this function
-    can be safely replayed against historical episodes for chronological
-    hazard-calibration training without lookahead leakage.
-    """
-    if not observations:
-        return []
-    recent = [item for item in observations if now - float(item.get("timestamp", now)) <= 60]
-    prior = [item for item in observations if 60 < now - float(item.get("timestamp", now)) <= 300]
-    signals: List[HazardSignal] = []
-    for item in recent:
-        if item.get("type") in _TYPE_TRIGGER_MAP:
-            signals.append(_make_signal(_TYPE_TRIGGER_MAP[item["type"]], item.get("strength", 1),
-                                        item.get("confidence", 0.8), item))
-
-    trades_recent = [item for item in recent if item.get("type") == "trade"]
-    trades_prior = [item for item in prior if item.get("type") == "trade"]
-    buy_recent = sum(_notional(item) for item in trades_recent if item.get("side") == "buy")
-    sell_recent = sum(_notional(item) for item in trades_recent if item.get("side") == "sell")
-    buy_prior = sum(_notional(item) for item in trades_prior if item.get("side") == "buy") / 4.0
-    sell_prior = sum(_notional(item) for item in trades_prior if item.get("side") == "sell") / 4.0
-    total_recent, total_prior = buy_recent + sell_recent, buy_prior + sell_prior
-    if total_recent > 0 and sell_recent / total_recent >= 0.65:
-        signals.append(_make_signal(HazardTrigger.SELL_ACCELERATION, sell_recent / total_recent, 0.85,
-                                    {"sell_share": sell_recent / total_recent}))
-    elif len(trades_recent) >= 4:
-        # Pump instruction arguments expose a limit, not the actual quote
-        # paid. Until balance-delta enrichment arrives, trade counts are a
-        # lower-confidence fallback and are never presented as notional.
-        sell_count = sum(item.get("side") == "sell" for item in trades_recent)
-        sell_share = sell_count / len(trades_recent)
-        if sell_share >= 0.75:
-            signals.append(_make_signal(
-                HazardTrigger.SELL_ACCELERATION, sell_share, 0.55,
-                {"sell_share_by_count": sell_share, "measurement": "count_fallback"},
-            ))
-    if buy_prior > 0 and buy_recent < buy_prior * 0.35:
-        signals.append(_make_signal(HazardTrigger.BUY_DECELERATION, 1 - buy_recent / buy_prior, 0.75, {}))
-    if total_prior > 0 and total_recent < total_prior * 0.25:
-        signals.append(_make_signal(HazardTrigger.VOLUME_COLLAPSE, 1 - total_recent / total_prior, 0.70, {}))
-
-    for item in _latest_by_type(observations).values():
-        event_type = item.get("type")
-        if event_type == "liquidity" and float(item.get("change_pct", 0)) <= -0.15:
-            signals.append(_make_signal(HazardTrigger.LIQUIDITY_WITHDRAWAL,
-                                        min(abs(float(item["change_pct"])), 1), 0.95, item))
-        elif event_type == "concentration" and float(item.get("top10_change_pct", 0)) >= 0.10:
-            signals.append(_make_signal(HazardTrigger.CONCENTRATION_CHANGE,
-                                        min(float(item["top10_change_pct"]) * 3, 1), 0.80, item))
-        elif event_type == "route":
-            feasible, impact = item.get("feasible"), float(item.get("price_impact_pct", 0) or 0)
-            if feasible is False or impact >= 0.15:
-                signals.append(_make_signal(HazardTrigger.ROUTE_DEGRADATION,
-                                            1 if feasible is False else min(impact * 3, 1), 0.98, item))
-        elif event_type == "social" and float(item.get("velocity_change_pct", 0)) <= -0.70:
-            signals.append(_make_signal(HazardTrigger.SOCIAL_VELOCITY_COLLAPSE,
-                                        abs(float(item["velocity_change_pct"])), 0.50, item))
-    return signals
-
-
-def score_signals(signals: List[HazardSignal], trigger_weights: Dict[HazardTrigger, float],
-                  adaptive_weight_fn=None) -> float:
-    """Combine independent hazard signals into a single survival-based score in [0, 1]."""
-    survival = 1.0
-    for signal in signals:
-        weight = trigger_weights.get(signal.trigger, 0.10)
-        adaptive = adaptive_weight_fn(signal.trigger.value, 1.0) if adaptive_weight_fn else 1.0
-        component = float(np.clip(signal.strength * signal.confidence * weight * adaptive, 0, 0.95))
-        survival *= 1.0 - component
-    return float(np.clip(1.0 - survival, 0, 1))
-
-
-def load_latest_hazard_calibration(model_dir: str) -> Tuple[Optional[Any], Dict[str, Any]]:
-    """Load the newest chronologically validated hazard calibration artifact, if any."""
-    import joblib
-    if not os.path.isdir(model_dir):
-        return None, {}
-    candidates = [
-        os.path.join(model_dir, name) for name in os.listdir(model_dir)
-        if name.endswith((".joblib", ".pkl"))
-    ]
-    for candidate in sorted(candidates, key=os.path.getmtime, reverse=True):
-        try:
-            data = joblib.load(candidate)
-            if data.get("artifact_version") != HAZARD_ARTIFACT_VERSION:
-                raise ValueError("unsupported hazard artifact version")
-            report = data.get("validation_report") or {}
-            if report.get("status") != "PASSED":
-                raise ValueError("hazard artifact lacks passed chronological validation")
-            report = dict(report)
-            report["model_path"] = candidate
-            return data["calibrator"], report
-        except Exception as exc:
-            logger.error("Hazard calibration artifact rejected (%s): %s", candidate, exc)
-    return None, {}
 
 
 class ContinuousRugHazardModel:
@@ -217,12 +82,21 @@ class ContinuousRugHazardModel:
         self.observations: Dict[str, Deque[Dict[str, Any]]] = defaultdict(lambda: deque(maxlen=5_000))
         self.token_metadata: Dict[str, Dict[str, Any]] = {}
         self.is_trained = False
-        self.hazard_calibrator: Optional[Any] = None
         self.data_status = "DATA_BLOCKED"
         self.data_status_detail = "no versioned chronological hazard training artifact"
         self._running = False
         self._monitor_task: Optional[asyncio.Task] = None
-        self.trigger_weights = dict(DEFAULT_TRIGGER_WEIGHTS)
+        self._historical_models: Dict[str, Any] = {}
+        self._historical_calibrators: Dict[str, Any] = {}
+        self.trigger_weights = {
+            HazardTrigger.CREATOR_TRANSFER: 0.38, HazardTrigger.INSIDER_SELL: 0.38,
+            HazardTrigger.SMART_WALLET_EXIT: 0.24, HazardTrigger.LIQUIDITY_WITHDRAWAL: 0.45,
+            HazardTrigger.CONCENTRATION_CHANGE: 0.20, HazardTrigger.BUY_DECELERATION: 0.15,
+            HazardTrigger.SELL_ACCELERATION: 0.22, HazardTrigger.VOLUME_COLLAPSE: 0.20,
+            HazardTrigger.ROUTE_DEGRADATION: 0.45, HazardTrigger.SOCIAL_VELOCITY_COLLAPSE: 0.08,
+            HazardTrigger.FAILED_MIGRATION: 0.30, HazardTrigger.DEV_WALLET_ACTIVATION: 0.25,
+            HazardTrigger.BUNDLE_DETECTION: 0.25,
+        }
 
     async def start(self):
         self._running = True
@@ -239,20 +113,31 @@ class ContinuousRugHazardModel:
                 return
 
     async def _load_historical_model(self):
-        self.data_status = "DATA_BLOCKED"
-        self.data_status_detail = "no versioned chronological hazard training artifact"
-        model_dir = os.getenv("HAZARD_MODEL_DIR", "models/hazard")
+        model_dir = Path(os.getenv("MODEL_DIR", "models"))
+        candidates = sorted(model_dir.glob("rug-hazard-*.joblib"), key=lambda path: path.stat().st_mtime, reverse=True)
+        if not candidates:
+            self.data_status = "DATA_BLOCKED"
+            self.data_status_detail = "no versioned chronological hazard training artifact"
+            return
         try:
-            calibrator, report = load_latest_hazard_calibration(model_dir)
+            artifact = joblib.load(candidates[0])
+            if artifact.get("schema_version") != 1:
+                raise ValueError("unsupported hazard artifact schema")
+            if tuple(artifact.get("feature_names", ())) != HAZARD_FEATURE_NAMES:
+                raise ValueError("hazard feature schema mismatch")
+            if artifact.get("validation", {}).get("status") != "PASSED":
+                raise ValueError("hazard artifact lacks passed chronological validation")
+            self._historical_models = dict(artifact.get("models") or {})
+            self._historical_calibrators = dict(artifact.get("calibrators") or {})
+            if not {"rug_30s", "rug_5m"}.issubset(self._historical_models):
+                raise ValueError("hazard artifact is missing required heads")
+            self.is_trained = True
+            self.data_status = "OK"
+            self.data_status_detail = candidates[0].name
         except Exception as exc:
-            logger.error("Hazard calibration artifact rejected: %s", exc)
-            return
-        if calibrator is None:
-            return
-        self.hazard_calibrator = calibrator
-        self.is_trained = True
-        self.data_status = "OK"
-        self.data_status_detail = f"loaded chronologically validated calibration ({report.get('model_path', '')})"
+            self.is_trained = False
+            self.data_status = "DATA_BLOCKED"
+            self.data_status_detail = f"invalid chronological hazard artifact: {exc}"
 
     def register_token(self, token: str, metadata: Optional[Dict[str, Any]] = None) -> HazardState:
         state = self.hazard_states.setdefault(token, HazardState(token=token, chain=self.chain_config.name))
@@ -288,14 +173,22 @@ class ContinuousRugHazardModel:
             return state
         signals = await self._collect_hazard_signals(token)
         state.signals = signals[-50:]
-        raw_hazard = score_signals(signals, self.trigger_weights, self.adversarial.get_adaptive_weight)
-        state.raw_hazard = raw_hazard
-        if self.hazard_calibrator is not None:
-            state.current_hazard = float(np.clip(self.hazard_calibrator.predict([raw_hazard])[0], 0, 1))
-        else:
-            state.current_hazard = raw_hazard
+        survival = 1.0
+        for signal in signals:
+            weight = self.trigger_weights.get(signal.trigger, 0.10)
+            adaptive = self.adversarial.get_adaptive_weight(signal.trigger.value, 1.0)
+            component = float(np.clip(signal.strength * signal.confidence * weight * adaptive, 0, 0.95))
+            survival *= 1.0 - component
+        state.current_hazard = float(np.clip(1.0 - survival, 0, 1))
         state.hazard_30s = self._project_hazard(state.current_hazard, 30)
         state.hazard_5m = self._project_hazard(state.current_hazard, 300)
+        if self.is_trained:
+            features = self.feature_vector_from_observations(observations, time.time()).reshape(1, -1)
+            for key, attr in (("rug_30s", "hazard_30s"), ("rug_5m", "hazard_5m")):
+                raw = self._historical_models[key].predict_proba(features)[:, 1]
+                calibrator = self._historical_calibrators.get(key)
+                probability = float(calibrator.predict(raw)[0] if calibrator else raw[0])
+                setattr(state, attr, max(getattr(state, attr), float(np.clip(probability, 0, 1))))
         state.hazard_30m = self._project_hazard(state.current_hazard, 1_800)
         state.exit_urgency = self._get_urgency(state.hazard_30s, state.hazard_5m)
         state.exit_recommended = state.exit_urgency in {"HIGH", "CRITICAL"}
@@ -326,34 +219,142 @@ class ContinuousRugHazardModel:
         if not observations:
             return []
         now = time.time()
-        signals = collect_observation_signals(observations, now)
-        signals.extend(self._collect_wallet_signals(observations, now))
-        return signals
-
-    def _collect_wallet_signals(self, observations: List[Dict[str, Any]], now: float) -> List[HazardSignal]:
-        """Signals that depend on live wallet-reputation state.
-
-        Kept separate from collect_observation_signals because wallet_intel
-        reputation is not point-in-time snapshotted anywhere in this codebase
-        -- replaying it against a historical episode would silently leak
-        information the model would not have had at that moment, so the
-        chronological hazard trainer never calls this.
-        """
         recent = [item for item in observations if now - float(item.get("timestamp", now)) <= 60]
-        trades_recent = [item for item in recent if item.get("type") == "trade"]
+        prior = [item for item in observations if 60 < now - float(item.get("timestamp", now)) <= 300]
         signals: List[HazardSignal] = []
+        mapping = {"creator_transfer": HazardTrigger.CREATOR_TRANSFER,
+                   "dev_wallet_activation": HazardTrigger.DEV_WALLET_ACTIVATION,
+                   "failed_migration": HazardTrigger.FAILED_MIGRATION, "bundle": HazardTrigger.BUNDLE_DETECTION}
+        for item in recent:
+            if item.get("type") in mapping:
+                signals.append(self._signal(mapping[item["type"]], item.get("strength", 1), item.get("confidence", 0.8), item))
+
+        trades_recent = [item for item in recent if item.get("type") == "trade"]
+        trades_prior = [item for item in prior if item.get("type") == "trade"]
+        buy_recent = sum(self._notional(item) for item in trades_recent if item.get("side") == "buy")
+        sell_recent = sum(self._notional(item) for item in trades_recent if item.get("side") == "sell")
+        buy_prior = sum(self._notional(item) for item in trades_prior if item.get("side") == "buy") / 4.0
+        sell_prior = sum(self._notional(item) for item in trades_prior if item.get("side") == "sell") / 4.0
+        total_recent, total_prior = buy_recent + sell_recent, buy_prior + sell_prior
+        if total_recent > 0 and sell_recent / total_recent >= 0.65:
+            signals.append(self._signal(HazardTrigger.SELL_ACCELERATION, sell_recent / total_recent, 0.85, {"sell_share": sell_recent / total_recent}))
+        elif len(trades_recent) >= 4:
+            # Pump instruction arguments expose a limit, not the actual quote
+            # paid. Until balance-delta enrichment arrives, trade counts are a
+            # lower-confidence fallback and are never presented as notional.
+            sell_count = sum(item.get("side") == "sell" for item in trades_recent)
+            sell_share = sell_count / len(trades_recent)
+            if sell_share >= 0.75:
+                signals.append(self._signal(
+                    HazardTrigger.SELL_ACCELERATION, sell_share, 0.55,
+                    {"sell_share_by_count": sell_share, "measurement": "count_fallback"},
+                ))
+        if buy_prior > 0 and buy_recent < buy_prior * 0.35:
+            signals.append(self._signal(HazardTrigger.BUY_DECELERATION, 1 - buy_recent / buy_prior, 0.75, {}))
+        if total_prior > 0 and total_recent < total_prior * 0.25:
+            signals.append(self._signal(HazardTrigger.VOLUME_COLLAPSE, 1 - total_recent / total_prior, 0.70, {}))
+
+        for item in self._latest_by_type(observations).values():
+            event_type = item.get("type")
+            if event_type == "liquidity" and float(item.get("change_pct", 0)) <= -0.15:
+                signals.append(self._signal(HazardTrigger.LIQUIDITY_WITHDRAWAL, min(abs(float(item["change_pct"])), 1), 0.95, item))
+            elif event_type == "concentration" and float(item.get("top10_change_pct", 0)) >= 0.10:
+                signals.append(self._signal(HazardTrigger.CONCENTRATION_CHANGE, min(float(item["top10_change_pct"]) * 3, 1), 0.80, item))
+            elif event_type == "route":
+                feasible, impact = item.get("feasible"), float(item.get("price_impact_pct", 0) or 0)
+                if feasible is False or impact >= 0.15:
+                    signals.append(self._signal(HazardTrigger.ROUTE_DEGRADATION, 1 if feasible is False else min(impact * 3, 1), 0.98, item))
+            elif event_type == "social" and float(item.get("velocity_change_pct", 0)) <= -0.70:
+                signals.append(self._signal(HazardTrigger.SOCIAL_VELOCITY_COLLAPSE, abs(float(item["velocity_change_pct"])), 0.50, item))
+
         smart_wallets = {score.wallet: score for score in self.wallet_intel.get_top_wallets(limit=50)}
         for item in trades_recent:
             if item.get("side") != "sell":
                 continue
             score = smart_wallets.get(item.get("wallet"))
             if score:
-                strength = min(_notional(item) / 1_000, 1) if _notional(item) else 0.25
-                signals.append(_make_signal(HazardTrigger.SMART_WALLET_EXIT, strength, score.overall_score, item))
+                strength = min(self._notional(item) / 1_000, 1) if self._notional(item) else 0.25
+                signals.append(self._signal(HazardTrigger.SMART_WALLET_EXIT, strength, score.overall_score, item))
             if item.get("is_insider"):
-                strength = min(_notional(item) / 1_000, 1) if _notional(item) else 0.25
-                signals.append(_make_signal(HazardTrigger.INSIDER_SELL, strength, 0.90, item))
+                strength = min(self._notional(item) / 1_000, 1) if self._notional(item) else 0.25
+                signals.append(self._signal(HazardTrigger.INSIDER_SELL, strength, 0.90, item))
         return signals
+
+    @staticmethod
+    def _notional(item: Dict[str, Any]) -> float:
+        if item.get("notional_usd") is not None:
+            return max(0.0, float(item["notional_usd"]))
+        return max(0.0, float(item.get("amount", 0) or 0) * float(item.get("price", 0) or 0))
+
+    @staticmethod
+    def feature_vector_from_observations(observations: List[Dict[str, Any]], as_of: float) -> np.ndarray:
+        """Build a PIT-only vector shared by offline training and live inference."""
+        eligible = [item for item in observations if float(item.get("timestamp", 0) or 0) <= as_of]
+        recent = [item for item in eligible if 0 <= as_of - float(item.get("timestamp", 0) or 0) <= 60]
+        prior = [item for item in eligible if 60 < as_of - float(item.get("timestamp", 0) or 0) <= 300]
+        recent_trades = [item for item in recent if item.get("type") == "trade"]
+        prior_trades = [item for item in prior if item.get("type") == "trade"]
+
+        def volumes(items: List[Dict[str, Any]]) -> Tuple[float, float]:
+            buys = sum(ContinuousRugHazardModel._notional(item) for item in items if item.get("side") == "buy")
+            sells = sum(ContinuousRugHazardModel._notional(item) for item in items if item.get("side") == "sell")
+            if buys + sells <= 0 and items:
+                buys = float(sum(item.get("side") == "buy" for item in items))
+                sells = float(sum(item.get("side") == "sell" for item in items))
+            return buys, sells
+
+        buy_recent, sell_recent = volumes(recent_trades)
+        buy_prior, sell_prior = volumes(prior_trades)
+        prior_scale = 4.0
+        buy_prior /= prior_scale
+        sell_prior /= prior_scale
+        recent_total, prior_total = buy_recent + sell_recent, buy_prior + sell_prior
+        sell_share = sell_recent / recent_total if recent_total else 0.0
+        buy_deceleration = max(0.0, 1 - buy_recent / buy_prior) if buy_prior else 0.0
+        volume_collapse = max(0.0, 1 - recent_total / prior_total) if prior_total else 0.0
+
+        price_items = sorted(
+            (item for item in eligible if float(item.get("price_multiple", item.get("price_usd", 0)) or 0) > 0),
+            key=lambda item: float(item.get("timestamp", 0) or 0),
+        )
+        drawdown = 0.0
+        if price_items:
+            if all(float(item.get("price_multiple", 0) or 0) > 0 for item in price_items):
+                values = [float(item["price_multiple"]) for item in price_items]
+            else:
+                entry = float(price_items[0].get("price_usd", 0) or 0)
+                values = [float(item.get("price_usd", 0) or 0) / max(entry, 1e-12) for item in price_items]
+            drawdown = 1 - values[-1] / max(max(values), 1e-12)
+
+        latest = ContinuousRugHazardModel._latest_by_type(eligible)
+        route = latest.get("route", {})
+        impact = float(route.get("price_impact_pct", 0) or 0)
+        route_degradation = 1.0 if route.get("feasible") is False else min(1.0, impact / 0.15)
+        liquidity = latest.get("liquidity", {})
+        liquidity_withdrawal = min(1.0, max(0.0, -float(liquidity.get("change_pct", 0) or 0)))
+        concentration = latest.get("concentration", {})
+        concentration_increase = min(1.0, max(0.0, float(concentration.get("top10_change_pct", 0) or 0) * 3))
+        explicit_types = {"creator_transfer", "dev_wallet_activation", "failed_migration", "bundle"}
+        explicit = min(1.0, sum(str(item.get("type")) in explicit_types for item in recent) / 2)
+        return np.asarray([
+            sell_share, buy_deceleration, volume_collapse, max(0.0, min(1.0, drawdown)),
+            route_degradation, liquidity_withdrawal, concentration_increase, explicit,
+        ], dtype=float)
+
+    @staticmethod
+    def _latest_by_type(observations: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        latest: Dict[str, Dict[str, Any]] = {}
+        for item in observations:
+            key = str(item.get("type", "unknown"))
+            if key not in latest or float(item.get("timestamp", 0)) >= float(latest[key].get("timestamp", 0)):
+                latest[key] = item
+        return latest
+
+    @staticmethod
+    def _signal(trigger: HazardTrigger, strength: Any, confidence: Any, metadata: Dict[str, Any]) -> HazardSignal:
+        return HazardSignal(trigger, float(np.clip(float(strength or 0), 0, 1)),
+                            float(np.clip(float(confidence or 0), 0, 1)),
+                            float(metadata.get("timestamp", time.time())), dict(metadata))
 
     def get_hazard(self, token: str) -> Optional[HazardState]:
         return self.hazard_states.get(token)

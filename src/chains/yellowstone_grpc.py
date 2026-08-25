@@ -23,10 +23,23 @@ import grpc
 
 logger = logging.getLogger(__name__)
 
+try:
+    from solana_fastpath import (
+        b58decode as _native_b58decode,
+        b58encode as _native_b58encode,
+        looks_like_pool_creation as _native_looks_like_pool_creation,
+    )
+    NATIVE_FASTPATH_STATUS = "OK: rust-pyo3-abi3"
+except ImportError:
+    _native_b58decode = _native_b58encode = _native_looks_like_pool_creation = None
+    NATIVE_FASTPATH_STATUS = "DEGRADED: Python fallback"
+
 B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
 def b58encode(raw: bytes) -> str:
+    if _native_b58encode is not None:
+        return _native_b58encode(raw)
     number = int.from_bytes(raw, "big")
     encoded = bytearray()
     while number:
@@ -37,6 +50,8 @@ def b58encode(raw: bytes) -> str:
 
 
 def b58decode(value: str) -> bytes:
+    if _native_b58decode is not None:
+        return bytes(_native_b58decode(value))
     number = 0
     for char in value.encode("ascii"):
         number = number * 58 + B58_ALPHABET.index(char)
@@ -397,6 +412,8 @@ class SolanaRpcProgramStream:
 
     @staticmethod
     def _looks_like_pool_creation(logs: List[str]) -> bool:
+        if _native_looks_like_pool_creation is not None:
+            return bool(_native_looks_like_pool_creation(logs))
         names = {
             "initialize", "initialize2", "initializepool", "initializepoolv2", "createpool",
             "initializelbpair", "initializecustomizablepermissionlesslbpair",

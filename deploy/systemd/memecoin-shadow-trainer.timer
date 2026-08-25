@@ -1,0 +1,11 @@
+[Unit]
+Description=Run chronological memecoin training hourly
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5m
+Persistent=true
+Unit=memecoin-shadow-trainer.service
+
+[Install]
+WantedBy=timers.target

@@ -289,6 +289,7 @@ class JitoClient:
     TIP_FLOOR_URL = "https://bundles.jito.wtf/api/v1/bundles/tip_floor"
     DEFAULT_REGIONS = (
         "https://mainnet.block-engine.jito.wtf",
+        "https://dublin.mainnet.block-engine.jito.wtf",
         "https://amsterdam.mainnet.block-engine.jito.wtf",
         "https://frankfurt.mainnet.block-engine.jito.wtf",
         "https://london.mainnet.block-engine.jito.wtf",
@@ -311,8 +312,21 @@ class JitoClient:
         # same transaction to one region twice.
         self.regions: List[str] = list(dict.fromkeys(bases))
         self.jito_url = self.regions[0] + self.METHOD_PATHS["sendBundle"]
+        # Which regions accepted a given bundle id, so status can be queried
+        # where it was actually received.
+        self._bundle_routes: Dict[str, List[str]] = {}
         self._session: Optional[aiohttp.ClientSession] = None
         self._tip_accounts: List[str] = []
+
+    @property
+    def jito_urls(self) -> List[str]:
+        """Bundle-submission URLs, one per configured region."""
+        return [base + self.METHOD_PATHS["sendBundle"] for base in self.regions]
+
+    @jito_urls.setter
+    def jito_urls(self, urls: List[str]):
+        self.regions = list(dict.fromkeys(self._base_of(url) for url in urls))
+        self.jito_url = self.regions[0] + self.METHOD_PATHS["sendBundle"] if self.regions else ""
 
     @staticmethod
     def _base_of(url: str) -> str:
@@ -335,11 +349,14 @@ class JitoClient:
             self._session = None
 
     async def _rpc(self, method: str, params: List[Any], base: Optional[str] = None) -> Any:
+        return await self._rpc_at(self.endpoint(method, base), method, params)
+
+    async def _rpc_at(self, url: str, method: str, params: List[Any]) -> Any:
         if not self._session:
             raise RuntimeError("Jito client is not started")
         try:
             async with self._session.post(
-                self.endpoint(method, base),
+                url,
                 json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
             ) as resp:
                 if resp.status != 200:
@@ -353,6 +370,33 @@ class JitoClient:
             logger.warning("Jito %s DATA_BLOCKED: %s", method, exc)
             return None
 
+    @staticmethod
+    async def _first_valid(tasks: List["asyncio.Task"]) -> Any:
+        """Return the first truthy result, cancelling the rest.
+
+        asyncio.gather would block until every region answered, so the slowest
+        relay set the latency of the whole submission even when a nearer one
+        had already accepted. Racing to first receipt is the entire point of
+        submitting to several regions.
+        """
+        pending = set(tasks)
+        winner = None
+        try:
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    try:
+                        value = task.result()
+                    except Exception:
+                        continue
+                    if value:
+                        return value
+                    winner = winner or None
+        finally:
+            for task in pending:
+                task.cancel()
+        return winner
+
     async def send_bundle(self, transactions: List[str]) -> Optional[str]:
         """Race one already-signed bundle across regions; first receipt wins.
 
@@ -360,27 +404,23 @@ class JitoClient:
         the auction, the identical transaction lands at most once. Building a
         differently-signed payload per region would risk a double fill.
         """
-        results = await asyncio.gather(
-            *(self._rpc("sendBundle", [transactions, {"encoding": "base64"}], base)
-              for base in self.regions),
-            return_exceptions=True,
-        )
-        for value in results:
-            if isinstance(value, str) and value:
-                return value
+        urls = self.jito_urls
+        tasks = [asyncio.ensure_future(self._rpc_at(url, "sendBundle",
+                                                    [transactions, {"encoding": "base64"}]))
+                 for url in urls]
+        bundle_id = await self._first_valid(tasks)
+        if isinstance(bundle_id, str) and bundle_id:
+            self._bundle_routes[bundle_id] = list(urls)
+            return bundle_id
         return None
 
     async def send_transaction(self, transaction: str) -> Optional[str]:
         """Single-transaction lane; often lands as well as a 1-tx bundle."""
-        results = await asyncio.gather(
-            *(self._rpc("sendTransaction", [transaction, {"encoding": "base64"}], base)
-              for base in self.regions),
-            return_exceptions=True,
-        )
-        for value in results:
-            if isinstance(value, str) and value:
-                return value
-        return None
+        tasks = [asyncio.ensure_future(
+            self._rpc_at(self.endpoint("sendTransaction", base), "sendTransaction",
+                         [transaction, {"encoding": "base64"}])) for base in self.regions]
+        signature = await self._first_valid(tasks)
+        return signature if isinstance(signature, str) and signature else None
 
     async def get_bundle_status(self, bundle_id: str) -> Optional[Dict[str, Any]]:
         """Landed status. Queries every region: only one auction accepted it."""

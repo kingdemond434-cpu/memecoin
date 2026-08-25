@@ -42,6 +42,18 @@ class ResearchLead:
 
 
 class GlobalResearchMiner:
+    RSS_FEEDS = [
+        ("https://solana.com/rss.xml", "en", "solana"),
+        ("https://www.coindesk.com/arc/outboundfeeds/rss/", "en", "coindesk"),
+        ("https://blog.chainalysis.com/feed/", "en", "chainalysis"),
+        ("https://www.theblock.co/rss.xml", "en", "theblock"),
+        ("https://www.chaincatcher.com/rss/clist", "zh-cn", "chaincatcher"),
+        ("https://rss.odaily.news/rss/newsflash", "zh-cn", "odaily"),
+        ("https://rss.odaily.news/rss/post", "zh-cn", "odaily"),
+        ("https://www.panewslab.com/rss.xml?lang=zh&type=NORMAL%2CNEWS", "zh-cn", "panews"),
+        ("https://www.panewslab.com/rss.xml?lang=ja&type=NORMAL%2CNEWS", "ja", "panews"),
+        ("https://www.panewslab.com/rss.xml?lang=ko&type=NORMAL%2CNEWS", "ko", "panews"),
+    ]
     QUERIES = [
         ("solana pump fun sniper trading", "en"),
         ("raydium solana mev execution", "en"),
@@ -61,15 +73,15 @@ class GlobalResearchMiner:
     ]
 
     FEATURE_PATTERNS = {
-        "wallet_copy_policy": (["copy", "wallet", "smart money"], ["wallet_lead_time", "wallet_independence", "copy_crowding"]),
-        "bundle_detection": (["bundle", "jito", "mev"], ["bundle_concentration", "same_slot_buyers", "independent_funding"]),
-        "curve_velocity": (["bonding curve", "pump", "velocity"], ["buy_velocity", "buy_acceleration", "curve_progress"]),
-        "liquidity_execution": (["liquidity", "slippage", "route"], ["liquidity_usd", "price_impact", "route_availability"]),
-        "social_propagation": (["telegram", "twitter", "social", "narrative"], ["social_velocity", "cross_platform", "source_lead_time"]),
+        "wallet_copy_policy": (["copy", "wallet", "smart money", "聪明钱", "钱包", "跟单"], ["wallet_lead_time", "wallet_independence", "copy_crowding"]),
+        "bundle_detection": (["bundle", "jito", "mev", "捆绑", "套利"], ["bundle_concentration", "same_slot_buyers", "independent_funding"]),
+        "curve_velocity": (["bonding curve", "pump", "velocity", "联合曲线", "绑定曲线", "发射"], ["buy_velocity", "buy_acceleration", "curve_progress"]),
+        "liquidity_execution": (["liquidity", "slippage", "route", "流动性", "滑点", "路由"], ["liquidity_usd", "price_impact", "route_availability"]),
+        "social_propagation": (["telegram", "twitter", "social", "narrative", "电报", "推特", "叙事"], ["social_velocity", "cross_platform", "source_lead_time"]),
         "risk_constrained_kelly": (["kelly", "geometric growth", "log utility"], ["tail_probabilities", "drawdown_budget", "calibration_width"]),
-        "optimal_stopping": (["optimal stopping", "trailing stop", "take profit"], ["high_water_mark", "continuation_probability", "hazard_rate"]),
-        "survival_hazard": (["survival", "hazard", "rug pull"], ["liquidity_change", "sell_acceleration", "route_degradation"]),
-        "order_flow_point_process": (["hawkes", "order flow", "self exciting"], ["buy_intensity", "sell_intensity", "intensity_acceleration"]),
+        "optimal_stopping": (["optimal stopping", "trailing stop", "take profit", "止盈", "止损", "追踪止损"], ["high_water_mark", "continuation_probability", "hazard_rate"]),
+        "survival_hazard": (["survival", "hazard", "rug pull", "风险率", "砸盘", "貔貅盘"], ["liquidity_change", "sell_acceleration", "route_degradation"]),
+        "order_flow_point_process": (["hawkes", "order flow", "self exciting", "订单流", "买盘", "卖盘"], ["buy_intensity", "sell_intensity", "intensity_acceleration"]),
         "probability_calibration": (["conformal", "calibration", "brier"], ["calibration_error", "interval_width", "regime_coverage"]),
         "public_coordination": (["same slot", "shared funder", "bundle detector"], ["same_slot_buyers", "shared_funder_fraction", "buy_size_similarity"]),
     }
@@ -84,14 +96,14 @@ class GlobalResearchMiner:
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self.data_status: Dict[str, str] = {}
+        self._github_token = ""
         self.ledger_path = Path(ledger_path)
+        self._query_cursor = 0
 
     async def start(self):
         await self._load_ledger()
-        github_token = os.getenv("GITHUB_TOKEN", "").strip()
+        self._github_token = os.getenv("GITHUB_TOKEN", "").strip()
         headers = {"User-Agent": "memecoin-quant-public-research/1.0"}
-        if github_token:
-            headers["Authorization"] = f"Bearer {github_token}"
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=20),
             headers=headers,
@@ -120,20 +132,38 @@ class GlobalResearchMiner:
             await asyncio.sleep(self.interval_seconds)
 
     async def run_once(self):
-        for query, language in self.QUERIES:
+        # Anonymous GitHub search permits only 10 requests/minute. Rotate eight
+        # queries per hourly cycle so a bad/expired token never exhausts the
+        # fallback budget while all languages are still covered over time.
+        count = min(8, len(self.QUERIES))
+        selected = [self.QUERIES[(self._query_cursor + i) % len(self.QUERIES)] for i in range(count)]
+        self._query_cursor = (self._query_cursor + count) % len(self.QUERIES)
+        for query, language in selected:
             await self._mine_github(query, language)
         await self._mine_arxiv()
+        for url, language, source in self.RSS_FEEDS:
+            await self._mine_rss(url, language, source)
 
     async def _mine_github(self, query: str, language: str):
         try:
-            async with self._session.get(
-                "https://api.github.com/search/repositories",
-                params={"q": query, "sort": "updated", "order": "desc", "per_page": 10},
-            ) as resp:
-                if resp.status != 200:
+            params = {"q": query, "sort": "updated", "order": "desc", "per_page": 10}
+            headers = {"Authorization": f"Bearer {self._github_token}"} if self._github_token else {}
+            fallback_used = False
+            async with self._session.get("https://api.github.com/search/repositories", params=params,
+                                         headers=headers) as resp:
+                if resp.status in (401, 403) and self._github_token:
+                    async with self._session.get("https://api.github.com/search/repositories",
+                                                 params=params) as fallback:
+                        if fallback.status != 200:
+                            self.data_status["github"] = f"DATA_BLOCKED: HTTP {fallback.status}"
+                            return
+                        payload = await fallback.json()
+                    fallback_used = True
+                elif resp.status != 200:
                     self.data_status["github"] = f"DATA_BLOCKED: HTTP {resp.status}"
                     return
-                payload = await resp.json()
+                else:
+                    payload = await resp.json()
             for item in payload.get("items", []):
                 await self._register_lead(ResearchLead(
                     source_type="github",
@@ -146,7 +176,7 @@ class GlobalResearchMiner:
                     updated_at=item.get("pushed_at", ""),
                     source_quality=min(1.0, 0.25 + np.log1p(int(item.get("stargazers_count", 0) or 0)) / 10),
                 ))
-            self.data_status["github"] = "OK"
+            self.data_status["github"] = "OK_FALLBACK_UNAUTHENTICATED" if fallback_used else "OK"
         except Exception as exc:
             self.data_status["github"] = f"DATA_BLOCKED: {exc}"
 
@@ -175,6 +205,31 @@ class GlobalResearchMiner:
             self.data_status["arxiv"] = "OK"
         except Exception as exc:
             self.data_status["arxiv"] = f"DATA_BLOCKED: {exc}"
+
+    async def _mine_rss(self, url: str, language: str, source: str):
+        """Ingest publisher-provided RSS summaries as research-only leads."""
+        status_key = f"rss:{source}:{language}"
+        try:
+            async with self._session.get(url) as resp:
+                if resp.status != 200:
+                    self.data_status[status_key] = f"DATA_BLOCKED: HTTP {resp.status}"
+                    return
+                raw = await resp.text()
+            root = ET.fromstring(raw)
+            for item in root.findall(".//item")[:100]:
+                title = (item.findtext("title") or "").strip()
+                link = (item.findtext("link") or item.findtext("guid") or "").strip()
+                summary = (item.findtext("description") or "").strip()
+                if not title or not link:
+                    continue
+                await self._register_lead(ResearchLead(
+                    source_type="publisher_rss", title=title, url=link,
+                    summary=summary[:4_000], language=language,
+                    license_spdx="RSS_SUMMARY_ONLY", source_quality=0.70,
+                ))
+            self.data_status[status_key] = "OK"
+        except (aiohttp.ClientError, asyncio.TimeoutError, ET.ParseError, ValueError) as exc:
+            self.data_status[status_key] = f"DATA_BLOCKED: {exc}"
 
     async def _load_ledger(self):
         if not self.ledger_path.exists():

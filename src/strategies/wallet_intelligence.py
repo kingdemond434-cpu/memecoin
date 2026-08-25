@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class WalletRegime(Enum):
+    GENERAL_HISTORY = "general_history"
     ULTRA_EARLY = "ultra_early"
     EARLY_CURVE = "early_curve"
     PRE_MIGRATION = "pre_migration"
@@ -87,6 +88,7 @@ class WalletIntelligenceEngine:
         self._hunter_task: Optional[asyncio.Task] = None
         self._watcher_task: Optional[asyncio.Task] = None
         self._recalc_task: Optional[asyncio.Task] = None
+        self._history_task: Optional[asyncio.Task] = None
         
         self._live_watch_wallets: Set[str] = set()
         self._recent_buys: deque = deque(maxlen=10000)
@@ -94,6 +96,11 @@ class WalletIntelligenceEngine:
         self._seen_live_signatures: Set[str] = set()
         self._history_signatures: Dict[str, Set[str]] = defaultdict(set)
         self._social_wallet_candidates: Set[str] = set()
+        self._token_launch_times: Dict[str, float] = {}
+        self._token_migration_times: Dict[str, float] = {}
+        self._history_candidates: deque = deque(maxlen=20_000)
+        self._queued_history_wallets: Set[str] = set()
+        self._history_evaluated_at: Dict[str, float] = {}
         self.data_status: Dict[str, str] = {}
         
         self._helius_base = "https://api.helius.xyz/v0"
@@ -111,12 +118,13 @@ class WalletIntelligenceEngine:
         self._hunter_task = asyncio.create_task(self._hunter_loop())
         self._watcher_task = asyncio.create_task(self._watcher_loop())
         self._recalc_task = asyncio.create_task(self._recalc_loop())
+        self._history_task = asyncio.create_task(self._history_worker_loop())
         
         await self._initial_discovery()
 
     async def stop(self):
         self._running = False
-        for task in [self._hunter_task, self._watcher_task, self._recalc_task]:
+        for task in [self._hunter_task, self._watcher_task, self._recalc_task, self._history_task]:
             if task:
                 task.cancel()
         if self._session:
@@ -153,6 +161,29 @@ class WalletIntelligenceEngine:
                 logger.error(f"Recalc loop error: {e}")
             await asyncio.sleep(300)
 
+    async def _history_worker_loop(self):
+        """Continuously reconstruct observed buyer histories within free-provider limits."""
+        while self._running:
+            if not self._history_candidates:
+                await asyncio.sleep(0.25)
+                continue
+            wallet, token = self._history_candidates.popleft()
+            self._queued_history_wallets.discard(wallet)
+            try:
+                await self._evaluate_new_wallet(wallet, token)
+                self._history_evaluated_at[wallet] = time.time()
+            except Exception as exc:
+                self.data_status[wallet] = f"DATA_BLOCKED: history worker: {exc}"
+            await asyncio.sleep(1.1)
+
+    def _queue_wallet_history(self, wallet: str, token: str):
+        if not wallet or not 32 <= len(wallet) <= 44 or wallet in self._queued_history_wallets:
+            return
+        if time.time() - self._history_evaluated_at.get(wallet, 0) < 3600:
+            return
+        self._queued_history_wallets.add(wallet)
+        self._history_candidates.append((wallet, token))
+
     async def _discover_wallets_from_recent_launches(self):
         # Launches are supplied by the validated Pump/Raydium program stream.
         # Helius does not expose a universal `/tokens/mintlist` endpoint.
@@ -184,19 +215,96 @@ class WalletIntelligenceEngine:
         await self._analyze_token_early_buyers(token)
 
     async def _evaluate_new_wallet(self, wallet: str, trigger_token: str):
-        if not self.helius_key:
-            self.data_status[wallet] = "DATA_BLOCKED: HELIUS_API_KEY missing"
-            return
+        txs: List[Dict[str, Any]] = []
         try:
-            async with self._session.get(
-                f"{self._helius_base}/addresses/{wallet}/transactions",
-                params={"api-key": self.helius_key, "limit": 100, "type": "SWAP"}
-            ) as resp:
-                if resp.status == 200:
-                    txs = await resp.json()
-                    await self._build_wallet_history(wallet, txs)
+            if self.helius_key:
+                async with self._session.get(
+                    f"{self._helius_base}/addresses/{wallet}/transactions",
+                    params={"api-key": self.helius_key, "limit": 100, "type": "SWAP"}
+                ) as resp:
+                    if resp.status == 200:
+                        txs = await resp.json()
+            if not txs:
+                txs = await self._rpc_wallet_history(wallet)
+                self.data_status[f"history_source:{wallet}"] = "OK: standard_solana_rpc"
+            else:
+                self.data_status[f"history_source:{wallet}"] = "OK: helius_enhanced"
+            await self._build_wallet_history(wallet, txs)
         except Exception as e:
+            self.data_status[wallet] = f"DATA_BLOCKED: wallet history unavailable: {e}"
             logger.debug(f"Wallet eval error: {e}")
+
+    async def _rpc_wallet_history(self, wallet: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Provider-independent fallback using standard Solana transaction balance deltas."""
+        signatures = await self.rpc.request(
+            "getSignaturesForAddress", [wallet, {"limit": limit, "commitment": "confirmed"}],
+        )
+        semaphore = asyncio.Semaphore(5)
+
+        async def fetch(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            if not row.get("signature") or row.get("err"):
+                return None
+            async with semaphore:
+                tx = await self.rpc.request("getTransaction", [row["signature"], {
+                    "encoding": "jsonParsed", "commitment": "confirmed",
+                    "maxSupportedTransactionVersion": 0,
+                }])
+            return self._standard_tx_to_enhanced(wallet, row, tx)
+
+        rows = await asyncio.gather(*(fetch(row) for row in (signatures or [])), return_exceptions=True)
+        return [row for row in rows if isinstance(row, dict)]
+
+    @staticmethod
+    def _standard_tx_to_enhanced(wallet: str, signature_row: Dict[str, Any], tx: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(tx, dict) or tx.get("meta") is None:
+            return None
+        meta = tx["meta"] or {}
+        message = ((tx.get("transaction") or {}).get("message") or {})
+        keys = message.get("accountKeys") or []
+        addresses = [item.get("pubkey") if isinstance(item, dict) else item for item in keys]
+        token_deltas: Dict[str, float] = defaultdict(float)
+        for sign, balances in ((-1.0, meta.get("preTokenBalances") or []),
+                               (1.0, meta.get("postTokenBalances") or [])):
+            for balance in balances:
+                if balance.get("owner") != wallet or not balance.get("mint"):
+                    continue
+                ui = ((balance.get("uiTokenAmount") or {}).get("uiAmountString"))
+                try:
+                    token_deltas[balance["mint"]] += sign * float(ui or 0)
+                except (TypeError, ValueError):
+                    continue
+        transfers = []
+        for mint, delta in token_deltas.items():
+            if abs(delta) <= 1e-12:
+                continue
+            transfers.append({
+                "mint": mint, "tokenAmount": abs(delta),
+                "toUserAccount": wallet if delta > 0 else None,
+                "fromUserAccount": wallet if delta < 0 else None,
+            })
+        native = []
+        if wallet in addresses:
+            index = addresses.index(wallet)
+            pre = meta.get("preBalances") or []
+            post = meta.get("postBalances") or []
+            if index < len(pre) and index < len(post):
+                delta = int(post[index]) - int(pre[index])
+                # Remove the payer fee so buys are not understated.
+                if index == 0 and delta < 0:
+                    delta += int(meta.get("fee", 0) or 0)
+                if delta:
+                    native.append({
+                        "amount": abs(delta),
+                        "toUserAccount": wallet if delta > 0 else None,
+                        "fromUserAccount": wallet if delta < 0 else None,
+                    })
+        if not transfers or not native:
+            return None
+        return {
+            "signature": signature_row.get("signature"),
+            "timestamp": tx.get("blockTime") or signature_row.get("blockTime") or 0,
+            "tokenTransfers": transfers, "nativeTransfers": native,
+        }
 
     async def _build_wallet_history(self, wallet: str, txs: List[Dict]):
         if wallet not in self.genealogy.wallets:
@@ -273,6 +381,7 @@ class WalletIntelligenceEngine:
             proceeds = normalized["base_value"] * matched / max(total_sold, 1e-12)
             closed.append({
                 "token": token,
+                "entry_timestamp": first_entry,
                 "timestamp": normalized["timestamp"],
                 "entry_timestamp": first_entry if first_entry is not None else normalized["timestamp"],
                 "multiple": proceeds / allocated_cost,
@@ -334,8 +443,11 @@ class WalletIntelligenceEngine:
             pass
         return None
 
-    ULTRA_EARLY_SECONDS = 15.0
-    EARLY_CURVE_SECONDS = 120.0
+    # Must match the thresholds _classify_regime applies to its own PIT
+    # registry: the same label assigned by two paths with different cutoffs
+    # is the training-serving skew problem in miniature.
+    ULTRA_EARLY_SECONDS = 10.0
+    EARLY_CURVE_SECONDS = 300.0
 
     def _attach_launch_relative_regime(self, trade: Dict[str, Any]):
         """Classify the two regimes that a real detected launch timestamp can
@@ -367,10 +479,32 @@ class WalletIntelligenceEngine:
                 return supplied if isinstance(supplied, WalletRegime) else WalletRegime(str(supplied))
             except ValueError:
                 return None
-        # Historical enhanced transactions do not establish launch-relative
-        # timing on their own. Defaulting every trade to EARLY_CURVE creates a
-        # false performance edge, so this remains explicitly unclassified.
-        return None
+        token = str(tx.get("token", ""))
+        entry_at = float(tx.get("entry_timestamp", tx.get("timestamp", 0)) or 0)
+        migration_at = self._token_migration_times.get(token)
+        if migration_at is not None and entry_at:
+            return WalletRegime.PRE_MIGRATION if entry_at < migration_at else WalletRegime.POST_MIGRATION
+        launch_at = self._token_launch_times.get(token)
+        if launch_at is not None and entry_at >= launch_at:
+            elapsed = entry_at - launch_at
+            if elapsed <= 10:
+                return WalletRegime.ULTRA_EARLY
+            if elapsed <= 300:
+                return WalletRegime.EARLY_CURVE
+        # This label asserts only a verified closed round trip. It does not
+        # fabricate launch-relative timing; dedicated regimes still require PIT
+        # launch/migration timestamps.
+        return WalletRegime.GENERAL_HISTORY if tx.get("data_status") == "OK" else None
+
+    def record_token_lifecycle(self, token: str, *, launch_at: Optional[float] = None,
+                               migration_at: Optional[float] = None):
+        """Register observed PIT lifecycle timestamps used to classify wallet skill."""
+        if not token:
+            return
+        if launch_at is not None:
+            self._token_launch_times[token] = float(launch_at)
+        if migration_at is not None:
+            self._token_migration_times[token] = float(migration_at)
 
     async def _update_regime_performance(self, wallet: str, regime: WalletRegime, tx: Dict):
         if regime not in self.regime_performances[wallet]:
@@ -496,6 +630,8 @@ class WalletIntelligenceEngine:
             "data_status": "OK" if event.get("price") else "DATA_BLOCKED_PRICE",
         }
         (self._recent_buys if side == "buy" else self._recent_sells).append(record)
+        if side == "buy":
+            self._queue_wallet_history(record["wallet"], token)
 
     def _determine_side(self, wallet: str, tx: Dict) -> str:
         try:
@@ -702,6 +838,8 @@ class WalletIntelligenceEngine:
             "tracked_wallets": len(self.genealogy.wallets),
             "scored_wallets": len(self.wallet_scores),
             "live_watching": len(self._live_watch_wallets),
+            "history_queue": len(self._history_candidates),
+            "histories_evaluated": len(self._history_evaluated_at),
             "regimes_tracked": len(WalletRegime),
             "recent_buys": len(self._recent_buys),
             "recent_sells": len(self._recent_sells),

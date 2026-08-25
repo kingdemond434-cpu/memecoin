@@ -57,6 +57,7 @@ def build_features(episode: Dict[str, Any], snapshot: Dict[str, Any]) -> Predict
     inference call this exact function with the same group shapes.
     """
     deployer = snapshot.get("deployer_features") or {}
+    market = snapshot.get("market_features") or {}
     wallet = snapshot.get("wallet_features") or {}
     flow = snapshot.get("flow_features") or {}
     liquidity = snapshot.get("liquidity_features") or {}
@@ -81,6 +82,7 @@ def build_features(episode: Dict[str, Any], snapshot: Dict[str, Any]) -> Predict
         deployer_avg_multiple=number(deployer, "avg_max_multiple"),
         deployer_cluster_risk=number(graph, "deployer_cluster_risk"),
         funding_wallet_risk=number(graph, "funding_wallet_risk"),
+        funding_wallet_reuse=number(graph, "funding_wallet_reuse"),
         initial_buyers=int(number(wallet, "initial_buyer_count")),
         smart_buyers=int(number(wallet, "smart_buyer_count")),
         insider_buyers=int(number(wallet, "insider_buyer_count")),
@@ -100,7 +102,20 @@ def build_features(episode: Dict[str, Any], snapshot: Dict[str, Any]) -> Predict
         chain_before_social=number(social, "chain_before_pct"),
         cross_platform=bool(social.get("cross_platform")),
         holder_concentration=number(token, "top_10_pct") / 100,
+        holder_concentration_delta=number(token, "top_10_delta_pct") / 100,
+        holder_concentration_velocity=number(token, "top_10_velocity_pct_per_second") / 100,
         top_10_pct=number(token, "top_10_pct"),
+        token_extension_risk=number(token, "extension_risk"),
+        # Market/regime group: whether the whole memecoin market is hot or
+        # dead conditions every other signal, so it belongs in the vector
+        # rather than being implicitly assumed constant.
+        meme_launch_rate_1h=number(market, "meme_launch_rate_1h"),
+        sol_change_24h=number(market, "sol_change_24h"),
+        btc_change_24h=number(market, "btc_change_24h"),
+        sol_btc_beta=number(market, "sol_btc_beta"),
+        solana_tvl_change=number(market, "solana_tvl_change"),
+        priority_fee_p90=number(market, "priority_fee_p90"),
+        fee_pressure=number(market, "fee_pressure"),
         data_coverage=sum(statuses) / len(statuses),
         wallet_history_available=bool(wallet.get("smart_buyer_count") is not None),
         social_available=bool(social.get("mention_count")),

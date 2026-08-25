@@ -21,9 +21,10 @@ import yaml
 from aiohttp import web
 from solders.keypair import Keypair
 
+from src.chains.provider_credentials import normalize_provider_environment
 from src.chains.rpc_manager import ChainRegistry, RPCManager
 from src.chains.yellowstone_grpc import (
-    PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
+    NATIVE_FASTPATH_STATUS, PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
     create_combined_subscription,
 )
 from src.detection.rug_detector import RugDetector
@@ -131,12 +132,15 @@ class MemecoinQuantDesk:
         self.successful_exits = 0
         self.total_pnl = 0.0
         self._market_observed_at: Dict[str, float] = {}
+        self._market_observation_cohort: set[str] = set()
         self._market_entry_price: Dict[str, float] = {}
         self._curve_entry_price: Dict[str, float] = {}
+        self._latest_stream_mark: Dict[str, Dict[str, float]] = {}
         self._market_cursor = 0
         self._model_artifact_mtime = 0.0
 
     async def initialize(self):
+        normalize_provider_environment(os.environ)
         with open(self.config_path, encoding="utf-8") as handle:
             self.config = yaml.safe_load(handle)
         self.global_config = self.config.get("global", {})
@@ -274,13 +278,18 @@ class MemecoinQuantDesk:
             policy_report.get("model_path", "") if trained_policy
             else "no chronologically validated exit policy; using default thresholds"
         )
+        # Shadow mode runs a deliberately broader book: many small independent
+        # trials capture rare tails without touching the separately gated
+        # live-capital limits, which keep their unprefixed values.
+        prefix = "shadow_" if self.dry_run else ""
+        setting = lambda name, default: self.global_config.get(f"{prefix}{name}", self.global_config.get(name, default))
         self.elogw_engine = ElogwEngine(
             self.predictor,
-            max_position_pct=float(self.global_config.get("max_position_pct", 0.05)),
-            max_position_usd=float(self.global_config.get("max_position_size_usd", 500)),
-            max_portfolio_risk=float(self.global_config.get("max_portfolio_risk", 0.10)),
-            max_total_exposure_pct=float(self.global_config.get("max_total_exposure_pct", 0.30)),
-            max_concurrent_positions=int(self.global_config.get("max_concurrent_positions", 10)),
+            max_position_pct=float(setting("max_position_pct", 0.05)),
+            max_position_usd=float(setting("max_position_size_usd", 500)),
+            max_portfolio_risk=float(setting("max_portfolio_risk", 0.10)),
+            max_total_exposure_pct=float(setting("max_total_exposure_pct", 0.30)),
+            max_concurrent_positions=int(setting("max_concurrent_positions", 10)),
             max_daily_loss_usd=float(self.global_config.get("max_daily_loss_usd", 1_000)),
             max_daily_loss_pct=(float(self.global_config["max_daily_loss_pct"])
                                 if self.global_config.get("max_daily_loss_pct") is not None else None),
@@ -456,6 +465,11 @@ class MemecoinQuantDesk:
     async def _candidate_pipeline(self, candidate: TokenCandidate):
         delays = self.global_config.get("candidate_recheck_delays_seconds", [0, 1, 3, 5, 10])
         checkpoints = sorted({max(0.0, float(delay)) for delay in delays})
+        if self.predictor is not None and not self.predictor._is_trained:
+            # A blocked model has no trading authority. One pass registers the
+            # episode/risk state; Yellowstone continues collecting outcomes.
+            # Holding thousands of five-pass tasks here adds latency but no evidence.
+            checkpoints = [0.0]
         started = time.monotonic()
         for delay in checkpoints:
             await asyncio.sleep(max(0.0, started + delay - time.monotonic()))
@@ -496,6 +510,9 @@ class MemecoinQuantDesk:
             return
         if risk.data_status == "DATA_BLOCKED" and self.global_config.get("reject_data_blocked_safety_checks", True):
             self._record_blocked_decision(token, "DATA_BLOCKED_safety_checks", risk_data)
+            return
+        if not self.predictor._is_trained:
+            self._record_blocked_decision(token, "DATA_BLOCKED_prediction_model", {})
             return
         liquidity = await self._resolve_liquidity(candidate)
         if liquidity <= 0:
@@ -596,13 +613,6 @@ class MemecoinQuantDesk:
         return estimate
 
     async def _build_prediction_features(self, candidate: TokenCandidate, risk: Any, liquidity: float) -> PredictionFeatures:
-        """Assemble point-in-time snapshot groups, then call the shared engine.
-
-        Live inference must not compute features its own way. The groups below
-        are produced by the same PointInTimeDatasetBuilder capture functions
-        that write the training episodes, so replay and serving see identical
-        variables rather than same-named different ones.
-        """
         as_of = time.time()
         episode = self.dataset_builder.active_episodes.get(candidate.address)
         episode_meta = {
@@ -617,27 +627,36 @@ class MemecoinQuantDesk:
             flow_features = await self.dataset_builder._capture_flow_features(episode, as_of)
             graph_features = await self.dataset_builder._capture_entity_graph_features(episode, as_of)
             social_features = await self.dataset_builder._capture_social_features(episode, as_of)
+            token_features = await self.dataset_builder._capture_token_features(episode, as_of)
+            market_features = await self.dataset_builder._capture_market_features(episode, as_of)
         else:
             # No episode yet: report every group DATA_BLOCKED rather than
             # substituting zeros that would read as real observations.
+            blocked = {"status": "DATA_BLOCKED", "reason": "episode_not_started"}
             deployer_features = {"has_profile": False}
             wallet_features = {}
-            flow_features = {"status": "DATA_BLOCKED", "reason": "episode_not_started"}
-            graph_features = {"status": "DATA_BLOCKED", "reason": "episode_not_started"}
+            flow_features = dict(blocked)
+            graph_features = dict(blocked)
+            token_features = dict(blocked)
+            market_features = dict(blocked)
             social_features = self.social_intel.get_token_social_signal(candidate.address, as_of=as_of)
 
-        liquidity_features = (
-            {"status": "OK", "liquidity_usd": liquidity, "liquidity_locked": bool(risk.liquidity_locked)}
-            if liquidity > 0 else {"status": "DATA_BLOCKED", "reason": "liquidity_not_observed"}
-        )
+        # The safety report is fresher than the episode snapshot for the
+        # fields it owns, so it takes precedence where both are present.
         token_features = {
+            **token_features,
             "status": risk.data_status,
             "ownership_renounced": bool(risk.ownership_renounced),
             "can_mint": bool(risk.can_mint),
             "can_freeze": bool(risk.can_freeze),
             "top_10_pct": float(risk.top_10_pct),
+            "extension_risk": float(getattr(risk, "extension_risk", 0) or 0),
             "sell_route_feasible": risk.sell_route_feasible,
         }
+        liquidity_features = (
+            {"status": "OK", "liquidity_usd": liquidity, "liquidity_locked": bool(risk.liquidity_locked)}
+            if liquidity > 0 else {"status": "DATA_BLOCKED", "reason": "liquidity_not_observed"}
+        )
 
         snapshot = {
             "timestamp": as_of,
@@ -647,6 +666,7 @@ class MemecoinQuantDesk:
             "liquidity_features": liquidity_features,
             "social_features": social_features,
             "token_features": token_features,
+            "market_features": market_features,
             "entity_graph_features": graph_features,
         }
         return build_features(episode_meta, snapshot)
@@ -745,6 +765,17 @@ class MemecoinQuantDesk:
                     "PAPER" if self.dry_run else "LIVE", token, added_cost, multiple, gain)
 
     async def _mark_position(self, token: str, position: Dict[str, Any]):
+        stream_mark = self._latest_stream_mark.get(token)
+        if self.dry_run and stream_mark and time.time() - stream_mark["timestamp"] <= 3.0:
+            multiple = float(stream_mark["multiple"])
+            current_value = max(0.0, float(position["remaining_cost_usd"]) * multiple)
+            observation = {"type": "stream_mark", "feasible": True, "value_usd": current_value,
+                           "price_multiple": multiple, "timestamp": stream_mark["timestamp"],
+                           "measurement": "decoded_onchain_reserve_event", "data_status": "OK"}
+            self.rug_hazard.record_observation(token, observation)
+            self.dataset_builder.record_market_observation(token, observation)
+            self.counterfactual_lab.record_market_observation(token, multiple, observation["timestamp"])
+            return multiple, current_value
         quote = await self.jupiter.get_quote(token, USDC_MINT, int(position["size_tokens"]), slippage_bps=500)
         if not quote:
             self.rug_hazard.record_observation(token, {"type": "route", "feasible": False, "timestamp": time.time()})
@@ -768,7 +799,10 @@ class MemecoinQuantDesk:
         """
         if not self.jupiter or not self.jupiter._session or not self.dataset_builder.active_episodes:
             return
-        tokens = list(self.dataset_builder.active_episodes)
+        self._refresh_market_observation_cohort()
+        tokens = list(self._market_observation_cohort)
+        if not tokens:
+            return
         budget = min(int(self.global_config.get("market_observation_budget", 5)), len(tokens))
         now = time.time()
         inspected = 0
@@ -787,8 +821,8 @@ class MemecoinQuantDesk:
             self._market_observed_at[token] = now
             budget -= 1
             due.append(token)
-        active = set(tokens)
-        for stale in set(self._market_observed_at) - active:
+        all_active = set(self.dataset_builder.active_episodes)
+        for stale in set(self._market_observed_at) - all_active:
             self._market_observed_at.pop(stale, None)
             self._market_entry_price.pop(stale, None)
             self._curve_entry_price.pop(stale, None)
@@ -800,6 +834,20 @@ class MemecoinQuantDesk:
             for token, result in zip(due, results):
                 if isinstance(result, Exception):
                     logger.warning("Market observation failed for %s: %s", token, result)
+
+    def _refresh_market_observation_cohort(self):
+        """Keep a bounded cohort long enough to collect repeated executable marks."""
+        active = self.dataset_builder.active_episodes
+        limit = max(1, int(self.global_config.get("market_observation_cohort_size", 100)))
+        self._market_observation_cohort.intersection_update(active)
+        if len(self._market_observation_cohort) >= limit:
+            return
+        newest = sorted(
+            (episode for token, episode in active.items() if token not in self._market_observation_cohort),
+            key=lambda episode: (float(episode.created_at), episode.token), reverse=True,
+        )
+        for episode in newest[:limit - len(self._market_observation_cohort)]:
+            self._market_observation_cohort.add(episode.token)
 
     async def _observe_token_market(self, token: str, observed_at: float):
         probe_lamports = int(self.global_config.get("market_probe_lamports", 10_000_000))
@@ -843,15 +891,25 @@ class MemecoinQuantDesk:
         if not result.success:
             self.dataset_builder.record_execution_attempt(token, attempt)
             return
+        actual_sold = int(result.actual_input_amount)
+        if actual_sold <= 0 or actual_sold > current_tokens:
+            attempt.update({
+                "status": "DATA_BLOCKED_ACCOUNTING",
+                "reason": "filled exit lacks a valid verified input-token balance decrease",
+            })
+            self.dataset_builder.record_execution_attempt(token, attempt)
+            return
         proceeds = result.output_amount / 1_000_000
         native_delta_usd = int(result.native_balance_delta_lamports) / 1e9 * self.sol_price_usd
-        allocated_cost = float(position["remaining_cost_usd"]) * sold_tokens / max(current_tokens, 1)
+        allocated_cost = float(position["remaining_cost_usd"]) * actual_sold / max(current_tokens, 1)
         pnl = proceeds + native_delta_usd - allocated_cost
         self.total_pnl += pnl
         self.successful_exits += int(pnl > 0)
         self.elogw_engine.update_pnl(pnl)
-        self.elogw_engine.reduce_position(token, sold_tokens, allocated_cost)
-        attempt.update({"proceeds_usd": proceeds, "native_balance_delta_usd": native_delta_usd,
+        self.elogw_engine.reduce_position(token, actual_sold, allocated_cost)
+        attempt.update({"exit_pct": actual_sold / max(current_tokens, 1),
+                        "requested_tokens": sold_tokens, "actual_sold_tokens": actual_sold,
+                        "proceeds_usd": proceeds, "native_balance_delta_usd": native_delta_usd,
                         "allocated_cost_usd": allocated_cost,
                         "realized_pnl_usd": pnl})
         self.dataset_builder.record_execution_attempt(token, attempt)
@@ -859,7 +917,7 @@ class MemecoinQuantDesk:
         for counterfactual in resolved:
             self.dataset_builder.record_counterfactual(token, counterfactual)
         logger.info("%s EXIT %s %.1f%% reason=%s proceeds=$%.2f allocated_cost=$%.2f pnl=$%.2f",
-                    "PAPER" if self.dry_run else "LIVE", token, sold_tokens / max(current_tokens, 1) * 100,
+                    "PAPER" if self.dry_run else "LIVE", token, actual_sold / max(current_tokens, 1) * 100,
                     reason, proceeds, allocated_cost, pnl)
 
     async def _refresh_portfolio_state(self):
@@ -908,6 +966,7 @@ class MemecoinQuantDesk:
         if not token:
             return
         if event.get("type") == "token_created":
+            self.wallet_intel.record_token_lifecycle(token, launch_at=event.get("timestamp", time.time()))
             self.dataset_builder.start_episode(
                 token, event.get("creator", ""), event.get("program", PumpFunMonitor.PUMP_FUN_PROGRAM),
                 event.get("bonding_curve", ""), WSOL_MINT, detected_at=event.get("timestamp", time.time()),
@@ -933,6 +992,9 @@ class MemecoinQuantDesk:
             if curve_price > 0:
                 curve_entry = self._curve_entry_price.setdefault(token, curve_price)
                 curve_multiple = curve_price / max(curve_entry, 1e-30)
+                self._latest_stream_mark[token] = {
+                    "multiple": curve_multiple, "timestamp": float(event.get("timestamp", time.time()))
+                }
             observation = {"type": "trade", "side": event.get("side"), "wallet": event.get("wallet"),
                            "amount": event.get("actual_token_amount_ui"),
                            "amount_raw": event.get("actual_token_delta_raw"),
@@ -956,10 +1018,12 @@ class MemecoinQuantDesk:
                 self.info_graph.record_event(token, event_type, event.get("wallet", ""), "wallet",
                                              event.get("timestamp", time.time()), event)
         elif event.get("type") == "token_migrated":
+            self.wallet_intel.record_token_lifecycle(token, migration_at=event.get("timestamp", time.time()))
             self.info_graph.record_event(token, LeadEventType.MIGRATION, "pump_fun", "program",
                                          event.get("timestamp", time.time()), event)
             self.dataset_builder.record_market_observation(token, {"type": "migration", **event})
         elif event.get("type") == "pool_created":
+            self.wallet_intel.record_token_lifecycle(token, migration_at=event.get("timestamp", time.time()))
             self.dataset_builder.start_episode(
                 token, event.get("creator", ""), event.get("program", PumpSwapMonitor.PUMP_AMM_PROGRAM),
                 event.get("pool", ""), event.get("quote_mint") or WSOL_MINT,
@@ -986,6 +1050,7 @@ class MemecoinQuantDesk:
         for mint in mints:
             if not mint or mint in {WSOL_MINT, USDC_MINT}:
                 continue
+            self.wallet_intel.record_token_lifecycle(mint, migration_at=event.get("timestamp", time.time()))
             quote_mint = next((other for other in mints if other in {WSOL_MINT, USDC_MINT}), None)
             self.dataset_builder.start_episode(
                 mint, event.get("creator", ""), event.get("program", ""), event.get("pool", ""),
@@ -1018,6 +1083,38 @@ class MemecoinQuantDesk:
                                          "social", signal.get("timestamp", time.time()), signal)
         self.rug_hazard.record_observation(token, {"type": "social", **signal})
         self.dataset_builder.record_market_observation(token, {"type": "social", **signal})
+        if signal.get("type") == "new_mention" and signal.get("first_mention"):
+            self._spawn_background(self._triage_social_candidate(signal))
+
+    async def _triage_social_candidate(self, signal: Dict[str, Any]):
+        """Evaluate social addresses only after verifying that the account is an SPL mint."""
+        token = str(signal.get("token", ""))
+        if not token or not self.solana_rpc or not self.detection_engine:
+            return
+        try:
+            result = await self.solana_rpc.request(
+                "getAccountInfo", [token, {"encoding": "jsonParsed", "commitment": "processed"}],
+            )
+            value = (result or {}).get("value") or {}
+            owner = str(value.get("owner", ""))
+            parsed = (((value.get("data") or {}).get("parsed") or {}))
+            if owner not in {
+                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+            } or parsed.get("type") != "mint":
+                return
+            await self.detection_engine._on_candidate(TokenCandidate(
+                address=token, chain="solana", source=DetectionSource.SOCIAL,
+                block_number=0, timestamp=float(signal.get("timestamp", time.time())),
+                metadata={
+                    "social_platform": signal.get("platform"),
+                    "social_account": signal.get("account"),
+                    "social_credibility": signal.get("credibility"),
+                    "mint_verified": True,
+                },
+            ))
+        except Exception as exc:
+            logger.debug("Social candidate mint verification blocked for %s: %s", token, exc)
 
     def readiness(self) -> Dict[str, Any]:
         return {
@@ -1032,6 +1129,7 @@ class MemecoinQuantDesk:
             "equity": {"status": self.equity_status, "wallet_equity_usd": self.wallet_equity_usd,
                        "sol_price_usd": self.sol_price_usd},
             "execution": {"dry_run": self.execution_engine.dry_run if self.execution_engine else True},
+            "native_fastpath": NATIVE_FASTPATH_STATUS,
             "portfolio": self.elogw_engine.get_portfolio_state() if self.elogw_engine else {},
             "rug_hazard": self.rug_hazard.get_stats() if self.rug_hazard else {},
             "dataset": self.dataset_builder.get_stats() if self.dataset_builder else {},

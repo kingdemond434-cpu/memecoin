@@ -101,6 +101,7 @@ class TokenRiskReport:
     deployer_balance_pct: float = 0
     token_program: str = ""
     token_extensions: List[str] = field(default_factory=list)
+    extension_risk: float = 0.0
     sell_route_feasible: Optional[bool] = None
     data_status: str = "OK"
     blocked_checks: List[str] = field(default_factory=list)
@@ -243,6 +244,7 @@ class RugDetector:
             top_10_pct=top10,
             token_program=owner,
             token_extensions=extensions,
+            extension_risk=min(1.0, sum(HIGH_RISK_EXTENSIONS.get(name, 0) for name in extensions) / 100.0),
             sell_route_feasible=route_feasible,
             data_status="DATA_BLOCKED" if blocked else "OK",
             blocked_checks=blocked,
