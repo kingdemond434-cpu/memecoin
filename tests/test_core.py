@@ -97,6 +97,11 @@ from ops.monitor import main as monitor_main
 from src.runtime.hot_state import (
     AsyncArchiveWriter, CompactWalletDNA, EconomicCache, HotState, HotStateBudget,
 )
+from src.research.lifecycle_replay import (
+    DEFAULT_DELAYS_S, DEFAULT_EXIT_RULES, Cell, Lifecycle, Mark,
+    delay_decay, hold_to_end, lifecycle_from_episode, replay_cell,
+    replay_lifecycle, sniper_scoreboard,
+)
 from src.research.attribution import (
     EdgeDecayMonitor, Leak, alpha_ledger, execution_miss, find_leaks,
     missed_monster, premature_exit, rank_research, rug_loss, sizing_leak,
@@ -6142,3 +6147,231 @@ class TestDeskWiringIsComplete(unittest.TestCase):
         for key in ("action_policy", "actor_graph", "hot_state", "mega_event_reserve"):
             self.assertIn(f'"{key}":', source,
                           f"{key} is not reported in readiness, so nothing can monitor it")
+
+
+class TestLifecycleReplay(unittest.TestCase):
+    """A launch reduced to one row with a final return throws away the question.
+
+    "Did this token go up" is not the question. "At each instant, what could we
+    have bought, how much, and what could we then actually have sold" is, and
+    only the second one has money in it.
+    """
+
+    T0 = 1_800_000_000.0
+
+    def _lifecycle(self, marks=None, **kwargs):
+        marks = marks if marks is not None else [
+            Mark(self.T0 + 0.0, 1.0, executable_sol=5.0),
+            Mark(self.T0 + 0.5, 1.4, executable_sol=5.0),
+            Mark(self.T0 + 2.0, 3.0, executable_sol=5.0),
+            Mark(self.T0 + 10.0, 8.0, executable_sol=5.0),
+            Mark(self.T0 + 60.0, 2.0, executable_sol=5.0),
+        ]
+        return Lifecycle(token="t", created_at=self.T0, marks=marks, **kwargs)
+
+    def test_entry_fills_at_the_last_mark_at_or_before_the_delay(self):
+        life = self._lifecycle()
+        # A buyer at T+1s cannot fill at a price that printed at T+2s, however
+        # much closer it is.
+        self.assertAlmostEqual(life.entry_mark(1.0).multiple, 1.4)
+        self.assertAlmostEqual(life.entry_mark(0.0).multiple, 1.0)
+        self.assertAlmostEqual(life.entry_mark(5.0).multiple, 3.0)
+
+    def test_arriving_before_the_first_mark_is_blocked(self):
+        life = Lifecycle("t", self.T0, [Mark(self.T0 + 5.0, 1.0, executable_sol=1.0)])
+        cell = replay_cell(life, 0.0, 1.0, "hold", hold_to_end)
+        self.assertEqual(cell.status, "DATA_BLOCKED")
+        self.assertFalse(cell.ok)
+
+    def test_being_earlier_is_worth_more_on_a_rising_launch(self):
+        life = self._lifecycle()
+        early = replay_cell(life, 0.0, 1.0, "hold", hold_to_end)
+        late = replay_cell(life, 5.0, 1.0, "hold", hold_to_end)
+        self.assertGreater(early.net_sol, late.net_sol)
+
+    def test_a_fill_is_capped_by_observed_depth(self):
+        thin = self._lifecycle(marks=[
+            Mark(self.T0, 1.0, executable_sol=0.2),
+            Mark(self.T0 + 10, 20.0, executable_sol=0.2),
+        ])
+        cell = replay_cell(thin, 0.0, 5.0, "hold", hold_to_end)
+        # A theoretical 20x on size that could never have been filled is not a
+        # 20x, and crediting it ranks the thinnest tokens highest.
+        self.assertAlmostEqual(cell.filled_sol, 0.2)
+        self.assertLess(cell.net_sol, 5.0)
+
+    def test_exit_is_credited_only_for_what_the_curve_could_absorb(self):
+        deep_in_thin_out = self._lifecycle(marks=[
+            Mark(self.T0, 1.0, executable_sol=5.0),
+            Mark(self.T0 + 10, 20.0, executable_sol=0.1),
+        ])
+        liquid = self._lifecycle(marks=[
+            Mark(self.T0, 1.0, executable_sol=5.0),
+            Mark(self.T0 + 10, 20.0, executable_sol=5.0),
+        ])
+        trapped = replay_cell(deep_in_thin_out, 0.0, 5.0, "hold", hold_to_end)
+        clean = replay_cell(liquid, 0.0, 5.0, "hold", hold_to_end)
+        self.assertLess(trapped.net_sol, clean.net_sol)
+
+    def test_unobserved_depth_blocks_rather_than_assuming_liquidity(self):
+        unknown = self._lifecycle(marks=[
+            Mark(self.T0, 1.0, executable_sol=None),
+            Mark(self.T0 + 10, 20.0, executable_sol=1.0),
+        ])
+        cell = replay_cell(unknown, 0.0, 1.0, "hold", hold_to_end)
+        self.assertEqual(cell.status, "DATA_BLOCKED")
+        self.assertIn("depth", cell.detail)
+
+    def test_replay_is_point_in_time(self):
+        """Checked structurally, not merely intended."""
+        life = self._lifecycle()
+        before = replay_cell(life, 1.0, 1.0, "hold", hold_to_end)
+
+        contaminated = self._lifecycle(marks=life.marks + [
+            Mark(self.T0 + 0.9, 99.0, executable_sol=99.0),
+        ])
+        # A mark at T+0.9s IS visible to a T+1s decision, so this one must
+        # move the result -- proving the boundary is real and not vacuous.
+        self.assertNotEqual(
+            replay_cell(contaminated, 1.0, 1.0, "hold", hold_to_end).entry_multiple,
+            before.entry_multiple)
+
+        future = self._lifecycle(marks=life.marks + [
+            Mark(self.T0 + 0.99, 1.4, executable_sol=5.0),
+        ])
+        entry_only = replay_cell(future, 0.5, 1.0, "hold", hold_to_end)
+        # A mark after the delay must not change the ENTRY.
+        self.assertAlmostEqual(entry_only.entry_multiple, 1.4)
+
+    def test_exit_rules_are_pure_and_replay_deterministically(self):
+        life = self._lifecycle()
+        first = replay_lifecycle(life, delays=(0.0,), sizes=(1.0,))
+        second = replay_lifecycle(life, delays=(0.0,), sizes=(1.0,))
+        self.assertEqual([cell.net_sol for cell in first],
+                         [cell.net_sol for cell in second])
+
+    def test_a_take_profit_caps_the_runner_and_the_grid_shows_it(self):
+        life = self._lifecycle()
+        held = replay_cell(life, 0.0, 1.0, "hold", DEFAULT_EXIT_RULES["hold"])
+        capped = replay_cell(life, 0.0, 1.0, "tp_2x", DEFAULT_EXIT_RULES["tp_2x"])
+        self.assertGreater(capped.exit_multiple, held.exit_multiple)
+        self.assertLess(capped.tail_capture, 1.0)
+
+    def test_tail_capture_is_against_maximum_feasible(self):
+        life = self._lifecycle()
+        cell = replay_cell(life, 0.0, 1.0, "tp_2x", DEFAULT_EXIT_RULES["tp_2x"])
+        self.assertAlmostEqual(cell.max_feasible_multiple, 8.0)
+        self.assertAlmostEqual(cell.tail_capture, cell.exit_multiple / 8.0)
+
+    def test_the_grid_covers_every_combination(self):
+        cells = replay_lifecycle(self._lifecycle(), delays=(0.0, 1.0),
+                                 sizes=(0.1, 1.0), exit_rules=DEFAULT_EXIT_RULES)
+        self.assertEqual(len(cells), 2 * 2 * len(DEFAULT_EXIT_RULES))
+
+    def test_the_default_grid_starts_below_one_second(self):
+        # On a newborn launch the edge is won or lost sub-second; a grid that
+        # starts at 1s cannot see it.
+        self.assertLess(min(DEFAULT_DELAYS_S), 0.1)
+        self.assertIn(0.0, DEFAULT_DELAYS_S)
+
+
+class TestSniperScoreboard(unittest.TestCase):
+    """Blocked cells are excluded, not scored zero."""
+
+    def _cells(self):
+        return [
+            Cell("a", 0.0, 1.0, "hold", "OK", entry_multiple=1.0, exit_multiple=8.0,
+                 filled_sol=1.0, net_sol=6.8, max_feasible_multiple=10.0),
+            Cell("b", 1.0, 1.0, "hold", "OK", entry_multiple=1.0, exit_multiple=2.0,
+                 filled_sol=1.0, net_sol=0.9, max_feasible_multiple=10.0),
+            Cell("c", 0.0, 1.0, "hold", "DATA_BLOCKED", detail="no depth"),
+        ]
+
+    def test_blocked_cells_are_excluded_and_counted(self):
+        board = sniper_scoreboard(self._cells(), launches_observed=3)
+        self.assertEqual(board["priced"], 2)
+        self.assertEqual(board["blocked"], 1)
+        # Scoring it zero would make a launch nobody could trade look like one
+        # that was traded and broke even.
+        self.assertAlmostEqual(board["net_sol_per_priced_cell"], (6.8 + 0.9) / 2)
+
+    def test_nothing_priceable_blocks_the_whole_board(self):
+        blocked = [Cell("a", 0.0, 1.0, "hold", "DATA_BLOCKED")]
+        self.assertEqual(sniper_scoreboard(blocked, 1)["status"], "DATA_BLOCKED")
+
+    def test_opportunity_extraction_is_per_launch_observed(self):
+        board = sniper_scoreboard(self._cells(), launches_observed=100)
+        self.assertAlmostEqual(board["net_sol_per_100_launches"], 6.8 + 0.9)
+
+    def test_the_board_reports_the_share_of_tens_actually_captured(self):
+        board = sniper_scoreboard(self._cells(), launches_observed=3)
+        # One of the two 10x-feasible cells exited above 5x.
+        self.assertAlmostEqual(board["share_of_10x_captured_above_5x"], 0.5)
+
+    def test_the_board_is_not_a_hedge_fund_report(self):
+        board = sniper_scoreboard(self._cells(), launches_observed=3)
+        for absent in ("sharpe", "sortino", "annualised_return", "volatility"):
+            self.assertNotIn(absent, board)
+        for present in ("net_sol_per_100_launches", "tail_capture_mean",
+                        "net_sol_by_delay", "net_sol_by_size"):
+            self.assertIn(present, board)
+
+    def test_delay_decay_shows_where_the_edge_goes(self):
+        cells = [
+            Cell("a", 0.0, 1.0, "hold", "OK", net_sol=1.0, exit_multiple=2.0,
+                 max_feasible_multiple=2.0),
+            Cell("a", 1.0, 1.0, "hold", "OK", net_sol=0.4, exit_multiple=1.4,
+                 max_feasible_multiple=2.0),
+            Cell("a", 10.0, 1.0, "hold", "OK", net_sol=0.05, exit_multiple=1.05,
+                 max_feasible_multiple=2.0),
+        ]
+        decay = delay_decay(sniper_scoreboard(cells, 1))
+        self.assertAlmostEqual(decay[0.0], 1.0)
+        self.assertAlmostEqual(decay[1.0], 0.4)
+        self.assertLess(decay[10.0], decay[1.0])
+
+    def test_delay_decay_refuses_a_ratio_against_a_non_positive_base(self):
+        cells = [Cell("a", 0.0, 1.0, "hold", "OK", net_sol=-1.0),
+                 Cell("a", 1.0, 1.0, "hold", "OK", net_sol=-0.5)]
+        # With no positive edge at T0 there is nothing to decay from.
+        self.assertIsNone(delay_decay(sniper_scoreboard(cells, 1)))
+
+
+class TestLifecycleFromEpisode(unittest.TestCase):
+    def test_an_episode_without_observations_yields_nothing(self):
+        self.assertIsNone(lifecycle_from_episode(
+            {"token": "t", "created_at": 1.0, "market_observations": []}))
+
+    def test_observations_that_priced_nothing_contribute_nothing(self):
+        life = lifecycle_from_episode({
+            "token": "t", "created_at": 100.0,
+            "market_observations": [
+                {"timestamp": 101.0, "price_multiple": 2.0, "executable_sol": 1.0},
+                {"timestamp": 102.0},
+                {"timestamp": 103.0, "price_multiple": 0.0},
+                {"timestamp": 104.0, "price_multiple": "not a number"},
+            ],
+        })
+        # A blank observation contributes nothing rather than a zero.
+        self.assertEqual(len(life.marks), 1)
+        self.assertAlmostEqual(life.marks[0].multiple, 2.0)
+
+    def test_marks_are_sorted_and_outcome_is_carried(self):
+        life = lifecycle_from_episode({
+            "token": "t", "created_at": 100.0,
+            "market_observations": [
+                {"timestamp": 105.0, "price_multiple": 3.0},
+                {"timestamp": 101.0, "price_multiple": 1.0},
+            ],
+            "final_outcome": {"migrated": True, "rugged": True, "rug_time": 42.0},
+        })
+        self.assertEqual([mark.timestamp for mark in life.marks], [101.0, 105.0])
+        self.assertTrue(life.migrated and life.rugged)
+        self.assertAlmostEqual(life.rug_time, 42.0)
+
+    def test_depth_is_none_where_it_was_not_recorded(self):
+        life = lifecycle_from_episode({
+            "token": "t", "created_at": 100.0,
+            "market_observations": [{"timestamp": 101.0, "price_multiple": 2.0}],
+        })
+        self.assertIsNone(life.marks[0].executable_sol)
