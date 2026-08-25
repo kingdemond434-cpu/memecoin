@@ -27,13 +27,40 @@ environment (no outbound Solana RPC here to capture them). Accordingly:
 
 import struct
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 # Anchor account discriminator for BondingCurve, sha256("account:BondingCurve")[:8].
 BONDING_CURVE_DISCRIMINATOR = bytes((23, 183, 248, 55, 96, 216, 172, 96))
+from src.execution.pump_fees import (
+    DEFAULT_SCHEDULE, LEGACY_TOTAL_FEE_BPS, PumpFeeSchedule, VENUE_BONDING_CURVE,
+)
 
-# Pump's published trade fee, in basis points, applied to the quote leg.
-DEFAULT_FEE_BPS = 100
+
+# Pump's published pre-2026-09-01 trade fee, in basis points, applied to the
+# quote leg. Kept as the default argument so existing callers behave exactly as
+# before, but the authority is src/execution/pump_fees.py: `resolve_fee_bps`
+# below routes through the versioned schedule and refuses to guess once the
+# dynamic market-cap-tiered structure is active.
+DEFAULT_FEE_BPS = LEGACY_TOTAL_FEE_BPS
+
+
+def resolve_fee_bps(
+    at_utc: Optional[float] = None,
+    market_cap_lamports: Optional[int] = None,
+    venue: str = VENUE_BONDING_CURVE,
+    schedule: Optional[PumpFeeSchedule] = None,
+) -> Tuple[str, int, str]:
+    """The fee to use for one leg at one instant: (status, bps, reason).
+
+    Quotes, capacity, labels and counterfactuals all come through here so a
+    single definition of "what a trade costs" reaches every one of them. A
+    quote priced on a stale fee is not slightly wrong -- it is a measured edge
+    that partly consists of money the protocol is taking.
+    """
+    quote = (schedule or DEFAULT_SCHEDULE).quote(venue, market_cap_lamports, at_utc)
+    if quote.ok:
+        return "OK", quote.total_bps, quote.schedule_version
+    return quote.status, 0, quote.reason
 
 LAMPORTS_PER_SOL = 1_000_000_000
 

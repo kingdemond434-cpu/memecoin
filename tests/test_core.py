@@ -44,6 +44,11 @@ from src.chains.pump_curve import (
     BONDING_CURVE_DISCRIMINATOR, observation_from_state, parse_bonding_curve,
     quote_buy, quote_sell, sell_capacity_lamports,
 )
+from src.execution.pump_fees import (
+    DYNAMIC_FEE_ACTIVATION_UTC, LEGACY_TOTAL_FEE_BPS, PumpFeeSchedule,
+    VENUE_BONDING_CURVE, VENUE_PUMPSWAP_CANONICAL,
+)
+from src.chains.pump_curve import DEFAULT_FEE_BPS, resolve_fee_bps
 from src.research.feature_engine import build_features
 from src.research import hazard_trainer
 from src.research.exit_policy_trainer import simulate, train_exit_policy
@@ -3062,3 +3067,129 @@ class TestHeldPositionBaselineGrowth(unittest.TestCase):
         # And it is genuinely an optimum, not a coincidence of the grid.
         self.assertLessEqual(engine.log_growth_at_fraction(good, fraction * 0.5), best)
         self.assertEqual(engine.log_growth_at_fraction(good, 0.0), 0.0)
+
+
+class TestPumpFeeSchedule(unittest.TestCase):
+    """Fees must be one versioned function, and must refuse to guess.
+
+    Pump's docs put a market-cap-dependent dynamic schedule into force on
+    2026-09-01 20:00 UTC. The tier table itself is published as an image, so
+    it cannot honestly be hardcoded here. A system that quietly kept charging
+    the legacy flat fee after that instant would keep producing labels and
+    counterfactuals against economics that no longer exist -- worse than
+    producing none, because nothing would signal it.
+    """
+
+    JUST_BEFORE = DYNAMIC_FEE_ACTIVATION_UTC - 1
+    AT_ACTIVATION = DYNAMIC_FEE_ACTIVATION_UTC
+
+    def test_the_legacy_flat_fee_applies_right_up_to_the_activation_instant(self):
+        quote = PumpFeeSchedule().quote(at_utc=self.JUST_BEFORE)
+        self.assertTrue(quote.ok)
+        self.assertEqual(quote.total_bps, 100)
+        self.assertEqual(quote.fee_lamports(1_000_000_000), 10_000_000)
+
+    def test_activation_is_inclusive_of_its_own_instant(self):
+        schedule = PumpFeeSchedule()
+        self.assertFalse(schedule.is_dynamic(self.JUST_BEFORE))
+        self.assertTrue(schedule.is_dynamic(self.AT_ACTIVATION))
+
+    def test_an_unloaded_dynamic_schedule_blocks_instead_of_falling_back(self):
+        quote = PumpFeeSchedule().quote(at_utc=self.AT_ACTIVATION,
+                                        market_cap_lamports=50_000_000_000)
+        self.assertFalse(quote.ok)
+        self.assertEqual(quote.status, "DATA_BLOCKED")
+        self.assertIn("fees.png", quote.reason)
+        # The failure must be loud at the point of use, not a silent zero.
+        with self.assertRaises(ValueError):
+            quote.fee_lamports(1_000_000_000)
+
+    def test_a_missing_timestamp_blocks_rather_than_assuming_now(self):
+        # A historical replay that silently used today's schedule would
+        # relabel every past episode with fees nobody was charged.
+        self.assertEqual(PumpFeeSchedule().quote().status, "DATA_BLOCKED")
+
+    def _loaded(self, rows=None):
+        rows = rows or [
+            {"max_market_cap_lamports": 10_000_000_000, "protocol_fee_bps": 90,
+             "creator_fee_bps": 10},
+            {"max_market_cap_lamports": 100_000_000_000, "protocol_fee_bps": 40,
+             "creator_fee_bps": 10},
+            {"max_market_cap_lamports": None, "protocol_fee_bps": 15, "creator_fee_bps": 5},
+        ]
+        directory = tempfile.mkdtemp()
+        path = Path(directory) / "tiers.json"
+        path.write_text(json.dumps({VENUE_BONDING_CURVE: rows}))
+        return PumpFeeSchedule.load(str(path))
+
+    def test_a_loaded_tier_table_resolves_by_market_cap(self):
+        schedule = self._loaded()
+        for market_cap, expected_bps, expected_tier in [
+            (1_000_000_000, 100, 0), (50_000_000_000, 50, 1), (500_000_000_000, 20, 2),
+        ]:
+            quote = schedule.quote(at_utc=self.AT_ACTIVATION, market_cap_lamports=market_cap)
+            self.assertTrue(quote.ok, quote)
+            self.assertEqual((quote.total_bps, quote.tier_index), (expected_bps, expected_tier))
+
+    def test_tier_boundaries_are_exclusive_upper_bounds(self):
+        schedule = self._loaded()
+        below = schedule.quote(at_utc=self.AT_ACTIVATION, market_cap_lamports=9_999_999_999)
+        at = schedule.quote(at_utc=self.AT_ACTIVATION, market_cap_lamports=10_000_000_000)
+        self.assertEqual(below.tier_index, 0)
+        self.assertEqual(at.tier_index, 1)
+
+    def test_an_unsorted_table_is_sorted_on_load(self):
+        """An out-of-order table would silently resolve the wrong bracket."""
+        schedule = self._loaded(rows=[
+            {"max_market_cap_lamports": None, "protocol_fee_bps": 15, "creator_fee_bps": 5},
+            {"max_market_cap_lamports": 100_000_000_000, "protocol_fee_bps": 40,
+             "creator_fee_bps": 10},
+            {"max_market_cap_lamports": 10_000_000_000, "protocol_fee_bps": 90,
+             "creator_fee_bps": 10},
+        ])
+        quote = schedule.quote(at_utc=self.AT_ACTIVATION, market_cap_lamports=1_000_000_000)
+        self.assertEqual((quote.total_bps, quote.tier_index), (100, 0))
+
+    def test_an_unobserved_market_cap_blocks_under_the_dynamic_schedule(self):
+        quote = self._loaded().quote(at_utc=self.AT_ACTIVATION, market_cap_lamports=None)
+        self.assertEqual(quote.status, "DATA_BLOCKED")
+
+    def test_a_venue_with_no_table_blocks_even_when_another_venue_has_one(self):
+        quote = self._loaded().quote(venue=VENUE_PUMPSWAP_CANONICAL,
+                                     at_utc=self.AT_ACTIVATION,
+                                     market_cap_lamports=1_000_000_000)
+        self.assertEqual(quote.status, "DATA_BLOCKED")
+
+    def test_round_trip_prices_each_leg_at_its_own_market_cap(self):
+        schedule = self._loaded()
+        status, total, detail = schedule.round_trip_bps(
+            entry_market_cap_lamports=1_000_000_000, exit_market_cap_lamports=500_000_000_000,
+            entry_utc=self.AT_ACTIVATION, exit_utc=self.AT_ACTIVATION + 300,
+        )
+        # Entry in the top-fee tier, exit in the cheapest: charging the exit at
+        # the entry tier would overstate the cost of exactly the trades that
+        # worked, and understate it for the ones that did not.
+        self.assertEqual((status, total), ("OK", 120))
+        self.assertEqual(detail["entry"].total_bps, 100)
+        self.assertEqual(detail["exit"].total_bps, 20)
+
+    def test_a_blocked_leg_blocks_the_whole_round_trip(self):
+        status, total, _ = PumpFeeSchedule().round_trip_bps(
+            entry_utc=self.JUST_BEFORE, exit_utc=self.AT_ACTIVATION,
+            exit_market_cap_lamports=1_000_000_000)
+        self.assertEqual((status, total), ("DATA_BLOCKED", 0))
+
+    def test_curve_quotes_route_through_the_same_schedule(self):
+        self.assertEqual(resolve_fee_bps(at_utc=self.JUST_BEFORE)[:2], ("OK", 100))
+        self.assertEqual(
+            resolve_fee_bps(at_utc=self.AT_ACTIVATION, market_cap_lamports=1)[0],
+            "DATA_BLOCKED")
+        # The curve module's default constant is the legacy fee, not a second
+        # independent guess at what a trade costs.
+        self.assertEqual(DEFAULT_FEE_BPS, LEGACY_TOTAL_FEE_BPS)
+
+    def test_an_unreadable_tier_file_does_not_break_pre_activation_operation(self):
+        schedule = PumpFeeSchedule.load("/nonexistent/tiers.json")
+        self.assertTrue(schedule.quote(at_utc=self.JUST_BEFORE).ok)
+        self.assertEqual(schedule.quote(at_utc=self.AT_ACTIVATION,
+                                        market_cap_lamports=1).status, "DATA_BLOCKED")
