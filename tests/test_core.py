@@ -32,9 +32,10 @@ from src.execution.jupiter_jito import (
     ExecutionEngine, ExecutionResult, JitoClient, JupiterClient, RouteType, SolanaTransactionBuilder, SwapQuote,
     SwapTransaction, TransactionStatus,
 )
-from src.main import MemecoinQuantDesk, _jsonable
+from src.main import CAPACITY_REJECTIONS, MemecoinQuantDesk, _jsonable
 from src.strategies.information_graph import CounterfactualExecutionLab
 from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPrediction, MultiHeadPredictor, PredictionFeatures
+from src.strategies.opportunity_allocator import Opportunity, OpportunityAllocator
 from src.strategies.public_coordination import PublicCoordinationMiner
 from src.strategies.wallet_intelligence import WalletIntelligenceEngine, WalletRegime
 from src.research.dataset_builder import LaunchEpisode, PointInTimeDatasetBuilder, SnapshotTimepoint
@@ -2746,3 +2747,318 @@ class TestPositionPredictionRefresh(unittest.IsolatedAsyncioTestCase):
 
 async def _async_none():
     return None
+
+
+class TestOpportunityAllocator(unittest.TestCase):
+    """Capital must contest, not queue.
+
+    The single-token hurdle test has a silent failure: ten mediocre positions
+    that each cleared it will lock out an eleventh that is five times better,
+    for as long as they are held.
+    """
+
+    @staticmethod
+    def _opportunity(token, elogw, capital, seconds, liquidity=100_000.0, **kwargs):
+        return Opportunity(token=token, elogw=elogw, capital_usd=capital,
+                           expected_hold_seconds=seconds, liquidity_usd=liquidity, **kwargs)
+
+    def test_ranking_is_growth_per_dollar_per_second(self):
+        # Same edge, same capital, one recycles 30x faster.
+        slow = self._opportunity("slow", 0.030, 100.0, 2_700.0)
+        fast = self._opportunity("fast", 0.010, 100.0, 90.0)
+        slate = OpportunityAllocator().rank([slow, fast])
+
+        self.assertEqual([item.token for item in slate.ranked], ["fast", "slow"])
+        # +3% held 45 minutes really is worse than +1% recycled every 90s.
+        self.assertGreater(fast.growth_velocity, slow.growth_velocity)
+
+    def test_a_bigger_edge_on_more_capital_does_not_automatically_win(self):
+        # 0.05 on $1000 is a worse use of the marginal dollar than 0.01 on $50
+        # at equal holding time, which is exactly what per-dollar scoring says.
+        large = self._opportunity("large", 0.05, 1_000.0, 60.0)
+        small = self._opportunity("small", 0.01, 50.0, 60.0)
+        slate = OpportunityAllocator().rank([large, small])
+        self.assertEqual(slate.best.token, "small")
+
+    def test_missing_hold_time_blocks_rather_than_defaulting(self):
+        unknown = self._opportunity("unknown", 0.05, 100.0, None)
+        known = self._opportunity("known", 0.001, 100.0, 600.0)
+        slate = OpportunityAllocator().rank([unknown, known])
+
+        self.assertEqual([item.token for item in slate.ranked], ["known"])
+        self.assertEqual(slate.blocked[0][1], "DATA_BLOCKED_HOLD_TIME")
+        # A denominator nobody predicted must not be invented: assuming any
+        # holding time would have ranked the unknown token first on its edge.
+        self.assertEqual(slate.report()["blocked_reasons"], ["DATA_BLOCKED_HOLD_TIME"])
+
+    def test_unobserved_depth_blocks_rather_than_ranking(self):
+        slate = OpportunityAllocator().rank([
+            self._opportunity("no_depth", 0.05, 100.0, 60.0, liquidity=None),
+            self._opportunity("zero_depth", 0.05, 100.0, 60.0, liquidity=0.0),
+        ])
+        self.assertEqual(slate.ranked, [])
+        self.assertEqual({reason for _, reason in slate.blocked}, {"DATA_BLOCKED_LIQUIDITY"})
+
+    def test_infinite_elogw_is_never_ranked(self):
+        slate = OpportunityAllocator().rank([
+            Opportunity("blocked", float("-inf"), 100.0, 60.0, 100_000.0),
+            self._opportunity("real", 0.01, 100.0, 60.0),
+        ])
+        self.assertEqual([item.token for item in slate.ranked], ["real"])
+
+    def test_a_clearly_better_challenger_displaces_the_weakest_position(self):
+        incumbent = self._opportunity("weak", 0.0005, 100.0, 3_600.0, is_open_position=True,
+                                      held_multiple=1.1)
+        challenger = self._opportunity("strong", 0.30, 100.0, 120.0)
+        allocator = OpportunityAllocator(replacement_cost_pct=0.02)
+        slate = allocator.rank([incumbent, challenger])
+
+        self.assertEqual(len(slate.displacements), 1)
+        move = slate.displacements[0]
+        self.assertEqual(move.incumbent.token, "weak")
+        self.assertEqual(move.challenger.token, "strong")
+        self.assertGreater(move.score_gain, 0)
+        # Capital released is the mark, not the cost basis.
+        self.assertAlmostEqual(move.freed_capital_usd, 110.0)
+
+    def test_marginally_better_challengers_never_churn_the_book(self):
+        incumbent = self._opportunity("held", 0.010, 100.0, 300.0, is_open_position=True)
+        barely = self._opportunity("barely", 0.0104, 100.0, 300.0)
+        slate = OpportunityAllocator(min_displacement_gain_ratio=1.5).rank([incumbent, barely])
+        self.assertEqual(slate.displacements, [])
+
+    def test_round_trip_cost_is_charged_before_comparing(self):
+        """The same challenger wins on a cheap venue and loses on a dear one."""
+        incumbent = self._opportunity("held", 0.040, 100.0, 300.0, is_open_position=True)
+        challenger = self._opportunity("new", 0.075, 100.0, 300.0)
+
+        cheap = OpportunityAllocator(replacement_cost_pct=0.0, min_displacement_gain_ratio=1.5)
+        dear = OpportunityAllocator(replacement_cost_pct=0.10, min_displacement_gain_ratio=1.5)
+
+        self.assertEqual(len(cheap.rank([incumbent, challenger]).displacements), 1)
+        self.assertEqual(dear.rank([incumbent, challenger]).displacements, [])
+
+    def test_a_challenger_the_venue_cannot_absorb_is_not_proposed(self):
+        incumbent = self._opportunity("held", 0.0002, 5_000.0, 3_600.0, is_open_position=True)
+        # $5,000 of edge in a $200 pool is not $5,000 of edge. A theoretical
+        # return you cannot fill is not a return, so no displacement is priced.
+        thin = self._opportunity("thin", 0.50, 5_000.0, 60.0, liquidity=200.0)
+        slate = OpportunityAllocator(replacement_cost_pct=0.0).rank([incumbent, thin])
+        self.assertEqual(slate.displacements, [])
+
+    def test_freed_capital_must_cover_the_size_the_edge_was_measured_at(self):
+        """E[log W] is not linear in capital, so it is not rescaled."""
+        incumbent = self._opportunity("small_position", 0.0001, 50.0, 3_600.0,
+                                      is_open_position=True, held_multiple=1.0)
+        big = self._opportunity("needs_1000", 0.50, 1_000.0, 60.0)
+        slate = OpportunityAllocator(replacement_cost_pct=0.0).rank([incumbent, big])
+        # Closing a $50 position does not fund a $1,000 trade, and quietly
+        # claiming the $1,000 edge on $50 of capital would be the invention.
+        self.assertEqual(slate.displacements, [])
+
+        funded = self._opportunity("needs_100", 0.50, 100.0, 60.0)
+        rich = self._opportunity("rich_position", 0.0001, 100.0, 3_600.0,
+                                 is_open_position=True, held_multiple=2.0)
+        self.assertEqual(
+            len(OpportunityAllocator(replacement_cost_pct=0.0).rank([rich, funded]).displacements), 1)
+
+    def test_displacements_are_capped_per_cycle(self):
+        opportunities = [
+            self._opportunity(f"held-{i}", 0.0001, 100.0, 3_600.0, is_open_position=True)
+            for i in range(5)
+        ] + [self._opportunity(f"new-{i}", 0.50, 100.0, 60.0) for i in range(5)]
+        slate = OpportunityAllocator(max_displacements_per_cycle=2).rank(opportunities)
+        self.assertEqual(len(slate.displacements), 2)
+        # Each challenger is spent once: two incumbents cannot both be told to
+        # make way for the same token.
+        self.assertEqual(len({m.challenger.token for m in slate.displacements}), 2)
+
+    def test_a_profitable_incumbent_is_not_displaced_by_a_worse_score(self):
+        incumbent = self._opportunity("winner", 0.08, 100.0, 120.0, is_open_position=True,
+                                      held_multiple=3.0)
+        challenger = self._opportunity("hopeful", 0.02, 100.0, 120.0)
+        slate = OpportunityAllocator().rank([incumbent, challenger])
+        self.assertEqual(slate.displacements, [])
+        self.assertEqual(slate.best.token, "winner")
+
+    def test_sleeve_grouping_keeps_attribution_separable(self):
+        slate = OpportunityAllocator().rank([
+            self._opportunity("a", 0.01, 100.0, 60.0, sleeve="t0_sniper"),
+            self._opportunity("b", 0.02, 100.0, 60.0, sleeve="migration"),
+            self._opportunity("c", 0.03, 100.0, 60.0, sleeve="migration"),
+        ])
+        self.assertEqual(slate.report()["sleeves"], {"migration": 2, "t0_sniper": 1})
+
+
+class TestCapitalContestWiring(unittest.IsolatedAsyncioTestCase):
+    """A full book must not be able to lock out a far better launch.
+
+    `should_trade` answers one token at a time, so `max_concurrent_positions`
+    reads as "this token is rejected" when what actually happened is "capital
+    is committed elsewhere". Those are different statements and only one of
+    them is about the token.
+    """
+
+    @staticmethod
+    def _prediction(token="new", **kwargs):
+        base = dict(p_2x=0.85, p_5x=0.6, p_10x=0.4, p_50x=0.1, expected_hold_time=90.0,
+                    expected_slippage=0.01)
+        base.update(kwargs)
+        return MultiHeadPrediction(token, "solana", 0.0, **base)
+
+    def _desk(self, exit_clears=True):
+        engine = ElogwEngine(SimpleNamespace(_is_trained=True), min_edge_bps=-10_000)
+        engine.portfolio_value = 10_000.0
+        weak = self._prediction("weak", p_2x=0.5, p_5x=0.2, p_10x=0.05, p_50x=0.0,
+                                expected_hold_time=3_600.0)
+        engine.open_positions["weak"] = {
+            "size_tokens": 1_000, "remaining_cost_usd": 100.0, "risk_contribution": 0.01,
+            "prediction_object": weak, "liquidity_usd": 80_000.0,
+            "high_water_multiple": 1.0, "entry_time": time.time() - 1_800,
+        }
+        exits = []
+
+        async def execute_exit(token, position, pct, reason):
+            exits.append((token, pct, reason))
+            if exit_clears:
+                engine.open_positions.pop(token, None)
+
+        async def refresh():
+            return None
+
+        desk = SimpleNamespace(
+            elogw_engine=engine, sol_price_usd=150.0, wallet_equity_usd=10_000.0,
+            opportunity_allocator=OpportunityAllocator(replacement_cost_pct=0.005,
+                                                       min_displacement_gain_ratio=1.5),
+            last_slate_report={}, _execute_exit=execute_exit,
+            _refresh_portfolio_state=refresh, exits=exits,
+        )
+        desk._incumbent_opportunities = (
+            lambda: MemecoinQuantDesk._incumbent_opportunities(desk))
+        return desk
+
+    async def _contest(self, desk, prediction, liquidity=200_000.0, reason="max_concurrent_positions"):
+        candidate = SimpleNamespace(address="new", metadata={})
+        return await MemecoinQuantDesk._contest_for_capital(
+            desk, "new", candidate, prediction, liquidity, {"reason": reason})
+
+    async def test_a_challenger_is_repriced_at_the_capital_a_displacement_frees(self):
+        """A $500 optimum funded by a $100 exit is not still worth $500 of edge."""
+        desk = self._desk()
+        desk.elogw_engine.open_positions["weak"]["remaining_cost_usd"] = 40.0
+        sizes = []
+        engine = desk.elogw_engine
+        original = engine.log_growth_at_fraction
+
+        def spy(prediction, fraction):
+            sizes.append(fraction)
+            return original(prediction, fraction)
+
+        engine.log_growth_at_fraction = spy
+        await self._contest(desk, self._prediction())
+        # The allocator asked what the edge is worth at the freed size rather
+        # than reusing the optimum computed for a size it cannot fund.
+        self.assertTrue(sizes, "challenger was never repriced")
+        self.assertLess(min(sizes), engine.exposure_cap(200_000.0))
+
+    async def test_a_far_better_candidate_closes_the_weakest_position_and_enters(self):
+        desk = self._desk()
+        should_trade, info = await self._contest(desk, self._prediction())
+
+        self.assertEqual(len(desk.exits), 1)
+        token, pct, reason = desk.exits[0]
+        self.assertEqual((token, pct), ("weak", 1.0))
+        self.assertEqual(reason, "displaced_by_new")
+        self.assertTrue(should_trade, info)
+        # The freed capital still has to clear the ordinary sizing path.
+        self.assertIn("position_size_sol", info)
+
+    async def test_a_similar_candidate_does_not_disturb_the_book(self):
+        desk = self._desk()
+        # Same shape as the incumbent: nothing here justifies a round trip.
+        twin = self._prediction(p_2x=0.5, p_5x=0.2, p_10x=0.05, p_50x=0.0,
+                                expected_hold_time=3_600.0)
+        should_trade, info = await self._contest(desk, twin)
+
+        self.assertEqual(desk.exits, [])
+        self.assertFalse(should_trade)
+        self.assertEqual(info["contest"], "no_incumbent_worth_displacing")
+        self.assertIn("weak", desk.elogw_engine.open_positions)
+
+    async def test_an_exit_that_did_not_fill_never_funds_the_challenger(self):
+        """Capital that was not actually freed must not be spent."""
+        desk = self._desk(exit_clears=False)
+        should_trade, info = await self._contest(desk, self._prediction())
+
+        self.assertEqual(len(desk.exits), 1)
+        self.assertFalse(should_trade)
+        self.assertEqual(info["contest"], "displacement_exit_did_not_fill")
+
+    async def test_a_prediction_with_no_hold_time_cannot_contest(self):
+        desk = self._desk()
+        should_trade, info = await self._contest(
+            desk, self._prediction(expected_hold_time=0.0))
+
+        self.assertEqual(desk.exits, [])
+        self.assertFalse(should_trade)
+        # Unknown holding time means the per-second denominator is unknown, so
+        # the candidate simply does not rank rather than ranking on a guess.
+        self.assertEqual(info["contest"], "no_incumbent_worth_displacing")
+        self.assertEqual(info["slate"]["blocked_reasons"], ["DATA_BLOCKED_HOLD_TIME"])
+
+    async def test_safety_rejections_are_outside_the_contest(self):
+        """The contest is reachable only from capacity rejections."""
+        for reason in ("safety_rejection", "rug_risk_too_high", "daily_loss_kill_switch",
+                       "insufficient_upside", "slippage_too_high", "liquidity_too_low",
+                       "edge_below_threshold", "DATA_BLOCKED"):
+            self.assertNotIn(reason, CAPACITY_REJECTIONS)
+        self.assertEqual(
+            CAPACITY_REJECTIONS,
+            {"max_concurrent_positions", "total_exposure_limit", "portfolio_risk_limit"})
+
+
+class TestHeldPositionBaselineGrowth(unittest.TestCase):
+    """A position already open cannot be rejected by the entry constraint."""
+
+    def _engine(self):
+        engine = ElogwEngine(SimpleNamespace(_is_trained=True), drawdown_aversion_lambda=3.0)
+        engine.portfolio_value = 10_000.0
+        return engine
+
+    @staticmethod
+    def _weak():
+        # Tail bad enough that opening this position would violate the
+        # drawdown bound outright.
+        return MultiHeadPrediction("t", "solana", 0.0, p_2x=0.12, p_5x=0.05,
+                                   p_10x=0.0, p_50x=0.0, expected_slippage=0.01)
+
+    def test_baseline_is_a_number_not_negative_infinity(self):
+        engine = self._engine()
+        baseline = engine.marginal_log_growth(self._weak(), 0.01, 1.0, 0.0)
+        self.assertTrue(math.isfinite(baseline))
+        # It is still a bad position -- just a finite bad, which is what any
+        # comparison against it requires.
+        self.assertLess(baseline, 0.0)
+
+    def test_the_drawdown_bound_still_rejects_adding_to_it(self):
+        engine = self._engine()
+        fraction, gain = engine.plan_scale_in(self._weak(), 100.0, 1.0, 500_000.0,
+                                              portfolio_value=10_000.0)
+        self.assertEqual((fraction, gain), (0.0, 0.0))
+
+    def test_the_entry_path_still_refuses_to_open_it(self):
+        engine = self._engine()
+        elogw, fraction, size_sol = engine.calculate_expected_log_growth(
+            self._weak(), 150.0, 500_000.0)
+        self.assertEqual(fraction, 0.0)
+        self.assertEqual(size_sol, 0.0)
+
+    def test_log_growth_at_fraction_agrees_with_the_optimiser(self):
+        engine = self._engine()
+        good = MultiHeadPrediction("t", "solana", 0.0, p_2x=0.8, p_5x=0.5, p_10x=0.3,
+                                   p_50x=0.05, expected_slippage=0.01)
+        best, fraction, _ = engine.calculate_expected_log_growth(good, 150.0, 500_000.0)
+        self.assertAlmostEqual(engine.log_growth_at_fraction(good, fraction), best, places=12)
+        # And it is genuinely an optimum, not a coincidence of the grid.
+        self.assertLessEqual(engine.log_growth_at_fraction(good, fraction * 0.5), best)
+        self.assertEqual(engine.log_growth_at_fraction(good, 0.0), 0.0)

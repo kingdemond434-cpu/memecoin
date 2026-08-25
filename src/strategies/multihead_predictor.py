@@ -559,6 +559,53 @@ class ElogwEngine:
         total = sum(probability for _, probability, _ in bins)
         return [(name, probability / total, outcome) for name, probability, outcome in bins] if total else []
 
+    def _growth_inputs(self, prediction: MultiHeadPrediction):
+        """Shared (probabilities, net returns, normalised entropy) for one prediction."""
+        bins = self.probability_bins(prediction)
+        if not bins or prediction.p_2x <= 0:
+            return None
+        execution_cost = 0.003 + max(0.0, prediction.expected_slippage)
+        probabilities = np.array([probability for _, probability, _ in bins], dtype=float)
+        returns = np.array([outcome - execution_cost for _, _, outcome in bins], dtype=float)
+        entropy = -float(np.sum(probabilities * np.log(np.clip(probabilities, 1e-12, 1))))
+        entropy /= max(np.log(len(probabilities)), 1e-12)
+        return probabilities, returns, entropy
+
+    def log_growth_at_fraction(self, prediction: MultiHeadPrediction, fraction: float) -> float:
+        """E[log W] for committing exactly ``fraction`` of equity.
+
+        The optimiser answers "what is the best size?"; this answers "what is
+        this specific size worth?". Cross-sectional comparison needs the
+        second question: when freed capital funds less than a candidate's
+        optimum, reusing the optimum's number would claim an edge at a size
+        that was never evaluated. E[log W] is not linear in size, so that is
+        an invention rather than an approximation.
+        """
+        inputs = self._growth_inputs(prediction)
+        if inputs is None or fraction < 0:
+            return -float("inf")
+        probabilities, returns, entropy = inputs
+        wealth = 1 + fraction * returns
+        if np.any(wealth <= 0):
+            return -float("inf")
+        if self.drawdown_aversion_lambda > 0 and fraction > 0:
+            drawdown_moment = float(np.sum(probabilities * wealth ** (-self.drawdown_aversion_lambda)))
+            if drawdown_moment > 1.0 + 1e-12:
+                return -float("inf")
+        value = float(np.sum(probabilities * np.log(wealth)))
+        value -= self.uncertainty_penalty * entropy * fraction
+        return value / self.risk_aversion
+
+    def exposure_cap(self, liquidity_usd: float) -> float:
+        """Largest fraction of equity this token may take, across all ceilings."""
+        if self.portfolio_value <= 0 or liquidity_usd <= 0:
+            return 0.0
+        return min(
+            self.max_position_pct,
+            self.max_position_usd / self.portfolio_value,
+            liquidity_usd * self.max_liquidity_fraction / self.portfolio_value,
+        )
+
     def calculate_expected_log_growth(
         self,
         prediction: MultiHeadPrediction,
@@ -567,41 +614,13 @@ class ElogwEngine:
     ) -> Tuple[float, float, float]:
         if self.portfolio_value <= 0 or sol_price_usd <= 0 or liquidity_usd <= 0:
             return -float("inf"), 0.0, 0.0
-        bins = self.probability_bins(prediction)
-        if not bins or prediction.p_2x <= 0:
+        if self._growth_inputs(prediction) is None:
             return -float("inf"), 0.0, 0.0
-
-        execution_cost = 0.003 + max(0.0, prediction.expected_slippage)
-        probabilities = np.array([probability for _, probability, _ in bins], dtype=float)
-        returns = np.array([outcome - execution_cost for _, _, outcome in bins], dtype=float)
-        entropy = -float(np.sum(probabilities * np.log(np.clip(probabilities, 1e-12, 1))))
-        entropy /= max(np.log(len(probabilities)), 1e-12)
-
-        exposure_cap = min(
-            self.max_position_pct,
-            self.max_position_usd / self.portfolio_value,
-            liquidity_usd * self.max_liquidity_fraction / self.portfolio_value,
-        )
-        if exposure_cap <= 0:
+        cap = self.exposure_cap(liquidity_usd)
+        if cap <= 0:
             return -float("inf"), 0.0, 0.0
-        fractions = np.linspace(0, exposure_cap, 401)
-        growth = []
-        for fraction in fractions:
-            wealth = 1 + fraction * returns
-            if np.any(wealth <= 0):
-                growth.append(-float("inf"))
-                continue
-            # Risk-constrained Kelly drawdown surrogate: E[W^-lambda] <= 1.
-            # This preserves the log-growth objective while rejecting fractions
-            # whose modeled tail distribution violates the configured bound.
-            if self.drawdown_aversion_lambda > 0:
-                drawdown_moment = float(np.sum(probabilities * wealth ** (-self.drawdown_aversion_lambda)))
-                if drawdown_moment > 1.0 + 1e-12:
-                    growth.append(-float("inf"))
-                    continue
-            value = float(np.sum(probabilities * np.log(wealth)))
-            value -= self.uncertainty_penalty * entropy * fraction
-            growth.append(value / self.risk_aversion)
+        fractions = np.linspace(0, cap, 401)
+        growth = [self.log_growth_at_fraction(prediction, float(f)) for f in fractions]
         index = int(np.argmax(growth))
         fraction = float(fractions[index])
         position_value = self.portfolio_value * fraction
@@ -651,7 +670,15 @@ class ElogwEngine:
         if np.any(wealth <= 0):
             return -float("inf")
 
-        if self.drawdown_aversion_lambda > 0:
+        # The drawdown constraint governs capital being COMMITTED, not capital
+        # already committed. Applying it at added == 0 asks "may I open this
+        # position?" of a position that is already open, and answers -inf --
+        # which is not a value the baseline can be compared against. It made
+        # plan_scale_in bail out ("baseline not finite") for exactly the held
+        # positions whose tail is worst, so a position could never be added to
+        # once its own held state tripped the bound, regardless of whether the
+        # addition itself was sound.
+        if self.drawdown_aversion_lambda > 0 and added > 0:
             drawdown_moment = float(np.sum(probabilities * wealth ** (-self.drawdown_aversion_lambda)))
             if drawdown_moment > 1.0 + 1e-12:
                 return -float("inf")
