@@ -48,6 +48,9 @@ from src.strategies.action_value import (
     Action as ActionValue, ActionValuePolicy, Decision as ActionDecision,
     PositionState as ActionState,
 )
+from src.strategies.decision_snapshot import (
+    DecisionSnapshot, StateSequencer, guard as decision_guard, state_hash,
+)
 from src.strategies.actor_graph import (
     Entry, IndependenceReport, WalletIndependence,
 )
@@ -380,6 +383,10 @@ class MemecoinQuantDesk:
             min_edge=float(self.global_config.get("action_min_edge", 1e-4)),
             max_add_fraction=float(setting("max_position_pct", 0.05)),
         )
+        self.state_sequencer = StateSequencer()
+        # Set properly once the predictor is constructed; until then a
+        # decision records that it was priced by no validated model.
+        self.model_feature_hash = "untrained"
         self.wallet_independence = WalletIndependence()
         self.independence_report = IndependenceReport(status="DATA_BLOCKED")
         self._actor_seen: Dict[str, set] = {}
@@ -406,6 +413,9 @@ class MemecoinQuantDesk:
             "artifact_version": self.predictor.ARTIFACT_VERSION,
             "features": list(self.predictor.feature_names),
         }, sort_keys=True).encode()).hexdigest()
+        # Stamped onto every frozen decision, so a fill can be traced to the
+        # exact model that priced it rather than to whatever is loaded now.
+        self.model_feature_hash = feature_hash[:16]
         hypothesis = HypothesisSpec(
             hypothesis_id=MODEL_HYPOTHESIS_ID, mechanism="calibrated multi-head tail and rug probabilities",
             target="net_elogw", features=list(self.predictor.feature_names), feature_hash=feature_hash,
@@ -1072,14 +1082,57 @@ class MemecoinQuantDesk:
             add_capacity_fraction=(self.elogw_engine.exposure_cap(liquidity) - held_fraction
                                    if liquidity > 0 else None),
         )
-        return self.action_policy.score(state)
+        decision = self.action_policy.score(state)
+        if decision.status == "OK" and decision.action is not ActionValue.HOLD:
+            decision.snapshot = self._freeze_decision(
+                token, position, decision, state, add_fraction)
+        return decision
+
+    def _freeze_decision(self, token: str, position: Dict[str, Any], decision: Any,
+                         state: Any, add_fraction: Optional[float]):
+        """Turn a chosen action into an immutable, executable object.
+
+        The exact size and the protective limit are carried, never the inputs
+        to recompute them: anything recomputable at execution time will be
+        recomputed, and then the executed trade is not the decided trade.
+        """
+        if decision.action is ActionValue.ADD:
+            slippage_bps = int(self.global_config.get("scale_in_slippage_bps", 100))
+            add_usd = max(self.wallet_equity_usd, 0.0) * float(add_fraction or 0.0)
+            size = int(add_usd / max(self.sol_price_usd, 1e-9) * 1e9)
+            # The bound the decision was made under, not one derived later
+            # from a price that has since moved.
+            limit = int(size * (1 + slippage_bps / 10_000))
+        else:
+            slippage_bps = int(self.global_config.get("exit_slippage_bps", 500))
+            held = int(position.get("size_tokens", 0) or 0)
+            size = int(held * decision.action.bank_fraction)
+            # Minimum acceptable proceeds for the slice being sold, frozen at
+            # the marked price rather than re-derived at submit time.
+            marked = size * max(0.0, state.current_multiple)
+            limit = int(marked * (1 - slippage_bps / 10_000))
+        return DecisionSnapshot(
+            token=token, action=decision.action.value,
+            state_seq=self.state_sequencer.current(token),
+            size_base_units=max(0, size), protective_limit=limit,
+            feature_hash=state_hash({"forward_bins": list(state.forward_bins),
+                                     "held": state.held_fraction,
+                                     "multiple": state.current_multiple,
+                                     "capacity": state.exit_capacity_ratio,
+                                     "escape": state.escape_probability}),
+            model_hash=self.model_feature_hash,
+            expiry_seconds=float(self.global_config.get("decision_expiry_seconds", 1.5)),
+            q_value=float(decision.q),
+            evidence={"fraction": add_fraction, "slippage_bps": slippage_bps},
+        )
 
     async def _apply_action(self, token: str, position: Dict[str, Any],
                             decision: Any, multiple: float) -> bool:
         """Execute a chosen action. Returns True when the position is done for this cycle."""
         action = decision.action
         if action is ActionValue.ADD:
-            await self._consider_scale_in(token, position, multiple)
+            snapshot = getattr(decision, "snapshot", None)
+            await self._consider_scale_in(token, position, multiple, snapshot)
             return True
         fraction = action.bank_fraction
         if fraction <= 0:
@@ -1315,18 +1368,30 @@ class MemecoinQuantDesk:
         if prediction is None:
             position["prediction_status"] = "DATA_BLOCKED_PREDICTION"
             return
+        # A fresh prediction is new state by definition.
+        self.state_sequencer.bump(token)
         position["prediction"] = _jsonable(prediction)
         position["prediction_object"] = prediction
         position["prediction_at"] = time.time()
         position["prediction_status"] = "OK"
 
-    async def _consider_scale_in(self, token: str, position: Dict[str, Any], multiple: float):
+    async def _consider_scale_in(self, token: str, position: Dict[str, Any],
+                                 multiple: float, decision: Any = None):
         """Add to a winner only while the NEXT unit still raises E[log W].
 
         Committing the whole position at T0 forces sizing before the flow that
         actually separates a launch has arrived. Re-predicting on current
         evidence and adding on the marginal quantity deploys capital as the
         evidence appears, and stops the moment it stops paying.
+
+        When the action policy supplies a `DecisionSnapshot`, the size in that
+        snapshot is what executes. Previously the policy scored ADD from one
+        `plan_scale_in` result and this method refreshed state and called
+        `plan_scale_in` again before submitting -- both calls correct, neither
+        of them the decision, and the trade that executed was sized from a
+        market state the policy never evaluated. Nothing in the logs showed
+        it: the decision and the fill were both recorded, referring to
+        different instants.
         """
         if self.predictor is None or not self.predictor._is_trained:
             return
@@ -1340,18 +1405,41 @@ class MemecoinQuantDesk:
         if prediction.p_rug_30s > 0.40 or prediction.p_rug_5m > 0.50:
             return
 
-        await self._refresh_portfolio_state()
-        fraction, gain = self.elogw_engine.plan_scale_in(
-            prediction, float(position["remaining_cost_usd"]), multiple, liquidity,
-            portfolio_value=self.wallet_equity_usd,
-        )
-        if fraction <= 0 or gain <= 0 or self.sol_price_usd <= 0:
-            return
+        if decision is not None:
+            outcome = decision_guard(decision, self.state_sequencer)
+            if not outcome.executed:
+                # A refusal is kept rather than swallowed: how often decisions
+                # go stale measures how fast state moves relative to how fast
+                # we decide, which is a latency number worth having.
+                logger.info("SCALE-IN refused for %s: %s", token, outcome.detail)
+                self._record_ops_event("stale_decisions", {
+                    "token": token, "action": "add", "status": outcome.status.value,
+                    "detail": outcome.detail,
+                    "decision_id": decision.decision_id})
+                return
+            decision.consume()
+            lamports = int(decision.size_base_units)
+            gain = float(decision.q_value)
+            fraction = float(decision.evidence.get("fraction", 0.0) or 0.0)
+            add_usd = lamports / 1e9 * self.sol_price_usd
+            slippage_bps = int(decision.evidence.get("slippage_bps", 100))
+        else:
+            await self._refresh_portfolio_state()
+            fraction, gain = self.elogw_engine.plan_scale_in(
+                prediction, float(position["remaining_cost_usd"]), multiple, liquidity,
+                portfolio_value=self.wallet_equity_usd,
+            )
+            if fraction <= 0 or gain <= 0 or self.sol_price_usd <= 0:
+                return
+            add_usd = self.wallet_equity_usd * fraction
+            lamports = int(add_usd / self.sol_price_usd * 1e9)
+            slippage_bps = 100
 
-        add_usd = self.wallet_equity_usd * fraction
+        if lamports <= 0 or self.sol_price_usd <= 0:
+            return
         result = await self.execution_engine.execute_swap(
-            candidate.base_token or WSOL_MINT, token, int(add_usd / self.sol_price_usd * 1e9),
-            slippage_bps=100,
+            candidate.base_token or WSOL_MINT, token, lamports,
+            slippage_bps=slippage_bps,
             priority_fee=self.fee_optimizer.get_optimal_fee(add_usd, 0.5),
             jito_tip=self.fee_optimizer.get_jito_tip(add_usd, "MEDIUM"),
             use_jito=True, decision_id=position.get("decision_id"),
@@ -1654,6 +1742,10 @@ class MemecoinQuantDesk:
             virtual_sol = int(event.get("virtual_sol_reserves") or 0)
             virtual_token = int(event.get("virtual_token_reserves") or 0)
             if virtual_sol > 0 and virtual_token > 0:
+                # Reserves moved, so any decision priced against the old ones
+                # is stale. Bumping here rather than on a timer is what makes
+                # staleness mean "the market changed" instead of "time passed".
+                self.state_sequencer.bump(token)
                 self._latest_curve_state[token] = BondingCurveState(
                     virtual_token_reserves=virtual_token, virtual_sol_reserves=virtual_sol,
                     # The TradeEvent carries no real reserves. Leaving these at

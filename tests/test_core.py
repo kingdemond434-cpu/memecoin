@@ -53,6 +53,10 @@ from src.collectors.adapters import (
 from src.collectors.event_source import (
     Event, EventSource, SourceClass, SourceMesh, SourceState,
 )
+from src.strategies.decision_snapshot import (
+    DecisionSnapshot, DecisionStatus, StateSequencer, guard as decision_guard,
+    state_hash,
+)
 from src.strategies.action_value import (
     Action, ActionValuePolicy, Decision, Decision as ActionDecision,
     PositionState, PositionState as ActionState,
@@ -2758,6 +2762,7 @@ class TestPositionPredictionRefresh(unittest.IsolatedAsyncioTestCase):
             _resolve_liquidity=resolve_liquidity,
             _build_prediction_features=build_features,
             liquidity_seen=seen,
+            state_sequencer=StateSequencer(),
         )
         return desk
 
@@ -2844,6 +2849,8 @@ class TestPositionPredictionRefresh(unittest.IsolatedAsyncioTestCase):
         desk._exit_capacity = (
             lambda token, pos: MemecoinQuantDesk._exit_capacity(desk, token, pos))
         desk.min_escape_probability = 0.05
+        desk.state_sequencer = StateSequencer()
+        desk.model_feature_hash = "test"
         desk.action_policy = ActionValuePolicy()
         desk._score_actions = (
             lambda token, pos, mult, dist:
@@ -3522,6 +3529,8 @@ class TestDistributionExitWiring(unittest.IsolatedAsyncioTestCase):
         desk._exit_capacity = (
             lambda token, pos: MemecoinQuantDesk._exit_capacity(desk, token, pos))
         desk.min_escape_probability = 0.05
+        desk.state_sequencer = StateSequencer()
+        desk.model_feature_hash = "test"
         desk.action_policy = ActionValuePolicy()
         desk._score_actions = (
             lambda token, pos, mult, dist:
@@ -3846,6 +3855,8 @@ class TestMonsterHoldWiring(unittest.IsolatedAsyncioTestCase):
         desk._exit_capacity = (
             lambda token, pos: MemecoinQuantDesk._exit_capacity(desk, token, pos))
         desk.min_escape_probability = 0.05
+        desk.state_sequencer = StateSequencer()
+        desk.model_feature_hash = "test"
         desk.action_policy = ActionValuePolicy()
         desk._score_actions = (
             lambda token, pos, mult, dist:
@@ -7328,3 +7339,175 @@ class TestSnapshotCaptureIsolation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot.deployer_features["status"], "OK")
         self.assertEqual(snapshot.flow_features["status"], "OK")
         self.assertEqual(snapshot.entity_graph_features["status"], "OK")
+
+
+class TestDecisionSnapshot(unittest.TestCase):
+    """A decision must execute against the state that produced it.
+
+    The bug this prevents does not look like a bug: the policy scores ADD from
+    one plan_scale_in, the executor refreshes state and calls plan_scale_in
+    again, and both calls are correct. Neither is the decision. What executes
+    is a size computed from a state the policy never evaluated -- and the two
+    diverge exactly when the market is moving, which is the only time the size
+    matters. The decision and the fill are both logged, referring to different
+    instants.
+    """
+
+    NOW = 1_800_000_000.0
+
+    def _snapshot(self, seq=1, **kwargs):
+        base = dict(token="mint", action="add", state_seq=seq, size_base_units=1_000,
+                    protective_limit=1_010, feature_hash="f", model_hash="m",
+                    created_at=self.NOW, expiry_seconds=1.5)
+        base.update(kwargs)
+        return DecisionSnapshot(**base)
+
+    def _sequencer(self, token="mint", seq=1):
+        sequencer = StateSequencer()
+        for _ in range(seq):
+            sequencer.bump(token)
+        return sequencer
+
+    def test_a_matching_decision_executes(self):
+        outcome = decision_guard(self._snapshot(), self._sequencer(), self.NOW)
+        self.assertTrue(outcome.executed)
+        self.assertEqual(outcome.status, DecisionStatus.VALID)
+
+    def test_state_advancing_makes_the_decision_stale(self):
+        outcome = decision_guard(self._snapshot(seq=1), self._sequencer(seq=2), self.NOW)
+        self.assertFalse(outcome.executed)
+        self.assertEqual(outcome.status, DecisionStatus.STALE)
+        self.assertIn("reprice", outcome.detail)
+
+    def test_the_newest_decision_can_still_be_too_old(self):
+        """Expiry is independent of staleness on purpose."""
+        outcome = decision_guard(self._snapshot(), self._sequencer(), self.NOW + 10)
+        self.assertFalse(outcome.executed)
+        # Nothing superseded it; on a launch moving in hundreds of
+        # milliseconds a 10-second-old size is still wrong.
+        self.assertEqual(outcome.status, DecisionStatus.EXPIRED)
+
+    def test_a_decision_executes_exactly_once(self):
+        snapshot = self._snapshot()
+        sequencer = self._sequencer()
+        self.assertTrue(decision_guard(snapshot, sequencer, self.NOW).executed)
+        snapshot.consume()
+        second = decision_guard(snapshot, sequencer, self.NOW)
+        # A retry loop resubmitting is a double position on a buy and an
+        # oversell on a sell.
+        self.assertFalse(second.executed)
+        self.assertEqual(second.status, DecisionStatus.CONSUMED)
+
+    def test_sequences_distinguish_updates_inside_one_clock_tick(self):
+        sequencer = StateSequencer()
+        first = sequencer.bump("mint")
+        second = sequencer.bump("mint")
+        # Two updates in one tick are indistinguishable by time and perfectly
+        # distinguishable by sequence, and under load they arrive together.
+        self.assertEqual((first, second), (1, 2))
+        self.assertEqual(sequencer.current("other"), 0)
+
+    def test_the_snapshot_carries_size_and_limit_not_the_inputs(self):
+        payload = self._snapshot().to_dict()
+        for key in ("size_base_units", "protective_limit", "state_seq",
+                    "feature_hash", "model_hash"):
+            self.assertIn(key, payload)
+        # Anything recomputable at execution time will be recomputed, and then
+        # the executed trade is not the decided trade.
+        self.assertNotIn("liquidity_usd", payload)
+        self.assertNotIn("prediction", payload)
+
+    def test_identical_inputs_hash_identically_and_different_ones_do_not(self):
+        self.assertEqual(state_hash({"a": 1, "b": 2}), state_hash({"b": 2, "a": 1}))
+        self.assertNotEqual(state_hash({"a": 1}), state_hash({"a": 2}))
+
+
+class TestScaleInExecutesTheDecidedSize(unittest.IsolatedAsyncioTestCase):
+    """The wiring, not just the object."""
+
+    def _desk(self, result, sequencer):
+        engine = ElogwEngine(SimpleNamespace(_is_trained=True), min_edge_bps=-1)
+        engine.portfolio_value = 10_000.0
+        replans = []
+        engine.plan_scale_in = lambda *a, **k: replans.append(1) or (0.5, 0.5)
+
+        desk = SimpleNamespace(
+            predictor=SimpleNamespace(_is_trained=True), dry_run=True,
+            champion_challenger=SimpleNamespace(is_live=lambda _id: True),
+            elogw_engine=engine, execution_engine=FakeExecutionEngineForExit(result),
+            dataset_builder=FakeDatasetBuilderForExit(),
+            fee_optimizer=SimpleNamespace(get_optimal_fee=lambda *a: 5_000,
+                                          get_jito_tip=lambda *a: 100_000),
+            wallet_equity_usd=10_000.0, sol_price_usd=150.0,
+            state_sequencer=sequencer, global_config={}, replans=replans,
+            ops_events=[],
+        )
+        desk._record_ops_event = (
+            lambda stream, payload: desk.ops_events.append((stream, payload)))
+
+        async def refresh():
+            return None
+
+        desk._refresh_portfolio_state = refresh
+        return desk
+
+    @staticmethod
+    def _position():
+        return {
+            "size_tokens": 1_000, "initial_size_tokens": 1_000,
+            "remaining_cost_usd": 100.0, "initial_cost_usd": 100.0,
+            "risk_contribution": 0.02, "decision_id": "d1",
+            "candidate": SimpleNamespace(base_token=None),
+            "risk_object": SimpleNamespace(), "liquidity_usd": 500_000.0,
+            "prediction_object": MultiHeadPrediction("mint", "solana", 0, p_2x=0.8,
+                                                     p_5x=0.5, p_rug_30s=0.01,
+                                                     p_rug_5m=0.02),
+        }
+
+    async def test_the_frozen_size_is_what_executes(self):
+        result = ExecutionResult(success=True, status=TransactionStatus.SIMULATED,
+                                 simulated=True, quoted_output_amount=500,
+                                 actual_input_amount=1)
+        sequencer = StateSequencer()
+        sequencer.bump("mint")
+        desk = self._desk(result, sequencer)
+        snapshot = DecisionSnapshot(
+            token="mint", action="add", state_seq=1, size_base_units=777_000_000,
+            protective_limit=800_000_000, feature_hash="f", model_hash="m",
+            q_value=0.5, evidence={"fraction": 0.01, "slippage_bps": 100})
+
+        await MemecoinQuantDesk._consider_scale_in(
+            desk, "mint", self._position(), 1.5, snapshot)
+
+        self.assertEqual(desk.execution_engine.buys[0][2], 777_000_000)
+        # The executor must not re-derive a size the policy never evaluated.
+        self.assertEqual(desk.replans, [])
+
+    async def test_a_stale_decision_is_refused_and_recorded(self):
+        result = ExecutionResult(success=True, status=TransactionStatus.SIMULATED,
+                                 simulated=True, quoted_output_amount=500)
+        sequencer = StateSequencer()
+        sequencer.bump("mint")
+        sequencer.bump("mint")
+        desk = self._desk(result, sequencer)
+        snapshot = DecisionSnapshot(
+            token="mint", action="add", state_seq=1, size_base_units=777_000_000,
+            protective_limit=800_000_000, feature_hash="f", model_hash="m")
+
+        await MemecoinQuantDesk._consider_scale_in(
+            desk, "mint", self._position(), 1.5, snapshot)
+
+        self.assertEqual(desk.execution_engine.buys, [])
+        # How often decisions go stale measures how fast state moves relative
+        # to how fast we decide -- a latency number worth keeping.
+        streams = [stream for stream, _ in desk.ops_events]
+        self.assertIn("stale_decisions", streams)
+
+    async def test_without_a_snapshot_the_legacy_path_still_works(self):
+        result = ExecutionResult(success=True, status=TransactionStatus.SIMULATED,
+                                 simulated=True, quoted_output_amount=500,
+                                 actual_input_amount=1)
+        desk = self._desk(result, StateSequencer())
+        await MemecoinQuantDesk._consider_scale_in(desk, "mint", self._position(), 1.5)
+        self.assertEqual(len(desk.execution_engine.buys), 1)
+        self.assertEqual(desk.replans, [1])
