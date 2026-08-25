@@ -38,6 +38,15 @@ from src.execution.jupiter_jito import (
 from src.main import CAPACITY_REJECTIONS, MemecoinQuantDesk, _jsonable
 from src.strategies.information_graph import CounterfactualExecutionLab
 from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPrediction, MultiHeadPredictor, PredictionFeatures
+from src.collectors.adapters import (
+    bluesky_source, code_repository_source, coverage_report, discord_gateway_source,
+    farcaster_source, mastodon_source, metadata_artifact_source, nostr_source,
+    official_site_source, rss_source, telegram_source, twitch_eventsub_source,
+    youtube_websub_source,
+)
+from src.collectors.event_source import (
+    Event, EventSource, SourceClass, SourceMesh, SourceState,
+)
 from src.strategies.action_value import (
     Action, ActionValuePolicy, Decision, Decision as ActionDecision,
     PositionState, PositionState as ActionState,
@@ -6645,3 +6654,201 @@ class TestBackfillFactory(unittest.TestCase):
             payload = run_backfill([], Path(directory)).to_dict()
             # Zero would read as "we tried and reconstructed nothing".
             self.assertIsNone(payload["yield"])
+
+
+class TestSourceMesh(unittest.IsolatedAsyncioTestCase):
+    """A dead feed and a quiet feed produce the same event count."""
+
+    MINT = "So11111111111111111111111111111111111111112"
+    NOW = 1_800_000_000.0
+
+    class _Fake(EventSource):
+        def __init__(self, source_id, events=None, raises=False):
+            super().__init__(source_id, SourceClass.CHAT)
+            self._events = events or []
+            self._raises = raises
+
+        async def poll(self):
+            if self._raises:
+                raise RuntimeError("upstream is down")
+            return list(self._events)
+
+    def _event(self, source_id, text, source_at=None, observed_at=None):
+        return Event(source_id=source_id, source_class=SourceClass.CHAT,
+                     source_at=source_at if source_at is not None else self.NOW,
+                     observed_at=observed_at if observed_at is not None else self.NOW,
+                     text=text, token_addresses=tuple(extract_mints(text)))
+
+    async def test_a_failing_source_does_not_take_down_the_mesh(self):
+        good = self._Fake("good", [self._event("good", "hello")])
+        bad = self._Fake("bad", raises=True)
+        mesh = SourceMesh([bad, good])
+        events = await mesh.collect(self.NOW)
+        # A mesh that stops on the first failure has coverage equal to its
+        # least reliable member.
+        self.assertEqual([event.source_id for event in events], ["good"])
+
+    async def test_a_never_polled_source_is_not_reported_ok(self):
+        mesh = SourceMesh([self._Fake("cold")])
+        health = mesh.health(self.NOW)
+        self.assertEqual(health["by_state"], {"NEVER_STARTED": 1})
+        self.assertEqual(health["coverage"], 0.0)
+
+    async def test_silence_becomes_degraded_then_dead(self):
+        source = self._Fake("s")
+        await source.collect(self.NOW)
+        self.assertEqual(source.health(self.NOW).state, SourceState.OK)
+        self.assertEqual(source.health(self.NOW + 400).state, SourceState.DEGRADED)
+        self.assertEqual(source.health(self.NOW + 1_000).state, SourceState.DEAD)
+
+    async def test_a_quiet_source_is_healthy_and_a_dead_one_is_not(self):
+        quiet = self._Fake("quiet", [])
+        await quiet.collect(self.NOW)
+        report = quiet.health(self.NOW)
+        # Zero events is not failure; a successful poll returning nothing is a
+        # working source with nothing to say.
+        self.assertEqual(report.state, SourceState.OK)
+        self.assertIsNone(report.last_event_at)
+        self.assertIsNotNone(report.last_poll_ok_at)
+
+    async def test_unhealthy_sources_are_named_not_just_counted(self):
+        alive = self._Fake("alive")
+        silent = self._Fake("silent")
+        await alive.collect(self.NOW)
+        await silent.collect(self.NOW - 5_000)
+        health = SourceMesh([alive, silent]).health(self.NOW)
+        # The failure mode is six adapters going silent while the dashboard
+        # stays green.
+        self.assertEqual([item["source_id"] for item in health["unhealthy"]], ["silent"])
+        self.assertAlmostEqual(health["coverage"], 0.5)
+
+    async def test_repeats_are_deduplicated_but_the_repeater_is_recorded(self):
+        text = f"official token {self.MINT}"
+        first = self._Fake("regional", [self._event("regional", text)])
+        second = self._Fake("big_channel", [self._event("big_channel", text)])
+        mesh = SourceMesh([first, second])
+        events = await mesh.collect(self.NOW)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].source_id, "regional")
+        # Dropping the repeat outright would throw away exactly the lead-lag
+        # evidence that says which source is upstream.
+        self.assertEqual(mesh.repeaters_of(events[0].content_hash),
+                         ["regional", "big_channel"])
+
+    async def test_content_hash_ignores_the_source(self):
+        one = self._event("a", f"buy {self.MINT} now")
+        two = self._event("b", f"buy {self.MINT} now")
+        self.assertEqual(one.content_hash, two.content_hash)
+        self.assertNotEqual(one.content_hash, self._event("a", "different").content_hash)
+
+    async def test_the_dedupe_window_expires(self):
+        text = "same text"
+        mesh = SourceMesh([self._Fake("a", [self._event("a", text)])], dedupe_window=60.0)
+        self.assertEqual(len(await mesh.collect(self.NOW)), 1)
+        self.assertEqual(len(await mesh.collect(self.NOW + 10)), 0)
+        self.assertEqual(len(await mesh.collect(self.NOW + 1_000)), 1)
+
+    def test_the_two_timestamps_are_never_collapsed(self):
+        event = self._event("s", "text", source_at=self.NOW, observed_at=self.NOW + 6.5)
+        # The source's own delivery latency, which no local speed recovers.
+        self.assertAlmostEqual(event.observation_lag, 6.5)
+
+    def test_a_clock_artefact_never_reports_a_negative_lag(self):
+        event = self._event("s", "text", source_at=self.NOW, observed_at=self.NOW - 30)
+        # Otherwise a source appears to reach us before it published, and
+        # ranks first.
+        self.assertEqual(event.observation_lag, 0.0)
+
+
+class TestSourceAdapters(unittest.IsolatedAsyncioTestCase):
+    MINT = "So11111111111111111111111111111111111111112"
+
+    async def _collect(self, source):
+        return await source.collect(1_800_000_000.0)
+
+    async def test_a_telegram_message_normalises_with_its_mint(self):
+        async def fetch():
+            return [{"message": f"official CA {self.MINT}", "date": 1_700_000_000,
+                     "id": 42, "sender_id": 1001}]
+        events = await self._collect(telegram_source("tg:alpha", fetch, channel="alpha"))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].token_addresses, (self.MINT,))
+        self.assertEqual(events[0].source_class, SourceClass.CHAT)
+        self.assertEqual(events[0].author_id, "1001")
+
+    async def test_youtube_uses_title_and_description_not_the_transcript(self):
+        async def fetch():
+            return [{"title": f"my coin {self.MINT}", "description": "launching now",
+                     "published": 1_700_000_000, "channel_id": "UC1", "video_id": "v1"}]
+        events = await self._collect(youtube_websub_source("yt:UC1", fetch))
+        # Waiting for a transcript to confirm what the title states spends the
+        # entire lead the push notification bought.
+        self.assertEqual(events[0].token_addresses, (self.MINT,))
+        self.assertEqual(events[0].metadata["video_id"], "v1")
+
+    async def test_rss_carries_language_and_host(self):
+        async def fetch():
+            return [{"title": "haber", "summary": "detay",
+                     "link": "https://ornek.com.tr/a", "published_epoch": 1_700_000_000}]
+        events = await self._collect(rss_source("rss:tr", fetch, language="tr"))
+        self.assertEqual(events[0].language, "tr")
+        self.assertEqual(events[0].metadata["host"], "ornek.com.tr")
+
+    async def test_metadata_artifacts_carry_a_structured_mint(self):
+        async def fetch():
+            return [{"name": "Doge", "symbol": "DOGE", "mint": self.MINT,
+                     "uri": "https://ipfs.example/x", "uploaded_at": 1_700_000_000}]
+        events = await self._collect(metadata_artifact_source("meta", fetch))
+        # The mint is a field here, not text, and must still reach the event.
+        self.assertIn(self.MINT, events[0].token_addresses)
+
+    async def test_a_malformed_record_does_not_lose_the_batch(self):
+        async def fetch():
+            return [{"message": "fine", "date": 1_700_000_000},
+                    {"date": "not a number", "message": "also fine"},
+                    {"message": "third", "date": 1_700_000_001}]
+        events = await self._collect(telegram_source("tg", fetch))
+        self.assertEqual(len(events), 2)
+
+    async def test_empty_text_produces_no_event(self):
+        async def fetch():
+            return [{"message": "", "date": 1_700_000_000}]
+        self.assertEqual(await self._collect(telegram_source("tg", fetch)), [])
+
+    async def test_adapters_do_not_judge_relevance(self):
+        """A source that filters silently becomes the model."""
+        async def fetch():
+            return [{"message": "gm", "date": 1_700_000_000},
+                    {"message": "totally irrelevant chatter", "date": 1_700_000_001}]
+        events = await self._collect(telegram_source("tg", fetch))
+        self.assertEqual(len(events), 2)
+
+    def test_uncovered_networks_are_stated_rather_than_hidden(self):
+        report = coverage_report({"sources": 4, "coverage": 1.0, "by_state": {"OK": 4}})
+        # 100% healthy across four adapters is still blind to most of the
+        # world, and coverage alone would not say so.
+        self.assertIn("x_twitter", report["uncovered_networks"])
+        self.assertTrue(report["coverage_is_over_connected_sources_only"])
+
+    async def test_every_adapter_produces_the_same_canonical_shape(self):
+        async def fetch_one(payload):
+            async def fetch():
+                return [payload]
+            return fetch
+
+        builders = [
+            (telegram_source, {"message": "x", "date": 1.0}),
+            (bluesky_source, {"commit": {"record": {"text": "x"}}, "time_us": 1e6}),
+            (nostr_source, {"content": "x", "created_at": 1.0}),
+            (farcaster_source, {"text": "x", "timestamp": 1.0}),
+            (mastodon_source, {"content": "x", "created_at_epoch": 1.0}),
+        ]
+        for builder, payload in builders:
+            source = builder("s", await fetch_one(payload))
+            events = await self._collect(source)
+            self.assertEqual(len(events), 1, builder.__name__)
+            event = events[0]
+            self.assertIsInstance(event, Event)
+            self.assertIn("schema_version", event.to_dict())
+            self.assertGreaterEqual(event.observation_lag, 0.0)
