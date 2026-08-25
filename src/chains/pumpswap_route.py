@@ -213,7 +213,7 @@ class PumpSwapRoute:
                first: int, second: int) -> PreparedInstruction:
         blocked = self.config.blocked_reason()
         if blocked:
-            return PreparedInstruction(status="DATA_BLOCKED", detail=blocked)
+            return PreparedInstruction(status="DATA_BLOCKED", detail=blocked, venue="pumpswap")
         if not pool.ok:
             return PreparedInstruction(status="DATA_BLOCKED",
                                        detail=f"pool not decoded: {pool.detail}")
@@ -267,7 +267,7 @@ class PumpSwapRoute:
         expected = len(account_names(PUMP_AMM_IDL, name))
         return PreparedInstruction(status="OK", program_id=self.program,
                                    accounts=accounts, data=data,
-                                   expected_accounts=expected)
+                                   expected_accounts=expected, venue="pumpswap")
 
     def report(self) -> Dict[str, Any]:
         blocked = self.config.blocked_reason()

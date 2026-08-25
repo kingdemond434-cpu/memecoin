@@ -924,12 +924,20 @@ class PumpSwapMonitor:
         quote_amount = struct.unpack_from("<Q", data, 64)[0]
         pool_base_reserves = struct.unpack_from("<Q", data, 48)[0]
         pool_quote_reserves = struct.unpack_from("<Q", data, 56)[0]
+        user_quote_amount = struct.unpack_from("<Q", data, 112)[0]
         pool = b58encode(data[120:152])
         wallet = b58encode(data[152:184])
         token, quote_mint, decimals = self._pool_tokens.get(pool, ("", "", 0))
         token_ui = token_amount / (10 ** decimals) if token and decimals >= 0 else None
         notional_sol = quote_amount / 1_000_000_000 if quote_mint == "So11111111111111111111111111111111111111112" else None
         is_buy = data.startswith(self.BUY_EVENT)
+        # The tail of the event carries what a local quote actually needs: the
+        # fee basis points CHARGED ON THIS TRADE, the pool's virtual quote
+        # reserves, and the base supply. Reading them is the difference
+        # between quoting against a measured fee schedule and quoting against
+        # an assumed one. It is decoded separately and tolerantly, because an
+        # event shape that predates a field must still yield its reserves.
+        tail = self._decode_trade_tail(data, is_buy)
         return {
             **base, "type": "token_trade", "pool": pool, "token": token,
             "quote_mint": quote_mint, "wallet": wallet, "side": "buy" if is_buy else "sell",
@@ -937,9 +945,77 @@ class PumpSwapMonitor:
             "actual_token_amount_ui": token_ui, "notional_sol": notional_sol,
             "price_sol_per_token": (notional_sol / token_ui) if notional_sol is not None and token_ui else None,
             "curve_price_raw": pool_quote_reserves / pool_base_reserves if pool_base_reserves else None,
+            # Post-trade reserves, straight off the event. These are what the
+            # next quote is priced against, so they are surfaced rather than
+            # collapsed into the price ratio above.
+            "pool_base_reserves": pool_base_reserves,
+            "pool_quote_reserves": pool_quote_reserves,
+            "quote_amount_gross": quote_amount,
+            "user_quote_amount": user_quote_amount,
             "timestamp": float(timestamp), "fill_data_status": "OBSERVED_PROGRAM_EVENT",
             "data_status": "OK" if token else "DATA_BLOCKED: pool mint mapping unavailable",
+            **tail,
         }
+
+    @staticmethod
+    def _decode_trade_tail(data: bytes, is_buy: bool) -> Dict[str, Any]:
+        """Fee basis points, virtual quote reserves and base supply.
+
+        Field order is taken from BuyEvent / SellEvent in idl/pump_amm.json.
+        The buy event carries a borsh string (`ix_name`) partway through, so
+        the tail cannot be read at fixed offsets and is walked instead.
+
+        Returns only what it could actually read. A short or unexpected tail
+        yields fewer keys, never a zero -- a fee schedule defaulted to zero
+        would quote every trade as free, which is the direction that makes a
+        losing trade look profitable.
+        """
+        out: Dict[str, Any] = {"tail_data_status": "DATA_BLOCKED: tail truncated"}
+        try:
+            # user_base_token_account .. protocol_fee_recipient_token_account
+            offset = 184 + 32 * 4
+            coin_creator = b58encode(data[offset:offset + 32])
+            offset += 32
+            coin_creator_fee_bps, coin_creator_fee = struct.unpack_from("<QQ", data, offset)
+            offset += 16
+            out["coin_creator"] = coin_creator
+            out["coin_creator_fee_bps"] = coin_creator_fee_bps
+            out["coin_creator_fee"] = coin_creator_fee
+            if is_buy:
+                # track_volume(bool) total_unclaimed total_claimed current_sol_volume
+                # last_update_timestamp min_base_amount_out, then ix_name(string).
+                offset += 1 + 8 * 5
+                (name_len,) = struct.unpack_from("<I", data, offset)
+                offset += 4
+                if name_len > 256:
+                    raise ValueError(f"implausible ix_name length {name_len}")
+                out["ix_name"] = data[offset:offset + name_len].decode("utf-8", "replace")
+                offset += name_len
+            cashback_bps, cashback, buyback_bps, buyback = struct.unpack_from("<QQQQ", data, offset)
+            offset += 32
+            virtual_quote = int.from_bytes(data[offset:offset + 16], "little", signed=True)
+            offset += 16
+            if len(data) < offset + 9:
+                raise ValueError("no can_boost/base_supply")
+            can_boost = bool(data[offset])
+            (base_supply,) = struct.unpack_from("<Q", data, offset + 1)
+            lp_fee_bps = struct.unpack_from("<Q", data, 72)[0]
+            protocol_fee_bps = struct.unpack_from("<Q", data, 88)[0]
+            out.update({
+                "cashback_fee_bps": cashback_bps, "cashback": cashback,
+                "buyback_fee_bps": buyback_bps, "buyback_fee": buyback,
+                "virtual_quote_reserves": virtual_quote,
+                "can_boost": can_boost, "base_supply": base_supply,
+                "lp_fee_bps": lp_fee_bps, "protocol_fee_bps": protocol_fee_bps,
+                # Every component the trade actually paid. The LP fee is part
+                # of it: leaving it out understates the cost of every swap.
+                "total_fee_bps": (lp_fee_bps + protocol_fee_bps + coin_creator_fee_bps
+                                  + cashback_bps + buyback_bps),
+                "tail_data_status": "OK",
+            })
+        except (struct.error, IndexError, ValueError, UnicodeDecodeError) as exc:
+            out["tail_data_status"] = f"DATA_BLOCKED: {exc}"
+        return out
 
     async def _on_transaction(self, tx_data: Any):
         received_ns = time.time_ns()

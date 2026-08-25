@@ -238,3 +238,31 @@ def curve_tradeability(state, quote_buy_fn, quote_sell_fn,
     entry.upper_bound_only = upper_bound_only
     exit_side.upper_bound_only = upper_bound_only
     return TradeabilityReport(entry=entry, exit=exit_side)
+
+
+def pool_tradeability(state, quote_buy_fn, quote_sell_fn,
+                      bounds: Sequence[float] = DEFAULT_IMPACT_BOUNDS) -> TradeabilityReport:
+    """Both frontiers for a PumpSwap pool, from local reserves only.
+
+    The curve's counterpart after graduation. A position that migrates would
+    otherwise lose its capacity measurement permanently -- the exit policy
+    would see DATA_BLOCKED for the rest of the position's life, which is not
+    a cautious answer but an absent one.
+
+    Unlike the curve, a pool's reserves are real rather than virtual, so
+    nothing here is an upper bound: what the frontier says is executable is
+    what the pool actually holds.
+    """
+    def buy_quote(lamports: int) -> Tuple[bool, float]:
+        quote = quote_buy_fn(state, int(lamports))
+        return (quote.data_status == "OK", float(quote.price_impact_pct))
+
+    def sell_quote(tokens: int) -> Tuple[bool, float]:
+        quote = quote_sell_fn(state, int(tokens))
+        return (quote.data_status == "OK", float(quote.price_impact_pct))
+
+    quote_ceiling = max(0, int(getattr(state, "effective_quote_reserves", 0)))
+    base_ceiling = max(0, int(getattr(state, "base_reserves", 0)))
+    return TradeabilityReport(
+        entry=build_frontier(buy_quote, quote_ceiling, "entry", bounds),
+        exit=build_frontier(sell_quote, base_ceiling, "exit", bounds))

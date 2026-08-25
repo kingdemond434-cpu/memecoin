@@ -8,6 +8,7 @@ both an explicit ``--live`` launch and the execution engine's independent
 import argparse
 import asyncio
 import base64
+import collections
 import hashlib
 import json
 import logging
@@ -17,7 +18,7 @@ import time
 from dataclasses import asdict, is_dataclass, replace as dataclasses_replace
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yaml
 from aiohttp import web
@@ -79,11 +80,14 @@ from src.chains.idl import report as idl_report
 from src.chains.pump_route import (
     TOKEN_2022_PROGRAM, TOKEN_PROGRAM, NativePumpRoute, PumpRouteConfig,
 )
-from src.chains.pumpswap_route import PumpSwapRoute, PumpSwapRouteConfig
+from src.chains.pumpswap_curve import PumpSwapPoolState
+from src.chains.pumpswap_curve import quote_buy as pool_quote_buy
+from src.chains.pumpswap_curve import quote_sell as pool_quote_sell
+from src.chains.pumpswap_route import PoolState, PumpSwapRoute, PumpSwapRouteConfig, parse_pool
 from src.execution.pump_fees import (
     DEFAULT_SCHEDULE as PUMP_FEE_SCHEDULE, VENUE_BONDING_CURVE,
 )
-from src.execution.tradeability import curve_tradeability, exit_capacity_ratio
+from src.execution.tradeability import curve_tradeability, exit_capacity_ratio, pool_tradeability
 from src.strategies.distribution import DistributionDetector
 from src.strategies.mega_event import MegaEventReserve
 from src.strategies.escape import (
@@ -247,6 +251,13 @@ class MemecoinQuantDesk:
         # stream, so exit capacity is answerable locally in the window a
         # decision actually has, with no RPC round trip.
         self._latest_curve_state: Dict[str, Any] = {}
+        # The post-graduation counterpart. Reserves and the fee schedule the
+        # pool actually charges, maintained off the PumpSwap event stream;
+        # and the decoded Pool account, which is the only source for the
+        # vaults, the coin_creator and the mayhem flag.
+        self._latest_pool_state: Dict[str, PumpSwapPoolState] = {}
+        self._pool_accounts: Dict[str, PoolState] = {}
+        self._pool_account_pending: Set[str] = set()
         # Partial-exit PnL accumulated per token, banked into the final
         # outcome row when the position actually closes.
         self._closed_pnl: Dict[str, float] = {}
@@ -619,11 +630,17 @@ class MemecoinQuantDesk:
         ))
         self.execution_engine = ExecutionEngine(self.solana_config, self.solana_rpc, self.jupiter, self.jito,
                                                 builder, self.counterfactual_lab, dry_run=self.dry_run,
-                                                pump_route=self.pump_route)
+                                                pump_route=self.pump_route,
+                                                pumpswap_route=self.pumpswap_route)
         # The desk owns the streamed curve state; the engine reads it through
         # this rather than keeping its own, because two views of the price we
         # are about to trade at is one view too many.
         self.execution_engine.curve_state_provider = self._latest_curve_state.get
+        # Graduation should change the venue and nothing else. The same desk
+        # state, the same policy and the same signing path continue across it;
+        # only the pool these two providers describe is new.
+        self.execution_engine.pool_state_provider = self._latest_pool_state.get
+        self.execution_engine.pool_account_provider = self._pool_accounts.get
         self.fee_optimizer = PriorityFeeOptimizer()
         if not self.offline:
             await self.execution_engine.start()
@@ -1640,6 +1657,146 @@ class MemecoinQuantDesk:
         self.request_redecision(token)
         return True
 
+    def _seed_pool_state(self, token: str, event: Dict[str, Any]) -> None:
+        """Open pool state at migration, from the CreatePoolEvent.
+
+        Reserves and identity only. The fee schedule is deliberately left
+        unset: it is read off the first trade that pays it, and until then a
+        quote refuses rather than assuming a rate. Assuming one would price
+        every graduated coin as though it were cheaper to trade than it is.
+        """
+        pool = str(event.get("pool", "") or "")
+        if not token or not pool:
+            return
+        existing = self._latest_pool_state.get(token)
+        state = PumpSwapPoolState(
+            pool=pool, base_mint=str(event.get("base_mint", token) or token),
+            quote_mint=str(event.get("quote_mint", "") or ""),
+            base_reserves=int(event.get("initial_base_amount", 0) or 0),
+            quote_reserves=int(event.get("initial_quote_amount", 0) or 0),
+            base_decimals=int(event.get("base_mint_decimals", 0) or 0),
+            updated_at=float(event.get("timestamp", time.time())),
+            slot=int(event.get("slot", 0) or 0), source="pool_created")
+        if existing is not None and existing.pool == pool:
+            # A second creation event for a pool we already track carries no
+            # newer reserves than the trades we have seen since.
+            state.total_fee_bps = existing.total_fee_bps
+            state.lp_fee_bps = existing.lp_fee_bps
+            state.protocol_fee_bps = existing.protocol_fee_bps
+            state.coin_creator_fee_bps = existing.coin_creator_fee_bps
+            state.coin_creator = existing.coin_creator
+            state.base_supply = existing.base_supply
+        self._latest_pool_state[token] = state
+        self.state_sequencer.bump(token)
+        self._spawn_background(self._fetch_pool_account(token, pool))
+
+    def _update_pool_state(self, token: str, event: Dict[str, Any]) -> None:
+        """Adopt post-trade reserves and the fee bps that trade actually paid.
+
+        The PumpSwap trade events carry both, so the pool is priced against
+        measurements rather than against a fee table we would otherwise have
+        to keep in step with the protocol by hand.
+        """
+        reserves_base = int(event.get("pool_base_reserves", 0) or 0)
+        reserves_quote = int(event.get("pool_quote_reserves", 0) or 0)
+        if not token or reserves_base <= 0 or reserves_quote <= 0:
+            return
+        previous = self._latest_pool_state.get(token)
+        pool = str(event.get("pool", "") or (previous.pool if previous else ""))
+        if not pool:
+            return
+        state = PumpSwapPoolState(
+            pool=pool,
+            base_mint=str(event.get("token", token) or token),
+            quote_mint=str(event.get("quote_mint", "")
+                           or (previous.quote_mint if previous else "")),
+            base_reserves=reserves_base, quote_reserves=reserves_quote,
+            base_decimals=(previous.base_decimals if previous else 0),
+            updated_at=float(event.get("timestamp", time.time())),
+            slot=int(event.get("slot", 0) or 0), source="token_trade")
+        if event.get("tail_data_status") == "OK":
+            state.lp_fee_bps = int(event.get("lp_fee_bps", 0) or 0)
+            state.protocol_fee_bps = int(event.get("protocol_fee_bps", 0) or 0)
+            state.coin_creator_fee_bps = int(event.get("coin_creator_fee_bps", 0) or 0)
+            state.total_fee_bps = int(event.get("total_fee_bps", 0) or 0)
+            state.virtual_quote_reserves = int(event.get("virtual_quote_reserves", 0) or 0)
+            state.base_supply = int(event.get("base_supply", 0) or 0)
+            state.coin_creator = str(event.get("coin_creator", "") or "")
+        elif previous is not None:
+            # An event whose tail we could not read still tells us the
+            # reserves. Carrying the last measured schedule forward is honest
+            # -- it is a measurement, just not of this trade -- where
+            # defaulting it to zero would not be.
+            state.total_fee_bps = previous.total_fee_bps
+            state.lp_fee_bps = previous.lp_fee_bps
+            state.protocol_fee_bps = previous.protocol_fee_bps
+            state.coin_creator_fee_bps = previous.coin_creator_fee_bps
+            state.virtual_quote_reserves = previous.virtual_quote_reserves
+            state.base_supply = previous.base_supply
+            state.coin_creator = previous.coin_creator
+        self._latest_pool_state[token] = state
+        # Reserves moved, so a decision priced against the old ones is stale.
+        self.state_sequencer.bump(token)
+        self.request_redecision(token)
+
+    async def _fetch_pool_account(self, token: str, pool: str) -> bool:
+        """Decode the Pool account once, off the hot path.
+
+        The vaults, the coin_creator and the mayhem flag are not in any event
+        and cannot be inferred: the mayhem flag alone selects which published
+        fee-recipient set the instruction must name, and choosing from the
+        wrong one builds a transaction that is well formed and fails. So this
+        is fetched at migration, when nothing is waiting on it, and the route
+        stays DATA_BLOCKED until it lands.
+        """
+        if not pool or not self.solana_rpc or pool in self._pool_account_pending:
+            return False
+        self._pool_account_pending.add(pool)
+        try:
+            result = await self.solana_rpc.request(
+                "getAccountInfo", [pool, {"encoding": "base64", "commitment": "confirmed"}])
+            value = (result or {}).get("value") or {}
+            encoded = (value.get("data") or [None])[0]
+            if not encoded:
+                return False
+            decoded = parse_pool(base64.b64decode(encoded), pool)
+            if not decoded.ok:
+                logger.warning("pool %s did not decode: %s", pool, decoded.detail)
+                return False
+            self._pool_accounts[token] = decoded
+            state = self._latest_pool_state.get(token)
+            if state is not None and not state.coin_creator:
+                state.coin_creator = decoded.coin_creator
+            return True
+        except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError) as exc:
+            logger.warning("pool account fetch failed for %s: %s", pool, exc)
+            return False
+        finally:
+            self._pool_account_pending.discard(pool)
+
+    def pool_route_report(self) -> Dict[str, Any]:
+        """Whether graduation actually keeps native execution.
+
+        A route that exists, is wired, and answers DATA_BLOCKED on every
+        migrated coin is indistinguishable from one that was never wired --
+        except that it looks finished. This is what tells the two apart.
+        """
+        tracked = len(self._latest_pool_state)
+        decoded = len(self._pool_accounts)
+        priced = sum(1 for state in self._latest_pool_state.values()
+                     if state.blocked_reason() is None)
+        executable = sum(1 for token, state in self._latest_pool_state.items()
+                         if state.blocked_reason() is None and token in self._pool_accounts)
+        return {
+            "status": "OK" if executable else "DATA_BLOCKED",
+            "pools_tracked": tracked, "accounts_decoded": decoded,
+            "pools_priceable": priced, "pools_executable": executable,
+            "executable_share": (executable / tracked) if tracked else None,
+            "reasons": dict(collections.Counter(
+                state.blocked_reason() or "ok"
+                for state in self._latest_pool_state.values())),
+        }
+
     def _prune_curve_static(self) -> int:
         """Drop static facts for tokens the hot state no longer tracks."""
         stale = [key for key in self._curve_static
@@ -1888,7 +2045,19 @@ class MemecoinQuantDesk:
         """
         state = self._latest_curve_state.get(token)
         if state is None:
-            return "DATA_BLOCKED_NO_CURVE_STATE", 0.0
+            # Graduated. The same question, asked of the pool the coin moved
+            # into -- because a position that migrates would otherwise be
+            # unmeasurable for the rest of its life, and the exit policy
+            # cannot tell an absent answer from a cautious one.
+            pool = self._latest_pool_state.get(token)
+            if pool is None or pool.blocked_reason() is not None:
+                return "DATA_BLOCKED_NO_CURVE_STATE", 0.0
+            report = pool_tradeability(pool, pool_quote_buy, pool_quote_sell)
+            position["tradeability"] = report.report()
+            return exit_capacity_ratio(
+                int(position.get("size_tokens", 0) or 0), report.exit,
+                acceptable_impact=float(self.global_config.get("acceptable_exit_impact", 0.10)),
+            )
         report = curve_tradeability(state, quote_buy, quote_sell)
         position["tradeability"] = report.report()
         return exit_capacity_ratio(
@@ -2297,6 +2466,16 @@ class MemecoinQuantDesk:
             report = curve_tradeability(state, quote_buy, quote_sell)
             sellable = report.exit.size_at(
                 float(self.global_config.get("acceptable_exit_impact", 0.10)))
+        else:
+            # Escape probability after graduation is measured against the pool
+            # for the same reason: how much can be sold before the price moves
+            # is the whole question, and it does not stop having an answer
+            # because the venue changed.
+            pool = self._latest_pool_state.get(token)
+            if pool is not None and pool.blocked_reason() is None:
+                report = pool_tradeability(pool, pool_quote_buy, pool_quote_sell)
+                sellable = report.exit.size_at(
+                    float(self.global_config.get("acceptable_exit_impact", 0.10)))
         # Latency measured from our own landed sells, not assumed. A constant
         # is fine right up until the moment it matters -- congestion, a
         # degraded relay, a priority fee that stopped clearing -- and those
@@ -2836,6 +3015,8 @@ class MemecoinQuantDesk:
                          "funding_transfers": event.get("funding_transfers", [])},
             ))
         elif event.get("type") == "token_trade":
+            if event.get("program") == PumpSwapMonitor.PUMP_AMM_PROGRAM:
+                self._update_pool_state(token, event)
             curve_price = float(event.get("curve_price_raw", 0) or 0)
             virtual_sol = int(event.get("virtual_sol_reserves") or 0)
             virtual_token = int(event.get("virtual_token_reserves") or 0)
@@ -2908,6 +3089,7 @@ class MemecoinQuantDesk:
                                          event.get("timestamp", time.time()), event)
             self.dataset_builder.record_market_observation(token, {"type": "migration", **event})
         elif event.get("type") == "pool_created":
+            self._seed_pool_state(token, event)
             self.wallet_intel.record_token_lifecycle(token, migration_at=event.get("timestamp", time.time()))
             self.dataset_builder.start_episode(
                 token, event.get("creator", ""), event.get("program", PumpSwapMonitor.PUMP_AMM_PROGRAM),
@@ -3019,6 +3201,7 @@ class MemecoinQuantDesk:
             "native_route": (self.execution_engine.native_route_report()
                              if self.execution_engine else {"status": "DATA_BLOCKED"}),
             "pumpswap_route": self.pumpswap_route.report(),
+            "pumpswap_execution": self.pool_route_report(),
             "idl": idl_report(),
             "action_policy": {"trained": self.action_policy.is_trained,
                               "min_edge": self.action_policy.min_edge},

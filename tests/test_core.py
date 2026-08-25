@@ -132,6 +132,11 @@ from src.chains.pump_fee_config import (
     FEE_CONFIG_DISCRIMINATOR, bonding_curve_market_cap, calculate_fee_tier,
     fee_config_address, parse_fee_config, pool_market_cap,
 )
+from src.chains.pumpswap_curve import (
+    PumpSwapPoolState, sell_capacity_base,
+)
+from src.chains.pumpswap_curve import quote_buy as pool_quote_buy
+from src.chains.pumpswap_curve import quote_sell as pool_quote_sell
 from src.chains.pumpswap_route import (
     POOL_DISCRIMINATOR, PoolState, PumpSwapRoute, derive_pool, parse_pool,
 )
@@ -2945,6 +2950,7 @@ class TestPositionPredictionRefresh(unittest.IsolatedAsyncioTestCase):
         desk._suppressed_monster_banks = 0
         desk._read_distribution = lambda token: MemecoinQuantDesk._read_distribution(desk, token)
         desk._latest_curve_state = getattr(desk, "_latest_curve_state", {})
+        desk._latest_pool_state = getattr(desk, "_latest_pool_state", {})
         desk.ops_events = []
         desk._record_ops_event = (
             lambda stream, payload: desk.ops_events.append((stream, payload)))
@@ -3629,6 +3635,7 @@ class TestDistributionExitWiring(unittest.IsolatedAsyncioTestCase):
         desk._suppressed_monster_banks = 0
         desk._read_distribution = lambda token: MemecoinQuantDesk._read_distribution(desk, token)
         desk._latest_curve_state = getattr(desk, "_latest_curve_state", {})
+        desk._latest_pool_state = getattr(desk, "_latest_pool_state", {})
         desk.ops_events = []
         desk._record_ops_event = (
             lambda stream, payload: desk.ops_events.append((stream, payload)))
@@ -4001,6 +4008,7 @@ class TestMonsterHoldWiring(unittest.IsolatedAsyncioTestCase):
         desk._suppressed_monster_banks = 0
         desk._read_distribution = lambda token: MemecoinQuantDesk._read_distribution(desk, token)
         desk._latest_curve_state = getattr(desk, "_latest_curve_state", {})
+        desk._latest_pool_state = getattr(desk, "_latest_pool_state", {})
         desk.ops_events = []
         desk._record_ops_event = (
             lambda stream, payload: desk.ops_events.append((stream, payload)))
@@ -8878,7 +8886,7 @@ class TestEscapeUsesEveryMechanism(unittest.IsolatedAsyncioTestCase):
             rug_hazard=SimpleNamespace(observations={}),
             global_config={"acceptable_exit_impact": 0.10,
                            "expected_exit_latency_s": 0.4},
-            _latest_curve_state={},
+            _latest_curve_state={}, _latest_pool_state={},
             landing_latency=latency or LandingLatency(),
         )
         desk.hazard = SimpleNamespace(signals=signals)
@@ -9354,6 +9362,9 @@ class TestNativeRouteIsTheCanonicalPath(unittest.TestCase):
         engine = ExecutionEngine.__new__(ExecutionEngine)
         engine.pump_route = route
         engine.curve_state_provider = (lambda token: curve) if curve else None
+        engine.pumpswap_route = None
+        engine.pool_state_provider = None
+        engine.pool_account_provider = None
         engine.tx_builder = SimpleNamespace(public_key=self.OTHER)
         engine.native_route_attempts = defaultdict(int)
         engine.stream_confirmations = 0
@@ -9545,6 +9556,468 @@ class TestOnChainFeeConfig(unittest.TestCase):
         self.assertEqual(legacy.status, "OK")
         self.assertEqual(legacy.total_bps, LEGACY_TOTAL_FEE_BPS)
 
+
+
+def _encode_pumpswap_trade_event(is_buy: bool, *, pool: bytes, user: bytes,
+                                 base_amount: int, quote_amount: int,
+                                 pool_base_reserves: int, pool_quote_reserves: int,
+                                 lp_fee_bps: int, protocol_fee_bps: int,
+                                 coin_creator: bytes, coin_creator_fee_bps: int,
+                                 cashback_fee_bps: int, buyback_fee_bps: int,
+                                 virtual_quote_reserves: int, base_supply: int,
+                                 user_quote_amount: int = 0,
+                                 ix_name: str = "buy") -> bytes:
+    """Encode a BuyEvent / SellEvent exactly as idl/pump_amm.json declares it.
+
+    Written field by field from the IDL rather than as a hex blob so that a
+    layout change upstream breaks this encoder and the decoder together,
+    instead of leaving a fixture that agrees with a decoder both of which are
+    wrong.
+    """
+    out = bytearray()
+    out += PumpSwapMonitor.BUY_EVENT if is_buy else PumpSwapMonitor.SELL_EVENT
+    out += struct.pack("<q", 1_700_000_000)
+    out += struct.pack("<QQQQ", base_amount, 0, 0, 0)     # amounts + user reserves
+    out += struct.pack("<QQ", pool_base_reserves, pool_quote_reserves)
+    out += struct.pack("<Q", quote_amount)
+    out += struct.pack("<QQ", lp_fee_bps, 0)
+    out += struct.pack("<QQ", protocol_fee_bps, 0)
+    out += struct.pack("<QQ", 0, user_quote_amount)       # with/without lp fee, user leg
+    out += pool + user
+    out += bytes(32) * 4                                  # the four token accounts
+    out += coin_creator
+    out += struct.pack("<QQ", coin_creator_fee_bps, 0)
+    if is_buy:
+        out += b"\x01"                                    # track_volume
+        out += struct.pack("<QQQqQ", 0, 0, 0, 0, 0)       # accumulators + min_base_out
+        encoded = ix_name.encode()
+        out += struct.pack("<I", len(encoded)) + encoded
+    out += struct.pack("<QQQQ", cashback_fee_bps, 0, buyback_fee_bps, 0)
+    out += int(virtual_quote_reserves).to_bytes(16, "little", signed=True)
+    out += b"\x00"                                        # can_boost
+    out += struct.pack("<Q", base_supply)
+    return bytes(out)
+
+
+class TestPumpSwapEventTailIsRead(unittest.TestCase):
+    """The fee schedule was on the wire the whole time.
+
+    Every PumpSwap trade event carries the basis points that trade actually
+    paid. Quoting a pool against an assumed fee table when the protocol is
+    telling us the real one on every swap is choosing to be wrong.
+    """
+
+    def _event(self, is_buy=True, **overrides):
+        pool, user, creator = (bytes([value]) * 32 for value in (5, 6, 7))
+        args = dict(pool=pool, user=user, base_amount=1_000_000,
+                    quote_amount=500_000_000, pool_base_reserves=10_000_000,
+                    pool_quote_reserves=20_000_000_000, lp_fee_bps=20,
+                    protocol_fee_bps=5, coin_creator=creator,
+                    coin_creator_fee_bps=5, cashback_fee_bps=1,
+                    buyback_fee_bps=2, virtual_quote_reserves=0,
+                    base_supply=1_000_000_000_000_000,
+                    user_quote_amount=501_650_000)
+        args.update(overrides)
+        return _encode_pumpswap_trade_event(is_buy, **args), args
+
+    def test_the_buy_tail_yields_the_fee_bps_actually_charged(self):
+        monitor = PumpSwapMonitor(DummyYellowstone(), lambda _: None)
+        data, args = self._event(True)
+        event = monitor._decode_program_event(data, "sig", 1)
+        self.assertEqual(event["tail_data_status"], "OK")
+        self.assertEqual(event["lp_fee_bps"], 20)
+        self.assertEqual(event["protocol_fee_bps"], 5)
+        self.assertEqual(event["coin_creator_fee_bps"], 5)
+        self.assertEqual(event["cashback_fee_bps"], 1)
+        self.assertEqual(event["buyback_fee_bps"], 2)
+        # Every component, LP fee included. Summing only protocol and creator
+        # understates the cost of the swap.
+        self.assertEqual(event["total_fee_bps"], 33)
+        self.assertEqual(event["base_supply"], args["base_supply"])
+        self.assertEqual(event["pool_base_reserves"], args["pool_base_reserves"])
+        self.assertEqual(event["pool_quote_reserves"], args["pool_quote_reserves"])
+
+    def test_the_sell_tail_has_no_ix_name_and_still_decodes(self):
+        """SellEvent is fixed layout; BuyEvent carries a borsh string."""
+        monitor = PumpSwapMonitor(DummyYellowstone(), lambda _: None)
+        data, _ = self._event(False, virtual_quote_reserves=777)
+        event = monitor._decode_program_event(data, "sig", 1)
+        self.assertEqual(event["tail_data_status"], "OK")
+        self.assertEqual(event["side"], "sell")
+        self.assertEqual(event["virtual_quote_reserves"], 777)
+        self.assertEqual(event["total_fee_bps"], 33)
+        self.assertNotIn("ix_name", event)
+
+    def test_a_variable_length_ix_name_does_not_shift_the_tail(self):
+        monitor = PumpSwapMonitor(DummyYellowstone(), lambda _: None)
+        short = monitor._decode_program_event(self._event(True, ix_name="buy")[0], "s", 1)
+        long = monitor._decode_program_event(
+            self._event(True, ix_name="buy_exact_quote_in_v2")[0], "s", 1)
+        self.assertEqual(short["total_fee_bps"], long["total_fee_bps"])
+        self.assertEqual(short["base_supply"], long["base_supply"])
+        self.assertEqual(long["ix_name"], "buy_exact_quote_in_v2")
+
+    def test_a_truncated_tail_blocks_rather_than_reporting_a_zero_fee(self):
+        """A fee defaulted to zero quotes every trade as free."""
+        monitor = PumpSwapMonitor(DummyYellowstone(), lambda _: None)
+        data, _ = self._event(True)
+        event = monitor._decode_program_event(data[:200], "sig", 1)
+        self.assertTrue(event["tail_data_status"].startswith("DATA_BLOCKED"))
+        self.assertNotIn("total_fee_bps", event)
+        # The reserves are before the truncation and are still reported.
+        self.assertEqual(event["pool_base_reserves"], 10_000_000)
+
+
+class TestPumpSwapPoolQuoting(unittest.TestCase):
+    """Graduation should change the venue, not whether we can price at all."""
+
+    POOL = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+    MINT = "So11111111111111111111111111111111111111112"
+
+    def _state(self, **overrides):
+        args = dict(pool=self.POOL, base_mint=self.MINT, quote_mint=self.MINT,
+                    base_reserves=1_000_000_000_000, quote_reserves=100_000_000_000,
+                    total_fee_bps=30, lp_fee_bps=20, protocol_fee_bps=5,
+                    coin_creator_fee_bps=5, updated_at=time.time(), source="test")
+        args.update(overrides)
+        return PumpSwapPoolState(**args)
+
+    def test_a_pool_whose_fee_schedule_was_never_observed_is_blocked(self):
+        blocked = pool_quote_buy(self._state(total_fee_bps=None), 1_000_000_000)
+        self.assertEqual(blocked.data_status, "DATA_BLOCKED")
+        self.assertEqual(blocked.reason, "fee_schedule_unobserved")
+        self.assertEqual(blocked.output_amount, 0)
+
+    def test_quotes_price_against_effective_quote_reserves(self):
+        """The docs are explicit: raw vault balance plus virtual reserves."""
+        plain = pool_quote_buy(self._state(), 1_000_000_000)
+        virtual = pool_quote_buy(
+            self._state(virtual_quote_reserves=100_000_000_000), 1_000_000_000)
+        self.assertEqual(plain.data_status, "OK")
+        # Twice the effective quote depth means materially fewer tokens for
+        # the same spend. Reading only the raw balance would report the two
+        # pools as identical.
+        self.assertLess(virtual.output_amount, plain.output_amount)
+
+    def test_the_buy_budget_is_what_leaves_the_wallet(self):
+        """Sizing chose the spend; the fee comes out of it, not on top of it."""
+        budget = 1_000_000_000
+        quote = pool_quote_buy(self._state(total_fee_bps=100), budget)
+        self.assertEqual(quote.input_amount, budget)
+        self.assertGreater(quote.fee_amount, 0)
+        # amm_leg + fee is exactly the budget: no lamport is created or lost.
+        amm_leg = (budget * 10_000) // 10_100
+        self.assertEqual(quote.fee_amount, budget - amm_leg)
+
+    def test_a_higher_fee_yields_strictly_fewer_tokens(self):
+        cheap = pool_quote_buy(self._state(total_fee_bps=10), 1_000_000_000)
+        dear = pool_quote_buy(self._state(total_fee_bps=500), 1_000_000_000)
+        self.assertLess(dear.output_amount, cheap.output_amount)
+
+    def test_the_sell_fee_rounds_against_us(self):
+        """Rounding the fee down overstates proceeds in the flattering direction."""
+        quote = pool_quote_sell(self._state(total_fee_bps=1), 3)
+        gross = (3 * 100_000_000_000) // (1_000_000_000_000 + 3)
+        self.assertEqual(quote.fee_amount, -((-gross * 1) // 10_000))
+        self.assertEqual(quote.output_amount, gross - quote.fee_amount)
+
+    def test_stale_state_refuses_rather_than_pricing_a_memory(self):
+        stale = self._state(updated_at=time.time() - 600)
+        self.assertEqual(pool_quote_sell(stale, 1_000).data_status, "DATA_BLOCKED")
+        # ...and the same state quotes fine when staleness is not the question.
+        self.assertEqual(pool_quote_sell(stale, 1_000, max_age_s=0).data_status, "OK")
+
+    def test_a_buy_can_never_be_quoted_the_pool_entire_inventory(self):
+        """Constant product approaches the inventory; it never delivers it."""
+        state = self._state()
+        huge = pool_quote_buy(state, 10 ** 18)
+        self.assertEqual(huge.data_status, "OK")
+        self.assertLess(huge.output_amount, state.base_reserves)
+        # And the price paid for trying says so.
+        self.assertGreater(huge.price_impact_pct, 100.0)
+
+    def test_capacity_is_the_largest_sale_within_the_impact_bound(self):
+        state = self._state()
+        capacity = sell_capacity_base(state, 0.05)
+        self.assertGreater(capacity, 0)
+        self.assertLessEqual(pool_quote_sell(state, capacity).price_impact_pct, 0.05)
+        self.assertGreater(pool_quote_sell(state, capacity * 4).price_impact_pct, 0.05)
+
+    def test_a_deeper_pool_absorbs_a_larger_exit(self):
+        shallow = sell_capacity_base(self._state(), 0.05)
+        deep = sell_capacity_base(self._state(base_reserves=10_000_000_000_000,
+                                              quote_reserves=1_000_000_000_000), 0.05)
+        self.assertGreater(deep, shallow)
+
+
+class TestGraduationKeepsNativeExecution(unittest.IsolatedAsyncioTestCase):
+    """A migrated coin is the same coin.
+
+    The route existed and was constructed, and the engine was never given it,
+    so graduation silently demoted every position to a router round trip at
+    exactly the point where the position is largest.
+    """
+
+    MINT = "So11111111111111111111111111111111111111112"
+    OTHER = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+
+    def _pool_account(self, **overrides):
+        base = dict(status="OK", pool=self.OTHER, base_mint=self.MINT,
+                    quote_mint=self.MINT, pool_base_token_account=self.OTHER,
+                    pool_quote_token_account=self.OTHER, creator=self.OTHER,
+                    coin_creator=self.MINT)
+        base.update(overrides)
+        return PoolState(**base)
+
+    def _reserves(self, **overrides):
+        args = dict(pool=self.OTHER, base_mint=self.MINT, quote_mint=self.MINT,
+                    base_reserves=1_000_000_000_000, quote_reserves=100_000_000_000,
+                    total_fee_bps=30, updated_at=time.time(), source="test")
+        args.update(overrides)
+        return PumpSwapPoolState(**args)
+
+    def _engine(self, *, reserves=None, account=None, curve=None):
+        engine = ExecutionEngine.__new__(ExecutionEngine)
+        engine.pump_route = NativePumpRoute()
+        engine.pumpswap_route = PumpSwapRoute()
+        engine.curve_state_provider = (lambda token: curve) if curve else None
+        engine.pool_state_provider = (lambda token: reserves) if reserves else None
+        engine.pool_account_provider = (lambda token: account) if account else None
+        engine.tx_builder = SimpleNamespace(public_key=self.OTHER)
+        engine.native_route_attempts = defaultdict(int)
+        engine.native_compute_unit_limit = 400_000
+        engine.dry_run = True
+        engine.landing_model = LandingModel()
+        engine.last_bid = {}
+        engine.stream_confirmations = 0
+        engine.poll_confirmations = 0
+        engine._signature_waiters = {}
+        engine.reconcile_min_interval = 0.005
+        engine.reconcile_max_interval = 0.05
+        engine.execution_history = deque(maxlen=16)
+        engine.route_performance = defaultdict(
+            lambda: {"total": 0, "landed": 0, "filled": 0, "failed": 0, "avg_latency": 0})
+        engine.counterfactual_lab = None
+        return engine
+
+    def test_a_migrated_coin_still_builds_its_own_instruction(self):
+        engine = self._engine(reserves=self._reserves(), account=self._pool_account())
+        prepared = engine.prepare_native_route(self.MINT, self.OTHER, 1_000_000_000, 100)
+        self.assertEqual(prepared.status, "OK")
+        self.assertEqual(prepared.venue, "pumpswap")
+        self.assertEqual(len(prepared.accounts), 23)
+
+    def test_the_sell_side_is_native_too(self):
+        engine = self._engine(reserves=self._reserves(), account=self._pool_account())
+        prepared = engine.prepare_native_route(self.OTHER, self.MINT, 1_000_000, 200)
+        self.assertEqual(prepared.status, "OK")
+        self.assertEqual(prepared.venue, "pumpswap")
+        self.assertEqual(len(prepared.accounts), 21)
+
+    def test_the_max_quote_in_bounds_the_amm_leg_not_the_whole_budget(self):
+        """The protocol takes its fee on top of the leg it is given."""
+        budget = 1_000_000_000
+        engine = self._engine(reserves=self._reserves(total_fee_bps=100),
+                              account=self._pool_account())
+        prepared = engine.prepare_native_route(self.MINT, self.OTHER, budget, 0)
+        bound = struct.unpack_from("<Q", prepared.data, 16)[0]
+        self.assertLess(bound, budget)
+
+    def test_an_undecoded_pool_account_blocks_rather_than_guessing(self):
+        """The mayhem flag picks the published fee-recipient set."""
+        engine = self._engine(reserves=self._reserves())
+        prepared = engine.prepare_native_route(self.MINT, self.OTHER, 1_000_000_000, 100)
+        self.assertEqual(prepared.status, "DATA_BLOCKED")
+        self.assertEqual(prepared.venue, "pumpswap")
+        self.assertIn("not decoded", prepared.detail)
+
+    def test_an_unknown_token_is_still_no_native_trade_at_all(self):
+        self.assertIsNone(
+            self._engine().prepare_native_route(self.MINT, self.OTHER, 1_000, 100))
+
+    def test_the_curve_wins_while_the_coin_is_still_on_it(self):
+        """Both venues answering means the coin has not graduated yet."""
+        curve = BondingCurveState(
+            virtual_token_reserves=1_000_000_000_000, virtual_sol_reserves=30_000_000_000,
+            real_token_reserves=800_000_000_000, real_sol_reserves=10_000_000_000,
+            token_total_supply=1_000_000_000_000, complete=False, creator=self.OTHER)
+        engine = self._engine(curve=curve, reserves=self._reserves(),
+                              account=self._pool_account())
+        prepared = engine.prepare_native_route(self.MINT, self.OTHER, 1_000_000_000, 100)
+        self.assertEqual(prepared.venue, "pump_curve")
+
+    def test_the_quote_follows_the_venue_the_instruction_was_built_for(self):
+        """A curve quote on a pool instruction looks valid right up to the fill."""
+        engine = self._engine(reserves=self._reserves(), account=self._pool_account())
+        pool_quote = engine._native_quote(self.MINT, self.OTHER, 1_000_000_000, "pumpswap")
+        self.assertIsNotNone(pool_quote)
+        self.assertIsNone(engine._native_quote(self.MINT, self.OTHER, 1_000_000_000))
+
+    async def test_a_pool_fill_is_reported_as_a_pool_fill(self):
+        engine = self._engine(reserves=self._reserves(), account=self._pool_account())
+        result = await engine.execute_swap(self.MINT, self.OTHER, 1_000_000_000,
+                                           slippage_bps=100)
+        self.assertTrue(result.success)
+        self.assertEqual(result.route_type, RouteType.PUMPSWAP_NATIVE)
+        self.assertEqual(engine.native_route_attempts["prepared:pumpswap"], 1)
+
+    def test_the_report_says_whether_the_pool_side_is_wired(self):
+        engine = self._engine(reserves=self._reserves(), account=self._pool_account())
+        report = engine.native_route_report()
+        self.assertEqual(report["pumpswap_route"]["status"], "OK")
+        self.assertTrue(report["pool_state_wired"])
+        self.assertTrue(report["pool_account_wired"])
+        self.assertFalse(self._engine().native_route_report()["pool_state_wired"])
+
+
+class TestDeskMaintainsPoolState(unittest.IsolatedAsyncioTestCase):
+    """The desk owns the pool view, exactly as it owns the curve view.
+
+    Two views of the price we are about to trade at is one view too many, so
+    the engine reads this through a provider rather than subscribing itself.
+    """
+
+    TOKEN = "So11111111111111111111111111111111111111112"
+    POOL = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+
+    def _desk(self):
+        desk = SimpleNamespace(
+            _latest_pool_state={}, _pool_accounts={}, _pool_account_pending=set(),
+            solana_rpc=None, state_sequencer=SimpleNamespace(bump=lambda token: None),
+        )
+        desk.redecisions = []
+        desk.request_redecision = desk.redecisions.append
+        desk.backgrounded = []
+
+        def spawn(coroutine):
+            desk.backgrounded.append(coroutine)
+            coroutine.close()
+
+        desk._spawn_background = spawn
+        desk._fetch_pool_account = (
+            lambda token, pool: MemecoinQuantDesk._fetch_pool_account(desk, token, pool))
+        return desk
+
+    def _created(self, **overrides):
+        event = {"pool": self.POOL, "base_mint": self.TOKEN, "quote_mint": self.TOKEN,
+                 "initial_base_amount": 1_000_000_000_000,
+                 "initial_quote_amount": 100_000_000_000,
+                 "base_mint_decimals": 6, "timestamp": time.time(), "slot": 5}
+        event.update(overrides)
+        return event
+
+    def _traded(self, **overrides):
+        event = {"pool": self.POOL, "token": self.TOKEN, "quote_mint": self.TOKEN,
+                 "pool_base_reserves": 900_000_000_000,
+                 "pool_quote_reserves": 110_000_000_000,
+                 "tail_data_status": "OK", "lp_fee_bps": 20, "protocol_fee_bps": 5,
+                 "coin_creator_fee_bps": 5, "total_fee_bps": 30,
+                 "virtual_quote_reserves": 0, "base_supply": 1_000_000_000_000_000,
+                 "coin_creator": self.POOL, "timestamp": time.time(), "slot": 6}
+        event.update(overrides)
+        return event
+
+    def test_migration_opens_pool_state_without_inventing_a_fee(self):
+        desk = self._desk()
+        MemecoinQuantDesk._seed_pool_state(desk, self.TOKEN, self._created())
+        state = desk._latest_pool_state[self.TOKEN]
+        self.assertEqual(state.pool, self.POOL)
+        self.assertEqual(state.base_reserves, 1_000_000_000_000)
+        # Not zero, and not a table lookup: unobserved.
+        self.assertIsNone(state.total_fee_bps)
+        self.assertEqual(state.blocked_reason(), "fee_schedule_unobserved")
+        # And the account decode is queued off the hot path.
+        self.assertEqual(len(desk.backgrounded), 1)
+
+    def test_the_first_trade_supplies_the_schedule_the_pool_actually_charges(self):
+        desk = self._desk()
+        MemecoinQuantDesk._seed_pool_state(desk, self.TOKEN, self._created())
+        MemecoinQuantDesk._update_pool_state(desk, self.TOKEN, self._traded())
+        state = desk._latest_pool_state[self.TOKEN]
+        self.assertEqual(state.total_fee_bps, 30)
+        self.assertEqual(state.base_reserves, 900_000_000_000)
+        self.assertIsNone(state.blocked_reason())
+        # Reserves moved, so anything priced against the old ones is stale.
+        self.assertIn(self.TOKEN, desk.redecisions)
+
+    def test_an_unreadable_tail_carries_the_last_measurement_forward(self):
+        """Not a default -- a measurement, just not of this trade."""
+        desk = self._desk()
+        MemecoinQuantDesk._seed_pool_state(desk, self.TOKEN, self._created())
+        MemecoinQuantDesk._update_pool_state(desk, self.TOKEN, self._traded())
+        MemecoinQuantDesk._update_pool_state(desk, self.TOKEN, self._traded(
+            tail_data_status="DATA_BLOCKED: truncated", pool_base_reserves=800_000_000_000))
+        state = desk._latest_pool_state[self.TOKEN]
+        self.assertEqual(state.total_fee_bps, 30)
+        self.assertEqual(state.base_reserves, 800_000_000_000)
+
+    def test_a_first_trade_we_could_not_read_leaves_the_pool_unpriceable(self):
+        desk = self._desk()
+        MemecoinQuantDesk._seed_pool_state(desk, self.TOKEN, self._created())
+        MemecoinQuantDesk._update_pool_state(desk, self.TOKEN, self._traded(
+            tail_data_status="DATA_BLOCKED: truncated"))
+        self.assertEqual(desk._latest_pool_state[self.TOKEN].blocked_reason(),
+                         "fee_schedule_unobserved")
+
+    def test_an_empty_trade_event_does_not_erase_live_reserves(self):
+        desk = self._desk()
+        MemecoinQuantDesk._seed_pool_state(desk, self.TOKEN, self._created())
+        MemecoinQuantDesk._update_pool_state(desk, self.TOKEN, self._traded())
+        MemecoinQuantDesk._update_pool_state(desk, self.TOKEN, self._traded(
+            pool_base_reserves=0, pool_quote_reserves=0))
+        self.assertEqual(desk._latest_pool_state[self.TOKEN].base_reserves, 900_000_000_000)
+
+    async def test_the_pool_account_is_decoded_once_and_cached(self):
+        desk = self._desk()
+        from solders.pubkey import Pubkey
+        body = (b"\x01" + (7).to_bytes(2, "little")
+                + bytes(Pubkey.from_string(self.POOL)) * 6
+                + (123).to_bytes(8, "little")
+                + bytes(Pubkey.from_string(self.TOKEN))
+                + b"\x00\x00" + (0).to_bytes(16, "little", signed=True))
+        encoded = base64.b64encode(POOL_DISCRIMINATOR + body).decode()
+        calls = []
+
+        async def request(method, params):
+            calls.append(params[0])
+            return {"value": {"data": [encoded, "base64"]}}
+
+        desk.solana_rpc = SimpleNamespace(request=request)
+        MemecoinQuantDesk._seed_pool_state(desk, self.TOKEN, self._created())
+        self.assertTrue(await MemecoinQuantDesk._fetch_pool_account(desk, self.TOKEN, self.POOL))
+        self.assertEqual(desk._pool_accounts[self.TOKEN].coin_creator, self.TOKEN)
+        self.assertEqual(calls, [self.POOL])
+
+    async def test_an_account_that_is_not_a_pool_is_not_adopted(self):
+        desk = self._desk()
+        encoded = base64.b64encode(bytes(300)).decode()
+
+        async def request(method, params):
+            return {"value": {"data": [encoded, "base64"]}}
+
+        desk.solana_rpc = SimpleNamespace(request=request)
+        self.assertFalse(await MemecoinQuantDesk._fetch_pool_account(desk, self.TOKEN, self.POOL))
+        self.assertNotIn(self.TOKEN, desk._pool_accounts)
+
+    def test_the_report_separates_wired_from_executable(self):
+        """A route blocked on every coin looks exactly like one never wired."""
+        desk = self._desk()
+        MemecoinQuantDesk._seed_pool_state(desk, self.TOKEN, self._created())
+        blocked = MemecoinQuantDesk.pool_route_report(desk)
+        self.assertEqual(blocked["status"], "DATA_BLOCKED")
+        self.assertEqual(blocked["pools_tracked"], 1)
+        self.assertEqual(blocked["pools_executable"], 0)
+        self.assertEqual(blocked["reasons"]["fee_schedule_unobserved"], 1)
+
+        MemecoinQuantDesk._update_pool_state(desk, self.TOKEN, self._traded())
+        desk._pool_accounts[self.TOKEN] = PoolState(
+            status="OK", pool=self.POOL, base_mint=self.TOKEN, quote_mint=self.TOKEN,
+            pool_base_token_account=self.POOL, pool_quote_token_account=self.POOL,
+            creator=self.POOL, coin_creator=self.TOKEN)
+        live = MemecoinQuantDesk.pool_route_report(desk)
+        self.assertEqual(live["status"], "OK")
+        self.assertEqual(live["pools_executable"], 1)
+        self.assertEqual(live["executable_share"], 1.0)
 
 class TestPumpSwapConstruction(unittest.TestCase):
     """The last DATA_BLOCKED that was never about missing information.
@@ -10005,6 +10478,9 @@ class TestNativeRouteIsActuallyTaken(unittest.IsolatedAsyncioTestCase):
         engine = ExecutionEngine.__new__(ExecutionEngine)
         engine.pump_route = NativePumpRoute()
         engine.curve_state_provider = (lambda token: curve) if curve else None
+        engine.pumpswap_route = None
+        engine.pool_state_provider = None
+        engine.pool_account_provider = None
         engine.tx_builder = SimpleNamespace(public_key=self.OTHER)
         engine.native_route_attempts = defaultdict(int)
         engine.native_compute_unit_limit = 400_000
@@ -10412,11 +10888,65 @@ class TestLandingModel(unittest.TestCase):
         self.assertGreater(measured["lamports"], 0)
 
 
+
+class TestCapacitySurvivesGraduation(unittest.TestCase):
+    """An absent answer is not a cautious one.
+
+    Exit capacity read only the bonding curve, so the moment a coin migrated
+    every position in it became permanently unmeasurable -- and the exit
+    policy cannot tell DATA_BLOCKED-because-we-stopped-looking from
+    DATA_BLOCKED-because-nothing-is-liquid.
+    """
+
+    TOKEN = "So11111111111111111111111111111111111111112"
+    POOL = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+
+    def _desk(self, pool=None):
+        return SimpleNamespace(
+            _latest_curve_state={}, global_config={},
+            _latest_pool_state={self.TOKEN: pool} if pool else {})
+
+    def _pool(self, **overrides):
+        args = dict(pool=self.POOL, base_mint=self.TOKEN, quote_mint=self.TOKEN,
+                    base_reserves=1_000_000_000_000, quote_reserves=100_000_000_000,
+                    total_fee_bps=30, updated_at=time.time(), source="test")
+        args.update(overrides)
+        return PumpSwapPoolState(**args)
+
+    def test_a_graduated_position_is_still_measured(self):
+        desk = self._desk(self._pool())
+        position = {"size_tokens": 1_000_000}
+        status, ratio = MemecoinQuantDesk._exit_capacity(desk, self.TOKEN, position)
+        self.assertEqual(status, "OK")
+        self.assertGreater(ratio, 0.0)
+        self.assertIn("tradeability", position)
+
+    def test_a_position_too_large_for_the_pool_is_measured_as_such(self):
+        desk = self._desk(self._pool())
+        small = MemecoinQuantDesk._exit_capacity(desk, self.TOKEN, {"size_tokens": 1_000})[1]
+        huge = MemecoinQuantDesk._exit_capacity(
+            desk, self.TOKEN, {"size_tokens": 900_000_000_000})[1]
+        self.assertEqual(small, 1.0)
+        self.assertLess(huge, small)
+
+    def test_no_pool_and_no_curve_is_still_blocked_never_one(self):
+        status, ratio = MemecoinQuantDesk._exit_capacity(
+            self._desk(), self.TOKEN, {"size_tokens": 1_000})
+        self.assertEqual(status, "DATA_BLOCKED_NO_CURVE_STATE")
+        self.assertEqual(ratio, 0.0)
+
+    def test_a_pool_whose_fee_was_never_observed_does_not_answer(self):
+        """An unpriceable pool is not a measured capacity."""
+        status, _ratio = MemecoinQuantDesk._exit_capacity(
+            self._desk(self._pool(total_fee_bps=None)), self.TOKEN, {"size_tokens": 1_000})
+        self.assertEqual(status, "DATA_BLOCKED_NO_CURVE_STATE")
+
 class TestLocalLiquidity(unittest.TestCase):
     """A T0 decision paid a Jupiter round trip to learn what the curve states."""
 
     def _desk(self, state=None, sol_price=150.0):
         return SimpleNamespace(_latest_curve_state={"mint": state} if state else {},
+                               _latest_pool_state={},
                                sol_price_usd=sol_price)
 
     def test_depth_comes_from_the_streamed_reserves(self):

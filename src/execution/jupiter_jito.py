@@ -27,6 +27,10 @@ from solders.transaction import VersionedTransaction
 from src.chains.pump_curve import quote_buy, quote_sell
 from src.execution.landing_model import Attempt, LandingModel
 from src.chains.pump_route import NativePumpRoute, PreparedInstruction, WSOL_MINT
+from src.chains.pumpswap_curve import PumpSwapPoolState
+from src.chains.pumpswap_curve import quote_buy as pool_quote_buy
+from src.chains.pumpswap_curve import quote_sell as pool_quote_sell
+from src.chains.pumpswap_route import PoolState, PumpSwapRoute
 from src.chains.rpc_manager import ChainConfig, RPCManager
 
 logger = logging.getLogger(__name__)
@@ -37,6 +41,7 @@ USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 class RouteType(Enum):
     PUMP_NATIVE = "pump_native"
+    PUMPSWAP_NATIVE = "pumpswap_native"
     JUPITER_V1 = "jupiter_v1"
     RAYDIUM_DIRECT = "raydium_direct"
     ORCA_DIRECT = "orca_direct"
@@ -556,6 +561,7 @@ class ExecutionEngine:
         dry_run: bool = True,
         confirmation_timeout: float = 45.0,
         pump_route: Optional[NativePumpRoute] = None,
+        pumpswap_route: Optional[PumpSwapRoute] = None,
     ):
         self.chain_config = chain_config
         self.rpc = rpc
@@ -571,11 +577,25 @@ class ExecutionEngine:
         # curve state is stale -- and loses the job it should never have had,
         # which is being a mandatory dependency of a sub-second decision.
         self.pump_route = pump_route
+        # The same route, on the other side of graduation. A migrated coin is
+        # the same coin, and every piece of intelligence we hold about it
+        # still applies -- so the one thing that should NOT change at
+        # migration is whether we can price and execute it ourselves. Without
+        # this, graduation silently demoted every position to a router round
+        # trip, at exactly the point where the position is largest.
+        self.pumpswap_route = pumpswap_route
         # Supplied by the desk, which owns the streamed curve state. The
         # engine does not subscribe to anything itself -- an execution
         # path that maintains its own view of the curve is a second
         # source of truth about the price we are about to trade at.
         self.curve_state_provider: Optional[Any] = None
+        # Likewise for pool state: mint -> PumpSwapPoolState, maintained by
+        # the desk off the PumpSwap event stream.
+        self.pool_state_provider: Optional[Any] = None
+        # Pool identity that the instruction needs but the reserve state does
+        # not carry (vault addresses, coin_creator, mayhem flag). mint ->
+        # PoolState, decoded from the Pool account.
+        self.pool_account_provider: Optional[Any] = None
         self.native_route_attempts: Dict[str, int] = defaultdict(int)
         # Set explicitly rather than left to the runtime default: a Pump buy
         # that runs out of compute in the middle of an init_if_needed is a
@@ -612,24 +632,31 @@ class ExecutionEngine:
 
     def prepare_native_route(self, input_mint: str, output_mint: str, amount: int,
                              slippage_bps: int) -> Optional[PreparedInstruction]:
-        """Build the Pump instruction locally, or say why it could not be built.
+        """Build the instruction locally, or say why it could not be built.
 
-        Returns None when this trade is not a Pump curve trade at all -- a
-        post-migration swap belongs to a router, and pretending otherwise
-        would build an instruction against a curve that has already graduated.
+        Two venues, one contract. Before graduation the trade is a bonding
+        curve trade; after graduation it is a PumpSwap pool trade. Returns
+        None only when NEITHER can answer -- that is the signal to fall back
+        to a router, and it is deliberately narrow: a migrated coin used to
+        take that path unconditionally, which meant graduation quietly ended
+        native execution at the point where the position is largest.
 
-        The protective bound is derived from the caller's slippage here rather
-        than invented: the sizing decision already chose the risk limit, and
-        this only expresses it in the units the instruction takes.
+        The protective bound is derived from the caller's slippage rather than
+        invented: the sizing decision already chose the risk limit, and this
+        only expresses it in the units the instruction takes.
         """
-        if self.pump_route is None:
-            return None
-        curve = self.curve_state_provider(output_mint if input_mint == WSOL_MINT
-                                          else input_mint) if self.curve_state_provider else None
-        if curve is None:
-            return None
         buying = input_mint == WSOL_MINT
         mint = output_mint if buying else input_mint
+        curve = self.curve_state_provider(mint) if self.curve_state_provider else None
+        if curve is not None:
+            return self._prepare_curve_route(mint, curve, buying, amount, slippage_bps)
+        return self._prepare_pool_route(mint, buying, amount, slippage_bps)
+
+    def _prepare_curve_route(self, mint: str, curve: Any, buying: bool, amount: int,
+                             slippage_bps: int) -> Optional[PreparedInstruction]:
+        """The pre-graduation route: `buy_v2` / `sell_v2` against the curve."""
+        if self.pump_route is None:
+            return None
         creator = getattr(curve, "creator", "")
         if not creator:
             return PreparedInstruction(
@@ -651,6 +678,48 @@ class ExecutionEngine:
                                        detail=f"local sell quote: {quote.reason}")
         return self.pump_route.build_sell(
             mint, creator, user, amount,
+            int(quote.output_amount * (1 - slippage_bps / 10_000)))
+
+    def _prepare_pool_route(self, mint: str, buying: bool, amount: int,
+                            slippage_bps: int) -> Optional[PreparedInstruction]:
+        """The post-graduation route: PumpSwap `buy` / `sell` against the pool.
+
+        Requires BOTH the decoded Pool account -- which carries the vaults, the
+        coin_creator and the mayhem flag, none of which can be inferred from
+        the event stream -- and live reserves. Missing either is a refusal,
+        not a default: a fee recipient chosen from the wrong published set
+        produces a transaction that is well formed and fails.
+        """
+        if self.pumpswap_route is None or self.pool_state_provider is None:
+            return None
+        reserves = self.pool_state_provider(mint)
+        if reserves is None:
+            return None
+        account = self.pool_account_provider(mint) if self.pool_account_provider else None
+        if account is None or not getattr(account, "ok", False):
+            return PreparedInstruction(
+                status="DATA_BLOCKED", venue="pumpswap",
+                detail="pool account not decoded; vaults and coin_creator unavailable")
+        user = self.tx_builder.public_key
+        if buying:
+            quote = pool_quote_buy(reserves, amount)
+            if quote.data_status != "OK" or quote.output_amount <= 0:
+                return PreparedInstruction(status="DATA_BLOCKED", venue="pumpswap",
+                                           detail=f"local pool buy quote: {quote.reason}")
+            # `buy` takes the base amount out and a cap on the QUOTE LEG, which
+            # is the budget less the fee the protocol takes on top of it --
+            # not the budget itself. Bounding with the budget would authorise
+            # the pool to take the fee twice over.
+            amm_leg = max(1, amount - int(quote.fee_amount))
+            return self.pumpswap_route.build_buy(
+                account, user, quote.output_amount,
+                int(amm_leg * (1 + slippage_bps / 10_000)))
+        quote = pool_quote_sell(reserves, amount)
+        if quote.data_status != "OK" or quote.output_amount <= 0:
+            return PreparedInstruction(status="DATA_BLOCKED", venue="pumpswap",
+                                       detail=f"local pool sell quote: {quote.reason}")
+        return self.pumpswap_route.build_sell(
+            account, user, amount,
             int(quote.output_amount * (1 - slippage_bps / 10_000)))
 
     def native_route_report(self) -> Dict[str, Any]:
@@ -677,10 +746,31 @@ class ExecutionEngine:
             },
             "route": self.pump_route.report() if self.pump_route else {
                 "status": "DATA_BLOCKED", "detail": "no native route configured"},
+            "pumpswap_route": self.pumpswap_route.report() if self.pumpswap_route else {
+                "status": "DATA_BLOCKED", "detail": "no pumpswap route configured"},
+            "pool_state_wired": self.pool_state_provider is not None,
+            "pool_account_wired": self.pool_account_provider is not None,
         }
 
-    def _native_quote(self, input_mint: str, output_mint: str, amount: int):
-        """The local quote backing a native trade. None when the curve cannot answer."""
+    def _native_quote(self, input_mint: str, output_mint: str, amount: int,
+                      venue: str = "pump_curve"):
+        """The local quote backing a native trade. None when nothing can answer.
+
+        The venue comes from the instruction that was actually built, not from
+        a second look at the providers: quoting the curve for a trade whose
+        accounts belong to the pool would be a valid-looking number about the
+        wrong market.
+        """
+        if venue == "pumpswap":
+            if self.pool_state_provider is None:
+                return None
+            buying = input_mint == WSOL_MINT
+            reserves = self.pool_state_provider(output_mint if buying else input_mint)
+            if reserves is None:
+                return None
+            quote = (pool_quote_buy(reserves, amount) if buying
+                     else pool_quote_sell(reserves, amount))
+            return quote if quote.data_status == "OK" and quote.output_amount > 0 else None
         if self.curve_state_provider is None:
             return None
         buying = input_mint == WSOL_MINT
@@ -705,15 +795,21 @@ class ExecutionEngine:
         only on the other branch is a path that will one day be the branch
         taken.
         """
+        # The route type follows the instruction. Reporting a pool fill as a
+        # curve fill would put post-graduation execution quality into the
+        # pre-graduation bucket, and the two are not the same market.
+        route_type = (RouteType.PUMPSWAP_NATIVE if native.venue == "pumpswap"
+                      else RouteType.PUMP_NATIVE)
         if self.dry_run:
             result = ExecutionResult(
                 success=True, status=TransactionStatus.SIMULATED,
                 input_amount=amount, actual_input_amount=amount,
                 quoted_output_amount=quote.output_amount, slippage_bps=slippage_bps,
                 latency_ms=int((time.time() - started) * 1000),
-                route_type=RouteType.PUMP_NATIVE, simulated=True,
+                route_type=route_type, simulated=True,
             )
             self.native_route_attempts["simulated"] += 1
+            self.native_route_attempts[f"simulated:{native.venue}"] += 1
             self._record(result, decision_id)
             return result
 
@@ -745,7 +841,7 @@ class ExecutionEngine:
         self.native_route_attempts["submitted"] += 1
         result = await self._submit_signed(signed, amount, slippage_bps, started,
                                            jito_tip=jito_tip, use_jito=use_jito,
-                                           route_type=RouteType.PUMP_NATIVE,
+                                           route_type=route_type,
                                            input_mint=input_mint, output_mint=output_mint)
         result.quoted_output_amount = quote.output_amount
         self._record(result, decision_id)
@@ -793,18 +889,19 @@ class ExecutionEngine:
         native = self.prepare_native_route(input_mint, output_mint, amount, slippage_bps)
         if native is not None and native.ok:
             self.native_route_attempts["prepared"] += 1
+            self.native_route_attempts[f"prepared:{native.venue}"] += 1
         elif native is not None:
             # Recorded rather than swallowed: a native route that is blocked on
             # every trade means the entry path is still paying two round trips
             # it was supposed to have stopped paying, and nothing else would
             # say so.
-            self.native_route_attempts[f"blocked:{native.status}"] += 1
+            self.native_route_attempts[f"blocked:{native.venue}:{native.status}"] += 1
         # The native route is taken when it builds, not merely prepared and
         # then ignored. Preparing an instruction and submitting somebody
         # else's transaction is the worst of both: it pays the construction
         # cost, keeps the round trips, and looks finished.
         if native is not None and native.ok:
-            quote = self._native_quote(input_mint, output_mint, amount)
+            quote = self._native_quote(input_mint, output_mint, amount, native.venue)
             if quote is None:
                 self.native_route_attempts["blocked:no_local_quote"] += 1
             else:

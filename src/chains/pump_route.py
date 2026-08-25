@@ -153,6 +153,11 @@ class PreparedInstruction:
     data: bytes = b""
     detail: str = ""
     expected_accounts: int = 0
+    # Which venue built this. Carried on the instruction rather than kept as
+    # engine state so the quote, the route type and the accounts can never
+    # disagree about what is being submitted -- a curve quote attached to a
+    # pool instruction would look entirely valid right up to the fill.
+    venue: str = "pump_curve"
 
     @property
     def ok(self) -> bool:
@@ -161,7 +166,8 @@ class PreparedInstruction:
     def to_dict(self) -> Dict[str, Any]:
         return {"status": self.status, "program_id": self.program_id,
                 "accounts": [item.to_dict() for item in self.accounts],
-                "data_hex": self.data.hex(), "detail": self.detail}
+                "data_hex": self.data.hex(), "detail": self.detail,
+                "venue": self.venue}
 
 
 class NativePumpRoute:
