@@ -142,6 +142,9 @@ POSITION_CONTRIBUTORS: Tuple[Contributor, ...] = (
                 "What share of the position the venue can actually absorb."),
     Contributor("strategies.action_value", "action_value",
                 "Every move priced against one forward distribution."),
+    Contributor("research.contribution", "contribution",
+                "Which inputs actually moved this decision. Coverage says a "
+                "module ran; only this says it mattered."),
     Contributor("strategies.exit_policy", "ratchet",
                 "The fallback threshold policy, for states the action-value "
                 "engine cannot price."),

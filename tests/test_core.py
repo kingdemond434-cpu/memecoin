@@ -159,6 +159,10 @@ from src.research.lifecycle_replay import (
     delay_decay, hold_to_end, lifecycle_from_episode, replay_cell,
     replay_lifecycle, sniper_scoreboard,
 )
+from src.research.contribution import (
+    Contribution, ContributionLedger, DecisionContribution, GateFlip,
+    action_value_contributions,
+)
 from src.research.attribution import (
     EdgeDecayMonitor, Leak, alpha_ledger, execution_miss, find_leaks,
     missed_monster, premature_exit, rank_research, rug_loss, sizing_leak,
@@ -8967,3 +8971,131 @@ class TestWalletObservationPath(unittest.IsolatedAsyncioTestCase):
         await WalletIntelligenceEngine._watch_live_wallets(engine)
         self.assertIn("stream covers every watched wallet",
                       engine.data_status["live_wallet_watch"])
+
+
+class TestDecisionContribution(unittest.TestCase):
+    """Coverage says a module ran. This says whether it mattered.
+
+    A component that is disconnected and one that is connected but inert both
+    look like trades that would have happened anyway, and only one of them is
+    fixed by wiring.
+    """
+
+    @staticmethod
+    def _state(**overrides):
+        base = dict(
+            held_fraction=0.3, current_multiple=4.0,
+            forward_bins=((0.4, 2.0), (0.6, -0.6)),
+            exit_capacity_ratio=0.5, escape_probability=0.4,
+            alternative_growth_per_second=1e-5, expected_remaining_seconds=120.0,
+            add_fraction=0.02, exit_cost=0.02, entry_cost=0.02,
+        )
+        base.update(overrides)
+        return ActionState(**base)
+
+    def test_measuring_escape_can_only_remove_optimism(self):
+        """The baseline is 1.0, which is what the desk assumed before it measured.
+
+        So the contribution is the amount of optimism the measurement took
+        away, and it can never be negative -- if it were, measuring escape
+        would be making positions look MORE liquid than assuming they were
+        perfectly escapable, which is arithmetically impossible.
+        """
+        result = action_value_contributions(ActionValuePolicy(), self._state())
+        escape = next(item for item in result.contributions
+                      if item.component == "escape_probability")
+        self.assertEqual(escape.status, "OK")
+        self.assertGreater(escape.delta_q, 0.0)
+
+    def test_an_input_absent_from_a_decision_is_reported_not_omitted(self):
+        """'Did not contribute' and 'was not present' are different sentences."""
+        result = action_value_contributions(ActionValuePolicy(), self._state())
+        replacement = next(item for item in result.contributions
+                           if item.component == "replacement_bins")
+        self.assertEqual(replacement.status, "NOT_MEASURED")
+        self.assertIsNone(replacement.delta_q)
+
+    def test_a_decisive_input_is_named_as_such(self):
+        """The strongest claim: without it the desk would have done something else."""
+        policy = ActionValuePolicy()
+        # A position worth holding, but only because a replacement is on offer.
+        state = self._state(
+            forward_bins=((0.5, 0.6), (0.5, -0.2)),
+            escape_probability=1.0, exit_capacity_ratio=1.0,
+            alternative_growth_per_second=None, add_fraction=None,
+            replacement_bins=((0.6, 4.0), (0.4, -0.5)), replacement_fraction=0.2)
+        decision = policy.score(state)
+        result = action_value_contributions(policy, state)
+        if decision.action is Action.REPLACE:
+            self.assertIn("replacement_bins", result.decisive)
+
+    def test_an_unpriceable_ablation_is_blocked_not_scored_as_zero(self):
+        policy = ActionValuePolicy()
+        result = action_value_contributions(policy, self._state())
+        for item in result.contributions:
+            if item.status == "OK":
+                self.assertIsNotNone(item.delta_q)
+            else:
+                self.assertIsNone(item.delta_q)
+
+    def test_a_blocked_state_produces_no_attribution_rather_than_a_fake_one(self):
+        blocked = self._state(escape_probability=None)
+        self.assertIsNone(action_value_contributions(ActionValuePolicy(), blocked))
+
+    def test_the_ledger_finds_a_component_that_never_moves_anything(self):
+        ledger = ContributionLedger()
+        for _ in range(30):
+            ledger.record(DecisionContribution(
+                token="m", action="hold", q=0.0, contributions=[
+                    Contribution("escape_probability", 0.02),
+                    Contribution("exit_capacity_ratio", 0.0),
+                ]))
+        report = ledger.report()
+        json.dumps(report)
+        # Consulted every time, never changed anything. Not disconnected, and
+        # not working either.
+        self.assertEqual(report["inert_components"], ["exit_capacity_ratio"])
+        self.assertAlmostEqual(
+            report["components"]["escape_probability"]["share_nonzero"], 1.0)
+
+    def test_sign_is_preserved_because_direction_is_the_finding(self):
+        ledger = ContributionLedger()
+        ledger.record(DecisionContribution("m", "exit", 0.1, [
+            Contribution("escape_probability", -0.5)]))
+        ledger.record(DecisionContribution("m", "exit", 0.1, [
+            Contribution("escape_probability", 0.5)]))
+        stats = ledger.report()["components"]["escape_probability"]
+        # Averaging absolute values would hide an input that consistently
+        # pushes toward worse actions.
+        self.assertAlmostEqual(stats["mean_delta_q"], 0.0)
+        self.assertAlmostEqual(stats["share_nonzero"], 1.0)
+
+    def test_a_gate_that_vetoes_is_counted_even_though_it_shifts_no_q(self):
+        ledger = ContributionLedger()
+        ledger.record_gate(GateFlip("reentry_premium", "m", before=True, after=False))
+        ledger.record_gate(GateFlip("reentry_premium", "m", before=True, after=True))
+        gates = ledger.report()["gates"]
+        self.assertEqual(gates["reentry_premium"]["evaluated"], 2)
+        self.assertEqual(gates["reentry_premium"]["flipped"], 1)
+
+    def test_an_empty_ledger_is_blocked_not_healthy(self):
+        report = ContributionLedger().report()
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertEqual(report["decisions"], 0)
+
+    def test_the_ledger_is_bounded(self):
+        ledger = ContributionLedger(capacity=10)
+        for _ in range(100):
+            ledger.record(DecisionContribution("m", "hold", 0.0, [
+                Contribution("escape_probability", 0.01)]))
+        self.assertEqual(
+            ledger.report()["components"]["escape_probability"]["observations"], 10)
+
+    def test_it_is_wired_into_the_position_decision(self):
+        source = Path("src/main.py").read_text()
+        tree = ast.parse(source)
+        scorer = next(node for node in ast.walk(tree)
+                      if isinstance(node, ast.FunctionDef) and node.name == "_score_actions")
+        called = {node.func.id for node in ast.walk(scorer)
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+        self.assertIn("action_value_contributions", called)

@@ -42,6 +42,9 @@ from src.execution.jupiter_jito import (
 from src.research.dataset_builder import PointInTimeDatasetBuilder
 from src.research.feature_engine import build_features
 from src.research.global_research_miner import GlobalResearchMiner
+from src.research.contribution import (
+    ContributionLedger, GateFlip, action_value_contributions,
+)
 from src.research.attribution import EdgeDecayMonitor
 from src.runtime.hot_state import HotState, HotStateBudget
 from src.strategies.action_value import (
@@ -187,6 +190,11 @@ class MemecoinQuantDesk:
         # unavailable. Fed only by landed, real sells, so a paper run cannot
         # teach the escape race a latency that was never paid.
         self.landing_latency = LandingLatency()
+        # Coverage says a module was consulted; this says whether it mattered.
+        # A component that is disconnected and one that is connected but inert
+        # both look like trades that would have happened anyway, and only one
+        # of them is fixed by wiring.
+        self.contribution_ledger = ContributionLedger()
         self._market_observed_at: Dict[str, float] = {}
         self._market_observation_cohort: set[str] = set()
         self._market_entry_price: Dict[str, float] = {}
@@ -759,6 +767,9 @@ class MemecoinQuantDesk:
         if should_trade and self.reentry_book.get(token) is not None:
             verdict = self._price_reentry(token, prediction, liquidity, trade_info)
             decision["reentry"] = intelligence["reentry"] = verdict.as_dict()
+            self.contribution_ledger.record_gate(GateFlip(
+                gate="reentry_premium", token=token, before=True,
+                after=verdict.admitted, reason=verdict.detail))
             if not verdict.admitted:
                 should_trade = False
                 trade_info = {**trade_info, "reason": f"reentry_{verdict.status.lower()}",
@@ -772,8 +783,12 @@ class MemecoinQuantDesk:
             # only evidence that capital is currently committed elsewhere, and
             # whether that is the right place for it is a cross-sectional
             # question the per-token hurdle cannot ask.
-            should_trade, trade_info = await self._contest_for_capital(
+            contested, trade_info = await self._contest_for_capital(
                 token, candidate, prediction, liquidity, trade_info)
+            self.contribution_ledger.record_gate(GateFlip(
+                gate="capital_contest", token=token, before=should_trade,
+                after=contested, reason=str(trade_info.get("reason", ""))))
+            should_trade = contested
             decision.update({"should_trade": should_trade, "trade_info": trade_info,
                              "contested_for_capital": True})
         decision_id = self.counterfactual_lab.record_decision(token, _jsonable(prediction), decision)
@@ -1266,6 +1281,8 @@ class MemecoinQuantDesk:
                               "ratio": position.get("exit_capacity_ratio")},
             "action_value": position.get("action_value")
             or {"status": "DATA_BLOCKED", "reason": "action policy not consulted"},
+            "contribution": position.get("contribution")
+            or {"status": "DATA_BLOCKED", "reason": "decision not attributed"},
             "ratchet": position.get("ratchet")
             or {"status": "DATA_BLOCKED", "reason": "threshold policy not consulted"},
             "hazard": ({"status": hazard.data_status, "hazard_30s": hazard.hazard_30s,
@@ -1512,6 +1529,13 @@ class MemecoinQuantDesk:
                                    if liquidity > 0 else None),
         )
         decision = self.action_policy.score(state)
+        # Cheap: a handful of pure evaluations over bins already built. Run on
+        # every decision rather than on a sample, because the decisions worth
+        # attributing are the rare ones and a sample misses exactly those.
+        contribution = action_value_contributions(self.action_policy, state, token=token)
+        self.contribution_ledger.record(contribution)
+        if contribution is not None:
+            position["contribution"] = contribution.to_dict()
         if decision.status == "OK" and decision.action is not ActionValue.HOLD:
             decision.snapshot = self._freeze_decision(
                 token, position, decision, state, add_fraction)
@@ -2500,6 +2524,7 @@ class MemecoinQuantDesk:
                             "scored_wallets": len(self.independence_report.scores)},
             "reentry": self.reentry_book.report(),
             "exit_latency": self.landing_latency.estimate().report(),
+            "decision_contribution": self.contribution_ledger.report(),
             "wallet_coverage": (self.wallet_intel.coverage_report()
                                 if self.wallet_intel else {"status": "DATA_BLOCKED"}),
             # Which declared modules actually reached a decision. A rate that
