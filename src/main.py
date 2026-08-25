@@ -2751,6 +2751,17 @@ class MemecoinQuantDesk:
                     "creator": str(event["creator"]),
                     "token_total_supply": int(event.get("token_total_supply", 0) or 0),
                 }
+            # Derive the twenty-seven accounts now, while nothing is waiting.
+            # They are derivations of constants for this (mint, creator,
+            # wallet) and never change, so paying for them at execution time
+            # is ~2ms of avoidable work inside the window the whole system
+            # exists to win.
+            if event.get("creator") and self.execution_engine is not None:
+                try:
+                    self.pump_route.warm(token, str(event["creator"]),
+                                         self.execution_engine.tx_builder.public_key)
+                except Exception as exc:  # pragma: no cover - warming is optional
+                    logger.debug("account prewarm failed for %s: %s", token, exc)
             self._spawn_background(self.social_intel.scan_token(token))
             await self.detection_engine._on_candidate(TokenCandidate(
                 address=token, chain="solana", source=DetectionSource.FACTORY, block_number=int(event.get("slot", 0)),

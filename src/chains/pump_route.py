@@ -165,11 +165,93 @@ class PreparedInstruction:
 
 
 class NativePumpRoute:
-    """Builds `buy_v2` / `sell_v2` locally from streamed curve state."""
+    """Builds `buy_v2` / `sell_v2` locally from streamed curve state.
 
-    def __init__(self, config: Optional[PumpRouteConfig] = None):
+    Account lists are prewarmed. For a given (mint, creator, user) the
+    twenty-seven accounts never change -- they are derivations of constants --
+    so deriving them at execution time is doing avoidable work inside the
+    window the whole system is optimised for. Warming at detection moves that
+    work to a moment where nothing is waiting on it, and leaves execution with
+    a lookup and an argument encode.
+
+    The cache is keyed on everything that can change the answer. Getting that
+    key wrong is worse than not caching at all: it would build a transaction
+    against another token's accounts, which is the failure mode where a cache
+    stops being an optimisation and becomes a way to lose money.
+    """
+
+    def __init__(self, config: Optional[PumpRouteConfig] = None,
+                 cache_size: int = 512):
         self.config = config or PumpRouteConfig()
         self.program = PUMP_PROGRAM
+        self.cache_size = max(1, int(cache_size))
+        self._accounts: Dict[Tuple[str, ...], List[AccountMeta]] = {}
+        self.warm_hits = 0
+        self.warm_misses = 0
+
+    def _cache_key(self, name: str, base_mint: str, creator: str,
+                   user: str) -> Tuple[str, ...]:
+        """Everything that can change the account list, and nothing that cannot.
+
+        The instruction name is part of it because buy and sell take different
+        lists. The token programs are part of it because they are seeds of
+        every associated token address. Amounts are NOT part of it, because
+        they are instruction data rather than accounts.
+        """
+        config = self.config
+        return (name, base_mint, creator, user, config.quote_mint,
+                config.base_token_program, config.quote_token_program,
+                str(config.mayhem))
+
+    def warm(self, base_mint: str, creator: str, user: str) -> int:
+        """Derive and cache both account lists ahead of any decision.
+
+        Returns how many were cached, so a caller can tell warming happened
+        from warming silently doing nothing.
+        """
+        warmed = 0
+        for name in ("buy_v2", "sell_v2"):
+            key = self._cache_key(name, base_mint, creator, user)
+            if key in self._accounts:
+                continue
+            try:
+                self._accounts[key] = self._derive(name, base_mint, creator, user)
+                warmed += 1
+            except (IdlError, ValueError, TypeError) as exc:
+                logger.debug("prewarm failed for %s %s: %s", name, base_mint, exc)
+        self._evict()
+        return warmed
+
+    def _evict(self) -> None:
+        # Insertion-ordered, so the oldest key goes first. A token we have not
+        # touched in five hundred launches is not the one about to trade.
+        while len(self._accounts) > self.cache_size:
+            self._accounts.pop(next(iter(self._accounts)))
+
+    def _derive(self, name: str, base_mint: str, creator: str,
+                user: str) -> List[AccountMeta]:
+        config = self.config
+        supplied = {
+            "base_mint": base_mint,
+            "quote_mint": config.quote_mint,
+            "base_token_program": config.base_token_program,
+            "quote_token_program": config.quote_token_program,
+            "associated_token_program": ASSOCIATED_TOKEN_PROGRAM,
+            "system_program": SYSTEM_PROGRAM,
+            # `fee_config` is declared before `fee_program` in the account
+            # list but derived UNDER it, so resolution order alone cannot
+            # supply it. Read from the pump_fees IDL's own published address
+            # rather than hardcoded here.
+            "fee_program": program_id(PUMP_FEES_IDL),
+            "user": user,
+            "fee_recipient": select_fee_recipient(base_mint, mayhem=config.mayhem),
+            "buyback_fee_recipient": select_buyback_recipient(base_mint),
+            # Named by the IDL as a seed path on an account we do not pass.
+            "bonding_curve.creator": creator,
+            "associated_base_user": associated_token_address(
+                user, base_mint, config.base_token_program),
+        }
+        return build_accounts(PUMP_IDL, name, supplied)
 
     def build_buy(self, base_mint: str, creator: str, user: str,
                   amount: int, max_sol_cost: int) -> PreparedInstruction:
@@ -202,29 +284,17 @@ class NativePumpRoute:
             return PreparedInstruction(
                 status="DATA_BLOCKED",
                 detail="no curve creator; creator_vault is underivable")
-        config = self.config
-        supplied = {
-            "base_mint": base_mint,
-            "quote_mint": config.quote_mint,
-            "base_token_program": config.base_token_program,
-            "quote_token_program": config.quote_token_program,
-            "associated_token_program": ASSOCIATED_TOKEN_PROGRAM,
-            "system_program": SYSTEM_PROGRAM,
-            # `fee_config` is declared before `fee_program` in the account
-            # list but derived UNDER it, so resolution order alone cannot
-            # supply it. Read from the pump_fees IDL's own published address
-            # rather than hardcoded here.
-            "fee_program": program_id(PUMP_FEES_IDL),
-            "user": user,
-            "fee_recipient": select_fee_recipient(base_mint, mayhem=config.mayhem),
-            "buyback_fee_recipient": select_buyback_recipient(base_mint),
-            # Named by the IDL as a seed path on an account we do not pass.
-            "bonding_curve.creator": creator,
-            "associated_base_user": associated_token_address(
-                user, base_mint, config.base_token_program),
-        }
+        key = self._cache_key(name, base_mint, creator, user)
+        cached = self._accounts.get(key)
         try:
-            accounts = build_accounts(PUMP_IDL, name, supplied)
+            if cached is None:
+                self.warm_misses += 1
+                cached = self._derive(name, base_mint, creator, user)
+                self._accounts[key] = cached
+                self._evict()
+            else:
+                self.warm_hits += 1
+            accounts = cached
             data = encode_u64_args(PUMP_IDL, name, (first, second))
         except (IdlError, ValueError, TypeError) as exc:
             return PreparedInstruction(status="REJECTED", detail=f"unbuildable: {exc}")
@@ -248,6 +318,13 @@ class NativePumpRoute:
             "buy_accounts": len(account_names(PUMP_IDL, "buy_v2")) if not blocked else 0,
             "sell_accounts": len(account_names(PUMP_IDL, "sell_v2")) if not blocked else 0,
             "fee_recipients": {name: len(values) for name, values in recipients.items()},
+            # Whether prewarming is actually reaching execution. A cache that
+            # never hits is a cache that is not being warmed at detection, and
+            # the derivation is still sitting in the decision window.
+            "prewarm": {"cached": len(self._accounts), "hits": self.warm_hits,
+                        "misses": self.warm_misses,
+                        "hit_rate": (self.warm_hits / (self.warm_hits + self.warm_misses))
+                        if (self.warm_hits + self.warm_misses) else None},
         }
 
 

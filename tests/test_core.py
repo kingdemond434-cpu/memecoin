@@ -10450,3 +10450,110 @@ class TestLocalLiquidity(unittest.TestCase):
                        and node.name == "_resolve_liquidity")
         text = ast.unparse(resolve)
         self.assertLess(text.index("_local_liquidity"), text.index("get_quote"))
+
+
+class TestAccountPrewarming(unittest.TestCase):
+    """Twenty-seven PDA derivations is ~2ms, and it was being paid at execution.
+
+    For a given (mint, creator, wallet) those accounts are derivations of
+    constants: they never change. Deriving them inside the window the whole
+    system is optimised for is avoidable work, and detection is a moment when
+    nothing is waiting.
+    """
+
+    MINT = "So11111111111111111111111111111111111111112"
+    OTHER = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+
+    def test_warming_populates_both_instructions(self):
+        route = NativePumpRoute()
+        self.assertEqual(route.warm(self.MINT, self.MINT, self.OTHER), 2)
+        # Warming twice caches nothing new.
+        self.assertEqual(route.warm(self.MINT, self.MINT, self.OTHER), 0)
+
+    def test_a_warmed_build_hits_the_cache(self):
+        route = NativePumpRoute()
+        route.warm(self.MINT, self.MINT, self.OTHER)
+        prepared = route.build_buy(self.MINT, self.MINT, self.OTHER, 100, 200)
+        self.assertEqual(prepared.status, "OK")
+        self.assertEqual(route.warm_hits, 1)
+        self.assertEqual(route.warm_misses, 0)
+
+    def test_the_cached_list_is_identical_to_a_cold_derivation(self):
+        cold = NativePumpRoute().build_buy(self.MINT, self.MINT, self.OTHER, 1, 2)
+        warm_route = NativePumpRoute()
+        warm_route.warm(self.MINT, self.MINT, self.OTHER)
+        warm = warm_route.build_buy(self.MINT, self.MINT, self.OTHER, 1, 2)
+        self.assertEqual([meta.to_dict() for meta in cold.accounts],
+                         [meta.to_dict() for meta in warm.accounts])
+
+    def test_the_key_separates_everything_that_changes_the_answer(self):
+        """A wrong key builds a transaction against another token's accounts."""
+        route = NativePumpRoute()
+        first = route.build_buy(self.MINT, self.MINT, self.OTHER, 1, 2)
+        second = route.build_buy(self.OTHER, self.MINT, self.OTHER, 1, 2)
+        self.assertNotEqual([m.pubkey for m in first.accounts],
+                            [m.pubkey for m in second.accounts])
+        # Different user, different accounts.
+        third = route.build_buy(self.MINT, self.MINT, self.MINT, 1, 2)
+        self.assertNotEqual([m.pubkey for m in first.accounts],
+                            [m.pubkey for m in third.accounts])
+        # Different creator, different vault.
+        fourth = route.build_buy(self.MINT, self.OTHER, self.OTHER, 1, 2)
+        self.assertNotEqual([m.pubkey for m in first.accounts],
+                            [m.pubkey for m in fourth.accounts])
+
+    def test_buy_and_sell_do_not_share_a_cache_entry(self):
+        route = NativePumpRoute()
+        buy = route.build_buy(self.MINT, self.MINT, self.OTHER, 1, 2)
+        sell = route.build_sell(self.MINT, self.MINT, self.OTHER, 1, 2)
+        self.assertEqual(len(buy.accounts), 27)
+        self.assertEqual(len(sell.accounts), 26)
+
+    def test_amounts_are_not_part_of_the_key(self):
+        """They are instruction data, not accounts."""
+        route = NativePumpRoute()
+        route.build_buy(self.MINT, self.MINT, self.OTHER, 1, 2)
+        route.build_buy(self.MINT, self.MINT, self.OTHER, 999, 888)
+        self.assertEqual(route.warm_hits, 1)
+
+    def test_the_cache_is_bounded(self):
+        route = NativePumpRoute(cache_size=4)
+        for index in range(20):
+            mint = str(Pubkey.from_bytes(bytes([index % 251] * 32)))
+            route.warm(mint, self.MINT, self.OTHER)
+        self.assertLessEqual(len(route._accounts), 4)
+
+    def test_warming_is_measurably_cheaper_than_deriving(self):
+        """Timed over several samples, because one sample is noise on a runner."""
+        colds, warms = [], []
+        for index in range(12):
+            # A distinct mint each round, so every cold measurement is cold.
+            mint = str(Pubkey.from_bytes(bytes([(index + 3) % 251] * 32)))
+            route = NativePumpRoute()
+            started = time.perf_counter()
+            route.build_buy(mint, self.MINT, self.OTHER, 1, 2)
+            colds.append(time.perf_counter() - started)
+            started = time.perf_counter()
+            route.build_buy(mint, self.MINT, self.OTHER, 1, 2)
+            warms.append(time.perf_counter() - started)
+        cold = sorted(colds)[len(colds) // 2]
+        warm = sorted(warms)[len(warms) // 2]
+        # An order of magnitude, asserted rather than the two seen in practice,
+        # so a loaded runner does not fail a working cache.
+        self.assertLess(warm * 10, cold, f"cold={cold:.6f}s warm={warm:.6f}s")
+
+    def test_the_hit_rate_is_reported_so_cold_warming_is_visible(self):
+        """A cache that never hits means warming is not reaching execution."""
+        route = NativePumpRoute()
+        self.assertIsNone(route.report()["prewarm"]["hit_rate"])
+        route.warm(self.MINT, self.MINT, self.OTHER)
+        route.build_buy(self.MINT, self.MINT, self.OTHER, 1, 2)
+        self.assertEqual(route.report()["prewarm"]["hit_rate"], 1.0)
+
+    def test_detection_warms_the_accounts(self):
+        source = Path("src/main.py").read_text()
+        tree = ast.parse(source)
+        handler = next(node for node in ast.walk(tree)
+                       if isinstance(node, ast.AsyncFunctionDef)
+                       and node.name == "_on_pump_event")
+        self.assertIn("pump_route.warm", ast.unparse(handler))
