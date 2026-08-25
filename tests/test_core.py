@@ -7618,3 +7618,155 @@ class TestPerSourceCadence(unittest.IsolatedAsyncioTestCase):
         detail = source.health(self.NOW + 5).detail
         self.assertIn("degraded at 30s", detail)
         self.assertIn("dead at 90s", detail)
+
+
+class TestActorIntelligenceIsLiveWired(unittest.TestCase):
+    """A module that exists without reaching the decision is not intelligence.
+
+    BuyerDNA, SmartFlow and SwarmPredictor were built and tested while main
+    imported only Entry, IndependenceReport and WalletIndependence -- so the
+    strongest actor work sat entirely outside the decision path and 555 tests
+    passed anyway.
+    """
+
+    def _desk(self, entries=None, report=None):
+        desk = SimpleNamespace(
+            buyer_dna=BuyerDNA(depth=25, min_corpus=50),
+            swarm_predictor=SwarmPredictor(),
+            independence_report=report or IndependenceReport(status="DATA_BLOCKED"),
+            _actor_entries={"mint": list(entries or [])},
+        )
+        return desk
+
+    def _entry(self, wallet, timestamp, skill=0.9, capital=100.0):
+        return Entry(token="mint", wallet=wallet, timestamp=timestamp,
+                     skill=skill, capital_usd=capital)
+
+    def test_main_imports_the_full_actor_surface(self):
+        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        for name in ("BuyerDNA", "SwarmPredictor", "aggregate_smart_flow",
+                     "build_fingerprint"):
+            self.assertIn(name, source, f"{name} is built but never reaches main")
+
+    def test_a_token_with_no_scored_buyers_is_blocked_not_zero(self):
+        result = MemecoinQuantDesk.actor_intelligence(self._desk(), "mint", 100.0)
+        # A launch nobody scored must not read as one whose buyers scored zero.
+        self.assertEqual(result["status"], "DATA_BLOCKED")
+        self.assertEqual(result["observed_buyers"], 0)
+
+    def test_smart_flow_and_swarm_reach_the_result(self):
+        entries = [self._entry(f"W{i}", 100.0 - i) for i in range(5)]
+        report = IndependenceReport(status="OK",
+                                    scores={f"W{i}": 1.0 for i in range(5)})
+        result = MemecoinQuantDesk.actor_intelligence(
+            self._desk(entries, report), "mint", 100.0)
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["smart_flow"]["status"], "OK")
+        self.assertGreater(result["smart_flow"]["evidence"], 0)
+        self.assertEqual(result["swarm"]["independent_skilled"], 5)
+
+    def test_a_sybil_cluster_is_discounted_in_the_wired_result(self):
+        entries = [self._entry(f"S{i}", 100.0 - i) for i in range(10)]
+        sybil = IndependenceReport(status="OK", scores={f"S{i}": 0.0 for i in range(10)})
+        clean = IndependenceReport(status="OK", scores={f"S{i}": 1.0 for i in range(10)})
+        discounted = MemecoinQuantDesk.actor_intelligence(
+            self._desk(entries, sybil), "mint", 100.0)
+        honest = MemecoinQuantDesk.actor_intelligence(
+            self._desk(entries, clean), "mint", 100.0)
+        self.assertLess(discounted["smart_flow"]["evidence"],
+                        honest["smart_flow"]["evidence"])
+
+    def test_an_uncalibrated_swarm_reports_evidence_and_no_probability(self):
+        entries = [self._entry(f"W{i}", 100.0 - i) for i in range(5)]
+        report = IndependenceReport(status="OK", scores={f"W{i}": 1.0 for i in range(5)})
+        result = MemecoinQuantDesk.actor_intelligence(
+            self._desk(entries, report), "mint", 100.0)
+        self.assertEqual(result["swarm"]["status"], "DATA_BLOCKED")
+        self.assertIsNone(result["swarm"]["probability"])
+
+    def test_a_thin_dna_corpus_blocks_rather_than_labelling(self):
+        entries = [self._entry(f"W{i}", 100.0 - i) for i in range(5)]
+        result = MemecoinQuantDesk.actor_intelligence(self._desk(entries), "mint", 100.0)
+        self.assertEqual(result["buyer_dna"]["status"], "DATA_BLOCKED")
+        self.assertIsNone(result["buyer_dna"]["label"])
+
+
+class TestSourceIntelligenceIsLiveWired(unittest.IsolatedAsyncioTestCase):
+    """src.collectors was not imported by main at all."""
+
+    MINT = "So11111111111111111111111111111111111111112"
+
+    class _Fake(EventSource):
+        def __init__(self, source_id, events):
+            super().__init__(source_id, SourceClass.CHAT)
+            self._events = events
+
+        async def poll(self):
+            return list(self._events)
+
+    def _event(self, source_id, at, lag=0.5, language="en"):
+        return Event(source_id=source_id, source_class=SourceClass.CHAT,
+                     source_at=at, observed_at=at + lag,
+                     text=f"call {self.MINT}", language=language,
+                     token_addresses=(self.MINT,))
+
+    def _desk(self, sources=()):
+        desk = SimpleNamespace(
+            source_mesh=SourceMesh(list(sources)),
+            _source_events={},
+            hot_state=HotState(HotStateBudget(), archive_root=Path("/tmp")),
+        )
+        return desk
+
+    def test_main_imports_the_collectors(self):
+        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        self.assertIn("src.collectors.event_source", source)
+        self.assertIn("src.collectors.registry", source)
+
+    async def test_events_are_indexed_by_token_and_reach_the_decision(self):
+        desk = self._desk([self._Fake("regional", [self._event("regional", 100.0)])])
+        desk.hot_state.touch_token(self.MINT)
+        collected = await MemecoinQuantDesk._poll_sources(desk)
+        self.assertEqual(collected, 1)
+
+        result = MemecoinQuantDesk.source_intelligence(desk, self.MINT)
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["first_source"], "regional")
+        # How stale their information already was when it reached us is the
+        # whole signal.
+        self.assertAlmostEqual(result["first_observation_lag_s"], 0.5)
+
+    def test_a_token_nobody_mentioned_is_blocked_not_silent_agreement(self):
+        result = MemecoinQuantDesk.source_intelligence(self._desk(), self.MINT)
+        self.assertEqual(result["status"], "DATA_BLOCKED")
+        self.assertIn("no public source", result["detail"])
+
+    async def test_an_empty_mesh_degrades_the_decision_without_stopping_it(self):
+        desk = self._desk()
+        # A dead mesh must degrade evidence, not gate the money path.
+        self.assertEqual(await MemecoinQuantDesk._poll_sources(desk), 0)
+        self.assertEqual(
+            MemecoinQuantDesk.source_intelligence(desk, self.MINT)["status"],
+            "DATA_BLOCKED")
+
+    async def test_per_token_observations_are_bounded(self):
+        many = [self._event("spam", 100.0 + index) for index in range(200)]
+        desk = self._desk([self._Fake("spam", many)])
+        desk.hot_state.touch_token(self.MINT)
+        await MemecoinQuantDesk._poll_sources(desk)
+        # A viral mint attracts thousands of posts and only the earliest few
+        # carry lead information.
+        self.assertLessEqual(len(desk._source_events[self.MINT]), 50)
+
+    def test_the_registry_reports_declared_sources_without_transport(self):
+        path = Path(__file__).resolve().parents[1] / "config" / "sources.yaml"
+        declarations = load_declarations(str(path))
+        _, report = build_sources(declarations, {})
+        payload = report.to_dict()
+        # "We have adapters" is not "those signals reach T0 decisions", and
+        # this is the number that says which.
+        self.assertGreater(payload["declared"], 20)
+        self.assertEqual(payload["ready"], 0)
+        self.assertEqual(payload["by_state"].get("NO_FETCHER", 0)
+                         + payload["by_state"].get("UNCONFIGURED", 0),
+                         payload["declared"])

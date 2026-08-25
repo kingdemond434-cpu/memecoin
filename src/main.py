@@ -48,11 +48,14 @@ from src.strategies.action_value import (
     Action as ActionValue, ActionValuePolicy, Decision as ActionDecision,
     PositionState as ActionState,
 )
+from src.collectors.event_source import Event, SourceMesh
+from src.collectors.registry import build_sources, load_declarations
 from src.strategies.decision_snapshot import (
     DecisionSnapshot, StateSequencer, guard as decision_guard, state_hash,
 )
 from src.strategies.actor_graph import (
-    Entry, IndependenceReport, WalletIndependence,
+    BuyerDNA, Entry, IndependenceReport, SwarmPredictor, WalletIndependence,
+    aggregate_smart_flow, build_fingerprint,
 )
 from src.strategies.champion_challenger import ChampionChallengerFramework, HypothesisSpec, TrialResult
 from src.strategies.exit_policy import ExitPolicy, evaluate_exit, load_latest_exit_policy
@@ -384,10 +387,38 @@ class MemecoinQuantDesk:
             max_add_fraction=float(setting("max_position_pct", 0.05)),
         )
         self.state_sequencer = StateSequencer()
+        # Production transport per source. Empty until an operator supplies
+        # connections; the registry then reports every declaration NO_FETCHER,
+        # which is the honest reading -- a declared source with no transport
+        # is a coverage hole, not a working source.
+        self.source_fetchers: Dict[str, Any] = getattr(self, "source_fetchers", {})
+        # The mesh is constructed from the declared universe. Sources without
+        # a production fetcher are reported NO_FETCHER by the registry rather
+        # than silently absent -- "we have adapters" is not "those signals
+        # reach T0 decisions", and the registry report is what says which.
+        declarations = load_declarations(
+            self.global_config.get("source_registry", "config/sources.yaml"))
+        sources, self.source_registry_report = build_sources(
+            declarations, self.source_fetchers)
+        self.source_mesh = SourceMesh(
+            sources,
+            dedupe_window=float(self.global_config.get("source_dedupe_window", 300.0)),
+            poll_timeout=float(self.global_config.get("source_poll_timeout", 5.0)))
+        # token -> observations naming it, newest last.
+        self._source_events: Dict[str, List[Any]] = {}
         # Set properly once the predictor is constructed; until then a
         # decision records that it was priced by no validated model.
         self.model_feature_hash = "untrained"
         self.wallet_independence = WalletIndependence()
+        self.buyer_dna = BuyerDNA(
+            depth=int(self.global_config.get("buyer_dna_depth", 25)),
+            min_corpus=int(self.global_config.get("buyer_dna_min_corpus", 50)))
+        self.swarm_predictor = SwarmPredictor(
+            skill_threshold=float(self.global_config.get("swarm_skill_threshold", 0.6)),
+            independence_threshold=float(
+                self.global_config.get("swarm_independence_threshold", 0.5)))
+        # Entries per token, kept only for tokens the hot state still holds.
+        self._actor_entries: Dict[str, List[Entry]] = {}
         self.independence_report = IndependenceReport(status="DATA_BLOCKED")
         self._actor_seen: Dict[str, set] = {}
         self._independence_computed_at = 0.0
@@ -640,7 +671,9 @@ class MemecoinQuantDesk:
             prediction, self.sol_price_usd, liquidity, self.wallet_equity_usd,
         )
         decision = {"should_trade": should_trade, "trade_info": trade_info,
-                    "authority": "shadow" if self.dry_run else "champion"}
+                    "authority": "shadow" if self.dry_run else "champion",
+                    "actor_intelligence": self.actor_intelligence(token),
+                    "source_intelligence": self.source_intelligence(token)}
         if not should_trade and trade_info.get("reason") in CAPACITY_REJECTIONS:
             # The book being full is not evidence this candidate is bad. It is
             # only evidence that capital is currently committed elsewhere, and
@@ -773,6 +806,30 @@ class MemecoinQuantDesk:
             token_features = dict(blocked)
             market_features = dict(blocked)
             social_features = self.social_intel.get_token_social_signal(candidate.address, as_of=as_of)
+
+        # Actor intelligence is computed from live entries rather than from
+        # the episode snapshot, so it reaches the decision at the age it was
+        # measured. Its status travels with it: a launch with no scored buyers
+        # must not read as one whose buyers scored zero.
+        actors = self.actor_intelligence(candidate.address, as_of)
+        graph_features = {
+            **graph_features,
+            "actor_status": actors.get("status", "DATA_BLOCKED"),
+            "observed_buyers": actors.get("observed_buyers", 0),
+        }
+        flow = actors.get("smart_flow") or {}
+        if flow.get("status") == "OK":
+            graph_features["actor_adjusted_flow"] = flow.get("evidence")
+            graph_features["sybil_discount"] = flow.get("discount")
+        swarm = actors.get("swarm") or {}
+        if swarm.get("status") == "OK":
+            graph_features["swarm_probability"] = swarm.get("probability")
+        elif swarm:
+            graph_features["swarm_evidence_uncalibrated"] = swarm.get("evidence")
+        dna = actors.get("buyer_dna") or {}
+        if dna.get("status") == "OK":
+            graph_features["first25_label"] = dna.get("label")
+            graph_features["first25_confidence"] = dna.get("confidence")
 
         # The safety report is fresher than the episode snapshot for the
         # fields it owns, so it takes precedence where both are present.
@@ -1198,13 +1255,123 @@ class MemecoinQuantDesk:
             except Exception as exc:  # pragma: no cover - defensive
                 logger.debug("wallet score unavailable for %s: %s", wallet, exc)
         notional = observation.get("notional_sol")
-        self.wallet_independence.record_entries([Entry(
+        entry = Entry(
             token=token, wallet=str(wallet),
             timestamp=float(observation.get("timestamp", time.time())),
             skill=(float(getattr(score, "overall_score", 0.0)) if score is not None else None),
             capital_usd=((float(notional) * self.sol_price_usd)
                          if notional and self.sol_price_usd > 0 else None),
-        )])
+        )
+        self.wallet_independence.record_entries([entry])
+        # Retained so First25 DNA, actor-adjusted flow and swarm probability
+        # have something to read. Bounded to the fingerprint depth: only the
+        # opening sequence is what those models consume, and keeping every
+        # buyer of every token is how a day of launches becomes a leak.
+        entries = self._actor_entries.setdefault(token, [])
+        if len(entries) < self.buyer_dna.depth:
+            entries.append(entry)
+        for stale in [key for key in self._actor_entries
+                      if key not in self.hot_state.active_tokens]:
+            self._actor_entries.pop(stale, None)
+
+    async def _poll_sources(self) -> int:
+        """Collect from every declared source and index events by token.
+
+        Runs off the money path. Source events inform the decision; they do
+        not gate it, and a mesh that is entirely dead must degrade the
+        decision's evidence rather than stop it from being made.
+        """
+        if not self.source_mesh.sources:
+            return 0
+        try:
+            events = await self.source_mesh.collect()
+        except Exception as exc:  # pragma: no cover - the mesh guards its own
+            logger.warning("source mesh collection failed: %s", exc)
+            return 0
+        for event in events:
+            for token in event.token_addresses:
+                observations = self._source_events.setdefault(token, [])
+                observations.append(event)
+                # Bounded per token: a viral mint attracts thousands of posts
+                # and only the earliest few carry lead information.
+                if len(observations) > 50:
+                    observations.pop(0)
+        for stale in [key for key in self._source_events
+                      if key not in self.hot_state.active_tokens]:
+            self._source_events.pop(stale, None)
+        return len(events)
+
+    def source_intelligence(self, token: str) -> Dict[str, Any]:
+        """What public sources have said about this token, and how early.
+
+        Reports the first observation and its lag, because who was first and
+        how stale their information already was when it reached us is the
+        whole signal. A token nobody mentioned is DATA_BLOCKED, not silent
+        agreement that it is uninteresting.
+        """
+        observations = self._source_events.get(token) or []
+        if not observations:
+            return {"status": "DATA_BLOCKED",
+                    "detail": "no public source has named this token",
+                    "mesh_sources": len(self.source_mesh.sources)}
+        first = observations[0]
+        return {
+            "status": "OK",
+            "observations": len(observations),
+            "first_source": first.source_id,
+            "first_source_class": first.source_class.value,
+            "first_observation_lag_s": first.observation_lag,
+            "repeaters": self.source_mesh.repeaters_of(first.content_hash),
+            "languages": sorted({event.language for event in observations
+                                 if event.language}),
+        }
+
+    def actor_intelligence(self, token: str, as_of: Optional[float] = None) -> Dict[str, Any]:
+        """First25 DNA, actor-adjusted flow and forward swarm probability.
+
+        Built from the same entries the independence graph consumes, so the
+        three cannot disagree about who bought and in what order. Every field
+        is DATA_BLOCKED rather than defaulted: a launch with no scored buyers
+        must not read as a launch whose buyers scored zero.
+        """
+        as_of = time.time() if as_of is None else as_of
+        entries = self._actor_entries.get(token) or []
+        report = self.independence_report
+        intelligence: Dict[str, Any] = {
+            "observed_buyers": len(entries),
+            "independence_status": report.status,
+        }
+
+        if not entries:
+            intelligence["status"] = "DATA_BLOCKED"
+            intelligence["detail"] = "no scored buyer observed for this token yet"
+            return intelligence
+
+        fingerprint = build_fingerprint(token, entries, report,
+                                        depth=self.buyer_dna.depth)
+        match = self.buyer_dna.match(fingerprint)
+        intelligence["buyer_dna"] = {
+            "status": match.status, "label": match.label,
+            "confidence": match.confidence, "detail": match.detail,
+            "depth": fingerprint.depth,
+        }
+
+        flow = aggregate_smart_flow(entries, report)
+        intelligence["smart_flow"] = {
+            "status": flow.status, "evidence": flow.evidence,
+            "naive_evidence": flow.naive_evidence, "discount": flow.discount,
+            "measured_wallets": flow.measured_wallets,
+            "unmeasured_wallets": flow.unmeasured_wallets,
+        }
+
+        swarm = self.swarm_predictor.evaluate(entries, report, as_of)
+        intelligence["swarm"] = {
+            "status": swarm.status, "evidence": swarm.evidence,
+            "probability": swarm.probability,
+            "independent_skilled": swarm.independent_skilled_so_far,
+        }
+        intelligence["status"] = "OK"
+        return intelligence
 
     def _refresh_independence(self) -> None:
         """Recompute the independence matrix on a cadence, not per trade.
@@ -1899,6 +2066,8 @@ class MemecoinQuantDesk:
             "native_fastpath": NATIVE_FASTPATH_STATUS,
             "action_policy": {"trained": self.action_policy.is_trained,
                               "min_edge": self.action_policy.min_edge},
+            "source_mesh": {**self.source_mesh.health(),
+                            "registry": self.source_registry_report.to_dict()},
             "actor_graph": {"independence_status": self.independence_report.status,
                             "measured_pairs": self.independence_report.observed_pairs,
                             "scored_wallets": len(self.independence_report.scores)},
