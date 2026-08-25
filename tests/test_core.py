@@ -97,6 +97,11 @@ from ops.monitor import main as monitor_main
 from src.runtime.hot_state import (
     AsyncArchiveWriter, CompactWalletDNA, EconomicCache, HotState, HotStateBudget,
 )
+from src.research.backfill import (
+    BACKFILL_PROVENANCE, PROVENANCE_KEY, Limitation, RawLaunch,
+    is_reconstructed, partition_by_provenance, reconstruct, run_backfill,
+    stamp_live,
+)
 from src.research.action_value_trainer import (
     PolicyMetrics, chronological_split, evaluate_candidate, measure_policy,
     save_report, select_policy, tail_preservation_gate,
@@ -6503,3 +6508,140 @@ class TestActionValueTrainerSelection(unittest.TestCase):
             # re-proposed next week as though it were new.
             self.assertIsNone(saved["shipped"])
             self.assertIn("generated_at", saved)
+
+
+class TestBackfillFactory(unittest.TestCase):
+    """Backfill buys history. It must never buy the illusion of observation."""
+
+    T0 = 1_700_000_000.0
+
+    def _raw(self, trades=None, **kwargs):
+        trades = trades if trades is not None else [
+            {"timestamp": self.T0 + index, "side": "buy", "wallet": f"w{index}",
+             "price_sol_per_token": 1e-9 * (1 + index), "notional_sol": 0.5}
+            for index in range(8)
+        ]
+        base = dict(token="mint", created_at=self.T0, creator="dev", trades=trades)
+        base.update(kwargs)
+        return RawLaunch(**base)
+
+    def test_a_reconstruction_is_stamped_and_lists_its_limitations(self):
+        result = reconstruct(self._raw())
+        self.assertEqual(result.status, "OK")
+        provenance = result.episode[PROVENANCE_KEY]
+        self.assertEqual(provenance["source"], BACKFILL_PROVENANCE)
+        # The differences that flatter a reconstruction are stated, not implied.
+        self.assertIn(Limitation.SURVIVORSHIP.value, provenance["limitations"])
+        self.assertIn(Limitation.NO_OBSERVATION_LATENCY.value, provenance["limitations"])
+
+    def test_inferred_depth_is_flagged_when_no_trade_recorded_reserves(self):
+        result = reconstruct(self._raw())
+        self.assertIn(Limitation.INFERRED_DEPTH.value,
+                      result.episode[PROVENANCE_KEY]["limitations"])
+        # And depth is simply absent, so the replay harness reads it as
+        # DATA_BLOCKED rather than as a fillable measurement.
+        self.assertNotIn("executable_sol", result.episode["market_observations"][0])
+
+    def test_recorded_depth_is_carried_and_not_flagged(self):
+        trades = [
+            {"timestamp": self.T0 + index, "side": "buy", "wallet": f"w{index}",
+             "price_sol_per_token": 1e-9 * (1 + index), "executable_sol": 2.0}
+            for index in range(8)
+        ]
+        result = reconstruct(self._raw(trades=trades))
+        self.assertNotIn(Limitation.INFERRED_DEPTH.value,
+                         result.episode[PROVENANCE_KEY]["limitations"])
+        self.assertEqual(result.episode["market_observations"][0]["executable_sol"], 2.0)
+
+    def test_thin_material_is_refused_rather_than_reconstructed(self):
+        thin = self._raw(trades=[
+            {"timestamp": self.T0, "side": "buy", "wallet": "w",
+             "price_sol_per_token": 1e-9}])
+        result = reconstruct(thin, min_trades=5)
+        # Three trades is three trades, not a lifecycle, and treating it as one
+        # puts noise into the moat wearing the shape of evidence.
+        self.assertEqual(result.status, "DATA_BLOCKED")
+        self.assertIsNone(result.episode)
+
+    def test_trades_without_a_usable_price_block(self):
+        result = reconstruct(self._raw(trades=[
+            {"timestamp": self.T0 + i, "side": "buy", "wallet": f"w{i}"}
+            for i in range(8)]))
+        self.assertEqual(result.status, "DATA_BLOCKED")
+
+    def test_a_collapse_is_recorded_as_observed_not_as_a_rug(self):
+        trades = [
+            {"timestamp": self.T0, "side": "buy", "wallet": "a", "price_sol_per_token": 1e-9},
+            {"timestamp": self.T0 + 10, "side": "buy", "wallet": "b", "price_sol_per_token": 2e-8},
+            {"timestamp": self.T0 + 20, "side": "sell", "wallet": "a", "price_sol_per_token": 1e-8},
+            {"timestamp": self.T0 + 30, "side": "sell", "wallet": "b", "price_sol_per_token": 5e-9},
+            {"timestamp": self.T0 + 40, "side": "sell", "wallet": "c", "price_sol_per_token": 1e-11},
+        ]
+        outcome = reconstruct(self._raw(trades=trades)).episode["final_outcome"]
+        self.assertTrue(outcome["collapsed"])
+        # Reconstruction cannot see WHO caused it. Labelling intent from price
+        # teaches a rug model to predict drawdowns instead of rugs.
+        self.assertIsNone(outcome["rugged"])
+
+    def test_first_buyers_are_ordered_and_deduplicated(self):
+        trades = [
+            {"timestamp": self.T0 + 3, "side": "buy", "wallet": "second",
+             "price_sol_per_token": 1e-9},
+            {"timestamp": self.T0 + 1, "side": "buy", "wallet": "first",
+             "price_sol_per_token": 1e-9},
+            {"timestamp": self.T0 + 5, "side": "buy", "wallet": "first",
+             "price_sol_per_token": 1e-9},
+            {"timestamp": self.T0 + 7, "side": "sell", "wallet": "third",
+             "price_sol_per_token": 1e-9},
+            {"timestamp": self.T0 + 9, "side": "buy", "wallet": "third",
+             "price_sol_per_token": 1e-9},
+        ]
+        buyers = reconstruct(self._raw(trades=trades))
+        names = [entry["wallet"] for entry in buyers.episode["first_buyers"]]
+        # Order matters: the sequence and the set mean different things.
+        self.assertEqual(names, ["first", "second", "third"])
+
+    def test_a_partial_buyer_set_is_flagged(self):
+        result = reconstruct(self._raw(), buyer_depth=25)
+        self.assertIn(Limitation.PARTIAL_BUYER_SET.value,
+                      result.episode[PROVENANCE_KEY]["limitations"])
+
+    def test_an_unstamped_episode_is_treated_as_reconstructed(self):
+        # The pessimistic default: mistaking a reconstruction for an
+        # observation inflates every downstream result; the reverse only
+        # wastes data.
+        self.assertTrue(is_reconstructed({"token": "t"}))
+        self.assertTrue(is_reconstructed({"token": "t", PROVENANCE_KEY: "nonsense"}))
+        self.assertFalse(is_reconstructed(stamp_live({"token": "t"})))
+
+    def test_partitioning_separates_the_two_populations(self):
+        observed = [stamp_live({"token": "live"})]
+        rebuilt = [reconstruct(self._raw()).episode]
+        live, back = partition_by_provenance(observed + rebuilt + [{"token": "bare"}])
+        self.assertEqual([item["token"] for item in live], ["live"])
+        self.assertEqual(len(back), 2)
+
+    def test_the_stamp_survives_a_json_round_trip(self):
+        episode = reconstruct(self._raw()).episode
+        # It has to survive into every downstream dataset or the separation is
+        # only true in memory.
+        revived = json.loads(json.dumps(episode, default=str))
+        self.assertTrue(is_reconstructed(revived))
+
+    def test_a_batch_reports_yield_and_why_it_lost_launches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            good = [self._raw(token=f"g{index}") for index in range(3)]
+            bad = [self._raw(token=f"b{index}", trades=[]) for index in range(2)]
+            report = run_backfill(good + bad, Path(directory))
+            payload = report.to_dict()
+            self.assertEqual((payload["attempted"], payload["reconstructed"],
+                              payload["blocked"]), (5, 3, 2))
+            self.assertAlmostEqual(payload["yield"], 0.6)
+            self.assertTrue(payload["blocked_reasons"])
+            self.assertEqual(len(list(Path(directory).glob("*.json"))), 3)
+
+    def test_an_empty_batch_reports_no_yield_rather_than_zero(self):
+        with tempfile.TemporaryDirectory() as directory:
+            payload = run_backfill([], Path(directory)).to_dict()
+            # Zero would read as "we tried and reconstructed nothing".
+            self.assertIsNone(payload["yield"])
