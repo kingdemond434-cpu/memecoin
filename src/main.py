@@ -42,6 +42,7 @@ from src.execution.jupiter_jito import (
 from src.research.dataset_builder import PointInTimeDatasetBuilder
 from src.research.feature_engine import build_features
 from src.research.global_research_miner import GlobalResearchMiner
+from src.research.forward_evidence import ForwardEvidence, Outcome as ForwardOutcome
 from src.research.contribution import (
     ContributionLedger, GateFlip, action_value_contributions,
 )
@@ -218,6 +219,16 @@ class MemecoinQuantDesk:
         # Bounded against the hot-state token set, because a day of launches
         # would otherwise accumulate every creator we have ever seen.
         self._curve_static: Dict[str, Dict[str, Any]] = {}
+        # The forward-shadow ledger. Every audit until now reported the proof
+        # "insufficient", which was true and unhelpful: insufficient and not
+        # started are the same sentence, and only one of them improves by
+        # waiting. This is the thing that makes the number go up, and it
+        # persists so a restart does not put it back to zero -- a requirement
+        # of five thousand decisions is unreachable by a counter that resets.
+        self.forward_evidence = ForwardEvidence(
+            Path(self.global_config.get("ops_state_dir", "data/state"))
+            / "forward_evidence.json")
+        self._evidence_saved_at = 0.0
         self._redecision_tasks: List[asyncio.Task] = []
         self._safety_task: Optional[asyncio.Task] = None
         self._intelligence_task: Optional[asyncio.Task] = None
@@ -2964,6 +2975,12 @@ class MemecoinQuantDesk:
                             "measured_pairs": self.independence_report.observed_pairs,
                             "scored_wallets": len(self.independence_report.scores)},
             "reentry": self.reentry_book.report(),
+            # Distance to the next promotion stage, as ratios. A gate that
+            # says FAIL cannot distinguish a week away from a year away, and
+            # that difference decides whether to keep running or change
+            # something.
+            "forward_evidence": self.forward_evidence.report(),
+            "regime": self.current_regime,
             # A queue silently shedding work looks exactly like a quiet market,
             # so both drop counters are surfaced rather than only logged.
             "event_loop": {
@@ -3008,6 +3025,67 @@ class MemecoinQuantDesk:
             self._persist_readiness(snapshot)
             await asyncio.sleep(60)
 
+    @property
+    def current_regime(self) -> str:
+        """A coarse label for the market the desk is trading in right now.
+
+        Deliberately coarse and deliberately observable: launch rate and the
+        24h SOL move are things the desk already measures, and a finely
+        conditioned regime over a handful of observations is a worse label
+        that looks better.
+
+        Returns "unknown" when the inputs are missing, and "unknown" does not
+        count toward the promotion gate's diversity requirement -- a desk that
+        never measured the market must not satisfy it with one bucket.
+        """
+        stats = (self.global_research.get_stats() if self.global_research else {}) or {}
+        launch_rate = stats.get("meme_launch_rate_1h")
+        sol_change = stats.get("sol_change_24h")
+        if launch_rate is None or sol_change is None:
+            return "unknown"
+        hot = float(launch_rate) >= float(
+            self.global_config.get("regime_hot_launch_rate", 300))
+        rising = float(sol_change) >= 0
+        if hot and rising:
+            return "euphoria"
+        if hot:
+            return "churn"
+        return "bull" if rising else "bear"
+
+    def _record_forward_evidence(self, payload: Dict[str, Any]) -> None:
+        """Feed one trade outcome into the promotion ledger.
+
+        Declines are recorded too. A ledger fed only on entries measures the
+        trades we took and says nothing about the ones we passed on, which is
+        half of what a decision policy does and the half that hides its
+        mistakes.
+        """
+        try:
+            self.forward_evidence.record(ForwardOutcome(
+                token=str(payload.get("token", "")),
+                entered=bool(payload.get("entered")),
+                regime=str((payload.get("regime") or self.current_regime or "unknown")),
+                realized_pnl_usd=float(payload.get("realized_pnl_usd", 0.0) or 0.0),
+                equity_at_decision_usd=float(self.wallet_equity_usd or 0.0),
+                real_fill=bool(payload.get("entered") and not self.dry_run),
+                rugged=bool(payload.get("rugged")),
+                max_multiple=(float(payload["max_feasible_multiple"])
+                              if payload.get("max_feasible_multiple") is not None else None),
+                execution_attempted=bool(payload.get("attempted")),
+                execution_succeeded=bool(payload.get("entered")),
+                catastrophic=bool(payload.get("rugged")
+                                  and float(payload.get("realized_pnl_usd", 0.0) or 0.0)
+                                  <= -float(self.wallet_equity_usd or 0.0) * 0.5),
+            ))
+        except (TypeError, ValueError) as exc:
+            logger.debug("forward evidence record failed: %s", exc)
+        # Persisted on a cadence rather than every outcome: an fsync per trade
+        # is latency the decision path does not need to pay, and losing at
+        # most a minute of counts to a crash costs a minute of shadow running.
+        if time.time() - self._evidence_saved_at > 60.0:
+            self._evidence_saved_at = time.time()
+            self.forward_evidence.save()
+
     def _record_ops_event(self, stream: str, payload: Dict[str, Any]) -> None:
         """Append one operational telemetry row for the monitor and audit pack.
 
@@ -3018,6 +3096,10 @@ class MemecoinQuantDesk:
         same reason readiness persistence is: telemetry must never be able to
         halt the desk it describes.
         """
+        # Trade outcomes are the promotion ledger's only input, and this is
+        # the one place every outcome passes through -- entered or declined.
+        if stream == "trade_outcomes":
+            self._record_forward_evidence(payload)
         try:
             root = Path(self.global_config.get("ops_state_dir", "data/state"))
             root.mkdir(parents=True, exist_ok=True)

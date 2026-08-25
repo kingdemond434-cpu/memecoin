@@ -181,6 +181,7 @@ from src.research.lifecycle_replay import (
     delay_decay, hold_to_end, lifecycle_from_episode, replay_cell,
     replay_lifecycle, sniper_scoreboard,
 )
+from src.research.forward_evidence import ForwardEvidence, Outcome
 from src.research.contribution import (
     Contribution, ContributionLedger, DecisionContribution, GateFlip,
     action_value_contributions,
@@ -10592,3 +10593,145 @@ class TestNoTestDependsOnOneMachine(unittest.TestCase):
 
         section = changes_section(Path(__file__).resolve().parents[1], since_days=3650)
         self.assertEqual(section.status, "OK")
+
+
+class TestForwardEvidence(unittest.TestCase):
+    """Every audit said the forward proof was insufficient, and nothing counted.
+
+    "Insufficient" and "not started" are the same sentence, and only one of
+    them improves by waiting. This is the thing that makes the number go up.
+    """
+
+    @staticmethod
+    def _row(**overrides):
+        # NOT named `_outcome`: unittest assigns `self._outcome` a `_Outcome`
+        # instance before each test, which would shadow this helper and make
+        # every call raise "not callable" from somewhere that looks unrelated.
+        base = dict(token="mint", entered=True, regime="bull",
+                    realized_pnl_usd=10.0, equity_at_decision_usd=10_000.0)
+        base.update(overrides)
+        return Outcome(**base)
+
+    def test_declines_are_recorded_too(self):
+        """A ledger fed only on entries hides the trades we passed on."""
+        ledger = ForwardEvidence()
+        ledger.record(self._row(entered=False, token="passed"))
+        ledger.record(self._row(entered=True, token="taken"))
+        evidence = ledger.evidence()
+        self.assertEqual(evidence.decisions, 2)
+        self.assertEqual(evidence.launch_cohorts, 2)
+        self.assertEqual(ledger.entered, 1)
+
+    def test_cohorts_are_a_set_not_a_total(self):
+        """5,000 decisions about one launch is one cohort."""
+        ledger = ForwardEvidence()
+        for _ in range(500):
+            ledger.record(self._row(token="same"))
+        self.assertEqual(ledger.evidence().decisions, 500)
+        self.assertEqual(ledger.evidence().launch_cohorts, 1)
+
+    def test_unknown_is_not_a_regime(self):
+        """Otherwise a desk that never measured passes with one bucket."""
+        ledger = ForwardEvidence()
+        for _ in range(50):
+            ledger.record(self._row(regime="unknown"))
+        self.assertIsNone(ledger.evidence().regimes_covered)
+        ledger.record(self._row(regime="bear"))
+        self.assertEqual(ledger.evidence().regimes_covered, 1)
+
+    def test_growth_is_logged_against_the_book_at_the_time(self):
+        """Summing percentages over a changing book overstates a winning run."""
+        ledger = ForwardEvidence()
+        ledger.record(self._row(realized_pnl_usd=1_000.0,
+                                    equity_at_decision_usd=10_000.0))
+        self.assertAlmostEqual(ledger.net_log_growth, math.log(1.1))
+
+    def test_a_trade_that_takes_the_book_is_catastrophic_not_negative_infinity(self):
+        ledger = ForwardEvidence()
+        ledger.record(self._row(realized_pnl_usd=-10_000.0,
+                                    equity_at_decision_usd=10_000.0))
+        self.assertEqual(ledger.catastrophic_failures, 1)
+        self.assertTrue(math.isfinite(ledger.net_log_growth))
+
+    def test_enrichment_is_none_against_a_zero_base_rate(self):
+        """Reporting infinite enrichment is the most flattering possible number."""
+        ledger = ForwardEvidence()
+        for _ in range(30):
+            ledger.record(self._row(max_multiple=1.1))
+        self.assertIsNone(ledger.evidence().monster_enrichment)
+
+    def test_unmeasured_fields_stay_none_rather_than_zero(self):
+        """The gate treats unmeasured as failing; zero would claim a pass."""
+        evidence = ForwardEvidence().evidence()
+        self.assertIsNone(evidence.net_log_growth)
+        self.assertIsNone(evidence.rug_loss_share)
+        self.assertIsNone(evidence.execution_success)
+        self.assertIsNone(evidence.monster_enrichment)
+
+    def test_rug_share_is_of_losses_not_of_everything(self):
+        ledger = ForwardEvidence()
+        ledger.record(self._row(realized_pnl_usd=-100.0, rugged=True))
+        ledger.record(self._row(realized_pnl_usd=-100.0, rugged=False))
+        ledger.record(self._row(realized_pnl_usd=500.0))
+        self.assertAlmostEqual(ledger.evidence().rug_loss_share, 0.5)
+
+    def test_distance_reports_ratios_and_names_the_slowest_requirement(self):
+        """A FAIL cannot distinguish a week away from a year away."""
+        ledger = ForwardEvidence()
+        for index in range(60):
+            ledger.record(self._row(token=f"mint{index}",
+                                        regime="bull" if index % 2 else "bear"))
+        distance = ledger.distance()
+        json.dumps(distance)
+        self.assertEqual(distance["status"], "OK")
+        self.assertFalse(distance["verdict"]["passed"])
+        self.assertEqual(distance["slowest"], "decisions")
+        self.assertLess(distance["progress"]["decisions"]["fraction"], 0.05)
+        self.assertEqual(distance["progress"]["launch_cohorts"]["have"], 60)
+
+    def test_it_survives_a_restart(self):
+        """A counter that resets never reaches five thousand, however long it runs."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "evidence.json"
+            first = ForwardEvidence(path)
+            for index in range(40):
+                first.record(self._row(token=f"mint{index}"))
+            self.assertTrue(first.save())
+
+            second = ForwardEvidence(path)
+            self.assertEqual(second.decisions, 40)
+            self.assertEqual(second.evidence().launch_cohorts, 40)
+            self.assertAlmostEqual(second.net_log_growth, first.net_log_growth)
+
+    def test_a_corrupt_ledger_does_not_crash_the_desk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "evidence.json"
+            path.write_text("{not json")
+            ledger = ForwardEvidence(path)
+            self.assertEqual(ledger.decisions, 0)
+
+    def test_saving_is_atomic(self):
+        """A half-written ledger parses to nothing and silently restarts the count."""
+        source = Path("src/research/forward_evidence.py").read_text()
+        self.assertIn("os.replace", source)
+        self.assertIn("NamedTemporaryFile", source)
+
+    def test_the_desk_feeds_it_from_trade_outcomes(self):
+        source = Path("src/main.py").read_text()
+        tree = ast.parse(source)
+        recorder = next(node for node in ast.walk(tree)
+                        if isinstance(node, ast.FunctionDef)
+                        and node.name == "_record_ops_event")
+        text = ast.unparse(recorder)
+        self.assertIn("trade_outcomes", text)
+        self.assertIn("_record_forward_evidence", text)
+
+    def test_the_regime_label_is_unknown_without_measurements(self):
+        desk = SimpleNamespace(global_research=None, global_config={})
+        self.assertEqual(MemecoinQuantDesk.current_regime.fget(desk), "unknown")
+        desk.global_research = SimpleNamespace(get_stats=lambda: {
+            "meme_launch_rate_1h": 500, "sol_change_24h": 5.0})
+        self.assertEqual(MemecoinQuantDesk.current_regime.fget(desk), "euphoria")
+        desk.global_research = SimpleNamespace(get_stats=lambda: {
+            "meme_launch_rate_1h": 10, "sol_change_24h": -5.0})
+        self.assertEqual(MemecoinQuantDesk.current_regime.fget(desk), "bear")
