@@ -37,6 +37,9 @@ from src.chains.yellowstone_grpc import (
 )
 from src.detection.rug_detector import TOKEN_2022_PROGRAM, TOKEN_PROGRAM, RugDetector
 from src.detection.token_detector import DetectionSource, TokenCandidate
+from src.execution.landing_model import (
+    BID_BUCKETS, Attempt, LandingModel, bid_bucket, congestion_bucket,
+)
 from src.execution.jupiter_jito import (
     ExecutionEngine, ExecutionResult, JitoClient, JupiterClient, RouteType, SolanaTransactionBuilder, SwapQuote,
     SwapTransaction, TransactionStatus,
@@ -9352,6 +9355,7 @@ class TestNativeRouteIsTheCanonicalPath(unittest.TestCase):
         engine.poll_confirmations = 0
         engine._signature_waiters = {}
         engine.reconcile_min_interval = 0.005
+        engine.landing_model = LandingModel()
         return engine
 
     @staticmethod
@@ -10291,3 +10295,158 @@ class TestStreamFillReconciliation(unittest.IsolatedAsyncioTestCase):
                        if isinstance(node, ast.AsyncFunctionDef)
                        and node.name == "_on_pump_event")
         self.assertIn("observe_signature", ast.unparse(handler))
+
+
+class TestLandingModel(unittest.TestCase):
+    """Tip selection was a lookup table consulted backwards.
+
+    The optimiser kept a fee history, filtered it to fees with an 80% landing
+    rate, and then took the CHEAPEST of them -- which is the wrong end: the
+    cheapest fee clearing 80% is the one closest to failing.
+    """
+
+    def _fitted(self, curve=((0, 0.05), (100_000, 0.5), (1_000_000, 0.95))):
+        model = LandingModel(min_bucket_attempts=10)
+        for bid, rate in curve:
+            landed = int(round(rate * 40))
+            for index in range(40):
+                model.record(Attempt(bid_lamports=bid, landed=index < landed,
+                                     congestion=0.5, route="jito"))
+        return model
+
+    def test_it_refuses_before_it_has_a_curve(self):
+        """A landing curve fitted to four attempts recommends whatever they paid."""
+        model = LandingModel()
+        estimate = model.probability(500_000)
+        self.assertEqual(estimate.status, "DATA_BLOCKED")
+        recommendation = model.recommend(1_000, 150)
+        self.assertEqual(recommendation.status, "DATA_BLOCKED")
+        self.assertTrue(recommendation.fallback)
+
+    def test_failures_are_evidence_too(self):
+        """A model fed only successes learns that everything lands."""
+        model = LandingModel(min_bucket_attempts=4)
+        for _ in range(10):
+            model.record(Attempt(bid_lamports=0, landed=False))
+        estimate = model.probability(0)
+        self.assertEqual(estimate.status, "OK")
+        self.assertEqual(estimate.probability, 0.0)
+
+    def test_the_curve_rises_with_the_bid(self):
+        model = self._fitted()
+        low = model.probability(0, 0.5).probability
+        mid = model.probability(100_000, 0.5).probability
+        high = model.probability(1_000_000, 0.5).probability
+        self.assertLess(low, mid)
+        self.assertLess(mid, high)
+
+    def test_a_large_edge_bids_up_and_a_worthless_one_does_not_bid(self):
+        model = self._fitted()
+        big = model.recommend(10_000.0, 150.0, congestion=0.5)
+        self.assertEqual(big.status, "OK")
+        self.assertGreater(big.bid_lamports, 0)
+        # At an edge smaller than the bid itself, not bidding is the answer.
+        tiny = model.recommend(0.0001, 150.0, congestion=0.5)
+        self.assertIn(tiny.status, {"OK", "REJECTED"})
+        self.assertEqual(tiny.bid_lamports, 0)
+
+    def test_no_edge_is_rejected_rather_than_bid_on(self):
+        model = self._fitted()
+        self.assertEqual(model.recommend(0.0, 150.0).status, "REJECTED")
+        self.assertEqual(model.recommend(100.0, 0.0).status, "REJECTED")
+
+    def test_it_falls_back_from_conditioned_to_pooled_before_refusing(self):
+        """'Never traded at this bid in a contested slot' is a narrow gap."""
+        model = LandingModel(min_bucket_attempts=10)
+        for index in range(20):
+            model.record(Attempt(bid_lamports=500_000, landed=index < 15,
+                                 congestion=0.1))
+        # Asked about a congestion bucket with no samples of its own.
+        estimate = model.probability(500_000, congestion=0.9)
+        self.assertEqual(estimate.status, "OK")
+        self.assertEqual(estimate.congestion, "pooled")
+
+    def test_buckets_are_geometric_because_bids_respond_to_magnitude(self):
+        self.assertEqual(bid_bucket(0), 0)
+        self.assertEqual(bid_bucket(99_999), 50_000)
+        self.assertEqual(bid_bucket(100_000), 100_000)
+        self.assertEqual(bid_bucket(10 ** 9), BID_BUCKETS[-1])
+        ratios = [BID_BUCKETS[i + 1] / BID_BUCKETS[i]
+                  for i in range(1, len(BID_BUCKETS) - 1)]
+        self.assertTrue(all(ratio >= 2 for ratio in ratios))
+
+    def test_congestion_is_bucketed_and_unknown_is_its_own_bucket(self):
+        self.assertEqual(congestion_bucket(None), "unknown")
+        self.assertEqual(congestion_bucket(0.1), "calm")
+        self.assertEqual(congestion_bucket(0.9), "contested")
+
+    def test_the_window_is_bounded_and_counts_stay_consistent(self):
+        model = LandingModel(capacity=50, min_bucket_attempts=5)
+        for index in range(500):
+            model.record(Attempt(bid_lamports=100_000, landed=index % 2 == 0))
+        report = model.report()
+        json.dumps(report)
+        self.assertEqual(report["attempts"], 50)
+        total = sum(row["attempts"] for row in report["curve"])
+        self.assertEqual(total, 50)
+
+    def test_the_engine_says_whether_a_bid_was_measured_or_guessed(self):
+        engine = ExecutionEngine.__new__(ExecutionEngine)
+        engine.landing_model = LandingModel()
+        guessed = ExecutionEngine.choose_bid(engine, 1_000.0, 150.0, 250_000)
+        self.assertFalse(guessed["measured"])
+        self.assertEqual(guessed["lamports"], 250_000)
+
+        engine.landing_model = self._fitted()
+        measured = ExecutionEngine.choose_bid(engine, 10_000.0, 150.0, 250_000,
+                                              congestion=0.5)
+        self.assertTrue(measured["measured"])
+        self.assertGreater(measured["lamports"], 0)
+
+
+class TestLocalLiquidity(unittest.TestCase):
+    """A T0 decision paid a Jupiter round trip to learn what the curve states."""
+
+    def _desk(self, state=None, sol_price=150.0):
+        return SimpleNamespace(_latest_curve_state={"mint": state} if state else {},
+                               sol_price_usd=sol_price)
+
+    def test_depth_comes_from_the_streamed_reserves(self):
+        state = BondingCurveState(
+            virtual_token_reserves=1_000_000_000_000,
+            virtual_sol_reserves=30_000_000_000,
+            real_token_reserves=800_000_000_000,
+            real_sol_reserves=12_000_000_000,
+            token_total_supply=10 ** 15, complete=False, creator="c")
+        desk = self._desk(state)
+        # Real reserves preferred: 12 SOL at $150.
+        self.assertAlmostEqual(
+            MemecoinQuantDesk._local_liquidity(desk, "mint"), 12.0 * 150.0)
+
+    def test_a_reconstruction_falls_back_to_the_virtual_reserve(self):
+        state = BondingCurveState(
+            virtual_token_reserves=1_000_000_000_000,
+            virtual_sol_reserves=30_000_000_000,
+            real_token_reserves=0, real_sol_reserves=0,
+            token_total_supply=0, complete=False, creator="c")
+        desk = self._desk(state)
+        self.assertAlmostEqual(
+            MemecoinQuantDesk._local_liquidity(desk, "mint"), 30.0 * 150.0)
+
+    def test_an_untradeable_or_unknown_curve_reports_zero(self):
+        self.assertEqual(MemecoinQuantDesk._local_liquidity(self._desk(), "mint"), 0.0)
+        done = BondingCurveState(
+            virtual_token_reserves=0, virtual_sol_reserves=0,
+            real_token_reserves=0, real_sol_reserves=0,
+            token_total_supply=0, complete=True, creator="c")
+        self.assertEqual(
+            MemecoinQuantDesk._local_liquidity(self._desk(done), "mint"), 0.0)
+
+    def test_the_local_read_is_tried_before_any_network_call(self):
+        source = Path("src/main.py").read_text()
+        tree = ast.parse(source)
+        resolve = next(node for node in ast.walk(tree)
+                       if isinstance(node, ast.AsyncFunctionDef)
+                       and node.name == "_resolve_liquidity")
+        text = ast.unparse(resolve)
+        self.assertLess(text.index("_local_liquidity"), text.index("get_quote"))

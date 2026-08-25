@@ -25,6 +25,7 @@ from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
 from src.chains.pump_curve import quote_buy, quote_sell
+from src.execution.landing_model import Attempt, LandingModel
 from src.chains.pump_route import NativePumpRoute, PreparedInstruction, WSOL_MINT
 from src.chains.rpc_manager import ChainConfig, RPCManager
 
@@ -589,6 +590,10 @@ class ExecutionEngine:
         self.reconcile_max_interval = 0.5
         self.stream_confirmations = 0
         self.poll_confirmations = 0
+        # P(land | bid) from our own attempts. Every submission feeds it,
+        # landed or not: a model fed only successes learns that everything
+        # lands.
+        self.landing_model = LandingModel()
         self.execution_history: deque = deque(maxlen=10_000)
         self.route_performance: Dict[RouteType, Dict[str, float]] = defaultdict(
             lambda: {"total": 0, "landed": 0, "filled": 0, "failed": 0, "avg_latency": 0}
@@ -659,6 +664,7 @@ class ExecutionEngine:
             "attempts": total, "prepared": prepared,
             "prepared_share": (prepared / total) if total else None,
             "outcomes": dict(self.native_route_attempts),
+            "landing_model": self.landing_model.report(),
             "reconciliation": {
                 "stream_confirmations": self.stream_confirmations,
                 "poll_confirmations": self.poll_confirmations,
@@ -751,6 +757,8 @@ class ExecutionEngine:
         jito_tip: int = 100_000,
         use_jito: bool = False,
         decision_id: Optional[str] = None,
+        expected_value_usd: float = 0.0,
+        sol_price_usd: float = 0.0,
     ) -> ExecutionResult:
         started = time.time()
         if amount <= 0 or slippage_bps <= 0 or slippage_bps > 2_000:
@@ -813,6 +821,16 @@ class ExecutionEngine:
             observed_tip = await self.jito.get_tip_floor_lamports(75)
             if observed_tip:
                 jito_tip = min(max(jito_tip, observed_tip), 5_000_000)
+            # The observed floor says what cleared; the landing curve says
+            # what is worth paying. Take the larger, because bidding under the
+            # floor is not a bid and bidding under the curve's answer is
+            # leaving expected value on the table.
+            chosen = self.choose_bid(
+                expected_value_usd=float(expected_value_usd or 0.0),
+                sol_price_usd=float(sol_price_usd or 0.0),
+                fallback_lamports=jito_tip)
+            if chosen.get("measured") and chosen["lamports"] > 0:
+                jito_tip = min(max(jito_tip, int(chosen["lamports"])), 5_000_000)
         swap_tx = await self.jupiter.get_swap_transaction(
             quote,
             self.tx_builder.public_key,
@@ -910,6 +928,11 @@ class ExecutionEngine:
             else TransactionStatus.LANDED if fill.get("landed")
             else TransactionStatus.TIMEOUT
         )
+        self.landing_model.record(Attempt(
+            bid_lamports=int(jito_tip if use_jito else 0),
+            landed=bool(fill.get("landed")),
+            route=route_type.value,
+            latency_ms=int((time.time() - started) * 1000)))
         return ExecutionResult(
             success=bool(fill.get("filled")), status=status, signature=signature,
             bundle_id=bundle_id, input_amount=amount,
@@ -1116,6 +1139,22 @@ class ExecutionEngine:
         if index >= len(before) or index >= len(after):
             return 0
         return int(after[index]) - int(before[index])
+
+    def choose_bid(self, expected_value_usd: float, sol_price_usd: float,
+                   fallback_lamports: int, congestion: Optional[float] = None) -> Dict[str, Any]:
+        """What to bid, from the landing curve where it can answer.
+
+        The fallback ladder is used when the curve cannot, and the result says
+        which happened -- so a desk running on guesses knows it is, rather
+        than reading a number that looks measured.
+        """
+        recommendation = self.landing_model.recommend(
+            expected_value_usd, sol_price_usd, congestion)
+        if recommendation.status == "OK":
+            return {"lamports": recommendation.bid_lamports, "measured": True,
+                    **recommendation.to_dict()}
+        return {"lamports": int(fallback_lamports), "measured": False,
+                **recommendation.to_dict()}
 
     def _record(self, result: ExecutionResult, decision_id: Optional[str]):
         result_data = result.__dict__.copy()

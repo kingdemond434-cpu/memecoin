@@ -1009,6 +1009,10 @@ class MemecoinQuantDesk:
             priority_fee=self.fee_optimizer.get_optimal_fee(trade_info["position_value_usd"], 0.5),
             jito_tip=self.fee_optimizer.get_jito_tip(trade_info["position_value_usd"], "MEDIUM"),
             use_jito=True, decision_id=decision_id,
+            # What the fill is worth, so the bid can be chosen against it
+            # rather than from a ladder that has never seen this trade.
+            expected_value_usd=float(trade_info.get("position_value_usd", 0.0) or 0.0),
+            sol_price_usd=float(self.sol_price_usd or 0.0),
         )
         self.dataset_builder.record_execution_attempt(token, _jsonable(result))
         self._record_ops_event("execution_attempts", {
@@ -1085,10 +1089,39 @@ class MemecoinQuantDesk:
             "entity_graph_features": {"intent_score": profile.intent_score},
         }
 
+    def _local_liquidity(self, token: str) -> float:
+        """Tradeable depth from the streamed curve, in USD. Zero when unknown.
+
+        A bonding curve's quote-side depth IS its SOL reserve: that is what a
+        seller can be paid out of, and no quote from anywhere makes it larger.
+        Reading it locally removes a network round trip from directly in front
+        of the T0 sizing decision.
+
+        Real reserves are preferred where an account update has supplied them.
+        Where only a trade event has been seen, the virtual reserve is used
+        and is an upper bound -- which is why the frontier built on it is
+        already labelled as one rather than treated as a measurement.
+        """
+        state = self._latest_curve_state.get(token)
+        if state is None or not state.tradeable or self.sol_price_usd <= 0:
+            return 0.0
+        lamports = int(state.real_sol_reserves or 0) or int(state.virtual_sol_reserves or 0)
+        if lamports <= 0:
+            return 0.0
+        return (lamports / 1e9) * float(self.sol_price_usd)
+
     async def _resolve_liquidity(self, candidate: TokenCandidate) -> float:
         explicit = candidate.initial_liquidity_usd or candidate.metadata.get("liquidity_usd")
         if explicit and float(explicit) > 0:
             return float(explicit)
+        # The curve already tells us this. Asking Jupiter meant a T0 decision
+        # paid a network round trip to learn something the streamed reserves
+        # state outright -- and the sizing engine cannot start until the
+        # answer arrives, so the round trip sat directly in front of the
+        # decision it was feeding.
+        local = self._local_liquidity(candidate.address)
+        if local > 0:
+            return local
         if not self.jupiter or not self.jupiter._session or self.sol_price_usd <= 0:
             return 0.0
         quote = await self.jupiter.get_quote(WSOL_MINT, candidate.address, 100_000_000, slippage_bps=300)
