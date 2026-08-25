@@ -2500,6 +2500,8 @@ class MemecoinQuantDesk:
                             "scored_wallets": len(self.independence_report.scores)},
             "reentry": self.reentry_book.report(),
             "exit_latency": self.landing_latency.estimate().report(),
+            "wallet_coverage": (self.wallet_intel.coverage_report()
+                                if self.wallet_intel else {"status": "DATA_BLOCKED"}),
             # Which declared modules actually reached a decision. A rate that
             # falls to zero between two audit packs means a component was
             # disconnected, and no test will say so.

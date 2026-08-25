@@ -5,7 +5,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 import json
 import numpy as np
 
@@ -78,6 +78,13 @@ class WalletIntelligenceEngine:
         self.helius_key = helius_key
         self.min_trades = min_trades_for_ranking
         self.recalc_interval = recalc_interval_hours * 3600
+        # A wallet the stream carried within this window needs no poll. Long
+        # enough that a wallet trading normally stays stream-covered, short
+        # enough that one going quiet on our programs is reconciled promptly.
+        self.stream_coverage_seconds = 120.0
+        self.max_reconcile_per_pass = 25
+        self.reconcile_concurrency = 8
+        self.reconcile_interval_seconds = 15.0
         
         self.regime_performances: Dict[str, Dict[WalletRegime, WalletRegimePerformance]] = defaultdict(dict)
         self.wallet_scores: Dict[str, WalletScore] = {}
@@ -102,6 +109,14 @@ class WalletIntelligenceEngine:
         self._queued_history_wallets: Set[str] = set()
         self._history_evaluated_at: Dict[str, float] = {}
         self.data_status: Dict[str, str] = {}
+        # When the geyser stream last carried each tracked wallet. A wallet the
+        # stream covers does not need to be polled, and polling it anyway
+        # spends the rate limit that the uncovered wallets need.
+        self._stream_seen_at: Dict[str, float] = {}
+        # Observation latency by path, so "our elite wallets are on a
+        # two-second HTTP delay" is a measured number rather than a worry.
+        self._observation_lag: Dict[str, Deque[float]] = {
+            "stream": deque(maxlen=512), "poll": deque(maxlen=512)}
         
         self._helius_base = "https://api.helius.xyz/v0"
 
@@ -150,7 +165,11 @@ class WalletIntelligenceEngine:
                 await self._watch_live_wallets()
             except Exception as e:
                 logger.error(f"Watcher loop error: {e}")
-            await asyncio.sleep(2)
+            # Reconciliation, not observation. The stream is the observation
+            # path; hammering Helius every two seconds for wallets it already
+            # covers bought nothing and spent the budget the uncovered ones
+            # need.
+            await asyncio.sleep(self.reconcile_interval_seconds)
 
     async def _recalc_loop(self):
         while self._running:
@@ -560,32 +579,92 @@ class WalletIntelligenceEngine:
         if wallet and 32 <= len(wallet) <= 44:
             self._social_wallet_candidates.add(wallet)
 
+    def stale_watch_wallets(self, now: Optional[float] = None) -> List[str]:
+        """Tracked wallets the stream has NOT covered recently, oldest first.
+
+        The poll used to walk all hundred watched wallets every two seconds,
+        sequentially. Even at fifty milliseconds a request that is five
+        seconds of work inside a two-second loop, so the hundredth wallet was
+        never on a two-second delay -- it was on whatever the queue happened
+        to be, and nobody was measuring which.
+
+        The stream already carries every trade on the programs we subscribe
+        to, at stream latency. So the poll stops being the primary path and
+        becomes what it should always have been: reconciliation for the
+        wallets the stream cannot see, which are the ones trading somewhere we
+        do not subscribe. Ordering by staleness means the budget goes to the
+        wallets we know least about rather than to whichever came first out of
+        a set.
+        """
+        now = time.time() if now is None else float(now)
+        stale = [(self._stream_seen_at.get(wallet, 0.0), wallet)
+                 for wallet in self._live_watch_wallets
+                 if now - self._stream_seen_at.get(wallet, 0.0) > self.stream_coverage_seconds]
+        stale.sort()
+        return [wallet for _, wallet in stale]
+
     async def _watch_live_wallets(self):
         if not self.helius_key:
             self.data_status["live_wallet_watch"] = "DATA_BLOCKED: HELIUS_API_KEY missing"
             return
         if not self._live_watch_wallets:
             return
-        
-        wallets = list(self._live_watch_wallets)[:100]
-        
-        for wallet in wallets:
-            try:
-                async with self._session.get(
-                    f"{self._helius_base}/addresses/{wallet}/transactions",
-                    params={
-                        "api-key": self.helius_key,
-                        "limit": 20,
-                        "type": "SWAP",
-                        "commitment": "processed"
-                    }
-                ) as resp:
-                    if resp.status == 200:
-                        txs = await resp.json()
-                        for tx in txs:
-                            await self._process_live_transaction(wallet, tx)
-            except Exception as e:
-                logger.debug(f"Live watch error for {wallet}: {e}")
+
+        wallets = self.stale_watch_wallets()[:self.max_reconcile_per_pass]
+        if not wallets:
+            self.data_status["live_wallet_watch"] = "OK: stream covers every watched wallet"
+            return
+
+        semaphore = asyncio.Semaphore(self.reconcile_concurrency)
+
+        async def reconcile(wallet: str) -> None:
+            async with semaphore:
+                try:
+                    async with self._session.get(
+                        f"{self._helius_base}/addresses/{wallet}/transactions",
+                        params={
+                            "api-key": self.helius_key,
+                            "limit": 20,
+                            "type": "SWAP",
+                            "commitment": "processed"
+                        }
+                    ) as resp:
+                        if resp.status == 200:
+                            txs = await resp.json()
+                            for tx in txs:
+                                await self._process_live_transaction(wallet, tx)
+                except Exception as e:
+                    logger.debug(f"Live watch error for {wallet}: {e}")
+
+        # Concurrently, because one slow wallet used to delay every wallet
+        # behind it, and the delay was invisible.
+        await asyncio.gather(*(reconcile(wallet) for wallet in wallets),
+                             return_exceptions=True)
+        self.data_status["live_wallet_watch"] = (
+            f"OK: reconciled {len(wallets)} of {len(self._live_watch_wallets)} watched wallets")
+
+    def coverage_report(self, now: Optional[float] = None) -> Dict[str, Any]:
+        """How each watched wallet is actually being observed, and how late."""
+        now = time.time() if now is None else float(now)
+        watched = len(self._live_watch_wallets)
+        streamed = sum(1 for wallet in self._live_watch_wallets
+                       if now - self._stream_seen_at.get(wallet, 0.0)
+                       <= self.stream_coverage_seconds)
+        lags = {}
+        for path, samples in self._observation_lag.items():
+            lags[path] = {
+                "observations": len(samples),
+                "median_s": (float(np.median(samples)) if samples else None),
+                "p90_s": (float(np.quantile(samples, 0.9)) if samples else None),
+            }
+        return {
+            "status": "OK" if watched else "DATA_BLOCKED",
+            "watched": watched,
+            "stream_covered": streamed,
+            "awaiting_reconciliation": max(0, watched - streamed),
+            "stream_coverage_seconds": self.stream_coverage_seconds,
+            "observation_lag": lags,
+        }
 
     async def _process_live_transaction(self, wallet: str, tx: Dict):
         sig = tx.get("signature")
@@ -617,6 +696,7 @@ class WalletIntelligenceEngine:
             self._recent_buys.append(event)
         else:
             self._recent_sells.append(event)
+        self._note_observation_lag("poll", event["timestamp"])
 
     def record_live_trade(self, token: str, event: Dict[str, Any]):
         """Register a decoded stream trade without pretending its limit is a fill price."""
@@ -630,8 +710,27 @@ class WalletIntelligenceEngine:
             "data_status": "OK" if event.get("price") else "DATA_BLOCKED_PRICE",
         }
         (self._recent_buys if side == "buy" else self._recent_sells).append(record)
+        wallet = record["wallet"]
+        if wallet:
+            # The stream carried this wallet, so the poll does not have to.
+            self._stream_seen_at[wallet] = time.time()
+            self._note_observation_lag("stream", record["timestamp"])
         if side == "buy":
-            self._queue_wallet_history(record["wallet"], token)
+            self._queue_wallet_history(wallet, token)
+
+    def _note_observation_lag(self, path: str, observed_event_time: Any) -> None:
+        """Seconds between a trade happening and us seeing it, by path.
+
+        Recorded rather than assumed, because the whole argument for moving
+        wallet monitoring onto the stream rests on this number, and an
+        argument that cannot be checked is a preference.
+        """
+        try:
+            lag = time.time() - float(observed_event_time)
+        except (TypeError, ValueError):
+            return
+        if 0 <= lag < 3600:
+            self._observation_lag[path].append(lag)
 
     def _determine_side(self, wallet: str, tx: Dict) -> str:
         try:

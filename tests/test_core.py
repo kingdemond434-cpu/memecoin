@@ -10,6 +10,7 @@ import os
 import struct
 import tempfile
 import time
+from collections import deque
 import unittest
 from dataclasses import asdict
 from pathlib import Path
@@ -8835,3 +8836,134 @@ class TestEscapeUsesEveryMechanism(unittest.IsolatedAsyncioTestCase):
                 trigger=SimpleNamespace(value="creator_transfer"),
                 strength=0.5, confidence=0.9)]))
         self.assertEqual(position["exit_latency"]["status"], "DATA_BLOCKED")
+
+
+class TestWalletObservationPath(unittest.IsolatedAsyncioTestCase):
+    """Elite wallets were watched by walking a hundred HTTP calls every 2s.
+
+    Sequentially. Even at fifty milliseconds a request that is five seconds of
+    work inside a two-second loop, so the hundredth wallet was never on a
+    two-second delay -- it was on whatever the queue happened to be, and
+    nothing measured which. Meanwhile the geyser stream was already carrying
+    every trade on the programs we subscribe to, in tens of milliseconds, and
+    the poll was duplicating it.
+    """
+
+    def _engine(self):
+        engine = WalletIntelligenceEngine.__new__(WalletIntelligenceEngine)
+        engine._live_watch_wallets = set()
+        engine._stream_seen_at = {}
+        engine._observation_lag = {"stream": deque(maxlen=512), "poll": deque(maxlen=512)}
+        engine._recent_buys = deque(maxlen=100)
+        engine._recent_sells = deque(maxlen=100)
+        engine._queued_history_wallets = set()
+        engine._history_candidates = deque(maxlen=100)
+        engine._history_evaluated_at = {}
+        engine.stream_coverage_seconds = 120.0
+        engine.max_reconcile_per_pass = 25
+        engine.reconcile_concurrency = 8
+        engine.data_status = {}
+        return engine
+
+    def test_a_stream_covered_wallet_is_not_polled(self):
+        engine = self._engine()
+        engine._live_watch_wallets = {"a", "b"}
+        engine._stream_seen_at["a"] = time.time()
+        self.assertEqual(engine.stale_watch_wallets(), ["b"])
+
+    def test_the_budget_goes_to_the_wallets_we_know_least_about(self):
+        engine = self._engine()
+        now = time.time()
+        engine._live_watch_wallets = {"fresh", "stale", "ancient"}
+        engine._stream_seen_at = {"fresh": now - 200, "stale": now - 600,
+                                  "ancient": now - 5_000}
+        self.assertEqual(engine.stale_watch_wallets(now),
+                         ["ancient", "stale", "fresh"])
+
+    def test_a_wallet_never_seen_on_the_stream_sorts_first(self):
+        engine = self._engine()
+        now = time.time()
+        engine._live_watch_wallets = {"seen", "never"}
+        engine._stream_seen_at = {"seen": now - 300}
+        self.assertEqual(engine.stale_watch_wallets(now)[0], "never")
+
+    def test_a_stream_trade_marks_the_wallet_covered(self):
+        engine = self._engine()
+        engine._live_watch_wallets = {"w"}
+        self.assertEqual(engine.stale_watch_wallets(), ["w"])
+        WalletIntelligenceEngine.record_live_trade(engine, "mint", {
+            "wallet": "w", "side": "buy", "amount": 1.0, "price": 0.001,
+            "timestamp": time.time()})
+        self.assertEqual(engine.stale_watch_wallets(), [])
+
+    def test_observation_lag_is_measured_per_path_not_assumed(self):
+        engine = self._engine()
+        WalletIntelligenceEngine.record_live_trade(engine, "mint", {
+            "wallet": "w", "side": "buy", "amount": 1.0, "price": 0.001,
+            "timestamp": time.time() - 0.05})
+        report = engine.coverage_report()
+        self.assertEqual(report["observation_lag"]["stream"]["observations"], 1)
+        self.assertLess(report["observation_lag"]["stream"]["median_s"], 1.0)
+        # The poll path has said nothing, and reports nothing rather than zero.
+        self.assertIsNone(report["observation_lag"]["poll"]["median_s"])
+
+    def test_a_nonsense_timestamp_does_not_enter_the_latency_record(self):
+        engine = self._engine()
+        for stamp in (None, "soon", time.time() + 500, 0):
+            engine._note_observation_lag("stream", stamp)
+        self.assertEqual(len(engine._observation_lag["stream"]), 0)
+
+    def test_the_coverage_split_is_reported_rather_than_assumed(self):
+        engine = self._engine()
+        now = time.time()
+        engine._live_watch_wallets = {"a", "b", "c"}
+        engine._stream_seen_at = {"a": now, "b": now - 10}
+        report = engine.coverage_report(now)
+        json.dumps(report)
+        self.assertEqual(report["watched"], 3)
+        self.assertEqual(report["stream_covered"], 2)
+        self.assertEqual(report["awaiting_reconciliation"], 1)
+
+    async def test_reconciliation_is_concurrent_and_bounded(self):
+        engine = self._engine()
+        engine.helius_key = "k"
+        engine.max_reconcile_per_pass = 4
+        engine._live_watch_wallets = {f"w{index}" for index in range(20)}
+        engine._helius_base = "http://local"
+        calls = []
+        active = {"now": 0, "peak": 0}
+
+        class _Response:
+            status = 500
+
+            async def __aenter__(self_inner):
+                active["now"] += 1
+                active["peak"] = max(active["peak"], active["now"])
+                await asyncio.sleep(0.01)
+                return self_inner
+
+            async def __aexit__(self_inner, *args):
+                active["now"] -= 1
+                return False
+
+        engine._session = SimpleNamespace(
+            get=lambda url, params=None: (calls.append(url), _Response())[1])
+
+        await WalletIntelligenceEngine._watch_live_wallets(engine)
+
+        # Bounded per pass, so one pass cannot outlast its own interval.
+        self.assertEqual(len(calls), 4)
+        self.assertGreater(active["peak"], 1)
+        self.assertIn("reconciled 4 of 20", engine.data_status["live_wallet_watch"])
+
+    async def test_full_stream_coverage_skips_the_poll_entirely(self):
+        engine = self._engine()
+        engine.helius_key = "k"
+        engine._live_watch_wallets = {"a", "b"}
+        now = time.time()
+        engine._stream_seen_at = {"a": now, "b": now}
+        engine._session = SimpleNamespace(
+            get=lambda *args, **kwargs: self.fail("polled a stream-covered wallet"))
+        await WalletIntelligenceEngine._watch_live_wallets(engine)
+        self.assertIn("stream covers every watched wallet",
+                      engine.data_status["live_wallet_watch"])
