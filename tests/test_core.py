@@ -2,6 +2,7 @@ import asyncio
 import base64
 import gzip
 import json
+import math
 import struct
 import tempfile
 import unittest
@@ -643,6 +644,115 @@ class TestPartialExitAccounting(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("realized_pnl_usd", desk.dataset_builder.attempts[0][1])
 
 
+class TestDailyLossBudget(unittest.TestCase):
+    def _engine(self, **kwargs):
+        predictor = MultiHeadPredictor()
+        predictor._is_trained = True
+        engine = ElogwEngine(predictor, **kwargs)
+        engine.portfolio_value = 10_000.0
+        engine._roll_day_if_needed()
+        return engine
+
+    def test_percentage_limit_scales_with_day_start_equity(self):
+        engine = self._engine(max_daily_loss_pct=0.10)
+        self.assertAlmostEqual(engine.daily_loss_limit(), 1_000.0)
+        # A larger book gets a proportionally larger budget, unlike a fixed
+        # dollar limit that would be 1% of a $100k book.
+        big = self._engine(max_daily_loss_pct=0.10)
+        big.portfolio_value = 100_000.0
+        big._day_start_equity = 100_000.0
+        self.assertAlmostEqual(big.daily_loss_limit(), 10_000.0)
+
+    def test_percentage_limit_does_not_tighten_as_equity_falls(self):
+        engine = self._engine(max_daily_loss_pct=0.10)
+        engine.portfolio_value = 6_000.0  # mid-day drawdown
+        # Anchored to day-start equity, so the budget stays $1,000 rather than
+        # shrinking to $600 and halting the book early.
+        self.assertAlmostEqual(engine.daily_loss_limit(), 1_000.0)
+
+    def test_absolute_limit_still_applies_when_no_percentage_configured(self):
+        engine = self._engine(max_daily_loss_usd=250.0)
+        self.assertAlmostEqual(engine.daily_loss_limit(), 250.0)
+
+    def test_kill_switch_trips_on_the_percentage_budget(self):
+        engine = self._engine(max_daily_loss_pct=0.10)
+        engine.update_pnl(-999.0)
+        self.assertFalse(engine.kill_switch_active)
+        engine.update_pnl(-2.0)
+        self.assertTrue(engine.kill_switch_active)
+
+    def test_budget_and_kill_switch_reset_at_the_utc_day_boundary(self):
+        engine = self._engine(max_daily_loss_pct=0.10)
+        engine.update_pnl(-1_500.0)
+        self.assertTrue(engine.kill_switch_active)
+        # Roll the clock forward one UTC day.
+        engine._pnl_day -= 1
+        engine._roll_day_if_needed()
+        self.assertFalse(engine.kill_switch_active)
+        self.assertEqual(engine.daily_pnl, 0.0)
+
+    def test_profit_offsets_loss_within_the_same_day_but_not_across_days(self):
+        engine = self._engine(max_daily_loss_pct=0.10)
+        engine.update_pnl(+5_000.0)
+        engine.update_pnl(-5_500.0)
+        # Net -500 against a 1,000 budget: still trading.
+        self.assertFalse(engine.kill_switch_active)
+        # Yesterday's profit must not finance today's loss.
+        engine._pnl_day -= 1
+        engine._roll_day_if_needed()
+        self.assertEqual(engine.daily_pnl, 0.0)
+        engine.update_pnl(-1_100.0)
+        self.assertTrue(engine.kill_switch_active)
+
+
+class TestDailyGivebackGuard(unittest.TestCase):
+    def _engine(self, **kwargs):
+        predictor = MultiHeadPredictor()
+        predictor._is_trained = True
+        engine = ElogwEngine(predictor, max_daily_loss_pct=0.10, **kwargs)
+        engine.portfolio_value = 10_000.0
+        engine._roll_day_if_needed()
+        return engine
+
+    def test_gains_are_uncapped_on_the_way_up(self):
+        engine = self._engine(daily_giveback_pct=0.35)
+        for _ in range(20):
+            engine.update_pnl(+500.0)
+        self.assertFalse(engine.kill_switch_active)
+        self.assertAlmostEqual(engine.daily_pnl, 10_000.0)
+
+    def test_guard_halts_after_handing_back_the_configured_share_of_the_peak(self):
+        engine = self._engine(daily_giveback_pct=0.35)
+        engine.update_pnl(+2_000.0)
+        self.assertAlmostEqual(engine.giveback_floor(), 1_300.0)
+        engine.update_pnl(-600.0)   # down to 1,400: still above the floor
+        self.assertFalse(engine.kill_switch_active)
+        engine.update_pnl(-150.0)   # down to 1,250: through the floor
+        self.assertTrue(engine.kill_switch_active)
+
+    def test_floor_ratchets_up_with_a_new_peak(self):
+        engine = self._engine(daily_giveback_pct=0.35)
+        engine.update_pnl(+2_000.0)
+        self.assertAlmostEqual(engine.giveback_floor(), 1_300.0)
+        engine.update_pnl(+2_000.0)
+        # New 4,000 peak lifts the floor rather than leaving it at the old one.
+        self.assertAlmostEqual(engine.giveback_floor(), 2_600.0)
+
+    def test_guard_stays_unarmed_on_trivial_gains(self):
+        engine = self._engine(daily_giveback_pct=0.35)
+        engine.update_pnl(+100.0)  # far below 50% of the 1,000 budget
+        self.assertIsNone(engine.giveback_floor())
+        engine.update_pnl(-90.0)
+        self.assertFalse(engine.kill_switch_active)
+
+    def test_guard_is_off_when_not_configured(self):
+        engine = self._engine()
+        engine.update_pnl(+5_000.0)
+        engine.update_pnl(-4_900.0)
+        self.assertIsNone(engine.giveback_floor())
+        self.assertFalse(engine.kill_switch_active)
+
+
 class TestExitPolicy(unittest.TestCase):
     def test_default_policy_reproduces_the_previous_hardcoded_thresholds(self):
         policy = ExitPolicy.default()
@@ -707,6 +817,21 @@ class TestExitPolicyTrainer(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(report["status"], "DATA_BLOCKED")
             persisted = json.loads((root / "models" / "last_exit_policy_report.json").read_text())
             self.assertEqual(persisted["status"], "DATA_BLOCKED")
+
+    def test_high_water_ignores_marks_the_router_could_not_fill(self):
+        policy = ExitPolicy.default()
+        # A 10x spike that was never quotable, then a fallback to 3x that was.
+        # Live, _mark_position returns None on an unquotable position and the
+        # high-water mark never moves, so the trailing stop must not treat the
+        # unsellable spike as a realized peak and dump the position at 3x.
+        unsellable_spike = [(0.0, 1.0, True), (10.0, 10.0, False), (20.0, 3.0, True), (30.0, 3.1, True)]
+        self.assertIsNone(
+            evaluate_exit(policy, 3.0, 1.0, 0.0, {"cost_recovery"}, 20.0),
+            "sanity: 3x against a 1x high water should not trail-stop",
+        )
+        # The simulator must reach the end still holding, i.e. score close to
+        # the final mark rather than an exit forced by a phantom peak.
+        self.assertGreater(simulate(policy, unsellable_spike), math.log(2.0))
 
     def test_simulation_only_credits_route_feasible_exits(self):
         policy = ExitPolicy.default()

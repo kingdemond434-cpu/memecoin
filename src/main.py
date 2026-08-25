@@ -281,6 +281,11 @@ class MemecoinQuantDesk:
             max_total_exposure_pct=float(self.global_config.get("max_total_exposure_pct", 0.30)),
             max_concurrent_positions=int(self.global_config.get("max_concurrent_positions", 10)),
             max_daily_loss_usd=float(self.global_config.get("max_daily_loss_usd", 1_000)),
+            max_daily_loss_pct=(float(self.global_config["max_daily_loss_pct"])
+                                if self.global_config.get("max_daily_loss_pct") is not None else None),
+            daily_giveback_pct=(float(self.global_config["daily_giveback_pct"])
+                                if self.global_config.get("daily_giveback_pct") is not None else None),
+            daily_giveback_arm_pct=float(self.global_config.get("daily_giveback_arm_pct", 0.5)),
             max_liquidity_fraction=float(self.global_config.get("max_liquidity_fraction", 0.01)),
         )
         self.champion_challenger = ChampionChallengerFramework(

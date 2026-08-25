@@ -415,6 +415,9 @@ class ElogwEngine:
         max_total_exposure_pct: float = 0.30,
         max_concurrent_positions: int = 10,
         max_daily_loss_usd: float = 1_000.0,
+        max_daily_loss_pct: Optional[float] = None,
+        daily_giveback_pct: Optional[float] = None,
+        daily_giveback_arm_pct: float = 0.5,
         min_edge_bps: float = 50,
         max_liquidity_fraction: float = 0.01,
         uncertainty_penalty: float = 0.15,
@@ -428,6 +431,9 @@ class ElogwEngine:
         self.max_total_exposure_pct = max_total_exposure_pct
         self.max_concurrent_positions = max_concurrent_positions
         self.max_daily_loss = max_daily_loss_usd
+        self.max_daily_loss_pct = max_daily_loss_pct
+        self.daily_giveback_pct = daily_giveback_pct
+        self.daily_giveback_arm_pct = daily_giveback_arm_pct
         self.min_edge_bps = min_edge_bps
         self.max_liquidity_fraction = max_liquidity_fraction
         self.uncertainty_penalty = uncertainty_penalty
@@ -437,6 +443,61 @@ class ElogwEngine:
         self.open_positions: Dict[str, Dict] = {}
         self.daily_pnl = 0.0
         self.kill_switch_active = False
+        self._pnl_day = self._utc_day()
+        self._day_start_equity = 0.0
+        self._daily_peak_pnl = 0.0
+
+    @staticmethod
+    def _utc_day() -> int:
+        return int(time.time() // 86_400)
+
+    def _roll_day_if_needed(self):
+        """Reset the daily budget at the UTC day boundary.
+
+        Without this the counter is not daily at all: it accumulates for the
+        life of the process, so a month of profit silently finances a loss far
+        past the configured limit, and a tripped switch never re-arms.
+        """
+        today = self._utc_day()
+        if today != self._pnl_day:
+            self._pnl_day = today
+            self.daily_pnl = 0.0
+            self.kill_switch_active = False
+            self._daily_peak_pnl = 0.0
+            self._day_start_equity = max(0.0, self.portfolio_value)
+        elif self._day_start_equity <= 0:
+            self._day_start_equity = max(0.0, self.portfolio_value)
+
+    def daily_loss_limit(self) -> float:
+        """The day's loss budget in USD.
+
+        A percentage limit is anchored to equity at the START of the day, not
+        current equity: anchoring to a shrinking balance would tighten the
+        budget precisely as losses mount, halting the book early on a normal
+        drawdown instead of at the level actually configured.
+        """
+        if self.max_daily_loss_pct is None:
+            return self.max_daily_loss
+        anchor = self._day_start_equity if self._day_start_equity > 0 else self.portfolio_value
+        return max(0.0, float(self.max_daily_loss_pct) * max(0.0, anchor))
+
+    def giveback_floor(self) -> Optional[float]:
+        """Rising floor under the day's banked gains, or None when unarmed.
+
+        A pure loss limit lets a +30% day round-trip to zero without ever
+        tripping, because net PnL never goes negative. This ratchets a floor
+        under the intraday peak instead: upside stays uncapped, but a fixed
+        share of realized gains cannot be handed back.
+
+        It stays unarmed until the peak is a meaningful fraction of the loss
+        budget, so ordinary noise around break-even cannot halt the book.
+        """
+        if self.daily_giveback_pct is None:
+            return None
+        arm_at = self.daily_loss_limit() * max(0.0, self.daily_giveback_arm_pct)
+        if self._daily_peak_pnl <= 0 or self._daily_peak_pnl < arm_at:
+            return None
+        return self._daily_peak_pnl * (1.0 - float(self.daily_giveback_pct))
 
     @staticmethod
     def probability_bins(prediction: MultiHeadPrediction) -> List[Tuple[str, float, float]]:
@@ -522,9 +583,10 @@ class ElogwEngine:
         portfolio_value: float,
     ) -> Tuple[bool, Dict]:
         self.portfolio_value = max(0.0, portfolio_value)
+        self._roll_day_if_needed()
         if not self.predictor._is_trained:
             return False, {"reason": "DATA_BLOCKED", "detail": "no validated multi-head model bundle"}
-        if self.kill_switch_active or self.daily_pnl <= -self.max_daily_loss:
+        if self.kill_switch_active or self.daily_pnl <= -self.daily_loss_limit():
             self.kill_switch_active = True
             return False, {"reason": "daily_loss_kill_switch", "daily_pnl": self.daily_pnl}
         if self.portfolio_value <= 0 or sol_price_usd <= 0:
@@ -592,10 +654,21 @@ class ElogwEngine:
         self.open_positions.pop(token, None)
 
     def update_pnl(self, pnl: float):
+        self._roll_day_if_needed()
         self.daily_pnl += float(pnl)
-        if self.daily_pnl <= -self.max_daily_loss:
+        self._daily_peak_pnl = max(self._daily_peak_pnl, self.daily_pnl)
+        if self.daily_pnl <= -self.daily_loss_limit():
             self.kill_switch_active = True
-            logger.critical("Daily loss kill switch activated: %.2f", self.daily_pnl)
+            logger.critical("Daily loss kill switch activated: %.2f (limit %.2f)",
+                            self.daily_pnl, self.daily_loss_limit())
+            return
+        floor = self.giveback_floor()
+        if floor is not None and self.daily_pnl <= floor:
+            self.kill_switch_active = True
+            logger.critical(
+                "Daily giveback guard activated: pnl %.2f fell to the %.2f floor under a %.2f peak",
+                self.daily_pnl, floor, self._daily_peak_pnl,
+            )
 
     def get_portfolio_state(self) -> Dict:
         exposure = sum(float(pos.get("remaining_cost_usd", 0)) for pos in self.open_positions.values())
@@ -605,7 +678,11 @@ class ElogwEngine:
             "open_positions": len(self.open_positions),
             "exposure_usd": exposure,
             "portfolio_risk": sum(float(pos.get("risk_contribution", 0)) for pos in self.open_positions.values()),
-            "max_daily_loss": self.max_daily_loss,
+            "max_daily_loss": self.daily_loss_limit(),
+            "max_daily_loss_pct": self.max_daily_loss_pct,
+            "day_start_equity": self._day_start_equity,
             "kill_switch_active": self.kill_switch_active,
-            "risk_budget_remaining": max(0.0, self.max_daily_loss + self.daily_pnl),
+            "risk_budget_remaining": max(0.0, self.daily_loss_limit() + self.daily_pnl),
+            "daily_peak_pnl": self._daily_peak_pnl,
+            "daily_giveback_floor": self.giveback_floor(),
         }

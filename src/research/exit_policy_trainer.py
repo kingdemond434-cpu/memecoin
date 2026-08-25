@@ -78,15 +78,22 @@ def simulate(policy: ExitPolicy, marks: Sequence[Tuple[float, float, bool]]) -> 
     """
     remaining = 1.0
     proceeds = 0.0
-    high_water = marks[0][1]
     stages: set = set()
     continuation = 0.0  # no trained predictor in replay; matches the live fallback
-    last_feasible = next((multiple for _, multiple, feasible in marks if feasible), marks[0][1])
+    first_feasible = next((multiple for _, multiple, feasible in marks if feasible), marks[0][1])
+    high_water = first_feasible
+    last_feasible = first_feasible
 
     for elapsed, multiple, feasible in marks:
+        # Live, _mark_position returns None when the router cannot quote, so
+        # the cycle is skipped entirely and the high-water mark never moves.
+        # Counting an unquotable spike here would raise the trailing floor to
+        # a peak that was never sellable and manufacture exits that could not
+        # have happened.
+        if not feasible:
+            continue
         high_water = max(high_water, multiple)
-        if feasible:
-            last_feasible = multiple
+        last_feasible = multiple
         if remaining <= 0:
             break
         decision = evaluate_exit(policy, multiple, high_water, continuation, stages, elapsed)

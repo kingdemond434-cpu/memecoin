@@ -142,7 +142,18 @@ global:
   enabled_chains: ["solana"]
   max_concurrent_positions: 10
   max_position_size_usd: 500
+  # Percentage of equity at the START of the UTC day, so the budget scales
+  # with the book instead of a fixed figure that is 10% at $10k and 1% at
+  # $100k. Anchored to day-start equity so a drawdown cannot tighten the
+  # limit against itself mid-day.
+  max_daily_loss_pct: 0.10
   max_daily_loss_usd: 1000
+  # Profit ratchet for the book as a whole: upside stays uncapped, but once
+  # the day's gains are meaningful, at most this share of the intraday peak
+  # can be given back. A pure loss limit never fires on a +30% day that
+  # round-trips to flat, because net PnL never goes negative.
+  daily_giveback_pct: 0.35
+  daily_giveback_arm_pct: 0.5
   min_profit_target_pct: 50
   max_hold_time_minutes: 60
   stop_loss_pct: 30
