@@ -8,17 +8,24 @@
 //! captures nearly all of the win while leaving the live-capital lock exactly
 //! where it is.
 //!
-//! The account order below is transcribed from Pump's published
-//! docs/instructions/BUY.md and SELL.md. It is deliberately expressed as a
-//! fixed-length array rather than a builder: an account list that can be
-//! assembled in the wrong order by a caller is a transaction that fails, or
+//! The account order and every flag below match idl/pump.json, which is what
+//! the program was compiled against. They were originally transcribed from the
+//! prose tables in docs/instructions/BUY.md and SELL.md, and on three flags
+//! those tables disagree with the program: `fee_recipient` and
+//! `buyback_fee_recipient` are writable and the tables say they are not, and
+//! `global_volume_accumulator` is NOT writable and the tables say it is. A
+//! transaction that declares the wrong mutability fails without pointing at
+//! why. The Python side generates its lists from the IDL directly (see
+//! src/chains/idl.py); this side is checked against it by the parity test.
+//!
+//! Expressed as a fixed-length array rather than a builder: an account list a
+//! caller can assemble in the wrong order is a transaction that fails, or
 //! worse, succeeds against the wrong account.
 //!
-//! Note the two lists differ in more than length. `buy_v2` takes 27 accounts
+//! The two lists differ in more than length. `buy_v2` takes 27 accounts
 //! including `global_volume_accumulator`; `sell_v2` takes 26 and omits it.
-//! `user` is writable and signer on a buy, and signer but NOT writable on a
-//! sell. Copying one list to the other is the obvious mistake and it is one
-//! the type system here prevents.
+//! `user` is writable AND signer on both. Copying one list to the other is the
+//! obvious mistake and it is one the type system here prevents.
 
 use sha2::{Digest, Sha256};
 
@@ -154,9 +161,9 @@ pub fn build_buy_v2(accounts: &BuyAccounts, amount: u64, max_sol_cost: u64) -> I
         AccountMeta::ro(accounts.base_token_program),
         AccountMeta::ro(accounts.quote_token_program),
         AccountMeta::ro(accounts.associated_token_program),
-        AccountMeta::ro(accounts.fee_recipient),
+        AccountMeta::rw(accounts.fee_recipient),
         AccountMeta::rw(accounts.associated_quote_fee_recipient),
-        AccountMeta::ro(accounts.buyback_fee_recipient),
+        AccountMeta::rw(accounts.buyback_fee_recipient),
         AccountMeta::rw(accounts.associated_quote_buyback_fee_recipient),
         AccountMeta::rw(accounts.bonding_curve),
         AccountMeta::rw(accounts.associated_base_bonding_curve),
@@ -167,7 +174,7 @@ pub fn build_buy_v2(accounts: &BuyAccounts, amount: u64, max_sol_cost: u64) -> I
         AccountMeta::rw(accounts.creator_vault),
         AccountMeta::rw(accounts.associated_creator_vault),
         AccountMeta::ro(accounts.sharing_config),
-        AccountMeta::rw(accounts.global_volume_accumulator),
+        AccountMeta::ro(accounts.global_volume_accumulator),
         AccountMeta::rw(accounts.user_volume_accumulator),
         AccountMeta::rw(accounts.associated_user_volume_accumulator),
         AccountMeta::ro(accounts.fee_config),
@@ -193,15 +200,17 @@ pub fn build_sell_v2(accounts: &SellAccounts, amount: u64, min_sol_output: u64) 
         AccountMeta::ro(accounts.base_token_program),
         AccountMeta::ro(accounts.quote_token_program),
         AccountMeta::ro(accounts.associated_token_program),
-        AccountMeta::ro(accounts.fee_recipient),
+        AccountMeta::rw(accounts.fee_recipient),
         AccountMeta::rw(accounts.associated_quote_fee_recipient),
-        AccountMeta::ro(accounts.buyback_fee_recipient),
+        AccountMeta::rw(accounts.buyback_fee_recipient),
         AccountMeta::rw(accounts.associated_quote_buyback_fee_recipient),
         AccountMeta::rw(accounts.bonding_curve),
         AccountMeta::rw(accounts.associated_base_bonding_curve),
         AccountMeta::rw(accounts.associated_quote_bonding_curve),
-        // Signer but NOT writable on a sell, unlike a buy.
-        AccountMeta::signer(accounts.user, false),
+        // Writable and signer on BOTH instructions. The prose table said
+        // signer-only here; the IDL says otherwise and the IDL is what the
+        // program was compiled against.
+        AccountMeta::signer(accounts.user, true),
         AccountMeta::rw(accounts.associated_base_user),
         AccountMeta::rw(accounts.associated_quote_user),
         AccountMeta::rw(accounts.creator_vault),
@@ -281,13 +290,25 @@ mod tests {
     }
 
     #[test]
-    fn user_is_writable_on_a_buy_and_read_only_on_a_sell() {
-        // The lists differ in more than length; copying one to the other is
-        // the obvious mistake.
+    fn user_is_the_only_signer_and_is_writable_on_both() {
+        // The prose table said signer-only on a sell. The IDL says writable on
+        // both, and the IDL is what the program was compiled against.
         let buy = build_buy_v2(&buy_accounts(), 1, 1);
         let sell = build_sell_v2(&sell_accounts(), 1, 1);
-        assert!(buy.accounts[13].is_signer && buy.accounts[13].is_writable);
-        assert!(sell.accounts[13].is_signer && !sell.accounts[13].is_writable);
+        for (ix, signers) in [
+            (&buy, &crate::generated_flags::BUY_V2_SIGNERS[..]),
+            (&sell, &crate::generated_flags::SELL_V2_SIGNERS[..]),
+        ] {
+            let found: Vec<usize> = ix
+                .accounts
+                .iter()
+                .enumerate()
+                .filter(|(_, meta)| meta.is_signer)
+                .map(|(index, _)| index + 1)
+                .collect();
+            assert_eq!(found, signers.to_vec());
+            assert!(ix.accounts[signers[0] - 1].is_writable);
+        }
     }
 
     #[test]
@@ -300,7 +321,10 @@ mod tests {
             .filter(|(_, meta)| meta.is_writable)
             .map(|(index, _)| index + 1)
             .collect();
-        assert_eq!(writable, vec![8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22]);
+        // Generated from idl/pump.json, so a hand edit here cannot drift from
+        // what the program actually expects.
+        assert_eq!(writable, crate::generated_flags::BUY_V2_WRITABLE.to_vec());
+        assert_eq!(ix.accounts.len(), crate::generated_flags::BUY_V2_ACCOUNT_COUNT);
     }
 
     #[test]
@@ -313,7 +337,8 @@ mod tests {
             .filter(|(_, meta)| meta.is_writable)
             .map(|(index, _)| index + 1)
             .collect();
-        assert_eq!(writable, vec![8, 10, 11, 12, 13, 15, 16, 17, 18, 20, 21]);
+        assert_eq!(writable, crate::generated_flags::SELL_V2_WRITABLE.to_vec());
+        assert_eq!(ix.accounts.len(), crate::generated_flags::SELL_V2_ACCOUNT_COUNT);
     }
 
     #[test]

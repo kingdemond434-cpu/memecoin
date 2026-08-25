@@ -39,6 +39,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from src.chains.pump_fee_config import calculate_fee_tier
+
 logger = logging.getLogger(__name__)
 
 FEE_SCHEDULE_VERSION = "pump-fees-v2"
@@ -117,6 +119,12 @@ class PumpFeeSchedule:
     activation_utc: float = DYNAMIC_FEE_ACTIVATION_UTC
     version: str = FEE_SCHEDULE_VERSION
     source: str = "builtin-legacy-only"
+    # Tiers decoded from the on-chain FeeConfig account. Preferred over any
+    # transcription, because it IS the source of truth -- the docs say a
+    # correct implementation reads it and is therefore unaffected by future
+    # tier changes. A transcription is a photograph of it going stale.
+    chain_tiers: Tuple[Any, ...] = ()
+    chain_source: str = ""
 
     @classmethod
     def load(cls, path: Optional[str] = None) -> "PumpFeeSchedule":
@@ -161,6 +169,23 @@ class PumpFeeSchedule:
                 tiers[str(venue)] = parsed
         return cls(dynamic_tiers=tiers, source=location or "builtin-legacy-only")
 
+    def adopt_chain_config(self, config: Any, source: str = "on-chain") -> bool:
+        """Take the tiers from a decoded FeeConfig account.
+
+        This is what lifts the post-activation block. The tier table is
+        published only as an image, and transcribing numbers out of a picture
+        is fabrication; the account those numbers describe is readable by
+        anybody, and reading it stays correct when Pump changes the tiers.
+        """
+        if config is None or not getattr(config, "ok", False):
+            return False
+        tiers = tuple(getattr(config, "fee_tiers", ()) or ())
+        if not tiers:
+            return False
+        self.chain_tiers = tiers
+        self.chain_source = source
+        return True
+
     def is_dynamic(self, at_utc: float) -> bool:
         return float(at_utc) >= self.activation_utc
 
@@ -185,12 +210,32 @@ class PumpFeeSchedule:
                 schedule_version=f"{self.version}:legacy_flat_{LEGACY_TOTAL_FEE_BPS}bps",
             )
 
+        if self.chain_tiers:
+            if market_cap_lamports is None or market_cap_lamports < 0:
+                return _blocked("market cap not observed; dynamic fee depends on it",
+                                self.version)
+            selected = calculate_fee_tier(self.chain_tiers, int(market_cap_lamports))
+            if selected is None:  # pragma: no cover - guarded by adopt_chain_config
+                return _blocked("on-chain fee config carries no tiers", self.version)
+            return FeeQuote(
+                status="OK",
+                # All three legs. Summing only protocol and creator -- the two
+                # the bonding-curve docs discuss -- understates every pool
+                # trade by the LP fee, and understating cost is the direction
+                # that makes bad trades look acceptable.
+                total_bps=selected.total_bps,
+                protocol_fee_bps=selected.protocol_fee_bps,
+                creator_fee_bps=selected.creator_fee_bps,
+                lp_fee_bps=selected.lp_fee_bps,
+                schedule_version=f"{self.version}:chain:{self.chain_source}",
+            )
+
         tiers = self.dynamic_tiers.get(venue)
         if not tiers:
             return _blocked(
-                f"dynamic schedule active for {venue} but no tier table loaded; "
-                "pump publishes the tiers as an image (docs/fees.png), set "
-                "PUMP_FEE_TIERS_PATH to a transcription",
+                f"dynamic schedule active for {venue} but no tiers available; "
+                "read the on-chain FeeConfig account (the source of truth) and "
+                "pass it to adopt_chain_config, or set PUMP_FEE_TIERS_PATH",
                 self.version,
             )
         if market_cap_lamports is None or market_cap_lamports < 0:

@@ -7,6 +7,7 @@
 pub mod curve;
 pub mod filter;
 pub mod helpers;
+pub mod generated_flags;
 pub mod instruction;
 pub mod pumpswap;
 pub mod telemetry;

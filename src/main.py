@@ -72,7 +72,11 @@ from src.strategies.information_graph import (
 from src.strategies.age_banded import AgeBandedPredictor
 from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPredictor, PredictionFeatures
 from src.chains.pump_curve import BondingCurveState, quote_buy, quote_sell
-from src.chains.pump_route import NativePumpRoute, PumpRouteConfig
+from src.chains.idl import report as idl_report
+from src.chains.pump_route import (
+    TOKEN_2022_PROGRAM, TOKEN_PROGRAM, NativePumpRoute, PumpRouteConfig,
+)
+from src.chains.pumpswap_route import PumpSwapRoute, PumpSwapRouteConfig
 from src.execution.pump_fees import (
     DEFAULT_SCHEDULE as PUMP_FEE_SCHEDULE, VENUE_BONDING_CURVE,
 )
@@ -557,17 +561,23 @@ class MemecoinQuantDesk:
         self.jupiter = JupiterClient()
         self.jito = JitoClient()
         builder = SolanaTransactionBuilder(self.solana_rpc, self.keypair)
-        # The native route needs three addresses the published docs do not
-        # give: the Pump Fees program, and the two fee recipients that live in
-        # the on-chain Global config. Supplied by the operator or left empty,
-        # in which case the route reports DATA_BLOCKED and the desk keeps
-        # using Jupiter -- which is the correct degradation, because a guessed
-        # program id builds a transaction that fails at best.
+        # Nothing here is an operator secret any more: the program addresses
+        # come from the vendored IDLs and the fee recipients from Pump's own
+        # published list. What remains configurable is the pair of token
+        # programs, because whether a mint is Token-2022 depends on how it was
+        # created and getting that wrong changes every associated token
+        # address in the instruction.
         self.pump_route = NativePumpRoute(PumpRouteConfig(
-            fee_program=str(self.global_config.get("pump_fee_program", "") or ""),
-            fee_recipient=str(self.global_config.get("pump_fee_recipient", "") or ""),
-            buyback_fee_recipient=str(
-                self.global_config.get("pump_buyback_fee_recipient", "") or ""),
+            base_token_program=str(self.global_config.get(
+                "pump_base_token_program", TOKEN_2022_PROGRAM)),
+            quote_token_program=str(self.global_config.get(
+                "pump_quote_token_program", TOKEN_PROGRAM)),
+        ))
+        self.pumpswap_route = PumpSwapRoute(PumpSwapRouteConfig(
+            base_token_program=str(self.global_config.get(
+                "pump_base_token_program", TOKEN_2022_PROGRAM)),
+            quote_token_program=str(self.global_config.get(
+                "pump_quote_token_program", TOKEN_PROGRAM)),
         ))
         self.execution_engine = ExecutionEngine(self.solana_config, self.solana_rpc, self.jupiter, self.jito,
                                                 builder, self.counterfactual_lab, dry_run=self.dry_run,
@@ -2535,6 +2545,8 @@ class MemecoinQuantDesk:
             "native_fastpath": NATIVE_FASTPATH_STATUS,
             "native_route": (self.execution_engine.native_route_report()
                              if self.execution_engine else {"status": "DATA_BLOCKED"}),
+            "pumpswap_route": self.pumpswap_route.report(),
+            "idl": idl_report(),
             "action_policy": {"trained": self.action_policy.is_trained,
                               "min_edge": self.action_policy.min_edge},
             "source_mesh": {**self.source_mesh.health(),

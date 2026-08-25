@@ -8,6 +8,8 @@ import json
 import math
 import os
 import struct
+import subprocess
+import sys
 import tempfile
 import time
 from collections import defaultdict, deque
@@ -21,6 +23,7 @@ import numpy as np
 import yaml
 from solders.hash import Hash
 from solders.keypair import Keypair
+from solders.pubkey import Pubkey
 from solders.message import MessageV0
 from solders.signature import Signature
 from solders.transaction import VersionedTransaction
@@ -118,10 +121,21 @@ from src.research.dataset_builder import (
 from src.research.shadow_trainer import (
     SNAPSHOT_ORDER, chronological_episode_split, train_age_bands, train_shadow,
 )
+from src.chains.idl import (
+    PUMP_AMM_IDL, PUMP_FEES_IDL, PUMP_IDL, IdlError, account_names, build_accounts,
+    discriminator, encode_u64_args, instruction, load_idl, program_id, unresolvable,
+)
+from src.chains.pump_fee_config import (
+    FEE_CONFIG_DISCRIMINATOR, bonding_curve_market_cap, calculate_fee_tier,
+    fee_config_address, parse_fee_config, pool_market_cap,
+)
+from src.chains.pumpswap_route import (
+    POOL_DISCRIMINATOR, PoolState, PumpSwapRoute, derive_pool, parse_pool,
+)
 from src.chains.pump_route import (
-    PUBLISHED_GLOBAL, PUMP_PROGRAM, ROUTE_STATUS, SEED_GLOBAL, TOKEN_2022_PROGRAM,
-    TOKEN_PROGRAM, NativePumpRoute, PumpRouteConfig, associated_token_address,
-    derive, encode_args, instruction_discriminator,
+    PUBLISHED_GLOBAL, PUMP_PROGRAM, ROUTE_STATUS, TOKEN_2022_PROGRAM, TOKEN_PROGRAM,
+    NativePumpRoute, PumpRouteConfig, associated_token_address, derived_global,
+    fee_recipients, select_buyback_recipient, select_fee_recipient,
 )
 from src.chains.pump_curve import (
     BONDING_CURVE_DISCRIMINATOR, observation_from_state, parse_bonding_curve,
@@ -3313,7 +3327,7 @@ class TestPumpFeeSchedule(unittest.TestCase):
                                         market_cap_lamports=50_000_000_000)
         self.assertFalse(quote.ok)
         self.assertEqual(quote.status, "DATA_BLOCKED")
-        self.assertIn("fees.png", quote.reason)
+        self.assertIn("FeeConfig", quote.reason)
         # The failure must be loud at the point of use, not a silent zero.
         with self.assertRaises(ValueError):
             quote.fee_lamports(1_000_000_000)
@@ -9112,89 +9126,149 @@ class TestNativePumpRoute(unittest.TestCase):
     On the one path where latency is the entire product. Both were avoidable:
     the curve state already arrives on the stream, the pricing already runs
     locally with Rust parity, and every account buy_v2 and sell_v2 need is a
-    fixed program, a published PDA, or an associated token account.
+    fixed program, a derivable PDA, or an associated token account.
     """
 
     MINT = "So11111111111111111111111111111111111111112"
     OTHER = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 
     def _route(self):
-        return NativePumpRoute(PumpRouteConfig(
-            fee_program=self.OTHER, fee_recipient=self.MINT,
-            buyback_fee_recipient=self.MINT))
+        return NativePumpRoute()
 
     def test_the_derivation_reproduces_an_address_the_docs_state_outright(self):
-        """The one check that says the seeds were read correctly.
+        """The one check that says the seeds and the program id are both right.
 
         pump-public-docs states the global config is
         4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf and separately that it is
         PDA-derived from ["global"]. Deriving one and getting the other is an
-        independent confirmation of both the seed and the program id.
+        independent confirmation of both readings.
         """
         self.assertEqual(ROUTE_STATUS, "OK")
-        self.assertEqual(derive([SEED_GLOBAL], PUMP_PROGRAM), PUBLISHED_GLOBAL)
+        self.assertEqual(derived_global(), PUBLISHED_GLOBAL)
 
-    def test_discriminators_are_recomputed_not_transcribed(self):
-        for name in ("buy_v2", "sell_v2"):
+    def test_every_program_address_comes_from_its_own_idl(self):
+        self.assertEqual(program_id(PUMP_IDL), PUMP_PROGRAM)
+        self.assertEqual(program_id(PUMP_AMM_IDL),
+                         "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA")
+        self.assertEqual(program_id(PUMP_FEES_IDL),
+                         "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ")
+
+    def test_discriminators_agree_with_anchors_derivation(self):
+        """A mismatch means the IDL is for a different program or the name is wrong."""
+        for idl, name in ((PUMP_IDL, "buy_v2"), (PUMP_IDL, "sell_v2"),
+                          (PUMP_AMM_IDL, "buy"), (PUMP_AMM_IDL, "sell")):
             expected = hashlib.sha256(f"global:{name}".encode()).digest()[:8]
-            self.assertEqual(instruction_discriminator(name), expected)
-        self.assertNotEqual(instruction_discriminator("buy_v2"),
-                            instruction_discriminator("sell_v2"))
+            self.assertEqual(discriminator(idl, name), expected, f"{idl}.{name}")
 
-    def test_buy_and_sell_take_the_documented_number_of_accounts(self):
+    def test_the_idl_contradicts_the_prose_on_three_flags(self):
+        """The reason the account lists are generated rather than transcribed.
+
+        docs/instructions/BUY.md presents fee_recipient and
+        buyback_fee_recipient as non-writable and global_volume_accumulator as
+        writable. The program says the opposite on all three, and a
+        transaction that declares the wrong mutability fails without pointing
+        at why.
+        """
         route = self._route()
-        buy = route.build_buy(self.MINT, self.MINT, self.MINT, 1_000, 5_000)
-        sell = route.build_sell(self.MINT, self.MINT, self.MINT, 1_000, 500)
+        buy = route.build_buy(self.MINT, self.MINT, self.OTHER, 1_000, 5_000)
         self.assertEqual(buy.status, "OK")
-        self.assertEqual(len(buy.accounts), 27)
-        self.assertEqual(sell.status, "OK")
-        self.assertEqual(len(sell.accounts), 26)
+        by_name = dict(zip(account_names(PUMP_IDL, "buy_v2"), buy.accounts))
+        self.assertTrue(by_name["fee_recipient"].is_writable)
+        self.assertTrue(by_name["buyback_fee_recipient"].is_writable)
+        self.assertFalse(by_name["global_volume_accumulator"].is_writable)
 
-    def test_the_two_lists_differ_in_more_than_length(self):
-        """Copying one to the other is the obvious mistake."""
+    def test_sharing_config_is_derived_under_the_fees_program_not_pump(self):
+        route = self._route()
+        buy = route.build_buy(self.MINT, self.MINT, self.OTHER, 1_000, 5_000)
+        by_name = dict(zip(account_names(PUMP_IDL, "buy_v2"), buy.accounts))
+        under_fees, _ = Pubkey.find_program_address(
+            [b"sharing-config", bytes(Pubkey.from_string(self.MINT))],
+            Pubkey.from_string(program_id(PUMP_FEES_IDL)))
+        under_pump, _ = Pubkey.find_program_address(
+            [b"sharing-config", bytes(Pubkey.from_string(self.MINT))],
+            Pubkey.from_string(PUMP_PROGRAM))
+        self.assertEqual(by_name["sharing_config"].pubkey, str(under_fees))
+        self.assertNotEqual(by_name["sharing_config"].pubkey, str(under_pump))
+
+    def test_buy_and_sell_take_the_number_of_accounts_the_idl_declares(self):
         route = self._route()
         buy = route.build_buy(self.MINT, self.MINT, self.OTHER, 1_000, 5_000)
         sell = route.build_sell(self.MINT, self.MINT, self.OTHER, 1_000, 500)
-        # `user` is writable and signer on a buy, signer but NOT writable on a sell.
-        self.assertTrue(buy.accounts[13].is_signer and buy.accounts[13].is_writable)
-        self.assertTrue(sell.accounts[13].is_signer)
-        self.assertFalse(sell.accounts[13].is_writable)
-        # buy_v2 includes global_volume_accumulator; sell_v2 omits it.
-        accumulator = route.global_volume_accumulator
-        self.assertIn(accumulator, [meta.pubkey for meta in buy.accounts])
-        self.assertNotIn(accumulator, [meta.pubkey for meta in sell.accounts])
+        self.assertEqual(buy.status, "OK")
+        self.assertEqual(sell.status, "OK")
+        self.assertEqual(len(buy.accounts), len(account_names(PUMP_IDL, "buy_v2")))
+        self.assertEqual(len(sell.accounts), len(account_names(PUMP_IDL, "sell_v2")))
+        self.assertEqual(len(buy.accounts), 27)
+        self.assertEqual(len(sell.accounts), 26)
+
+    def test_only_the_buy_carries_the_global_volume_accumulator(self):
+        self.assertIn("global_volume_accumulator", account_names(PUMP_IDL, "buy_v2"))
+        self.assertNotIn("global_volume_accumulator", account_names(PUMP_IDL, "sell_v2"))
 
     def test_exactly_one_signer_and_it_is_the_user(self):
         route = self._route()
-        for prepared in (route.build_buy(self.MINT, self.MINT, self.OTHER, 10, 20),
-                         route.build_sell(self.MINT, self.MINT, self.OTHER, 10, 5)):
+        for prepared, name in ((route.build_buy(self.MINT, self.MINT, self.OTHER, 10, 20), "buy_v2"),
+                               (route.build_sell(self.MINT, self.MINT, self.OTHER, 10, 5), "sell_v2")):
             signers = [meta for meta in prepared.accounts if meta.is_signer]
-            self.assertEqual(len(signers), 1)
+            self.assertEqual(len(signers), 1, name)
             self.assertEqual(signers[0].pubkey, self.OTHER)
+            # Writable on BOTH, which the prose tables also got wrong.
+            self.assertTrue(signers[0].is_writable, name)
 
     def test_instruction_data_is_discriminator_then_two_little_endian_u64(self):
         route = self._route()
-        buy = route.build_buy(self.MINT, self.MINT, self.MINT, 1_234, 5_678)
-        self.assertEqual(buy.data[:8], instruction_discriminator("buy_v2"))
+        buy = route.build_buy(self.MINT, self.MINT, self.OTHER, 1_234, 5_678)
+        self.assertEqual(buy.data[:8], discriminator(PUMP_IDL, "buy_v2"))
         self.assertEqual(int.from_bytes(buy.data[8:16], "little"), 1_234)
         self.assertEqual(int.from_bytes(buy.data[16:24], "little"), 5_678)
         self.assertEqual(len(buy.data), 24)
 
-    def test_an_unsupplied_fee_program_blocks_rather_than_guesses(self):
-        """A guessed program id does not fail loudly; it builds a bad transaction."""
-        blocked = NativePumpRoute().build_buy(self.MINT, self.MINT, self.MINT, 1, 1)
-        self.assertEqual(blocked.status, "DATA_BLOCKED")
-        self.assertIn("fee_program", blocked.detail)
-        self.assertIn("not published", blocked.detail)
+    def test_the_wrong_number_of_arguments_is_refused_not_encoded(self):
+        with self.assertRaises(IdlError):
+            encode_u64_args(PUMP_IDL, "buy_v2", (1,))
+        with self.assertRaises(IdlError):
+            encode_u64_args(PUMP_IDL, "buy_v2", (1, 2, 3))
+
+    def test_an_account_that_is_neither_a_pda_nor_supplied_raises(self):
+        """A silently substituted account touches something nobody chose."""
+        with self.assertRaises(IdlError):
+            build_accounts(PUMP_IDL, "buy_v2", {})
+        self.assertIn("user", unresolvable(PUMP_IDL, "buy_v2", {}))
+        self.assertNotIn("bonding_curve", unresolvable(PUMP_IDL, "buy_v2", {}))
 
     def test_an_unbounded_trade_is_refused(self):
         route = self._route()
-        self.assertEqual(route.build_buy(self.MINT, self.MINT, self.MINT, 100, 0).status,
+        self.assertEqual(route.build_buy(self.MINT, self.MINT, self.OTHER, 100, 0).status,
                          "REJECTED")
-        self.assertEqual(route.build_sell(self.MINT, self.MINT, self.MINT, 100, 0).status,
+        self.assertEqual(route.build_sell(self.MINT, self.MINT, self.OTHER, 100, 0).status,
                          "REJECTED")
-        self.assertEqual(route.build_buy(self.MINT, self.MINT, self.MINT, 0, 100).status,
+        self.assertEqual(route.build_buy(self.MINT, self.MINT, self.OTHER, 0, 100).status,
                          "REJECTED")
+
+    def test_a_curve_without_a_creator_blocks_rather_than_deriving_a_wrong_vault(self):
+        blocked = self._route().build_buy(self.MINT, "", self.OTHER, 10, 20)
+        self.assertEqual(blocked.status, "DATA_BLOCKED")
+        self.assertIn("creator", blocked.detail)
+
+    def test_all_twenty_four_published_recipients_are_parsed(self):
+        groups = fee_recipients()
+        self.assertEqual(len(groups["normal"]), 8)
+        self.assertEqual(len(groups["reserved"]), 8)
+        self.assertEqual(len(groups["buyback"]), 8)
+        # The three sets are disjoint; picking from the wrong one is rejected
+        # on chain, so they must never be conflated.
+        self.assertEqual(len(set(groups["normal"]) | set(groups["reserved"])
+                             | set(groups["buyback"])), 24)
+
+    def test_recipient_choice_is_deterministic_in_the_mint(self):
+        """So a failing transaction reproduces, and two trades on one coin agree."""
+        first = select_fee_recipient(self.MINT)
+        self.assertEqual(first, select_fee_recipient(self.MINT))
+        self.assertIn(first, fee_recipients()["normal"])
+        self.assertIn(select_buyback_recipient(self.MINT), fee_recipients()["buyback"])
+        # Mayhem coins draw from the reserved set, never the normal one.
+        self.assertIn(select_fee_recipient(self.MINT, mayhem=True),
+                      fee_recipients()["reserved"])
 
     def test_the_token_program_is_part_of_the_ata_seed(self):
         """A Token-2022 base and an SPL quote give the same owner different ATAs."""
@@ -9202,18 +9276,12 @@ class TestNativePumpRoute(unittest.TestCase):
         quote = associated_token_address(self.MINT, self.MINT, TOKEN_PROGRAM)
         self.assertNotEqual(base, quote)
 
-    def test_arguments_that_cannot_fit_a_u64_are_refused(self):
-        with self.assertRaises(ValueError):
-            encode_args("buy_v2", 2 ** 64, 1)
-        with self.assertRaises(ValueError):
-            encode_args("buy_v2", 1, -1)
-
-    def test_the_report_says_why_it_is_blocked(self):
-        report = NativePumpRoute().report()
+    def test_the_route_is_no_longer_blocked_on_unpublished_addresses(self):
+        report = self._route().report()
         json.dumps(report)
-        self.assertEqual(report["status"], "DATA_BLOCKED")
-        self.assertEqual(report["global"], PUBLISHED_GLOBAL)
-        self.assertEqual(self._route().report()["status"], "OK")
+        self.assertEqual(report["status"], "OK")
+        self.assertEqual(report["buy_accounts"], 27)
+        self.assertEqual(report["sell_accounts"], 26)
 
 
 class TestNativeRouteIsTheCanonicalPath(unittest.TestCase):
@@ -9249,20 +9317,16 @@ class TestNativeRouteIsTheCanonicalPath(unittest.TestCase):
         self.assertIn("creator", prepared.detail)
 
     def test_a_buy_is_built_from_the_streamed_curve_with_no_quote_call(self):
-        route = NativePumpRoute(PumpRouteConfig(
-            fee_program=self.OTHER, fee_recipient=self.MINT,
-            buyback_fee_recipient=self.MINT))
-        engine = self._engine(route=route, curve=self._curve(creator=self.MINT))
+        engine = self._engine(route=NativePumpRoute(),
+                              curve=self._curve(creator=self.MINT))
         prepared = engine.prepare_native_route(self.MINT, self.OTHER, 1_000_000_000, 100)
         self.assertEqual(prepared.status, "OK")
         self.assertEqual(len(prepared.accounts), 27)
-        self.assertEqual(prepared.data[:8], instruction_discriminator("buy_v2"))
+        self.assertEqual(prepared.data[:8], discriminator(PUMP_IDL, "buy_v2"))
 
     def test_a_sell_carries_a_protective_floor_derived_from_the_local_quote(self):
-        route = NativePumpRoute(PumpRouteConfig(
-            fee_program=self.OTHER, fee_recipient=self.MINT,
-            buyback_fee_recipient=self.MINT))
-        engine = self._engine(route=route, curve=self._curve(creator=self.MINT))
+        engine = self._engine(route=NativePumpRoute(),
+                              curve=self._curve(creator=self.MINT))
         prepared = engine.prepare_native_route(self.OTHER, self.MINT, 1_000_000_000, 500)
         self.assertEqual(prepared.status, "OK")
         self.assertEqual(len(prepared.accounts), 26)
@@ -9279,3 +9343,293 @@ class TestNativeRouteIsTheCanonicalPath(unittest.TestCase):
         engine.native_route_attempts["prepared"] = 3
         engine.native_route_attempts["blocked:DATA_BLOCKED"] = 1
         self.assertAlmostEqual(engine.native_route_report()["prepared_share"], 0.75)
+
+
+class TestOnChainFeeConfig(unittest.TestCase):
+    """The fee block was lifted by reading an account, not by squinting at a picture.
+
+    The engine reported DATA_BLOCKED for every trade after 2026-09-01 on the
+    grounds that Pump publishes the tier table only as docs/fees.png. That was
+    the right refusal and the wrong conclusion: the image is a courtesy
+    snapshot of the on-chain FeeConfig account, and the docs say outright that
+    a correct implementation reads the account and is therefore unaffected by
+    future tier changes.
+    """
+
+    @staticmethod
+    def _fees(lp, protocol, creator):
+        return struct.pack("<QQQ", lp, protocol, creator)
+
+    @classmethod
+    def _tier(cls, threshold, lp, protocol, creator):
+        return threshold.to_bytes(16, "little") + cls._fees(lp, protocol, creator)
+
+    @classmethod
+    def _account(cls, tiers=((0, 5, 50, 45), (10 ** 9, 5, 30, 25)), stable=()):
+        data = FEE_CONFIG_DISCRIMINATOR + b"\x01" + bytes(32) + cls._fees(1, 2, 3)
+        data += len(tiers).to_bytes(4, "little")
+        for row in tiers:
+            data += cls._tier(*row)
+        data += len(stable).to_bytes(4, "little")
+        for row in stable:
+            data += cls._tier(*row)
+        return data
+
+    def test_the_account_decodes_to_the_published_layout(self):
+        config = parse_fee_config(self._account())
+        self.assertTrue(config.ok)
+        self.assertEqual(len(config.fee_tiers), 2)
+        self.assertEqual(config.fee_tiers[0].fees.protocol_fee_bps, 50)
+        self.assertEqual(config.fee_tiers[1].market_cap_lamports_threshold, 10 ** 9)
+        json.dumps(config.to_dict())
+
+    def test_the_total_charges_all_three_legs(self):
+        """Summing only protocol and creator understates every pool trade."""
+        config = parse_fee_config(self._account())
+        self.assertEqual(config.fee_tiers[0].fees.total_bps, 5 + 50 + 45)
+
+    def test_a_wrong_discriminator_is_refused_rather_than_decoded(self):
+        """A same-length account decodes into plausible-looking pubkeys."""
+        data = bytearray(self._account())
+        data[:8] = bytes(8)
+        config = parse_fee_config(bytes(data))
+        self.assertEqual(config.status, "DATA_BLOCKED")
+        self.assertIn("not a FeeConfig", config.detail)
+
+    def test_an_implausible_tier_count_does_not_allocate(self):
+        """A vec length read at the wrong offset is a very large number."""
+        data = FEE_CONFIG_DISCRIMINATOR + b"\x01" + bytes(32) + self._fees(0, 0, 0)
+        # Padded past the length guard so the count itself is what is refused,
+        # not the account being short.
+        data += (2 ** 31).to_bytes(4, "little") + bytes(64)
+        config = parse_fee_config(data)
+        self.assertEqual(config.status, "DATA_BLOCKED")
+        self.assertIn("implausible", config.detail)
+
+    def test_a_config_with_no_tiers_is_blocked_not_empty(self):
+        config = parse_fee_config(self._account(tiers=()))
+        self.assertEqual(config.status, "DATA_BLOCKED")
+        self.assertIn("no tiers", config.detail)
+
+    def test_tier_selection_matches_the_published_algorithm(self):
+        """Thresholds are floors on an ascending list, scanned in reverse."""
+        config = parse_fee_config(self._account())
+        tiers = config.fee_tiers
+        # Below the first threshold the first tier applies.
+        self.assertEqual(calculate_fee_tier(tiers, 0).protocol_fee_bps, 50)
+        # At and above a threshold, the highest tier reached applies.
+        self.assertEqual(calculate_fee_tier(tiers, 10 ** 9 - 1).protocol_fee_bps, 50)
+        self.assertEqual(calculate_fee_tier(tiers, 10 ** 9).protocol_fee_bps, 30)
+        self.assertEqual(calculate_fee_tier(tiers, 10 ** 15).protocol_fee_bps, 30)
+
+    def test_a_gap_in_the_table_resolves_to_the_highest_tier_reached(self):
+        """Where a forward scan over ceilings would give a different answer."""
+        config = parse_fee_config(self._account(
+            tiers=((100, 0, 90, 0), (200, 0, 80, 0), (10_000, 0, 10, 0))))
+        tiers = config.fee_tiers
+        self.assertEqual(calculate_fee_tier(tiers, 50).protocol_fee_bps, 90)
+        self.assertEqual(calculate_fee_tier(tiers, 5_000).protocol_fee_bps, 80)
+        self.assertEqual(calculate_fee_tier(tiers, 10_000).protocol_fee_bps, 10)
+
+    def test_the_market_cap_formulas_are_integer_arithmetic(self):
+        """Floating point drifts across exactly the boundaries that matter."""
+        self.assertEqual(bonding_curve_market_cap(10 ** 15, 30 * 10 ** 9, 10 ** 12),
+                         (30 * 10 ** 9 * 10 ** 15) // 10 ** 12)
+        self.assertEqual(pool_market_cap(1_000, 3, 7), (7 * 1_000) // 3)
+        self.assertIsNone(bonding_curve_market_cap(10 ** 15, 30 * 10 ** 9, 0))
+        self.assertIsNone(pool_market_cap(1_000, 0, 7))
+
+    def test_adopting_the_chain_config_lifts_the_post_activation_block(self):
+        schedule = PumpFeeSchedule()
+        blocked = schedule.quote(market_cap_lamports=5 * 10 ** 8,
+                                 at_utc=DYNAMIC_FEE_ACTIVATION_UTC + 1)
+        self.assertEqual(blocked.status, "DATA_BLOCKED")
+
+        self.assertTrue(schedule.adopt_chain_config(parse_fee_config(self._account())))
+        quote = schedule.quote(market_cap_lamports=5 * 10 ** 8,
+                               at_utc=DYNAMIC_FEE_ACTIVATION_UTC + 1)
+        self.assertEqual(quote.status, "OK")
+        self.assertEqual(quote.total_bps, 100)
+        self.assertIn("chain", quote.schedule_version)
+        # And the tier actually moves with the market cap.
+        higher = schedule.quote(market_cap_lamports=2 * 10 ** 9,
+                                at_utc=DYNAMIC_FEE_ACTIVATION_UTC + 1)
+        self.assertEqual(higher.total_bps, 60)
+
+    def test_an_unmeasured_market_cap_still_blocks_after_adoption(self):
+        """The tiers being readable does not make the market cap known."""
+        schedule = PumpFeeSchedule()
+        schedule.adopt_chain_config(parse_fee_config(self._account()))
+        quote = schedule.quote(at_utc=DYNAMIC_FEE_ACTIVATION_UTC + 1)
+        self.assertEqual(quote.status, "DATA_BLOCKED")
+        with self.assertRaises(ValueError):
+            quote.fee_lamports(1_000_000_000)
+
+    def test_a_blocked_config_is_not_adopted(self):
+        schedule = PumpFeeSchedule()
+        self.assertFalse(schedule.adopt_chain_config(parse_fee_config(b"short")))
+        self.assertFalse(schedule.adopt_chain_config(None))
+
+    def test_the_legacy_era_is_untouched_by_adoption(self):
+        schedule = PumpFeeSchedule()
+        schedule.adopt_chain_config(parse_fee_config(self._account()))
+        legacy = schedule.quote(at_utc=DYNAMIC_FEE_ACTIVATION_UTC - 1)
+        self.assertEqual(legacy.status, "OK")
+        self.assertEqual(legacy.total_bps, LEGACY_TOTAL_FEE_BPS)
+
+
+class TestPumpSwapConstruction(unittest.TestCase):
+    """The last DATA_BLOCKED that was never about missing information.
+
+    PumpSwap's account lists are absent from Pump's prose docs and present in
+    idl/pump_amm.json, in the same repository. The block was looking in the
+    wrong file.
+    """
+
+    MINT = "So11111111111111111111111111111111111111112"
+    OTHER = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+
+    def _pool(self, **overrides):
+        base = dict(status="OK", pool=self.OTHER, base_mint=self.MINT,
+                    quote_mint=self.MINT, pool_base_token_account=self.OTHER,
+                    pool_quote_token_account=self.OTHER, creator=self.OTHER,
+                    coin_creator=self.MINT)
+        base.update(overrides)
+        return PoolState(**base)
+
+    def test_the_account_lists_come_from_the_idl(self):
+        self.assertEqual(len(account_names(PUMP_AMM_IDL, "buy")), 23)
+        self.assertEqual(len(account_names(PUMP_AMM_IDL, "sell")), 21)
+        route = PumpSwapRoute()
+        buy = route.build_buy(self._pool(), self.OTHER, 1_000, 5_000)
+        sell = route.build_sell(self._pool(), self.OTHER, 1_000, 500)
+        self.assertEqual(buy.status, "OK")
+        self.assertEqual(sell.status, "OK")
+        self.assertEqual(len(buy.accounts), 23)
+        self.assertEqual(len(sell.accounts), 21)
+
+    def test_only_the_buy_tracks_volume(self):
+        self.assertIn("global_volume_accumulator", account_names(PUMP_AMM_IDL, "buy"))
+        self.assertNotIn("global_volume_accumulator", account_names(PUMP_AMM_IDL, "sell"))
+
+    def test_the_buy_carries_the_option_bool_the_sell_does_not(self):
+        """`track_volume` is an OptionBool, encoded explicitly as absent."""
+        route = PumpSwapRoute()
+        buy = route.build_buy(self._pool(), self.OTHER, 1_000, 5_000)
+        sell = route.build_sell(self._pool(), self.OTHER, 1_000, 500)
+        self.assertEqual(len(buy.data), 8 + 8 + 8 + 1)
+        self.assertEqual(buy.data[-1], 0)
+        self.assertEqual(len(sell.data), 8 + 8 + 8)
+
+    def test_an_account_declared_before_its_own_seed_still_resolves(self):
+        """coin_creator_vault_ata is account 18; its authority is account 19."""
+        route = PumpSwapRoute()
+        buy = route.build_buy(self._pool(), self.OTHER, 1_000, 5_000)
+        names = account_names(PUMP_AMM_IDL, "buy")
+        authority = buy.accounts[names.index("coin_creator_vault_authority")].pubkey
+        ata = buy.accounts[names.index("coin_creator_vault_ata")].pubkey
+        self.assertTrue(authority and ata and authority != ata)
+
+    def test_the_creator_vault_follows_coin_creator_not_creator(self):
+        """The two sit adjacent in the layout with the same type."""
+        route = PumpSwapRoute()
+        names = account_names(PUMP_AMM_IDL, "buy")
+        index = names.index("coin_creator_vault_authority")
+        as_built = route.build_buy(self._pool(), self.OTHER, 10, 20).accounts[index].pubkey
+        swapped = route.build_buy(
+            self._pool(coin_creator=self.OTHER), self.OTHER, 10, 20).accounts[index].pubkey
+        self.assertNotEqual(as_built, swapped)
+
+    def test_a_mayhem_pool_draws_from_the_reserved_recipient_set(self):
+        route = PumpSwapRoute()
+        names = account_names(PUMP_AMM_IDL, "buy")
+        index = names.index("protocol_fee_recipient")
+        normal = route.build_buy(self._pool(), self.OTHER, 10, 20).accounts[index].pubkey
+        mayhem = route.build_buy(
+            self._pool(is_mayhem_mode=True), self.OTHER, 10, 20).accounts[index].pubkey
+        self.assertIn(normal, fee_recipients()["normal"])
+        self.assertIn(mayhem, fee_recipients()["reserved"])
+
+    def test_a_pool_address_is_an_input_never_derived_from_the_mint(self):
+        """A guessed index derives a real address that is not this pool."""
+        blocked = PumpSwapRoute().build_buy(self._pool(pool=""), self.OTHER, 10, 20)
+        self.assertEqual(blocked.status, "DATA_BLOCKED")
+        self.assertIn("never derived", blocked.detail)
+
+    def test_the_pool_index_is_part_of_the_address(self):
+        first = derive_pool(0, self.OTHER, self.MINT, self.MINT)
+        second = derive_pool(1, self.OTHER, self.MINT, self.MINT)
+        self.assertNotEqual(first, second)
+
+    def test_an_undecoded_pool_blocks_construction(self):
+        blocked = PumpSwapRoute().build_buy(
+            PoolState(status="DATA_BLOCKED", detail="nope"), self.OTHER, 10, 20)
+        self.assertEqual(blocked.status, "DATA_BLOCKED")
+
+    def test_an_unbounded_trade_is_refused(self):
+        route = PumpSwapRoute()
+        self.assertEqual(route.build_buy(self._pool(), self.OTHER, 10, 0).status, "REJECTED")
+        self.assertEqual(route.build_sell(self._pool(), self.OTHER, 0, 10).status, "REJECTED")
+
+    def test_the_pool_account_decodes_and_a_wrong_discriminator_does_not(self):
+        from solders.pubkey import Pubkey
+        body = (b"\x01" + (7).to_bytes(2, "little")
+                + bytes(Pubkey.from_string(self.OTHER)) * 6
+                + (123).to_bytes(8, "little")
+                + bytes(Pubkey.from_string(self.MINT))
+                + b"\x01\x00" + (-5).to_bytes(16, "little", signed=True))
+        good = parse_pool(POOL_DISCRIMINATOR + body, address=self.OTHER)
+        self.assertTrue(good.ok)
+        self.assertEqual(good.index, 7)
+        self.assertEqual(good.lp_supply, 123)
+        self.assertEqual(good.coin_creator, self.MINT)
+        self.assertTrue(good.is_mayhem_mode)
+        self.assertFalse(good.is_cashback_coin)
+        self.assertEqual(good.virtual_quote_reserves, -5)
+        self.assertEqual(parse_pool(bytes(8) + body).status, "DATA_BLOCKED")
+
+
+class TestGeneratedFlagsCannotDrift(unittest.TestCase):
+    """The Rust builder carried three wrong flags for as long as it existed.
+
+    Because they were transcribed from prose. Fixing them by hand fixes them
+    once; generating them fixes them permanently, and makes the next upstream
+    change a regeneration rather than a re-reading.
+    """
+
+    def test_the_checked_in_rust_table_matches_the_idl(self):
+        result = subprocess.run(
+            [sys.executable, "tools/gen_account_flags.py", "--check"],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_generated_table_agrees_with_the_python_route(self):
+        """Two builders, one source. They must agree account for account."""
+        generated = (Path(__file__).resolve().parents[1] / "native" / "solana_fastpath"
+                     / "src" / "generated_flags.rs").read_text()
+        for prefix, idl, name in (("BUY_V2", PUMP_IDL, "buy_v2"),
+                                  ("SELL_V2", PUMP_IDL, "sell_v2"),
+                                  ("PUMPSWAP_BUY", PUMP_AMM_IDL, "buy"),
+                                  ("PUMPSWAP_SELL", PUMP_AMM_IDL, "sell")):
+            names = account_names(idl, name)
+            self.assertIn(f"pub const {prefix}_ACCOUNT_COUNT: usize = {len(names)};",
+                          generated)
+            accounts = instruction(idl, name)["accounts"]
+            writable = [index for index, account in enumerate(accounts, 1)
+                        if account.get("writable")]
+            self.assertIn(f"pub const {prefix}_WRITABLE: [usize; {len(writable)}] = "
+                          f"{writable};".replace("'", ""), generated)
+
+    def test_the_prose_and_the_program_disagree_and_the_program_wins(self):
+        """Documented here so the next reader does not re-transcribe the prose."""
+        accounts = instruction(PUMP_IDL, "buy_v2")["accounts"]
+        by_name = {account["name"]: account for account in accounts}
+        self.assertTrue(by_name["fee_recipient"].get("writable"))
+        self.assertTrue(by_name["buyback_fee_recipient"].get("writable"))
+        self.assertFalse(by_name["global_volume_accumulator"].get("writable", False))
+        # And `user` is writable on the sell too, which the prose denied.
+        sell = {account["name"]: account
+                for account in instruction(PUMP_IDL, "sell_v2")["accounts"]}
+        self.assertTrue(sell["user"].get("writable"))
+        self.assertTrue(sell["user"].get("signer"))
