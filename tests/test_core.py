@@ -9633,3 +9633,155 @@ class TestGeneratedFlagsCannotDrift(unittest.TestCase):
                 for account in instruction(PUMP_IDL, "sell_v2")["accounts"]}
         self.assertTrue(sell["user"].get("writable"))
         self.assertTrue(sell["user"].get("signer"))
+
+
+class TestEventDrivenRuntime(unittest.IsolatedAsyncioTestCase):
+    """T0 ran on a 500ms clock, which is not a sniper's control loop.
+
+    One pass dequeued a single candidate and then slept. On a chain where the
+    first four buyers decide the trade, a candidate detected just after a pass
+    began waited out the whole cycle before anything looked at it, and a burst
+    of ten launches took five seconds to start evaluating. The detection queue
+    already blocks until something arrives, so the sleep bought nothing: it
+    was latency with no corresponding saving.
+    """
+
+    def _desk(self):
+        desk = SimpleNamespace(
+            _running=True,
+            global_config={},
+            elogw_engine=SimpleNamespace(open_positions={}),
+            _candidate_pipelines={},
+            _background_tasks=set(),
+            _redecide=asyncio.Queue(maxsize=4),
+            _redecide_pending=set(),
+            _redecision_drops=0,
+            _candidate_drops=0,
+            position_coverage=CoverageTracker("position"),
+            managed=[],
+        )
+        desk.request_redecision = (
+            lambda token: MemecoinQuantDesk.request_redecision(desk, token))
+
+        async def manage_one(token, position):
+            desk.managed.append(token)
+
+        desk._manage_one_position = manage_one
+        desk._position_intelligence = (
+            lambda token, position: MemecoinQuantDesk._position_intelligence(
+                desk, token, position))
+        desk.rug_hazard = SimpleNamespace(get_hazard=lambda token: None)
+        return desk
+
+    def test_the_dispatcher_never_sleeps_between_candidates(self):
+        source = Path("src/main.py").read_text()
+        tree = ast.parse(source)
+        loop = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.AsyncFunctionDef)
+                    and node.name == "_candidate_dispatch_loop")
+        sleeps = [node for node in ast.walk(loop)
+                  if isinstance(node, ast.Call)
+                  and isinstance(node.func, ast.Attribute)
+                  and node.func.attr == "sleep"]
+        # The only sleep is the error backoff, and it is inside an except.
+        self.assertLessEqual(len(sleeps), 1)
+        self.assertNotIn("wait_for", ast.dump(loop))
+
+    def test_the_old_clocked_loop_is_gone(self):
+        source = Path("src/main.py").read_text()
+        self.assertNotIn("await self._process_new_tokens()\n                await self._manage_positions()",
+                         source)
+        tree = ast.parse(source)
+        names = {node.name for node in ast.walk(tree)
+                 if isinstance(node, ast.AsyncFunctionDef)}
+        self.assertIn("_candidate_dispatch_loop", names)
+        self.assertIn("_redecision_loop", names)
+        # The sweep survives as a backstop, not as the decision path.
+        self.assertIn("_safety_sweep_loop", names)
+
+    def test_a_trade_on_an_open_position_requests_an_immediate_redecision(self):
+        source = Path("src/main.py").read_text()
+        tree = ast.parse(source)
+        handler = next(node for node in ast.walk(tree)
+                       if isinstance(node, ast.AsyncFunctionDef)
+                       and node.name == "_on_pump_event")
+        called = {node.func.attr for node in ast.walk(handler)
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+        self.assertIn("request_redecision", called)
+
+    def test_requests_are_coalesced_per_token(self):
+        """Forty trades in one slot describe one state, so one decision."""
+        desk = self._desk()
+        desk.elogw_engine.open_positions["mint"] = {"size_tokens": 1}
+        self.assertTrue(desk.request_redecision("mint"))
+        for _ in range(39):
+            self.assertFalse(desk.request_redecision("mint"))
+        self.assertEqual(desk._redecide.qsize(), 1)
+
+    def test_a_token_we_do_not_hold_is_not_queued(self):
+        desk = self._desk()
+        self.assertFalse(desk.request_redecision("unheld"))
+        self.assertEqual(desk._redecide.qsize(), 0)
+
+    def test_the_queue_is_bounded_and_drops_are_counted(self):
+        """A queue silently shedding work looks exactly like a quiet market."""
+        desk = self._desk()
+        for index in range(8):
+            token = f"mint{index}"
+            desk.elogw_engine.open_positions[token] = {"size_tokens": 1}
+            desk.request_redecision(token)
+        self.assertEqual(desk._redecide.qsize(), 4)
+        self.assertEqual(desk._redecision_drops, 4)
+        # A dropped request leaves no pending marker behind, so the token can
+        # be requested again rather than being wedged out forever.
+        self.assertEqual(len(desk._redecide_pending), 4)
+
+    async def test_the_worker_redecides_and_clears_the_coalescing_marker(self):
+        desk = self._desk()
+        desk.elogw_engine.open_positions["mint"] = {"size_tokens": 1}
+        desk.request_redecision("mint")
+        desk._running = True
+
+        worker = asyncio.create_task(MemecoinQuantDesk._redecision_loop(desk))
+        for _ in range(200):
+            if desk.managed:
+                break
+            await asyncio.sleep(0.001)
+        desk._running = False
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+
+        self.assertEqual(desk.managed, ["mint"])
+        self.assertNotIn("mint", desk._redecide_pending)
+        # And it can be requested again immediately afterwards.
+        self.assertTrue(desk.request_redecision("mint"))
+
+    async def test_a_position_closed_before_its_turn_is_skipped(self):
+        desk = self._desk()
+        desk.elogw_engine.open_positions["mint"] = {"size_tokens": 1}
+        desk.request_redecision("mint")
+        desk.elogw_engine.open_positions.pop("mint")
+        desk._running = True
+
+        worker = asyncio.create_task(MemecoinQuantDesk._redecision_loop(desk))
+        await asyncio.sleep(0.02)
+        desk._running = False
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+        self.assertEqual(desk.managed, [])
+
+    def test_dispatch_is_synchronous_so_it_cannot_block_the_queue(self):
+        source = Path("src/main.py").read_text()
+        tree = ast.parse(source)
+        dispatch = next(node for node in ast.walk(tree)
+                        if isinstance(node, ast.FunctionDef)
+                        and node.name == "_dispatch_candidate")
+        self.assertNotIsInstance(dispatch, ast.AsyncFunctionDef)
+        self.assertEqual([], [node for node in ast.walk(dispatch)
+                              if isinstance(node, ast.Await)])

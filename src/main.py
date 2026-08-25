@@ -195,6 +195,19 @@ class MemecoinQuantDesk:
         # unavailable. Fed only by landed, real sells, so a paper run cannot
         # teach the escape race a latency that was never paid.
         self.landing_latency = LandingLatency()
+        # Event-driven redecision. Bounded on purpose: dropping a request is
+        # survivable because the safety sweep still runs, while an unbounded
+        # queue under a trade burst is not. Both drop counters are reported,
+        # because a queue that is silently shedding work looks exactly like a
+        # quiet market.
+        self._redecide: asyncio.Queue = asyncio.Queue(
+            maxsize=int(self.global_config.get("redecision_queue_size", 2_048)))
+        self._redecide_pending: set = set()
+        self._redecision_drops = 0
+        self._candidate_drops = 0
+        self._redecision_tasks: List[asyncio.Task] = []
+        self._safety_task: Optional[asyncio.Task] = None
+        self._intelligence_task: Optional[asyncio.Task] = None
         # Coverage says a module was consulted; this says whether it mattered.
         # A component that is disconnected and one that is connected but inert
         # both look like trades that would have happened anyway, and only one
@@ -616,7 +629,16 @@ class MemecoinQuantDesk:
             return
         self._running = True
         await self._setup_health_server()
-        self._main_task = asyncio.create_task(self._main_loop())
+        # Four independent loops rather than one clocked sweep. The two that
+        # decide -- candidates and redecisions -- are driven by events and
+        # never sleep; the two that maintain are driven by the clock and never
+        # sit in front of a decision.
+        self._main_task = asyncio.create_task(self._candidate_dispatch_loop())
+        self._redecision_tasks = [
+            asyncio.create_task(self._redecision_loop())
+            for _ in range(int(self.global_config.get("redecision_workers", 4)))]
+        self._safety_task = asyncio.create_task(self._safety_sweep_loop())
+        self._intelligence_task = asyncio.create_task(self._intelligence_loop())
         self._health_task = asyncio.create_task(self._health_loop())
         self._market_task = asyncio.create_task(self._market_observer_loop())
 
@@ -626,7 +648,9 @@ class MemecoinQuantDesk:
             task.cancel()
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
-        for task in (self._main_task, self._health_task, self._market_task):
+        for task in (self._main_task, self._health_task, self._market_task,
+                     self._safety_task, self._intelligence_task,
+                     *self._redecision_tasks):
             if task:
                 task.cancel()
                 try:
@@ -650,15 +674,115 @@ class MemecoinQuantDesk:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
-    async def _main_loop(self):
+    async def _candidate_dispatch_loop(self):
+        """Dispatch every candidate the instant it is detected.
+
+        This used to be one pass of a 500ms control loop that dequeued a
+        single candidate and then slept. On a chain where the first four
+        buyers decide the trade, a candidate detected just after a pass began
+        waited out the whole cycle before anything looked at it, and a burst
+        of ten launches took five seconds to even start evaluating.
+
+        The detection queue already blocks until something arrives, so the
+        sleep bought nothing at all: it was latency with no corresponding
+        saving. Now the loop awaits the queue directly and dispatches
+        immediately, with concurrency bounded by the pipeline cap rather than
+        by the clock.
+        """
         while self._running:
             try:
-                await self._process_new_tokens()
+                candidate = await self.detection_engine.get_candidate()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Candidate dispatch error: %s", exc)
+                await asyncio.sleep(0.01)
+                continue
+            try:
+                self._dispatch_candidate(candidate)
+            except Exception as exc:
+                logger.exception("Candidate dispatch failed: %s", exc)
+
+    async def _redecision_loop(self):
+        """Re-decide a position the moment its market changes.
+
+        Open positions were swept on the same 500ms cadence, so a rug
+        beginning at t+10ms was acted on at t+510ms at best. Trades that touch
+        a position now queue an immediate redecision, coalesced per token so a
+        burst of forty trades in one slot produces one decision rather than
+        forty -- and one decision is also the correct number, because they all
+        describe the same state.
+        """
+        while self._running:
+            try:
+                token = await self._redecide.get()
+            except asyncio.CancelledError:
+                raise
+            self._redecide_pending.discard(token)
+            position = self.elogw_engine.open_positions.get(token)
+            if position is None:
+                continue
+            try:
+                await self._manage_one_position(token, position)
+            except Exception as exc:
+                logger.exception("Redecision failed for %s: %s", token, exc)
+            finally:
+                try:
+                    position["intelligence"] = self._position_intelligence(token, position)
+                    position["coverage"] = self.position_coverage.record(
+                        position["intelligence"]).to_dict()
+                except Exception as exc:  # pragma: no cover - reporting only
+                    logger.warning("position coverage failed for %s: %s", token, exc)
+
+    def request_redecision(self, token: str) -> bool:
+        """Ask for one. Coalesced, non-blocking, safe from any callback.
+
+        Called from the stream decode path, which must never await on a
+        decision: a handler that blocks is a handler that drops the next
+        event, and the next event is the one that matters.
+        """
+        if not token or token in self._redecide_pending:
+            return False
+        if token not in self.elogw_engine.open_positions:
+            return False
+        self._redecide_pending.add(token)
+        try:
+            self._redecide.put_nowait(token)
+        except asyncio.QueueFull:
+            # Bounded on purpose. Dropping a redecision request is survivable
+            # -- the safety sweep still runs -- while an unbounded queue under
+            # a trade burst is not.
+            self._redecide_pending.discard(token)
+            self._redecision_drops += 1
+            return False
+        return True
+
+    async def _safety_sweep_loop(self):
+        """The backstop, not the decision path.
+
+        A position whose token has stopped trading produces no events, so it
+        would otherwise never be re-examined -- and "no trades at all" is
+        itself one of the shapes a rug takes. This sweep exists for that case
+        and runs at a cadence chosen for cost, not for latency, because
+        anything latency-sensitive arrives as an event.
+        """
+        interval = float(self.global_config.get("safety_sweep_seconds", 1.0))
+        while self._running:
+            await asyncio.sleep(interval)
+            try:
                 await self._manage_positions()
+            except Exception as exc:
+                logger.exception("Safety sweep error: %s", exc)
+
+    async def _intelligence_loop(self):
+        """Cluster rebuilds and attribution, off the decision path entirely."""
+        while self._running:
+            await asyncio.sleep(float(self.global_config.get(
+                "intelligence_sweep_seconds", 5.0)))
+            try:
                 await self._update_intelligence()
             except Exception as exc:
-                logger.exception("Main loop error: %s", exc)
-            await asyncio.sleep(0.5)
+                logger.exception("Intelligence loop error: %s", exc)
 
     async def _market_observer_loop(self):
         """Keep research quotes off the latency-sensitive decision loop."""
@@ -670,17 +794,33 @@ class MemecoinQuantDesk:
             await asyncio.sleep(float(self.global_config.get("market_observer_sleep_seconds", 0.25)))
 
     async def _process_new_tokens(self):
+        """One candidate, pulled with a short timeout. Retained for tests only.
+
+        The live path is `_candidate_dispatch_loop`, which awaits the queue
+        with no timeout. This wrapper stays because it is the shape the tests
+        drive, and because a timeout is the right behaviour when a caller
+        wants to make exactly one attempt.
+        """
         try:
             candidate = await asyncio.wait_for(self.detection_engine.get_candidate(), timeout=0.05)
         except asyncio.TimeoutError:
             return
+        self._dispatch_candidate(candidate)
+
+    def _dispatch_candidate(self, candidate: TokenCandidate) -> bool:
+        """Start a candidate's pipeline. Synchronous, so dispatch cannot block.
+
+        Returns whether a pipeline was started, which is what makes
+        saturation observable rather than merely logged.
+        """
         token = candidate.address
         if not token or token in self._candidate_pipelines:
-            return
+            return False
         if len(self._candidate_pipelines) >= int(self.global_config.get("max_candidate_pipelines", 100)):
             logger.warning("Candidate pipeline saturated; preserving DATA_BLOCKED decision for %s", token)
             self._record_blocked_decision(token, "DATA_BLOCKED_candidate_pipeline_saturated", {})
-            return
+            self._candidate_drops += 1
+            return False
         task = asyncio.create_task(self._candidate_pipeline(candidate))
         self._candidate_pipelines[token] = task
         self._background_tasks.add(task)
@@ -697,6 +837,7 @@ class MemecoinQuantDesk:
                     )
 
         task.add_done_callback(completed)
+        return True
 
     async def _candidate_pipeline(self, candidate: TokenCandidate):
         delays = self.global_config.get("candidate_recheck_delays_seconds", [0, 1, 3, 5, 10])
@@ -2420,6 +2561,11 @@ class MemecoinQuantDesk:
                            "signature": event.get("signature"), "program": event.get("program")}
             self._record_actor_entry(token, event, observation)
             self.rug_hazard.record_observation(token, observation)
+            # The event that changes a position's world is the one that should
+            # make it think again. Coalesced and non-blocking, because a decode
+            # handler that awaits a decision is a handler that drops the next
+            # event -- and the next event is the one that matters.
+            self.request_redecision(token)
             self.public_coordination.record_trade(token, observation)
             self.dataset_builder.record_market_observation(token, observation)
             if hasattr(self.wallet_intel, "record_live_trade"):
@@ -2555,6 +2701,15 @@ class MemecoinQuantDesk:
                             "measured_pairs": self.independence_report.observed_pairs,
                             "scored_wallets": len(self.independence_report.scores)},
             "reentry": self.reentry_book.report(),
+            # A queue silently shedding work looks exactly like a quiet market,
+            # so both drop counters are surfaced rather than only logged.
+            "event_loop": {
+                "redecision_queued": self._redecide.qsize(),
+                "redecision_drops": self._redecision_drops,
+                "candidate_drops": self._candidate_drops,
+                "candidate_pipelines": len(self._candidate_pipelines),
+                "redecision_workers": len(self._redecision_tasks),
+            },
             "exit_latency": self.landing_latency.estimate().report(),
             "decision_contribution": self.contribution_ledger.report(),
             "wallet_coverage": (self.wallet_intel.coverage_report()
