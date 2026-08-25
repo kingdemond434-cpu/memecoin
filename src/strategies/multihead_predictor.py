@@ -575,6 +575,104 @@ class ElogwEngine:
         position_value = self.portfolio_value * fraction
         return float(growth[index]), fraction, position_value / sol_price_usd
 
+    def marginal_log_growth(
+        self,
+        prediction: MultiHeadPrediction,
+        held_cost_fraction: float,
+        current_multiple: float,
+        added_fraction: float,
+    ) -> float:
+        """E[log W] for adding ``added_fraction`` on top of an open position.
+
+        A single all-at-once entry has to commit before the evidence that
+        actually separates a launch has arrived. Scaling in needs the marginal
+        quantity, not the from-scratch optimum: the slice already held rides
+        from its own entry, while new capital enters at today's price, so both
+        slices share the same forward return but not the same basis.
+
+        Wealth is normalised to 1 at the current instant:
+            cash            = 1 - held_cost - added
+            position value  = held_cost * current_multiple + added
+        and the forward return R applies to the position from here.
+        """
+        held_cost = max(0.0, float(held_cost_fraction))
+        added = max(0.0, float(added_fraction))
+        multiple = max(0.0, float(current_multiple))
+        bins = self.probability_bins(prediction)
+        if not bins:
+            return -float("inf")
+
+        cash = 1.0 - held_cost - added
+        if cash < 0:
+            return -float("inf")
+        # A flat book is a legitimate baseline worth log(1) = 0, not an error:
+        # it is exactly what "adding nothing" must score against.
+        position_now = held_cost * multiple + added
+        if position_now < 0:
+            return -float("inf")
+
+        execution_cost = 0.003 + max(0.0, prediction.expected_slippage)
+        probabilities = np.array([probability for _, probability, _ in bins], dtype=float)
+        # Only the newly added slice pays entry cost again.
+        returns = np.array([outcome for _, _, outcome in bins], dtype=float)
+        wealth = cash + position_now * (1.0 + returns) - added * execution_cost
+        if np.any(wealth <= 0):
+            return -float("inf")
+
+        if self.drawdown_aversion_lambda > 0:
+            drawdown_moment = float(np.sum(probabilities * wealth ** (-self.drawdown_aversion_lambda)))
+            if drawdown_moment > 1.0 + 1e-12:
+                return -float("inf")
+
+        entropy = -float(np.sum(probabilities * np.log(np.clip(probabilities, 1e-12, 1))))
+        entropy /= max(np.log(len(probabilities)), 1e-12)
+        value = float(np.sum(probabilities * np.log(wealth)))
+        value -= self.uncertainty_penalty * entropy * added
+        return value / self.risk_aversion
+
+    def plan_scale_in(
+        self,
+        prediction: MultiHeadPrediction,
+        held_cost_usd: float,
+        current_multiple: float,
+        liquidity_usd: float,
+        portfolio_value: Optional[float] = None,
+        steps: int = 200,
+    ) -> Tuple[float, float]:
+        """Additional exposure to add now, as (fraction_of_equity, delta_elogw).
+
+        Returns (0, 0) when no addition improves expected log growth — the
+        stop-scaling condition. Capital is deployed as evidence arrives rather
+        than guessed at T0, and the same rule cuts the position off the moment
+        the marginal contribution turns negative.
+        """
+        if portfolio_value is not None:
+            self.portfolio_value = max(0.0, portfolio_value)
+        if self.portfolio_value <= 0 or liquidity_usd <= 0:
+            return 0.0, 0.0
+
+        held_fraction = max(0.0, held_cost_usd) / self.portfolio_value
+        headroom = min(
+            self.max_position_pct,
+            self.max_position_usd / self.portfolio_value,
+            liquidity_usd * self.max_liquidity_fraction / self.portfolio_value,
+        ) - held_fraction
+        if headroom <= 0:
+            return 0.0, 0.0
+
+        baseline = self.marginal_log_growth(prediction, held_fraction, current_multiple, 0.0)
+        if not np.isfinite(baseline):
+            return 0.0, 0.0
+
+        best_fraction, best_gain = 0.0, 0.0
+        for candidate in np.linspace(0.0, headroom, max(2, steps))[1:]:
+            gain = self.marginal_log_growth(prediction, held_fraction, current_multiple, float(candidate))
+            if not np.isfinite(gain):
+                continue
+            if gain - baseline > best_gain:
+                best_fraction, best_gain = float(candidate), gain - baseline
+        return best_fraction, best_gain
+
     def should_trade(
         self,
         prediction: MultiHeadPrediction,

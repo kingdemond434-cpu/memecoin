@@ -551,6 +551,9 @@ class MemecoinQuantDesk:
             "entry_time": time.time(), "entry_sol": float(trade_info["position_size_sol"]),
             "prediction": _jsonable(prediction), "risk_report": risk_data, "trade_info": trade_info,
             "decision_id": decision_id, "paper": self.dry_run, "high_water_multiple": 1.0,
+            # Retained so the position can be re-predicted on fresh evidence
+            # for marginal-E[log W] scale-in rather than sized once at entry.
+            "candidate": candidate, "risk_object": risk, "liquidity_usd": liquidity,
             "ratchet_stages": [],
         }
         self.elogw_engine.update_position(token, position)
@@ -667,6 +670,7 @@ class MemecoinQuantDesk:
                 set(stages), time.time() - float(position["entry_time"]),
             )
             if not decision:
+                await self._consider_scale_in(token, position, multiple)
                 continue
             reason, exit_pct = decision
             stage_name = {"profit_ratchet_cost_recovery": "cost_recovery",
@@ -675,6 +679,70 @@ class MemecoinQuantDesk:
             if stage_name:
                 stages.append(stage_name)
             await self._execute_exit(token, position, exit_pct, reason)
+
+    async def _consider_scale_in(self, token: str, position: Dict[str, Any], multiple: float):
+        """Add to a winner only while the NEXT unit still raises E[log W].
+
+        Committing the whole position at T0 forces sizing before the flow that
+        actually separates a launch has arrived. Re-predicting on current
+        evidence and adding on the marginal quantity deploys capital as the
+        evidence appears, and stops the moment it stops paying.
+        """
+        if self.predictor is None or not self.predictor._is_trained:
+            return
+        if not self.dry_run and not self.champion_challenger.is_live(MODEL_HYPOTHESIS_ID):
+            return
+        candidate = position.get("candidate")
+        risk = position.get("risk_object")
+        liquidity = float(position.get("liquidity_usd", 0) or 0)
+        if candidate is None or risk is None or liquidity <= 0:
+            return
+
+        features = await self._build_prediction_features(candidate, risk, liquidity)
+        prediction = self.predictor.predict(features)
+        if prediction is None:
+            return
+        if prediction.p_rug_30s > 0.40 or prediction.p_rug_5m > 0.50:
+            return
+
+        await self._refresh_portfolio_state()
+        fraction, gain = self.elogw_engine.plan_scale_in(
+            prediction, float(position["remaining_cost_usd"]), multiple, liquidity,
+            portfolio_value=self.wallet_equity_usd,
+        )
+        if fraction <= 0 or gain <= 0 or self.sol_price_usd <= 0:
+            return
+
+        add_usd = self.wallet_equity_usd * fraction
+        result = await self.execution_engine.execute_swap(
+            candidate.base_token or WSOL_MINT, token, int(add_usd / self.sol_price_usd * 1e9),
+            slippage_bps=100,
+            priority_fee=self.fee_optimizer.get_optimal_fee(add_usd, 0.5),
+            jito_tip=self.fee_optimizer.get_jito_tip(add_usd, "MEDIUM"),
+            use_jito=True, decision_id=position.get("decision_id"),
+        )
+        attempt = {**_jsonable(result), "scale_in": True, "marginal_elogw": gain,
+                   "added_fraction": fraction, "at_multiple": multiple}
+        self.dataset_builder.record_execution_attempt(token, attempt)
+        if not result.success:
+            return
+
+        if result.simulated:
+            added_cost = add_usd
+        else:
+            native_spent = max(0, -int(result.native_balance_delta_lamports)) / 1e9 * self.sol_price_usd
+            added_cost = native_spent or add_usd
+            if added_cost <= 0:
+                return
+        position["size_tokens"] = int(position["size_tokens"]) + int(result.output_amount)
+        position["initial_size_tokens"] = int(position.get("initial_size_tokens", 0)) + int(result.output_amount)
+        position["remaining_cost_usd"] = float(position["remaining_cost_usd"]) + added_cost
+        position["initial_cost_usd"] = float(position.get("initial_cost_usd", 0.0)) + added_cost
+        position.setdefault("scale_ins", []).append(
+            {"fraction": fraction, "cost_usd": added_cost, "multiple": multiple, "elogw_gain": gain}
+        )
+        logger.info("%s SCALE-IN %s +$%.2f at %.2fx marginal_elogw=%.6f",
+                    "PAPER" if self.dry_run else "LIVE", token, added_cost, multiple, gain)
 
     async def _mark_position(self, token: str, position: Dict[str, Any]):
         quote = await self.jupiter.get_quote(token, USDC_MINT, int(position["size_tokens"]), slippage_bps=500)

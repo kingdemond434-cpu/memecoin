@@ -536,9 +536,14 @@ class FakeExecutionEngineForExit:
     def __init__(self, result):
         self.result = result
         self.calls = []
+        self.buys = []
 
     async def execute_sell(self, token, sold_tokens, **kwargs):
         self.calls.append((token, sold_tokens, kwargs))
+        return self.result
+
+    async def execute_swap(self, input_mint, output_mint, amount, **kwargs):
+        self.buys.append((input_mint, output_mint, amount, kwargs))
         return self.result
 
 
@@ -964,6 +969,83 @@ class TestJitoEndpointRouting(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await client.get_tip_floor_lamports(75))
 
 
+class TestIncrementalScaleIn(unittest.TestCase):
+    """Capital should follow evidence rather than commit once at T0.
+
+    A single all-at-once entry has to size before the flow that separates a
+    launch has arrived. Scaling in asks the marginal question instead: does
+    the NEXT unit still raise expected log growth?
+    """
+
+    def _engine(self, **kwargs):
+        predictor = MultiHeadPredictor()
+        predictor._is_trained = True
+        engine = ElogwEngine(predictor, min_edge_bps=-1, drawdown_aversion_lambda=0, **kwargs)
+        engine.portfolio_value = 10_000.0
+        return engine
+
+    @staticmethod
+    def _strong():
+        return MultiHeadPrediction("mint", "solana", 0, p_2x=0.85, p_5x=0.6, p_10x=0.3,
+                                   p_50x=0.05, p_rug_30s=0.01, p_rug_5m=0.02,
+                                   expected_slippage=0.01)
+
+    @staticmethod
+    def _weak():
+        return MultiHeadPrediction("mint", "solana", 0, p_2x=0.10, p_5x=0.02, p_10x=0.0,
+                                   p_50x=0.0, p_rug_30s=0.35, p_rug_5m=0.55,
+                                   expected_slippage=0.05)
+
+    def test_improving_evidence_justifies_adding_to_an_open_position(self):
+        engine = self._engine()
+        fraction, gain = engine.plan_scale_in(self._strong(), held_cost_usd=100.0,
+                                              current_multiple=1.2, liquidity_usd=500_000)
+        self.assertGreater(fraction, 0)
+        self.assertGreater(gain, 0)
+
+    def test_deteriorating_evidence_stops_scaling(self):
+        engine = self._engine()
+        fraction, gain = engine.plan_scale_in(self._weak(), held_cost_usd=100.0,
+                                              current_multiple=0.9, liquidity_usd=500_000)
+        self.assertEqual(fraction, 0.0)
+        self.assertEqual(gain, 0.0)
+
+    def test_scaling_respects_the_remaining_position_headroom(self):
+        engine = self._engine(max_position_pct=0.02)
+        fraction, _ = engine.plan_scale_in(self._strong(), held_cost_usd=0.0,
+                                           current_multiple=1.0, liquidity_usd=500_000)
+        self.assertLessEqual(fraction, 0.02 + 1e-9)
+
+    def test_a_position_already_at_the_cap_cannot_add(self):
+        engine = self._engine(max_position_pct=0.02)
+        fraction, gain = engine.plan_scale_in(self._strong(), held_cost_usd=200.0,
+                                              current_multiple=1.5, liquidity_usd=500_000)
+        self.assertEqual(fraction, 0.0)
+        self.assertEqual(gain, 0.0)
+
+    def test_thin_liquidity_caps_the_add_below_the_position_cap(self):
+        engine = self._engine(max_position_pct=0.05, max_liquidity_fraction=0.01)
+        thin, _ = engine.plan_scale_in(self._strong(), held_cost_usd=0.0,
+                                       current_multiple=1.0, liquidity_usd=10_000)
+        deep, _ = engine.plan_scale_in(self._strong(), held_cost_usd=0.0,
+                                       current_multiple=1.0, liquidity_usd=1_000_000)
+        self.assertLess(thin, deep)
+
+    def test_marginal_growth_accounts_for_the_existing_slice_basis(self):
+        """A slice already up 3x contributes its appreciated value, so the
+        marginal calculation is not the same as sizing from scratch."""
+        engine = self._engine()
+        at_entry = engine.marginal_log_growth(self._strong(), 0.01, 1.0, 0.01)
+        appreciated = engine.marginal_log_growth(self._strong(), 0.01, 3.0, 0.01)
+        self.assertNotAlmostEqual(at_entry, appreciated)
+        self.assertGreater(appreciated, at_entry)
+
+    def test_overcommitted_cash_is_rejected_rather_than_levered(self):
+        engine = self._engine()
+        self.assertEqual(
+            engine.marginal_log_growth(self._strong(), 0.8, 1.0, 0.5), -float("inf"))
+
+
 class TestDailyLossBudget(unittest.TestCase):
     def _engine(self, **kwargs):
         predictor = MultiHeadPredictor()
@@ -1195,6 +1277,102 @@ class TestExitPolicyTrainer(unittest.IsolatedAsyncioTestCase):
             report = train_exit_policy(storage, root / "models", min_episodes=60)
             self.assertEqual(report["status"], "REJECTED", report)
             self.assertIsNone(load_latest_exit_policy(str(root / "models"))[0])
+
+
+class TestScaleInWiring(unittest.IsolatedAsyncioTestCase):
+    """The marginal-E[log W] add must actually run from the position manager."""
+
+    def _desk(self, result, prediction, plan=(0.01, 0.5)):
+        engine = ElogwEngine(SimpleNamespace(_is_trained=True), min_edge_bps=-1)
+        engine.portfolio_value = 10_000.0
+        engine.plan_scale_in = lambda *a, **k: plan
+        desk = SimpleNamespace(
+            predictor=SimpleNamespace(_is_trained=True, predict=lambda features: prediction),
+            dry_run=True,
+            champion_challenger=SimpleNamespace(is_live=lambda _id: True),
+            elogw_engine=engine,
+            execution_engine=FakeExecutionEngineForExit(result),
+            dataset_builder=FakeDatasetBuilderForExit(),
+            fee_optimizer=SimpleNamespace(get_optimal_fee=lambda *a: 5_000,
+                                          get_jito_tip=lambda *a: 100_000),
+            wallet_equity_usd=10_000.0,
+            sol_price_usd=150.0,
+            _build_prediction_features=self._features,
+            _refresh_portfolio_state=self._noop,
+        )
+        return desk
+
+    @staticmethod
+    async def _features(candidate, risk, liquidity):
+        return PredictionFeatures("mint", "solana", 0)
+
+    @staticmethod
+    async def _noop():
+        return None
+
+    @staticmethod
+    def _position():
+        return {
+            "size_tokens": 1_000, "initial_size_tokens": 1_000,
+            "remaining_cost_usd": 100.0, "initial_cost_usd": 100.0,
+            "risk_contribution": 0.02, "decision_id": "d1",
+            "candidate": SimpleNamespace(base_token=None),
+            "risk_object": SimpleNamespace(),
+            "liquidity_usd": 500_000.0,
+        }
+
+    @staticmethod
+    def _prediction(rug_30s=0.01, rug_5m=0.02):
+        return MultiHeadPrediction("mint", "solana", 0, p_2x=0.8, p_5x=0.5,
+                                   p_rug_30s=rug_30s, p_rug_5m=rug_5m)
+
+    async def test_add_increases_size_and_cost_basis(self):
+        result = ExecutionResult(success=True, status=TransactionStatus.SIMULATED, simulated=True,
+                                 quoted_output_amount=500, actual_input_amount=1)
+        desk = self._desk(result, self._prediction())
+        position = self._position()
+        await MemecoinQuantDesk._consider_scale_in(desk, "mint", position, 1.5)
+        self.assertEqual(position["size_tokens"], 1_500)
+        self.assertGreater(position["remaining_cost_usd"], 100.0)
+        self.assertEqual(len(position["scale_ins"]), 1)
+        self.assertEqual(position["scale_ins"][0]["elogw_gain"], 0.5)
+
+    async def test_no_add_when_marginal_growth_is_not_positive(self):
+        result = ExecutionResult(success=True, status=TransactionStatus.SIMULATED, simulated=True,
+                                 quoted_output_amount=500)
+        desk = self._desk(result, self._prediction(), plan=(0.0, 0.0))
+        position = self._position()
+        await MemecoinQuantDesk._consider_scale_in(desk, "mint", position, 1.5)
+        self.assertEqual(position["size_tokens"], 1_000)
+        self.assertEqual(position["remaining_cost_usd"], 100.0)
+        self.assertEqual(desk.execution_engine.buys, [])
+
+    async def test_rug_risk_blocks_adding_even_on_a_winner(self):
+        result = ExecutionResult(success=True, status=TransactionStatus.SIMULATED, simulated=True,
+                                 quoted_output_amount=500)
+        desk = self._desk(result, self._prediction(rug_30s=0.9, rug_5m=0.9))
+        position = self._position()
+        await MemecoinQuantDesk._consider_scale_in(desk, "mint", position, 3.0)
+        self.assertEqual(position["size_tokens"], 1_000)
+        self.assertEqual(desk.execution_engine.buys, [])
+
+    async def test_untrained_model_never_scales_in(self):
+        result = ExecutionResult(success=True, status=TransactionStatus.SIMULATED, simulated=True)
+        desk = self._desk(result, self._prediction())
+        desk.predictor = SimpleNamespace(_is_trained=False, predict=lambda f: None)
+        position = self._position()
+        await MemecoinQuantDesk._consider_scale_in(desk, "mint", position, 1.5)
+        self.assertEqual(position["size_tokens"], 1_000)
+        self.assertEqual(desk.execution_engine.buys, [])
+
+    async def test_failed_add_leaves_the_position_untouched(self):
+        result = ExecutionResult(success=False, status=TransactionStatus.TIMEOUT, error="no fill")
+        desk = self._desk(result, self._prediction())
+        position = self._position()
+        await MemecoinQuantDesk._consider_scale_in(desk, "mint", position, 1.5)
+        self.assertEqual(position["size_tokens"], 1_000)
+        self.assertEqual(position["remaining_cost_usd"], 100.0)
+        self.assertNotIn("scale_ins", position)
 
 
 class TestShadowTrainer(unittest.TestCase):
