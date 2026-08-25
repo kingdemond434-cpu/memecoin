@@ -58,8 +58,8 @@ from src.strategies.decision_snapshot import (
     state_hash,
 )
 from src.strategies.action_value import (
-    Action, ActionValuePolicy, Decision, Decision as ActionDecision,
-    PositionState, PositionState as ActionState,
+    Action, Action as ActionValue, ActionValuePolicy, Decision,
+    Decision as ActionDecision, PositionState, PositionState as ActionState,
 )
 from src.strategies.actor_graph import (
     BuyerDNA, BuyerFingerprint, Entry, IndependenceReport, SwarmPredictor,
@@ -71,8 +71,9 @@ from src.strategies.authenticity import (
     rank_copycats,
 )
 from src.strategies.escape import (
-    HAZARD_HORIZONS, HazardCurve, HazardMechanism, escape_probability,
-    hazard_curve_from_probabilities, liquidation_ladder, ride_or_reject,
+    HAZARD_HORIZONS, UNESCAPABLE_MECHANISMS, HazardCurve, HazardMechanism,
+    escape_probability, hazard_curve_from_probabilities, liquidation_ladder,
+    ride_or_reject,
 )
 from src.strategies.distribution import (
     DISTRIBUTION_FEATURE_NAMES, DISTRIBUTION_HORIZONS, DistributionDetector,
@@ -91,6 +92,9 @@ from src.strategies.monster import (
     hold_versus_exit, premature_exit_rates, tail_capture_ratio,
 )
 from src.strategies.opportunity_allocator import Opportunity, OpportunityAllocator
+from src.strategies.reentry import (
+    BARRED_DISPOSITIONS, ExitDisposition, ReentryBook, ReentryPolicy, classify_exit,
+)
 from src.strategies.public_coordination import PublicCoordinationMiner
 from src.strategies.genealogy_graph import WalletProfile
 from src.strategies.wallet_intelligence import (
@@ -770,6 +774,8 @@ class TestPartialExitAccounting(unittest.IsolatedAsyncioTestCase):
             elogw_engine=ElogwEngine(None),
             sol_price_usd=150.0, total_pnl=0.0, successful_exits=0, dry_run=True,
             wallet_equity_usd=10_000.0,
+            rug_hazard=SimpleNamespace(get_hazard=lambda token: None),
+            reentry_book=ReentryBook(),
         )
         desk.ops_events = []
         desk._record_ops_event = (
@@ -7770,3 +7776,360 @@ class TestSourceIntelligenceIsLiveWired(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["by_state"].get("NO_FETCHER", 0)
                          + payload["by_state"].get("UNCONFIGURED", 0),
                          payload["declared"])
+
+
+class TestReentryBook(unittest.TestCase):
+    """Re-entry has to be a decision, not an enum value."""
+
+    @staticmethod
+    def _bins(upside_probability=0.5, upside=3.0):
+        return [(upside_probability, upside), (1.0 - upside_probability, -0.5)]
+
+    def _price(self, book, token, **overrides):
+        kwargs = dict(
+            bins=self._bins(), size_fraction=0.05, capital_usd=500.0,
+            expected_hold_seconds=120.0, liquidity_usd=50_000.0,
+            exit_capacity_ratio=1.0, escape_probability=1.0,
+            prediction_at=2_000.0, entry_cost=0.02, exit_cost=0.02, now=2_000.0,
+        )
+        kwargs.update(overrides)
+        return book.price(token, **kwargs)
+
+    def test_exit_reasons_map_onto_dispositions(self):
+        self.assertIs(classify_exit("rug_hazard_critical"), ExitDisposition.HAZARD_ESCAPE)
+        self.assertIs(classify_exit("monster_catastrophic_collapse"), ExitDisposition.CATASTROPHIC)
+        self.assertIs(classify_exit("profit_ratchet_5x"), ExitDisposition.BANKED_STRENGTH)
+        self.assertIs(classify_exit("action_bank_25"), ExitDisposition.BANKED_STRENGTH)
+        self.assertIs(classify_exit("displaced_by_challenger"), ExitDisposition.DISPLACED)
+        self.assertIs(classify_exit("distribution_detected"), ExitDisposition.DISTRIBUTION)
+        self.assertIs(classify_exit("something_new"), ExitDisposition.UNKNOWN)
+
+    def test_a_token_never_held_is_not_a_reentry(self):
+        book = ReentryBook()
+        verdict = book.admits("fresh", now=1_000.0)
+        self.assertTrue(verdict.admitted)
+        self.assertIn("not a post-exit candidate", verdict.detail)
+
+    def test_catastrophic_exits_are_barred_not_priced(self):
+        book = ReentryBook()
+        book.record_exit("mint", "monster_catastrophic_collapse", exited_at=1_000.0)
+        verdict = book.admits("mint", now=1_000_000.0)
+        # Even long past the cooldown, and even though the window would have
+        # dropped it, the bar is on the reason, not the clock.
+        self.assertEqual(verdict.status, "REJECTED")
+        self.assertIs(verdict.disposition, ExitDisposition.CATASTROPHIC)
+        self.assertIn(ExitDisposition.CATASTROPHIC, BARRED_DISPOSITIONS)
+
+    def test_cooldown_blocks_buying_back_into_our_own_exit_impact(self):
+        book = ReentryBook(ReentryPolicy(cooldown_seconds=90.0))
+        book.record_exit("mint", "profit_ratchet_5x", exited_at=1_000.0)
+        early = book.admits("mint", now=1_030.0)
+        self.assertEqual(early.status, "REJECTED")
+        self.assertIn("own exit impact", early.detail)
+        self.assertTrue(book.admits("mint", now=1_100.0).admitted)
+
+    def test_hazard_exit_requires_the_hazard_to_have_actually_fallen(self):
+        book = ReentryBook(ReentryPolicy(cooldown_seconds=0.0, min_hazard_improvement=0.25))
+        book.record_exit("mint", "rug_hazard_critical", exited_at=1_000.0, hazard_at_exit=0.80)
+        # Unchanged: the reason we left still holds.
+        stale = book.admits("mint", now=1_100.0, hazard_now=0.79)
+        self.assertEqual(stale.status, "REJECTED")
+        self.assertIn("has not fallen", stale.detail)
+        # Materially lower: now it is a question worth asking.
+        self.assertTrue(book.admits("mint", now=1_100.0, hazard_now=0.55).admitted)
+
+    def test_an_unmeasured_hazard_is_not_an_improved_one(self):
+        book = ReentryBook(ReentryPolicy(cooldown_seconds=0.0))
+        book.record_exit("mint", "rug_hazard_critical", exited_at=1_000.0, hazard_at_exit=0.8)
+        blocked = book.admits("mint", now=1_100.0, hazard_now=None)
+        self.assertEqual(blocked.status, "DATA_BLOCKED")
+        self.assertFalse(blocked.admitted)
+
+    def test_an_exit_taken_without_a_hazard_reading_cannot_be_cleared_later(self):
+        book = ReentryBook(ReentryPolicy(cooldown_seconds=0.0))
+        book.record_exit("mint", "rug_hazard_critical", exited_at=1_000.0, hazard_at_exit=None)
+        verdict = book.admits("mint", now=1_100.0, hazard_now=0.01)
+        self.assertEqual(verdict.status, "DATA_BLOCKED")
+        self.assertIn("never quantified", verdict.detail)
+
+    def test_unescapable_mechanisms_bar_reentry_from_either_side(self):
+        unescapable = next(iter(UNESCAPABLE_MECHANISMS))
+        book = ReentryBook(ReentryPolicy(cooldown_seconds=0.0))
+        book.record_exit("a", "profit_ratchet_5x", exited_at=1_000.0,
+                         mechanism_at_exit=unescapable)
+        self.assertEqual(book.admits("a", now=1_100.0).status, "REJECTED")
+        book.record_exit("b", "profit_ratchet_5x", exited_at=1_000.0)
+        self.assertEqual(
+            book.admits("b", now=1_100.0, mechanism_now=unescapable).status, "REJECTED")
+
+    def test_window_expiry_makes_it_an_ordinary_candidate_again(self):
+        book = ReentryBook(ReentryPolicy(cooldown_seconds=0.0, window_seconds=600.0))
+        book.record_exit("mint", "profit_ratchet_5x", exited_at=1_000.0)
+        verdict = book.admits("mint", now=1_000.0 + 601.0)
+        self.assertTrue(verdict.admitted)
+        self.assertIsNone(book.get("mint"))
+
+    def test_a_stale_prediction_cannot_be_reused_across_the_exit(self):
+        book = ReentryBook(ReentryPolicy(cooldown_seconds=0.0))
+        book.record_exit("mint", "profit_ratchet_5x", exited_at=2_000.0)
+        verdict = self._price(book, "mint", prediction_at=1_999.0)
+        self.assertEqual(verdict.status, "DATA_BLOCKED")
+        self.assertIn("predates the exit", verdict.detail)
+
+    def test_unmeasured_capacity_or_escape_blocks_rather_than_defaults(self):
+        book = ReentryBook(ReentryPolicy(cooldown_seconds=0.0))
+        book.record_exit("mint", "profit_ratchet_5x", exited_at=1_000.0)
+        for field in ("exit_capacity_ratio", "escape_probability"):
+            verdict = self._price(book, "mint", **{field: None})
+            self.assertEqual(verdict.status, "DATA_BLOCKED", field)
+
+    def test_a_hazard_exit_costs_more_to_undo_than_a_banked_one(self):
+        banked = ReentryBook(ReentryPolicy(cooldown_seconds=0.0))
+        banked.record_exit("mint", "profit_ratchet_5x", exited_at=1_000.0)
+        fled = ReentryBook(ReentryPolicy(cooldown_seconds=0.0))
+        fled.record_exit("mint", "rug_hazard_high", exited_at=1_000.0, hazard_at_exit=0.5)
+        cheap = self._price(banked, "mint")
+        dear = self._price(fled, "mint")
+        self.assertIsNotNone(cheap.required_q)
+        self.assertIsNotNone(dear.required_q)
+        self.assertGreater(dear.required_q, cheap.required_q)
+        # The gross edge is identical; only the bar moved.
+        self.assertAlmostEqual(cheap.q, dear.q)
+
+    def test_the_premium_is_at_least_the_round_trip_it_costs(self):
+        book = ReentryBook(ReentryPolicy(cooldown_seconds=0.0))
+        book.record_exit("mint", "profit_ratchet_5x", exited_at=1_000.0)
+        verdict = self._price(book, "mint", size_fraction=0.05,
+                              entry_cost=0.02, exit_cost=0.02)
+        self.assertGreaterEqual(verdict.required_q, 0.05 * (0.02 + 0.02))
+
+    def test_a_marginal_reentry_is_rejected_and_a_strong_one_admitted(self):
+        book = ReentryBook(ReentryPolicy(cooldown_seconds=0.0))
+        book.record_exit("mint", "profit_ratchet_5x", exited_at=1_000.0)
+        thin = self._price(book, "mint", bins=[(0.5, 0.05), (0.5, -0.04)])
+        self.assertEqual(thin.status, "REJECTED")
+        self.assertIn("does not clear", thin.detail)
+        strong = self._price(book, "mint", bins=[(0.5, 4.0), (0.5, -0.4)])
+        self.assertEqual(strong.status, "OK")
+        self.assertGreater(strong.q, strong.required_q)
+
+    def test_each_completed_reentry_raises_the_bar_for_the_next(self):
+        book = ReentryBook(ReentryPolicy(cooldown_seconds=0.0, max_reentries=5))
+        book.record_exit("mint", "profit_ratchet_5x", exited_at=1_000.0)
+        first = self._price(book, "mint")
+        book.note_reentry("mint")
+        second = self._price(book, "mint")
+        self.assertGreater(second.required_q, first.required_q)
+
+    def test_the_reentry_count_survives_the_next_exit(self):
+        book = ReentryBook(ReentryPolicy(cooldown_seconds=0.0))
+        book.record_exit("mint", "profit_ratchet_5x", exited_at=1_000.0)
+        book.note_reentry("mint")
+        book.record_exit("mint", "profit_ratchet_5x", exited_at=1_100.0)
+        # A token that has already cycled us once must not look like a
+        # first-timer merely because it was exited again.
+        self.assertEqual(book.get("mint").reentries, 1)
+
+    def test_a_token_that_has_farmed_us_enough_times_is_cut_off(self):
+        book = ReentryBook(ReentryPolicy(cooldown_seconds=0.0, max_reentries=2))
+        book.record_exit("mint", "profit_ratchet_5x", exited_at=1_000.0)
+        book.note_reentry("mint")
+        book.note_reentry("mint")
+        verdict = book.admits("mint", now=1_100.0)
+        self.assertEqual(verdict.status, "REJECTED")
+        self.assertIn("already re-entered", verdict.detail)
+
+    def test_an_admitted_reentry_contests_for_capital_net_of_its_premium(self):
+        book = ReentryBook(ReentryPolicy(cooldown_seconds=0.0))
+        book.record_exit("mint", "profit_ratchet_5x", exited_at=1_000.0)
+        verdict = self._price(book, "mint", bins=[(0.5, 4.0), (0.5, -0.4)])
+        opportunity = verdict.opportunity
+        self.assertIsNotNone(opportunity)
+        self.assertIsNone(opportunity.blocked_reason)
+        self.assertEqual(opportunity.sleeve, "reentry")
+        # The allocator ranks the number the trade actually adds, not the
+        # gross edge -- otherwise a re-entry scraping past its own bar would
+        # outrank a fresh launch that cleared a higher one.
+        self.assertAlmostEqual(opportunity.elogw, verdict.q - verdict.required_q)
+        self.assertTrue(opportunity.metadata["reentry"])
+
+    def test_the_book_is_bounded_and_drops_the_oldest_exits_first(self):
+        book = ReentryBook(ReentryPolicy(window_seconds=10_000.0), capacity=3)
+        for index in range(6):
+            book.record_exit(f"mint{index}", "profit_ratchet_5x", exited_at=1_000.0 + index)
+        self.assertEqual(len(book.candidates(now=1_010.0)), 3)
+        self.assertIsNone(book.get("mint0"))
+        self.assertIsNotNone(book.get("mint5"))
+
+    def test_report_is_serialisable_and_counts_by_disposition(self):
+        book = ReentryBook(ReentryPolicy(window_seconds=10_000.0))
+        book.record_exit("a", "profit_ratchet_5x", exited_at=1_000.0)
+        book.record_exit("b", "rug_hazard_critical", exited_at=1_000.0, hazard_at_exit=0.7)
+        report = book.report(now=1_010.0)
+        json.dumps(report)
+        self.assertEqual(report["by_disposition"]["banked_strength"], 1)
+        self.assertEqual(report["by_disposition"]["hazard_escape"], 1)
+
+
+class TestReentryIsLiveWired(unittest.TestCase):
+    """The last time re-entry was 'wired' it was an unreachable enum member."""
+
+    def test_reenter_is_unreachable_from_an_open_position(self):
+        # The reason the enum member was dead: every caller of the action
+        # policy in the position loop holds a positive fraction, and REENTER
+        # is only scorable at zero. This is asserted so that a future change
+        # which appears to "enable" REENTER on open positions has to confront
+        # the fact that it would be pricing a flat book.
+        policy = ActionValuePolicy()
+        state = ActionState(
+            held_fraction=0.4, current_multiple=2.0,
+            forward_bins=((0.5, 1.0), (0.5, -0.5)),
+            exit_capacity_ratio=1.0, escape_probability=1.0,
+            reentry_bins=((0.5, 4.0), (0.5, -0.4)), add_fraction=0.05,
+        )
+        decision = policy.score(state)
+        reenter = next(score for score in decision.scores
+                       if score.action is ActionValue.REENTER)
+        self.assertFalse(reenter.feasible)
+        self.assertIn("still open", reenter.detail)
+
+    def test_desk_constructs_a_reentry_book_and_reports_it(self):
+        source = Path("src/main.py").read_text()
+        tree = ast.parse(source)
+        assigned = {
+            node.targets[0].attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign) and node.targets
+            and isinstance(node.targets[0], ast.Attribute)
+        }
+        self.assertIn("reentry_book", assigned)
+        self.assertIn('"reentry": self.reentry_book.report()', source)
+
+    def test_full_exits_are_recorded_and_partial_ones_are_not(self):
+        source = Path("src/main.py").read_text()
+        tree = ast.parse(source)
+        exit_fn = next(node for node in ast.walk(tree)
+                       if isinstance(node, ast.AsyncFunctionDef)
+                       and node.name == "_execute_exit")
+        calls = [node for node in ast.walk(exit_fn)
+                 if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute)
+                 and node.func.attr == "record_exit"]
+        self.assertEqual(len(calls), 1)
+        # A partial bank leaves the position open, so recording it would let
+        # ADD be re-litigated through a path that believes the book is flat.
+        # The one call must sit inside the remaining<=0 branch.
+        closed_branch = next(
+            node for node in ast.walk(exit_fn)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "remaining"
+        )
+        self.assertTrue(any(call in ast.walk(closed_branch) for call in calls))
+
+    def test_the_entry_path_gates_and_prices_reentries(self):
+        source = Path("src/main.py").read_text()
+        tree = ast.parse(source)
+        evaluate = next(node for node in ast.walk(tree)
+                        if isinstance(node, ast.AsyncFunctionDef)
+                        and node.name == "_evaluate_candidate")
+        called = {node.func.attr for node in ast.walk(evaluate)
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+        self.assertIn("admits", called)
+        self.assertIn("_price_reentry", called)
+        self.assertIn("note_reentry", called)
+
+
+class TestExecuteExitFeedsTheReentryBook(unittest.IsolatedAsyncioTestCase):
+    async def test_a_full_exit_lands_in_the_book_with_its_reason_and_hazard(self):
+        result = ExecutionResult(
+            success=True, status=TransactionStatus.SIMULATED, simulated=True,
+            quoted_output_amount=150_000_000, native_balance_delta_lamports=0,
+            actual_input_amount=1_000,
+        )
+        desk = TestPartialExitAccounting()._desk(result)
+        desk.rug_hazard = SimpleNamespace(
+            get_hazard=lambda token: SimpleNamespace(hazard_30s=0.62))
+        position = TestPartialExitAccounting._position()
+        position["high_water_multiple"] = 6.0
+        desk.elogw_engine.update_position("mint", position)
+
+        await MemecoinQuantDesk._execute_exit(desk, "mint", position, 1.0, "rug_hazard_critical")
+
+        record = desk.reentry_book.get("mint")
+        self.assertIsNotNone(record)
+        self.assertIs(record.disposition, ExitDisposition.HAZARD_ESCAPE)
+        self.assertAlmostEqual(record.hazard_at_exit, 0.62)
+        self.assertAlmostEqual(record.exit_multiple, 6.0)
+
+    async def test_a_partial_exit_leaves_the_book_empty(self):
+        result = ExecutionResult(
+            success=True, status=TransactionStatus.SIMULATED, simulated=True,
+            quoted_output_amount=150_000_000, native_balance_delta_lamports=0,
+            actual_input_amount=500,
+        )
+        desk = TestPartialExitAccounting()._desk(result)
+        position = TestPartialExitAccounting._position()
+        desk.elogw_engine.update_position("mint", position)
+
+        await MemecoinQuantDesk._execute_exit(desk, "mint", position, 0.5, "profit_ratchet_5x")
+
+        self.assertIsNone(desk.reentry_book.get("mint"))
+
+
+class TestPartialExitIsNotAFinalOutcome(unittest.IsolatedAsyncioTestCase):
+    """A bank of half or more used to be recorded as a closed trade.
+
+    `reduce_position` applies the sale to the position dict, and `_execute_exit`
+    then subtracted the same sale again. At 50% the remainder computed to zero
+    and at 75% it went negative, so both were treated as closes: log growth was
+    attributed to capital still at risk, the outcome row carried a
+    `realized_multiple` for a live position, and `_closed_pnl` stayed empty so
+    the eventual real close banked the same PnL twice.
+    """
+
+    async def _bank(self, fraction: float, sold_tokens: int):
+        result = ExecutionResult(
+            success=True, status=TransactionStatus.SIMULATED, simulated=True,
+            quoted_output_amount=150_000_000, native_balance_delta_lamports=0,
+            actual_input_amount=sold_tokens,
+        )
+        desk = TestPartialExitAccounting()._desk(result)
+        position = TestPartialExitAccounting._position()
+        desk.elogw_engine.update_position("mint", position)
+        await MemecoinQuantDesk._execute_exit(desk, "mint", position, fraction,
+                                              "profit_ratchet_5x")
+        return desk
+
+    async def test_banking_three_quarters_leaves_the_trade_open(self):
+        desk = await self._bank(0.75, 750)
+        self.assertIn("mint", desk.elogw_engine.open_positions)
+        outcomes = [payload for stream, payload in desk.ops_events
+                    if stream == "trade_outcomes"]
+        self.assertEqual(outcomes, [])
+        self.assertEqual(desk._mechanism_growth, {})
+        # The banked PnL is carried, not attributed, so the eventual close
+        # reports the whole trade once rather than the last slice twice.
+        self.assertAlmostEqual(desk._closed_pnl["mint"], 75.0)
+        self.assertIsNone(desk.reentry_book.get("mint"))
+
+    async def test_the_closing_slice_reports_the_whole_trade_once(self):
+        desk = await self._bank(0.75, 750)
+        position = desk.elogw_engine.open_positions["mint"]
+        desk.execution_engine = FakeExecutionEngineForExit(ExecutionResult(
+            success=True, status=TransactionStatus.SIMULATED, simulated=True,
+            quoted_output_amount=37_500_000, native_balance_delta_lamports=0,
+            actual_input_amount=250,
+        ))
+        await MemecoinQuantDesk._execute_exit(desk, "mint", position, 1.0,
+                                              "profit_ratchet_10x")
+
+        self.assertNotIn("mint", desk.elogw_engine.open_positions)
+        outcomes = [payload for stream, payload in desk.ops_events
+                    if stream == "trade_outcomes"]
+        self.assertEqual(len(outcomes), 1)
+        # $150.00 banked against a $75.00 basis, then $37.50 against $25.00.
+        self.assertAlmostEqual(outcomes[0]["realized_pnl_usd"], 87.5)
+        self.assertEqual(len(desk._mechanism_growth["t0_sniper"]), 1)
+        self.assertIsNotNone(desk.reentry_book.get("mint"))

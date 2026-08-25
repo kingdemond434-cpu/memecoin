@@ -80,6 +80,7 @@ from src.strategies.monster import (
 )
 from src.strategies.opportunity_allocator import Opportunity, OpportunityAllocator
 from src.strategies.prelaunch_intent import PrelaunchIntentModel
+from src.strategies.reentry import ReentryBook, ReentryPolicy, ReentryVerdict
 from src.strategies.public_coordination import PublicCoordinationMiner
 from src.strategies.rug_hazard import ContinuousRugHazardModel
 from src.strategies.social_intelligence import SocialIntelligenceEngine
@@ -387,6 +388,17 @@ class MemecoinQuantDesk:
             max_add_fraction=float(setting("max_position_pct", 0.05)),
         )
         self.state_sequencer = StateSequencer()
+        # Re-entry is a post-exit candidate, not an action an open
+        # position can take: `Action.REENTER` is only scorable at zero held
+        # fraction, so the book lives outside the position loop and gates
+        # the ordinary entry path instead of running a parallel one.
+        self.reentry_book = ReentryBook(ReentryPolicy(
+            cooldown_seconds=float(self.global_config.get("reentry_cooldown_seconds", 90.0)),
+            window_seconds=float(self.global_config.get("reentry_window_seconds", 1800.0)),
+            max_reentries=int(self.global_config.get("max_reentries_per_token", 2)),
+            min_hazard_improvement=float(
+                self.global_config.get("reentry_min_hazard_improvement", 0.25)),
+        ), action_policy=self.action_policy)
         # Production transport per source. Empty until an operator supplies
         # connections; the registry then reports every declaration NO_FETCHER,
         # which is the honest reading -- a declared source with no transport
@@ -624,6 +636,19 @@ class MemecoinQuantDesk:
         token = candidate.address
         if token in self.elogw_engine.open_positions:
             return
+        # A token we have already exited is not an ordinary candidate. The
+        # cheap gates -- cooldown, permanent bars, whether the hazard we fled
+        # has actually receded -- run before the expensive path, because there
+        # is no point buying a risk report and a prediction for a token that a
+        # 90-second cooldown already excludes.
+        hazard_state = self.rug_hazard.get_hazard(token)
+        gate = self.reentry_book.admits(
+            token, hazard_now=(float(hazard_state.hazard_30s)
+                               if hazard_state is not None else None))
+        if not gate.admitted:
+            self._record_blocked_decision(token, f"reentry_{gate.status.lower()}",
+                                          gate.as_dict())
+            return
         self.dataset_builder.start_episode(
             token, candidate.deployer or "", candidate.factory or "", candidate.pair or "",
             candidate.base_token or WSOL_MINT, detected_at=candidate.timestamp,
@@ -674,6 +699,22 @@ class MemecoinQuantDesk:
                     "authority": "shadow" if self.dry_run else "champion",
                     "actor_intelligence": self.actor_intelligence(token),
                     "source_intelligence": self.source_intelligence(token)}
+        # A re-entry that has cleared the ordinary hurdle has still not paid
+        # for itself: holding through would have cost nothing, and the round
+        # trip costs an exit and an entry. The premium is charged here, on the
+        # fresh prediction, so a re-entry can never be admitted on the
+        # conviction that existed before the exit.
+        if should_trade and self.reentry_book.get(token) is not None:
+            verdict = self._price_reentry(token, prediction, liquidity, trade_info)
+            decision["reentry"] = verdict.as_dict()
+            if not verdict.admitted:
+                should_trade = False
+                trade_info = {**trade_info, "reason": f"reentry_{verdict.status.lower()}",
+                              "reentry_detail": verdict.detail}
+                decision.update({"should_trade": False, "trade_info": trade_info})
+            else:
+                decision["reentry_opportunity"] = (
+                    verdict.opportunity.metadata if verdict.opportunity else {})
         if not should_trade and trade_info.get("reason") in CAPACITY_REJECTIONS:
             # The book being full is not evidence this candidate is bad. It is
             # only evidence that capital is currently committed elsewhere, and
@@ -733,6 +774,13 @@ class MemecoinQuantDesk:
             "ratchet_stages": [],
         }
         self.elogw_engine.update_position(token, position)
+        if self.reentry_book.get(token) is not None:
+            # Counted only on a fill, not on admission: the next re-entry into
+            # this token has to clear a strictly higher bar, and a bar that
+            # rose on rejected attempts would punish the token for our own
+            # indecision rather than for having cycled us.
+            self.reentry_book.note_reentry(token)
+            position["reentry"] = True
         self.trade_count += 1
         logger.info("%s BUY %s %.4f SOL status=%s", "PAPER" if self.dry_run else "LIVE", token,
                     trade_info["position_size_sol"], result.status.value)
@@ -1066,6 +1114,55 @@ class MemecoinQuantDesk:
         self.elogw_engine.observe_opportunity_set(
             quality=float(best.elogw) / hurdle,
             uncertainty=float(blocked) / float(total),
+        )
+
+    def _price_reentry(self, token: str, prediction: Any, liquidity: float,
+                       trade_info: Dict[str, Any]):
+        """Charge the re-entry premium against a distribution built after the exit.
+
+        Capacity and escape are measured at the size this trade would actually
+        hold, not at the size the previous position held. Re-using the old
+        measurement would price the new trade on the old book -- and the book
+        is exactly what our own exit changed.
+        """
+        size_sol = float(trade_info.get("position_size_sol", 0.0) or 0.0)
+        size_usd = float(trade_info.get("position_value_usd", 0.0) or 0.0)
+        equity = max(self.wallet_equity_usd, 1e-9)
+        bins = [(probability, gross) for _, probability, gross
+                in self.elogw_engine.probability_bins(prediction)]
+        if not bins or size_sol <= 0:
+            return ReentryVerdict(token=token, status="DATA_BLOCKED",
+                                  detail="no sized forward distribution")
+
+        # The size we would hold, quoted off the live curve rather than
+        # assumed. Without it there is no honest capacity measurement, and an
+        # assumed one is the permissive default this codebase refuses.
+        state = self._latest_curve_state.get(token)
+        if state is None:
+            return ReentryVerdict(token=token, status="DATA_BLOCKED",
+                                  detail="no curve state; re-entry capacity unmeasurable")
+        quote = quote_buy(state, int(size_sol * 1e9))
+        expected_tokens = int(quote.output_amount or 0)
+        if expected_tokens <= 0 or quote.data_status != "OK":
+            return ReentryVerdict(token=token, status="DATA_BLOCKED",
+                                  detail=f"re-entry buy unquotable: "
+                                         f"{quote.reason or quote.data_status}")
+        probe: Dict[str, Any] = {"size_tokens": expected_tokens}
+        capacity_status, capacity = self._exit_capacity(token, probe)
+        escape = self._estimate_escape(token, probe, self.rug_hazard.get_hazard(token))
+        return self.reentry_book.price(
+            token,
+            bins=bins,
+            size_fraction=min(1.0, size_usd / equity),
+            capital_usd=size_usd,
+            expected_hold_seconds=float(getattr(prediction, "expected_hold_time", 0.0) or 0.0) or None,
+            liquidity_usd=liquidity or None,
+            exit_capacity_ratio=(capacity if str(capacity_status).startswith("OK") else None),
+            escape_probability=(float(escape.probability)
+                                if escape.status == "OK" else None),
+            prediction_at=time.time(),
+            entry_cost=float(self.global_config.get("assumed_entry_cost", 0.02)),
+            exit_cost=float(self.global_config.get("assumed_exit_cost", 0.02)),
         )
 
     def _exit_capacity(self, token: str, position: Dict[str, Any]) -> Tuple[str, float]:
@@ -1789,12 +1886,34 @@ class MemecoinQuantDesk:
                         "allocated_cost_usd": allocated_cost,
                         "realized_pnl_usd": pnl})
         self.dataset_builder.record_execution_attempt(token, attempt)
-        remaining = int(position["size_tokens"]) - actual_sold
+        # `reduce_position` has already applied this sale to the position, so
+        # what it now holds IS the remainder. Subtracting the sale again here
+        # double-counted it: every bank of half the position or more computed
+        # a non-positive remainder and was recorded as a FINAL trade outcome
+        # while the position was still open -- attributing log growth to
+        # capital that had not been returned, and leaving `_closed_pnl` empty
+        # so the eventual real close counted the same PnL a second time.
+        remaining = int(position["size_tokens"])
         if remaining <= 0:
             # The position is closed, so its outcome is now final and can be
             # attributed. Partial exits are deliberately not recorded here:
             # attributing a trade that is still open would count the same
             # capital twice in the ledger.
+            # The position is flat, so re-entry becomes a question that can
+            # actually be asked. What is recorded is the REASON, not the price:
+            # a token banked at 8x and a token fled at 0.3x are different
+            # propositions, and the hazard reading is captured now because a
+            # hazard-driven exit can only be cleared later by showing that the
+            # same measurement has fallen -- which is impossible if it was
+            # never taken.
+            hazard_state = self.rug_hazard.get_hazard(token)
+            self.reentry_book.record_exit(
+                token, reason,
+                exit_multiple=float(position.get("high_water_multiple", 1.0)),
+                realized_pnl_usd=self._closed_pnl.get(token, 0.0) + pnl,
+                hazard_at_exit=(float(hazard_state.hazard_30s)
+                                if hazard_state is not None else None),
+            )
             mechanism = str(position.get("sleeve", "t0_sniper"))
             self._mechanism_growth.setdefault(mechanism, []).append(
                 math.log(max(1e-9, 1.0 + pnl / max(self.wallet_equity_usd, 1e-9))))
@@ -2071,6 +2190,7 @@ class MemecoinQuantDesk:
             "actor_graph": {"independence_status": self.independence_report.status,
                             "measured_pairs": self.independence_report.observed_pairs,
                             "scored_wallets": len(self.independence_report.scores)},
+            "reentry": self.reentry_book.report(),
             "hot_state": self.hot_state.report(),
             "mega_event_reserve": self.mega_event_reserve_state,
             "portfolio": self.elogw_engine.get_portfolio_state() if self.elogw_engine else {},
