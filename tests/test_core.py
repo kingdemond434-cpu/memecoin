@@ -25,7 +25,7 @@ from src.chains.yellowstone_grpc import (
 )
 from src.detection.rug_detector import TOKEN_2022_PROGRAM, TOKEN_PROGRAM, RugDetector
 from src.execution.jupiter_jito import (
-    ExecutionEngine, ExecutionResult, JupiterClient, RouteType, SolanaTransactionBuilder, SwapQuote,
+    ExecutionEngine, ExecutionResult, JitoClient, JupiterClient, RouteType, SolanaTransactionBuilder, SwapQuote,
     SwapTransaction, TransactionStatus,
 )
 from src.main import MemecoinQuantDesk
@@ -644,6 +644,112 @@ class TestPartialExitAccounting(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("realized_pnl_usd", desk.dataset_builder.attempts[0][1])
 
 
+class RecordingJitoSession:
+    """Captures which URL each JSON-RPC method was actually POSTed to."""
+
+    def __init__(self, results=None, tip_payload=None):
+        self.posts = []
+        self.results = results or {}
+        self.tip_payload = tip_payload
+
+    def post(self, url, json=None, **kwargs):
+        self.posts.append((url, (json or {}).get("method")))
+        result = self.results.get((json or {}).get("method"))
+        return _FakeAsyncResponse({"jsonrpc": "2.0", "id": 1, "result": result})
+
+    def get(self, url, **kwargs):
+        return _FakeAsyncResponse(self.tip_payload)
+
+
+class _FakeAsyncResponse:
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self.status = status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def json(self, **kwargs):
+        return self._payload
+
+
+class TestJitoEndpointRouting(unittest.IsolatedAsyncioTestCase):
+    def _client(self, session):
+        client = JitoClient(regions=["https://mainnet.block-engine.jito.wtf"])
+        client._session = session
+        return client
+
+    async def test_each_method_uses_its_own_documented_path(self):
+        session = RecordingJitoSession(results={
+            "sendBundle": "bundle-1",
+            "getBundleStatuses": {"value": [{"confirmationStatus": "confirmed"}]},
+            "getTipAccounts": ["tip-account"],
+            "getInflightBundleStatuses": {"value": [{"status": "Pending"}]},
+        })
+        client = self._client(session)
+        await client.send_bundle(["tx"])
+        await client.get_bundle_status("bundle-1")
+        await client.get_inflight_bundle_status("bundle-1")
+        await client._rpc("getTipAccounts", [])
+
+        routed = dict((method, url) for url, method in session.posts)
+        base = "https://mainnet.block-engine.jito.wtf"
+        # Posting every method at /api/v1/bundles is the bug: status and tip
+        # lookups silently fail, so a landed bundle looks permanently pending.
+        self.assertEqual(routed["sendBundle"], f"{base}/api/v1/bundles")
+        self.assertEqual(routed["getBundleStatuses"], f"{base}/api/v1/getBundleStatuses")
+        self.assertEqual(routed["getInflightBundleStatuses"],
+                         f"{base}/api/v1/getInflightBundleStatuses")
+        self.assertEqual(routed["getTipAccounts"], f"{base}/api/v1/getTipAccounts")
+
+    async def test_single_transaction_lane_uses_the_transactions_path(self):
+        session = RecordingJitoSession(results={"sendTransaction": "sig-1"})
+        client = self._client(session)
+        self.assertEqual(await client.send_transaction("tx"), "sig-1")
+        self.assertEqual(session.posts[0][0],
+                         "https://mainnet.block-engine.jito.wtf/api/v1/transactions")
+
+    async def test_bundle_is_raced_across_regions_with_one_identical_payload(self):
+        session = RecordingJitoSession(results={"sendBundle": "bundle-1"})
+        client = JitoClient(regions=[
+            "https://amsterdam.mainnet.block-engine.jito.wtf",
+            "https://frankfurt.mainnet.block-engine.jito.wtf",
+        ])
+        client._session = session
+        self.assertEqual(await client.send_bundle(["signed-tx"]), "bundle-1")
+        hosts = {url for url, _ in session.posts}
+        self.assertEqual(hosts, {
+            "https://amsterdam.mainnet.block-engine.jito.wtf/api/v1/bundles",
+            "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles",
+        })
+
+    async def test_duplicate_regions_are_collapsed(self):
+        client = JitoClient(regions=[
+            "https://mainnet.block-engine.jito.wtf",
+            "https://mainnet.block-engine.jito.wtf/",
+        ])
+        self.assertEqual(client.regions, ["https://mainnet.block-engine.jito.wtf"])
+
+    async def test_a_full_bundles_url_is_normalized_back_to_its_base(self):
+        client = JitoClient(jito_url="https://ny.mainnet.block-engine.jito.wtf/api/v1/bundles")
+        self.assertEqual(client.regions, ["https://ny.mainnet.block-engine.jito.wtf"])
+        self.assertEqual(client.endpoint("getTipAccounts"),
+                         "https://ny.mainnet.block-engine.jito.wtf/api/v1/getTipAccounts")
+
+    async def test_tip_floor_is_converted_from_sol_to_lamports(self):
+        session = RecordingJitoSession(tip_payload=[{"landed_tips_75th_percentile": 0.000123}])
+        client = self._client(session)
+        self.assertEqual(await client.get_tip_floor_lamports(75), 123_000)
+
+    async def test_tip_floor_is_data_blocked_rather_than_guessed(self):
+        session = RecordingJitoSession(tip_payload=[{}])
+        client = self._client(session)
+        self.assertIsNone(await client.get_tip_floor_lamports(75))
+
+
 class TestDailyLossBudget(unittest.TestCase):
     def _engine(self, **kwargs):
         predictor = MultiHeadPredictor()
@@ -1245,6 +1351,9 @@ class LiveFakeJito:
 
     async def get_bundle_status(self, bundle_id):
         return self.status
+
+    async def get_tip_floor_lamports(self, percentile=75):
+        return None
 
 
 class LiveFakeRpc:

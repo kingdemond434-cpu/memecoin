@@ -268,10 +268,62 @@ class JupiterClient:
 
 
 class JitoClient:
-    def __init__(self, jito_url: str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles"):
-        self.jito_url = jito_url
+    """Jito Block Engine transport.
+
+    Each JSON-RPC method has its own documented path; posting every method
+    at ``/api/v1/bundles`` silently breaks status and tip-account lookups,
+    which in turn makes a bundle look permanently unconfirmed. Endpoints are
+    therefore routed per method rather than sharing one URL.
+
+    A bundle id means the engine RECEIVED the bundle, never that it landed.
+    """
+
+    # Method -> documented path suffix on the Block Engine.
+    METHOD_PATHS = {
+        "sendBundle": "/api/v1/bundles",
+        "getBundleStatuses": "/api/v1/getBundleStatuses",
+        "getInflightBundleStatuses": "/api/v1/getInflightBundleStatuses",
+        "getTipAccounts": "/api/v1/getTipAccounts",
+        "sendTransaction": "/api/v1/transactions",
+    }
+    TIP_FLOOR_URL = "https://bundles.jito.wtf/api/v1/bundles/tip_floor"
+    DEFAULT_REGIONS = (
+        "https://mainnet.block-engine.jito.wtf",
+        "https://amsterdam.mainnet.block-engine.jito.wtf",
+        "https://frankfurt.mainnet.block-engine.jito.wtf",
+        "https://london.mainnet.block-engine.jito.wtf",
+        "https://ny.mainnet.block-engine.jito.wtf",
+        "https://tokyo.mainnet.block-engine.jito.wtf",
+    )
+
+    def __init__(self, jito_url: Optional[str] = None, regions: Optional[List[str]] = None):
+        configured = [value.strip().rstrip("/") for value in
+                      os.getenv("JITO_BLOCK_ENGINE_URLS", "").split(",") if value.strip()]
+        if regions:
+            bases = [value.rstrip("/") for value in regions]
+        elif configured:
+            bases = configured
+        elif jito_url:
+            bases = [self._base_of(jito_url)]
+        else:
+            bases = list(self.DEFAULT_REGIONS)
+        # Preserve order while removing duplicates so racing does not send the
+        # same transaction to one region twice.
+        self.regions: List[str] = list(dict.fromkeys(bases))
+        self.jito_url = self.regions[0] + self.METHOD_PATHS["sendBundle"]
         self._session: Optional[aiohttp.ClientSession] = None
         self._tip_accounts: List[str] = []
+
+    @staticmethod
+    def _base_of(url: str) -> str:
+        trimmed = url.rstrip("/")
+        for suffix in JitoClient.METHOD_PATHS.values():
+            if trimmed.endswith(suffix):
+                return trimmed[: -len(suffix)]
+        return trimmed
+
+    def endpoint(self, method: str, base: Optional[str] = None) -> str:
+        return (base or self.regions[0]) + self.METHOD_PATHS[method]
 
     async def start(self):
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
@@ -282,12 +334,12 @@ class JitoClient:
             await self._session.close()
             self._session = None
 
-    async def _rpc(self, method: str, params: List[Any]) -> Any:
+    async def _rpc(self, method: str, params: List[Any], base: Optional[str] = None) -> Any:
         if not self._session:
             raise RuntimeError("Jito client is not started")
         try:
             async with self._session.post(
-                self.jito_url,
+                self.endpoint(method, base),
                 json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
             ) as resp:
                 if resp.status != 200:
@@ -302,10 +354,78 @@ class JitoClient:
             return None
 
     async def send_bundle(self, transactions: List[str]) -> Optional[str]:
-        return await self._rpc("sendBundle", [transactions, {"encoding": "base64"}])
+        """Race one already-signed bundle across regions; first receipt wins.
+
+        The same signed payload is idempotent on chain: whichever region wins
+        the auction, the identical transaction lands at most once. Building a
+        differently-signed payload per region would risk a double fill.
+        """
+        results = await asyncio.gather(
+            *(self._rpc("sendBundle", [transactions, {"encoding": "base64"}], base)
+              for base in self.regions),
+            return_exceptions=True,
+        )
+        for value in results:
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    async def send_transaction(self, transaction: str) -> Optional[str]:
+        """Single-transaction lane; often lands as well as a 1-tx bundle."""
+        results = await asyncio.gather(
+            *(self._rpc("sendTransaction", [transaction, {"encoding": "base64"}], base)
+              for base in self.regions),
+            return_exceptions=True,
+        )
+        for value in results:
+            if isinstance(value, str) and value:
+                return value
+        return None
 
     async def get_bundle_status(self, bundle_id: str) -> Optional[Dict[str, Any]]:
-        return await self._rpc("getBundleStatuses", [[bundle_id]])
+        """Landed status. Queries every region: only one auction accepted it."""
+        results = await asyncio.gather(
+            *(self._rpc("getBundleStatuses", [[bundle_id]], base) for base in self.regions),
+            return_exceptions=True,
+        )
+        for value in results:
+            if isinstance(value, dict) and (value.get("value") or []):
+                return value
+        return None
+
+    async def get_inflight_bundle_status(self, bundle_id: str) -> Optional[Dict[str, Any]]:
+        """Pre-landing state, distinguishing 'still pending' from 'dropped'."""
+        results = await asyncio.gather(
+            *(self._rpc("getInflightBundleStatuses", [[bundle_id]], base) for base in self.regions),
+            return_exceptions=True,
+        )
+        for value in results:
+            if isinstance(value, dict) and (value.get("value") or []):
+                return value
+        return None
+
+    async def get_tip_floor_lamports(self, percentile: int = 75) -> Optional[int]:
+        """Observed landed-tip floor in lamports, or None when unavailable.
+
+        Bidding a hand-picked constant either overpays or silently never
+        lands; this reports what actually cleared recently so the tip can be
+        chosen against evidence.
+        """
+        if not self._session or percentile not in {25, 50, 75, 95, 99}:
+            return None
+        key = f"landed_tips_{percentile}th_percentile"
+        try:
+            async with self._session.get(self.TIP_FLOOR_URL) as resp:
+                if resp.status != 200:
+                    return None
+                payload = await resp.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            logger.warning("Jito tip floor DATA_BLOCKED: %s", exc)
+            return None
+        row = payload[0] if isinstance(payload, list) and payload else payload
+        if not isinstance(row, dict) or row.get(key) is None:
+            return None
+        return max(0, int(float(row[key]) * 1e9))  # reported in SOL
 
 
 class SolanaTransactionBuilder:
@@ -406,6 +526,14 @@ class ExecutionEngine:
                 error="live submission is locked; ALLOW_LIVE_TRADING acknowledgement absent",
             )
 
+        if use_jito:
+            # Bid against what actually cleared recently rather than a fixed
+            # constant. One data-driven tip only: a differently signed
+            # escalation ladder could double-fill if an earlier attempt lands
+            # late, so the tip is chosen once, before signing.
+            observed_tip = await self.jito.get_tip_floor_lamports(75)
+            if observed_tip:
+                jito_tip = min(max(jito_tip, observed_tip), 5_000_000)
         swap_tx = await self.jupiter.get_swap_transaction(
             quote,
             self.tx_builder.public_key,
