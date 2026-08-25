@@ -50,6 +50,40 @@ SURVIVAL_LEVELS: Tuple[Tuple[PredictionTarget, float], ...] = (
     (PredictionTarget.P_500X, 500.0),
 )
 
+# What a launch IS, at the age the decision is being made.
+#
+# A pooled model trained across every horizon learns the average launch, and
+# there is no such thing. At 100ms almost nothing is observable except who
+# funded whom and how fast the first buys arrived; by five minutes the holder
+# distribution and the whole social response exist, and the features that
+# mattered at 100ms have been overwritten by their own consequences. The same
+# column means a different thing in each regime, so one model reconciling them
+# is not learning a launch -- it is learning a blend of four.
+#
+# Bands are closed below and open above.
+# One-hot regimes. Fixed and ordered so the feature schema hash is stable, and
+# an unrecognised regime lights nothing rather than being folded into a
+# neighbour it has nothing to do with.
+REGIME_NAMES: Tuple[str, ...] = ("bull", "bear", "chop", "euphoria")
+
+
+AGE_BANDS: Tuple[Tuple[str, float, float], ...] = (
+    ("flash", 0.0, 0.5),
+    ("early", 0.5, 5.0),
+    ("forming", 5.0, 60.0),
+    ("mature", 60.0, float("inf")),
+)
+
+
+def band_for(age_seconds: float) -> str:
+    """Which brain owns a decision at this age."""
+    age = max(0.0, float(age_seconds))
+    for name, low, high in AGE_BANDS:
+        if low <= age < high:
+            return name
+    return AGE_BANDS[-1][0]
+
+
 CLASSIFICATION_TARGETS = {target for target, _ in SURVIVAL_LEVELS} | {
     PredictionTarget.P_MIGRATION, PredictionTarget.P_RUG_30S, PredictionTarget.P_RUG_5M,
 }
@@ -164,6 +198,13 @@ class PredictionFeatures:
             float(self.social_available),
             float(self.coordination_available),
             float(self.flow_available),
+            # Age was carried on the dataclass and never reached the array, so
+            # every model was blind to whether it was being asked about a
+            # hundred-millisecond launch or an hour-old one. Log-scaled
+            # because the difference between 50ms and 500ms is the whole
+            # decision while the difference between 50 and 55 minutes is not.
+            float(np.clip(np.log1p(max(0.0, self.time_since_launch)) / 10.0, 0, 1)),
+            *(float(self.regime == name) for name in REGIME_NAMES),
         ], dtype=np.float32)
 
 
@@ -191,6 +232,12 @@ class MultiHeadPrediction:
     model_version: str = ""
     feature_hash: str = ""
     calibration_version: str = ""
+    # Which age brain answered, and whether it was the one fitted to this age.
+    # Carried on the prediction rather than looked up later, so a decision
+    # made on a labelled pooled fallback is distinguishable afterwards from
+    # one made on the band's own model -- promotion reads this.
+    age_band: str = ""
+    band_status: str = ""
 
 
 class MultiHeadPredictor:
@@ -214,7 +261,9 @@ class MultiHeadPredictor:
             "sol_change_24h", "btc_change_24h", "sol_btc_beta", "solana_tvl_change",
             "priority_fee_p90", "fee_pressure",
             "data_coverage", "wallet_history_available",
-            "social_available", "coordination_available", "flow_available"
+            "social_available", "coordination_available", "flow_available",
+            "time_since_launch",
+            *(f"regime_{name}" for name in REGIME_NAMES),
         ]
         self.model_version = "1.0"
         self._training_data: Dict[PredictionTarget, List[Tuple[np.ndarray, float, float]]] = defaultdict(list)
@@ -325,7 +374,7 @@ class MultiHeadPredictor:
                     elif target == PredictionTarget.EXPECTED_HOLD_TIME:
                         val = max(0, val)
                     elif target == PredictionTarget.EXPECTED_FEASIBLE_MULTIPLE:
-                        val = np.clip(val, 0.02, 50)
+                        val = np.clip(val, 0.02, SURVIVAL_LEVELS[-1][1])
                     setattr(pred, target.value, float(val))
             except Exception as e:
                 logger.error(f"Prediction failed for {target.value}: {e}")
@@ -366,7 +415,7 @@ class MultiHeadPredictor:
                         elif target == PredictionTarget.EXPECTED_HOLD_TIME:
                             val = max(0, val)
                         elif target == PredictionTarget.EXPECTED_FEASIBLE_MULTIPLE:
-                            val = np.clip(val, 0.02, 50)
+                            val = np.clip(val, 0.02, SURVIVAL_LEVELS[-1][1])
                         setattr(pred, target.value, float(val))
                 except Exception as e:
                     logger.error(f"Batch prediction failed for {target.value}: {e}")

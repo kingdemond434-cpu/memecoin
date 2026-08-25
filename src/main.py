@@ -66,6 +66,7 @@ from src.strategies.information_graph import (
     InformationLeadGraph,
     LeadEventType,
 )
+from src.strategies.age_banded import AgeBandedPredictor
 from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPredictor, PredictionFeatures
 from src.chains.pump_curve import BondingCurveState, quote_buy, quote_sell
 from src.execution.pump_fees import (
@@ -319,9 +320,20 @@ class MemecoinQuantDesk:
                 await component.start()
 
     async def _setup_prediction(self):
-        self.predictor = MultiHeadPredictor()
-        self.predictor.initialize_models()
-        model_loaded = self.predictor.load_latest()
+        # One brain per launch age. A pooled model trained across every horizon
+        # learns the average launch and there is no such thing: at 100ms the
+        # holder distribution does not exist yet, and by five minutes the
+        # features that mattered at 100ms have been overwritten by their own
+        # consequences. The pooled model stays as a LABELLED bridge while the
+        # per-band artifacts accumulate; `band_status` on every prediction says
+        # which answered, so promotion can require the band's own.
+        self.predictor = AgeBandedPredictor(
+            os.getenv("MODEL_DIR", "models"),
+            allow_pooled_fallback=bool(
+                self.global_config.get("allow_pooled_model_fallback", True)),
+        )
+        loaded = self.predictor.load_latest()
+        model_loaded = any(loaded.values())
         trained_policy, policy_report = load_latest_exit_policy(os.getenv("MODEL_DIR", "models"))
         # Without a validated policy the operator's configured hold time still
         # governs; a trained policy has earned the right to set its own.
@@ -2249,9 +2261,11 @@ class MemecoinQuantDesk:
         if self.dry_run:
             latest_mtime = self._latest_model_mtime()
             if latest_mtime > self._model_artifact_mtime:
-                candidate = MultiHeadPredictor()
-                candidate.initialize_models()
-                if candidate.load_latest():
+                candidate = AgeBandedPredictor(
+                    os.getenv("MODEL_DIR", "models"),
+                    allow_pooled_fallback=bool(
+                        self.global_config.get("allow_pooled_model_fallback", True)))
+                if any(candidate.load_latest().values()):
                     self.predictor = candidate
                     self.elogw_engine.predictor = candidate
                     self._model_artifact_mtime = latest_mtime
@@ -2437,6 +2451,7 @@ class MemecoinQuantDesk:
             "yellowstone": self.yellowstone.get_status() if self.yellowstone else {"status": "NOT_STARTED"},
             "rpc_program_stream": self.rpc_program_stream.get_status() if self.rpc_program_stream else None,
             "prediction": "OK" if self.predictor and self.predictor._is_trained else "DATA_BLOCKED",
+            "age_bands": self.predictor.report() if self.predictor else {"status": "DATA_BLOCKED"},
             "exit_policy": {"status": self.exit_policy_status, "detail": self.exit_policy_detail,
                             "policy": asdict(self.exit_policy)},
             "equity": {"status": self.equity_status, "wallet_equity_usd": self.wallet_equity_usd,

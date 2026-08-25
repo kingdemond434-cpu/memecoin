@@ -12,8 +12,10 @@ import numpy as np
 
 from src.research.feature_engine import FEATURE_SCHEMA_VERSION, build_features
 from src.strategies.multihead_predictor import (
-    SURVIVAL_LEVELS, ElogwEngine, MultiHeadPredictor, PredictionFeatures, PredictionTarget,
+    SURVIVAL_LEVELS, ElogwEngine, MultiHeadPredictor, PredictionFeatures,
+    PredictionTarget, band_for,
 )
+from src.strategies.age_banded import BAND_NAMES
 
 
 # The rows a shadow model trains on, earliest first. The sub-second rungs come
@@ -234,6 +236,60 @@ def chronological_episode_split(
     return train, oos
 
 
+def train_age_bands(train_samples, oos_samples, model_dir: Path,
+                    min_band_samples: int = 60) -> Dict[str, Any]:
+    """One artifact per age band, each fitted only to rows from that band.
+
+    A band that cannot muster enough rows is reported DATA_BLOCKED and its
+    directory left empty, so the runtime finds nothing and answers nothing for
+    that age. Training it anyway on a handful of rows -- or, worse, topping it
+    up from a neighbouring band -- would produce exactly the pooled model this
+    split exists to replace, wearing a band's name.
+
+    The chronological split is done ONCE, upstream, and each band inherits it.
+    Splitting per band would let a band's out-of-sample window overlap another
+    band's training window on the same episode, and the same launch appearing
+    on both sides of a split is the oldest way to validate a model against
+    itself.
+    """
+    report: Dict[str, Any] = {"bands": {}, "min_band_samples": min_band_samples}
+    for band in BAND_NAMES:
+        band_train = [item for item in train_samples
+                      if band_for(item[0].time_since_launch) == band]
+        band_oos = [item for item in oos_samples
+                    if band_for(item[0].time_since_launch) == band]
+        entry: Dict[str, Any] = {"train_samples": len(band_train),
+                                 "oos_samples": len(band_oos)}
+        if len(band_train) < min_band_samples or not band_oos:
+            entry.update({"status": "DATA_BLOCKED",
+                          "reason": f"need_at_least_{min_band_samples}_rows_in_band"})
+            report["bands"][band] = entry
+            continue
+        predictor = MultiHeadPredictor(str(model_dir / "bands" / band))
+        predictor.initialize_models()
+        for features, labels, _ in band_train:
+            predictor.add_training_sample(features, labels)
+        entry["training"] = predictor.train(min_samples=min(100, len(band_train)))
+        if not predictor._is_trained:
+            entry.update({"status": "DATA_BLOCKED",
+                          "reason": "one_or_more_heads_lack_chronological_class_coverage"})
+            report["bands"][band] = entry
+            continue
+        entry.update(validate_oos(predictor, band_train, band_oos))
+        if entry.get("status") == "PASSED":
+            band_dir = model_dir / "bands" / band
+            band_dir.mkdir(parents=True, exist_ok=True)
+            output = band_dir / f"multihead-shadow-{int(time.time())}-{predictor.model_version}.joblib"
+            predictor.save(str(output), entry)
+            entry["model_path"] = str(output)
+        report["bands"][band] = entry
+    passed = [band for band, entry in report["bands"].items()
+              if entry.get("status") == "PASSED"]
+    report["status"] = "PASSED" if passed else "DATA_BLOCKED"
+    report["passed_bands"] = passed
+    return report
+
+
 def train_shadow(storage: Path, model_dir: Path, min_samples: int = 250) -> Dict[str, Any]:
     samples = load_samples(storage)
     report: Dict[str, Any] = {"created_at": time.time(), "samples": len(samples)}
@@ -268,6 +324,10 @@ def train_shadow(storage: Path, model_dir: Path, min_samples: int = 250) -> Dict
                 output = model_dir / f"multihead-shadow-{int(time.time())}-{predictor.model_version}.joblib"
                 predictor.save(str(output), report)
                 report["model_path"] = str(output)
+            # The pooled model is the bridge; the bands are the destination.
+            # Both are trained from the same chronological split so the two
+            # can be compared on the same out-of-sample window.
+            report["age_bands"] = train_age_bands(train_samples, oos_samples, model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
     (model_dir / "last_training_report.json").write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     return report

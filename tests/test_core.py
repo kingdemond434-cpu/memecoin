@@ -39,9 +39,12 @@ from src.execution.jupiter_jito import (
 )
 from src.main import CAPACITY_REJECTIONS, WSOL_MINT, MemecoinQuantDesk, _jsonable
 from src.strategies.information_graph import CounterfactualExecutionLab
+from src.strategies.age_banded import (
+    BAND_NAMES, AgeBandedPredictor, band_model_dir,
+)
 from src.strategies.multihead_predictor import (
-    SURVIVAL_LEVELS, ElogwEngine, MultiHeadPrediction, MultiHeadPredictor,
-    PredictionFeatures,
+    AGE_BANDS, SURVIVAL_LEVELS, ElogwEngine, MultiHeadPrediction,
+    MultiHeadPredictor, PredictionFeatures, band_for,
 )
 from src.collectors.registry import (
     ADAPTER_KINDS, SourceDeclaration, SourceDiscovery, build_sources,
@@ -111,7 +114,7 @@ from src.research.dataset_builder import (
     PointInTimeDatasetBuilder, SnapshotTimepoint,
 )
 from src.research.shadow_trainer import (
-    SNAPSHOT_ORDER, chronological_episode_split, train_shadow,
+    SNAPSHOT_ORDER, chronological_episode_split, train_age_bands, train_shadow,
 )
 from src.chains.pump_curve import (
     BONDING_CURVE_DISCRIMINATOR, observation_from_state, parse_bonding_curve,
@@ -8518,3 +8521,145 @@ class TestExtendedTailLabels(unittest.TestCase):
                   / "shadow_trainer.py").read_text()
         self.assertNotIn("np.clip(feasible, 0.02, 50)", source)
         self.assertIn("SURVIVAL_LEVELS[-1][1]", source)
+
+
+class TestAgeBandedBrains(unittest.TestCase):
+    """A launch at 100ms and a launch at five minutes are different objects.
+
+    The pooled model was trained on every horizon at once, so it learned the
+    average launch -- and the average was dominated by whichever horizon
+    produced the most rows. The decisions that matter most were being priced
+    by a model fitted mostly to states that arrive long after the decision.
+    """
+
+    def test_bands_partition_the_whole_timeline_without_gaps(self):
+        self.assertEqual(AGE_BANDS[0][1], 0.0)
+        self.assertEqual(AGE_BANDS[-1][2], float("inf"))
+        for (_, _, high), (_, low, _) in zip(AGE_BANDS, AGE_BANDS[1:]):
+            self.assertEqual(high, low)
+
+    def test_the_subsecond_rungs_all_land_in_one_band(self):
+        """Otherwise the sub-second rows would be split across two brains."""
+        for offset in (0.0, 0.05, 0.1, 0.25, 0.4):
+            self.assertEqual(band_for(offset), "flash")
+        self.assertNotEqual(band_for(1.0), "flash")
+
+    def test_band_boundaries_are_closed_below_and_open_above(self):
+        self.assertEqual(band_for(0.5), "early")
+        self.assertEqual(band_for(0.499), "flash")
+        self.assertEqual(band_for(60.0), "mature")
+        self.assertEqual(band_for(59.9), "forming")
+
+    def test_age_and_regime_reach_the_feature_array(self):
+        """Both lived on the dataclass and never got into the vector."""
+        predictor = MultiHeadPredictor()
+        self.assertIn("time_since_launch", predictor.feature_names)
+        for name in ("regime_bull", "regime_bear", "regime_chop", "regime_euphoria"):
+            self.assertIn(name, predictor.feature_names)
+        young = PredictionFeatures("m", "solana", 0, time_since_launch=0.1).to_array()
+        old = PredictionFeatures("m", "solana", 0, time_since_launch=3600).to_array()
+        self.assertEqual(len(young), len(predictor.feature_names))
+        self.assertNotEqual(young.tolist(), old.tolist())
+
+    def test_an_unrecognised_regime_lights_nothing(self):
+        vector = PredictionFeatures("m", "solana", 0, regime="something_new").to_array()
+        names = MultiHeadPredictor().feature_names
+        for name in ("regime_bull", "regime_bear", "regime_chop", "regime_euphoria"):
+            self.assertEqual(vector[names.index(name)], 0.0)
+
+    def test_each_band_gets_its_own_directory(self):
+        """Sharing one would let load_latest pick up a neighbour's artifact."""
+        directories = {band_model_dir("models", band) for band in BAND_NAMES}
+        self.assertEqual(len(directories), len(BAND_NAMES))
+        for directory in directories:
+            self.assertTrue(directory.startswith(os.path.join("models", "bands")))
+
+    def test_an_untrained_band_answers_nothing_rather_than_borrowing_a_neighbour(self):
+        predictor = AgeBandedPredictor("/nonexistent-models", allow_pooled_fallback=False)
+        features = PredictionFeatures("m", "solana", 0, time_since_launch=0.1)
+        self.assertIsNone(predictor.predict(features))
+        self.assertFalse(predictor._is_trained)
+
+    def test_a_pooled_answer_is_always_labelled_as_one(self):
+        predictor = AgeBandedPredictor("/nonexistent-models", allow_pooled_fallback=True)
+        predictor.pooled._is_trained = True
+        predictor.pooled.predict = lambda features: MultiHeadPrediction(
+            features.token, features.chain, features.timestamp, p_2x=0.5)
+        prediction = predictor.predict(
+            PredictionFeatures("m", "solana", 0, time_since_launch=0.1))
+        self.assertIsNotNone(prediction)
+        # Shadow evaluation may run on the bridge; promotion must be able to
+        # tell that it did.
+        self.assertEqual(prediction.band_status, "POOLED_FALLBACK")
+        self.assertEqual(prediction.age_band, "flash")
+
+    def test_a_band_answer_is_labelled_as_its_own(self):
+        predictor = AgeBandedPredictor("/nonexistent-models")
+        flash = predictor.bands["flash"]
+        flash._is_trained = True
+        flash.predict = lambda features: MultiHeadPrediction(
+            features.token, features.chain, features.timestamp, p_2x=0.9)
+        prediction = predictor.predict(
+            PredictionFeatures("m", "solana", 0, time_since_launch=0.2))
+        self.assertEqual(prediction.band_status, "OWN_BAND")
+        self.assertEqual(prediction.age_band, "flash")
+        self.assertAlmostEqual(prediction.p_2x, 0.9)
+
+    def test_one_trained_band_does_not_unblock_the_others(self):
+        predictor = AgeBandedPredictor("/nonexistent-models", allow_pooled_fallback=False)
+        predictor.bands["flash"]._is_trained = True
+        predictor.bands["flash"].predict = lambda features: MultiHeadPrediction(
+            features.token, features.chain, features.timestamp)
+        self.assertTrue(predictor._is_trained)
+        self.assertIsNotNone(predictor.predict(
+            PredictionFeatures("m", "solana", 0, time_since_launch=0.1)))
+        # A mature launch has no brain, and gets no answer.
+        self.assertIsNone(predictor.predict(
+            PredictionFeatures("m", "solana", 0, time_since_launch=600)))
+
+    def test_the_report_names_which_ages_are_covered(self):
+        predictor = AgeBandedPredictor("/nonexistent-models")
+        report = predictor.report()
+        json.dumps(report)
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertEqual(report["trained_bands"], [])
+        predictor.bands["flash"]._is_trained = True
+        self.assertEqual(predictor.report()["status"], "PARTIAL")
+        for band in BAND_NAMES:
+            predictor.bands[band]._is_trained = True
+        self.assertEqual(predictor.report()["status"], "OK")
+
+    def test_every_band_is_shown_the_same_columns(self):
+        predictor = AgeBandedPredictor("/nonexistent-models")
+        for band in BAND_NAMES:
+            self.assertEqual(predictor.bands[band].feature_names, predictor.feature_names)
+
+
+class TestAgeBandTraining(unittest.TestCase):
+    def test_a_band_without_enough_rows_is_blocked_not_topped_up(self):
+        def sample(age):
+            features = PredictionFeatures("m", "solana", age, time_since_launch=age)
+            return (features, {}, {})
+
+        train = [sample(0.1) for _ in range(5)]
+        oos = [sample(0.1)]
+        with tempfile.TemporaryDirectory() as tmp:
+            report = train_age_bands(train, oos, Path(tmp), min_band_samples=60)
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertEqual(report["bands"]["flash"]["status"], "DATA_BLOCKED")
+        self.assertIn("need_at_least_60", report["bands"]["flash"]["reason"])
+        # And the bands with no rows at all are blocked too, not skipped.
+        for band in BAND_NAMES:
+            self.assertIn(band, report["bands"])
+
+    def test_rows_are_routed_to_the_band_that_owns_their_age(self):
+        def sample(age):
+            return (PredictionFeatures("m", "solana", age, time_since_launch=age), {}, {})
+
+        train = [sample(0.1), sample(0.2), sample(2.0), sample(30.0), sample(600.0)]
+        with tempfile.TemporaryDirectory() as tmp:
+            report = train_age_bands(train, [], Path(tmp), min_band_samples=1000)
+        self.assertEqual(report["bands"]["flash"]["train_samples"], 2)
+        self.assertEqual(report["bands"]["early"]["train_samples"], 1)
+        self.assertEqual(report["bands"]["forming"]["train_samples"], 1)
+        self.assertEqual(report["bands"]["mature"]["train_samples"], 1)
