@@ -97,6 +97,10 @@ from ops.monitor import main as monitor_main
 from src.runtime.hot_state import (
     AsyncArchiveWriter, CompactWalletDNA, EconomicCache, HotState, HotStateBudget,
 )
+from src.research.action_value_trainer import (
+    PolicyMetrics, chronological_split, evaluate_candidate, measure_policy,
+    save_report, select_policy, tail_preservation_gate,
+)
 from src.research.lifecycle_replay import (
     DEFAULT_DELAYS_S, DEFAULT_EXIT_RULES, Cell, Lifecycle, Mark,
     delay_decay, hold_to_end, lifecycle_from_episode, replay_cell,
@@ -6375,3 +6379,127 @@ class TestLifecycleFromEpisode(unittest.TestCase):
             "market_observations": [{"timestamp": 101.0, "price_multiple": 2.0}],
         })
         self.assertIsNone(life.marks[0].executable_sol)
+
+
+class TestActionValueTrainerGate(unittest.TestCase):
+    """The gate exists to refuse the trade a search will otherwise make.
+
+    Raise the win rate, cut the drawdown, quietly stop holding the trades that
+    pay for everything. Every aggregate improves while the book gets worse.
+    """
+
+    @staticmethod
+    def _metrics(launches=100, growth=0.05, tail=0.80, premature=0.10, monsters=25):
+        return PolicyMetrics(
+            launches=launches, priced_cells=launches, mean_net_sol=1.0,
+            mean_log_growth=growth, tail_capture_on_monsters=tail,
+            premature_exit_rate=premature, monster_launches=monsters)
+
+    def test_a_genuine_improvement_passes(self):
+        gate = tail_preservation_gate(
+            self._metrics(growth=0.05, tail=0.80, premature=0.10),
+            self._metrics(growth=0.08, tail=0.82, premature=0.08))
+        self.assertTrue(gate.passed, gate.reasons)
+
+    def test_better_growth_that_kills_the_tail_is_rejected(self):
+        """The exact trade the gate exists to refuse."""
+        gate = tail_preservation_gate(
+            self._metrics(growth=0.05, tail=0.80, premature=0.10),
+            self._metrics(growth=0.20, tail=0.30, premature=0.10))
+        self.assertFalse(gate.passed)
+        self.assertTrue(any("tail capture fell" in reason for reason in gate.reasons))
+
+    def test_no_aggregate_score_buys_past_the_tail_check(self):
+        gate = tail_preservation_gate(
+            self._metrics(growth=0.05, tail=0.90, premature=0.05),
+            self._metrics(growth=99.0, tail=0.10, premature=0.90))
+        self.assertFalse(gate.passed)
+
+    def test_more_premature_exits_are_rejected_even_at_stable_tail_capture(self):
+        gate = tail_preservation_gate(
+            self._metrics(growth=0.05, tail=0.80, premature=0.05),
+            self._metrics(growth=0.09, tail=0.79, premature=0.40))
+        self.assertFalse(gate.passed)
+        self.assertTrue(any("premature exits rose" in reason for reason in gate.reasons))
+
+    def test_growth_that_did_not_improve_is_rejected(self):
+        gate = tail_preservation_gate(
+            self._metrics(growth=0.05), self._metrics(growth=0.05))
+        self.assertFalse(gate.passed)
+        self.assertTrue(any("did not improve" in reason for reason in gate.reasons))
+
+    def test_a_thin_out_of_sample_set_is_a_sample_not_a_measurement(self):
+        gate = tail_preservation_gate(
+            self._metrics(launches=5), self._metrics(launches=5, growth=0.5))
+        self.assertFalse(gate.passed)
+        self.assertTrue(any("not a measurement" in reason for reason in gate.reasons))
+
+    def test_no_monster_evidence_is_unproven_not_proven(self):
+        """A candidate that met no monsters has shown nothing about the tail."""
+        gate = tail_preservation_gate(
+            self._metrics(tail=None, monsters=0),
+            self._metrics(growth=0.20, tail=None, monsters=0))
+        self.assertFalse(gate.passed)
+        self.assertTrue(any("unproven, not proven" in reason for reason in gate.reasons))
+
+
+class TestActionValueTrainerSelection(unittest.TestCase):
+    T0 = 1_800_000_000.0
+
+    def _monster(self, index, exit_early: bool):
+        """A launch where a 20x was feasible."""
+        marks = [
+            Mark(self.T0 + index * 1_000 + 0.0, 1.0, executable_sol=5.0),
+            Mark(self.T0 + index * 1_000 + 5.0, 2.0, executable_sol=5.0),
+            Mark(self.T0 + index * 1_000 + 30.0, 20.0, executable_sol=5.0),
+            Mark(self.T0 + index * 1_000 + 90.0, 12.0, executable_sol=5.0),
+        ]
+        return Lifecycle(f"m{index}", self.T0 + index * 1_000, marks)
+
+    def test_chronological_split_orders_by_launch_time(self):
+        lives = [self._monster(index, False) for index in range(10)]
+        train, oos = chronological_split(list(reversed(lives)), 0.7)
+        self.assertEqual(len(train), 7)
+        self.assertEqual(len(oos), 3)
+        # Whole launches, ordered: a random split puts the same regime on both
+        # sides and every candidate looks like it generalises.
+        self.assertLess(max(life.created_at for life in train),
+                        min(life.created_at for life in oos))
+
+    def test_a_take_profit_that_caps_monsters_is_rejected(self):
+        lives = [self._monster(index, True) for index in range(60)]
+        gate, report = evaluate_candidate(
+            lives, "hold", "tp_2x", DEFAULT_EXIT_RULES)
+        self.assertFalse(gate.passed)
+        self.assertEqual(report["oos_launches"], len(lives) - int(len(lives) * 0.7))
+
+    def test_shipping_nothing_is_a_valid_outcome(self):
+        lives = [self._monster(index, True) for index in range(60)]
+        result = select_policy(lives, DEFAULT_EXIT_RULES, "hold")
+        self.assertEqual(result["status"], "OK")
+        # A search that always finds a winner has found overfitting.
+        self.assertIsNone(result["shipped"])
+        self.assertTrue(result["evaluated"])
+
+    def test_too_few_launches_blocks_rather_than_shipping(self):
+        lives = [self._monster(index, True) for index in range(5)]
+        result = select_policy(lives, DEFAULT_EXIT_RULES, "hold")
+        self.assertEqual(result["status"], "DATA_BLOCKED")
+        self.assertIsNone(result["shipped"])
+
+    def test_growth_is_measured_in_log_wealth_not_profit(self):
+        cells = [Cell("a", 0.0, 1.0, "hold", "OK", net_sol=1.0, filled_sol=1.0,
+                      exit_multiple=2.0, max_feasible_multiple=2.0)]
+        metrics = measure_policy(cells, 1)
+        # log(1 + 1/1) = log 2. Summing profit would rank a policy that risks
+        # everything above one that risks a sensible fraction.
+        self.assertAlmostEqual(metrics.mean_log_growth, math.log(2.0))
+
+    def test_a_rejected_run_is_still_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_report(Path(directory), {"status": "OK", "shipped": None})
+            saved = json.loads(path.read_text())
+            # The more informative record: it stops the same candidate being
+            # re-proposed next week as though it were new.
+            self.assertIsNone(saved["shipped"])
+            self.assertIn("generated_at", saved)
