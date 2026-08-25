@@ -77,9 +77,10 @@ from src.strategies.authenticity import (
     rank_copycats,
 )
 from src.strategies.escape import (
-    HAZARD_HORIZONS, UNESCAPABLE_MECHANISMS, HazardCurve, HazardMechanism,
-    escape_probability, hazard_curve_from_probabilities, liquidation_ladder,
-    ride_or_reject,
+    HAZARD_HORIZONS, TRIGGER_MECHANISMS, UNESCAPABLE_MECHANISMS, HazardCurve,
+    HazardMechanism, LandingLatency, escape_probability,
+    hazard_curve_from_probabilities, liquidation_ladder,
+    mechanisms_from_signals, ride_or_reject,
 )
 from src.strategies.distribution import (
     DISTRIBUTION_FEATURE_NAMES, DISTRIBUTION_HORIZONS, DistributionDetector,
@@ -840,6 +841,7 @@ class TestPartialExitAccounting(unittest.IsolatedAsyncioTestCase):
             wallet_equity_usd=10_000.0,
             rug_hazard=SimpleNamespace(get_hazard=lambda token: None),
             reentry_book=ReentryBook(),
+            landing_latency=LandingLatency(),
         )
         desk.ops_events = []
         desk._record_ops_event = (
@@ -8663,3 +8665,173 @@ class TestAgeBandTraining(unittest.TestCase):
         self.assertEqual(report["bands"]["early"]["train_samples"], 1)
         self.assertEqual(report["bands"]["forming"]["train_samples"], 1)
         self.assertEqual(report["bands"]["mature"]["train_samples"], 1)
+
+
+class TestMechanismDecomposition(unittest.TestCase):
+    """The race saw two mechanisms; the hazard model detects seven.
+
+    Both of the two were built from the same aggregate hazard under different
+    names, so the same number was fed in twice. Of the five that never
+    arrived, three are unescapable -- which meant the mechanisms being dropped
+    were exactly the ones that decide whether running is even the right move.
+    """
+
+    @staticmethod
+    def _signal(trigger, strength=0.8, confidence=0.9):
+        return SimpleNamespace(trigger=SimpleNamespace(value=trigger),
+                               strength=strength, confidence=confidence)
+
+    def test_every_unescapable_mechanism_is_reachable_from_a_live_trigger(self):
+        reachable = {mechanism for mechanism, _ in TRIGGER_MECHANISMS.values()}
+        reachable.add(HazardMechanism.AUTHORITY_ABUSE)  # from the safety report
+        for mechanism in UNESCAPABLE_MECHANISMS:
+            self.assertIn(mechanism, reachable, mechanism.value)
+
+    def test_every_mechanism_the_enum_declares_can_actually_be_produced(self):
+        producible = {mechanism for mechanism, _ in TRIGGER_MECHANISMS.values()}
+        producible.add(HazardMechanism.AUTHORITY_ABUSE)
+        self.assertEqual(producible, set(HazardMechanism))
+
+    def test_decay_triggers_are_not_mistaken_for_ways_of_dying(self):
+        """A token can fade for an hour and stay sellable the whole way down."""
+        decomposition = mechanisms_from_signals([
+            self._signal("buy_deceleration"), self._signal("volume_collapse"),
+            self._signal("social_velocity_collapse"), self._signal("sell_acceleration"),
+        ])
+        self.assertEqual(decomposition.mechanisms, {})
+        # Not silently dropped either -- unattributed hazard is reported.
+        self.assertEqual(len(decomposition.unattributed_triggers), 4)
+        self.assertIn("sell_acceleration", decomposition.unattributed_triggers)
+
+    def test_repeated_evidence_for_one_mechanism_compounds_rather_than_maxes(self):
+        one = mechanisms_from_signals([self._signal("liquidity_withdrawal", 0.5, 0.8)])
+        two = mechanisms_from_signals([self._signal("liquidity_withdrawal", 0.5, 0.8),
+                                       self._signal("liquidity_withdrawal", 0.5, 0.8)])
+        single = one.mechanisms[HazardMechanism.LIQUIDITY_REMOVAL][0]
+        double = two.mechanisms[HazardMechanism.LIQUIDITY_REMOVAL][0]
+        self.assertGreater(double, single)
+        # Two independent observations of liquidity leaving are more than one.
+        self.assertAlmostEqual(double, 1 - (1 - single) ** 2)
+
+    def test_the_shortest_horizon_wins_for_a_mechanism(self):
+        decomposition = mechanisms_from_signals([
+            self._signal("insider_sell"),        # 300s
+            self._signal("smart_wallet_exit"),   # 300s
+            self._signal("creator_transfer"),    # 30s
+        ])
+        self.assertEqual(
+            decomposition.mechanisms[HazardMechanism.CREATOR_SELLING][1], 30.0)
+
+    def test_a_live_authority_is_a_standing_mechanism_with_no_trigger(self):
+        """No signal fires for a capability that is merely present."""
+        blocked = mechanisms_from_signals([], authority_live=True)
+        self.assertIn(HazardMechanism.AUTHORITY_ABUSE, blocked.mechanisms)
+        self.assertIn(HazardMechanism.AUTHORITY_ABUSE, UNESCAPABLE_MECHANISMS)
+        clean = mechanisms_from_signals([], authority_live=False)
+        self.assertNotIn(HazardMechanism.AUTHORITY_ABUSE, clean.mechanisms)
+        # Unmeasured is not clean.
+        unknown = mechanisms_from_signals([], authority_live=None)
+        self.assertNotIn(HazardMechanism.AUTHORITY_ABUSE, unknown.mechanisms)
+
+    def test_the_report_is_serialisable(self):
+        json.dumps(mechanisms_from_signals(
+            [self._signal("route_degradation")], authority_live=True).report())
+
+
+class TestLearnedExitLatency(unittest.TestCase):
+    """The escape race was run against a config constant."""
+
+    def test_below_the_sample_floor_it_refuses_rather_than_guesses(self):
+        latency = LandingLatency()
+        for _ in range(5):
+            latency.record(400, landed=True)
+        estimate = latency.estimate()
+        self.assertEqual(estimate.status, "DATA_BLOCKED")
+        self.assertIsNone(estimate.seconds)
+        self.assertIn("have 5", estimate.detail)
+
+    def test_a_paper_fill_teaches_it_nothing(self):
+        latency = LandingLatency()
+        for _ in range(50):
+            self.assertFalse(latency.record(400, landed=True, simulated=True))
+        self.assertEqual(latency.estimate().observations, 0)
+
+    def test_a_submission_that_never_landed_has_no_latency(self):
+        """Counting a timeout would make a failing relay look merely slow."""
+        latency = LandingLatency()
+        for _ in range(50):
+            self.assertFalse(latency.record(30_000, landed=False))
+        self.assertEqual(latency.estimate().observations, 0)
+
+    def test_it_prices_the_slow_race_not_the_typical_one(self):
+        latency = LandingLatency()
+        for value in list(range(100, 1_100, 50)):
+            latency.record(value, landed=True)
+        estimate = latency.estimate()
+        self.assertEqual(estimate.status, "OK")
+        median = np.median([value / 1000 for value in range(100, 1_100, 50)])
+        # The race that matters is the one run while something is collapsing.
+        self.assertGreater(estimate.seconds, median)
+
+    def test_nonsense_measurements_are_refused(self):
+        latency = LandingLatency()
+        for value in (0, -5, None, "slow", float("inf")):
+            self.assertFalse(latency.record(value, landed=True))
+        self.assertEqual(latency.estimate().observations, 0)
+
+    def test_the_window_is_bounded_so_old_conditions_age_out(self):
+        latency = LandingLatency(capacity=20)
+        for _ in range(100):
+            latency.record(400, landed=True)
+        self.assertEqual(latency.estimate().observations, 20)
+
+
+class TestEscapeUsesEveryMechanism(unittest.IsolatedAsyncioTestCase):
+    def _desk(self, signals, *, risk=None, latency=None):
+        desk = SimpleNamespace(
+            rug_hazard=SimpleNamespace(observations={}),
+            global_config={"acceptable_exit_impact": 0.10,
+                           "expected_exit_latency_s": 0.4},
+            _latest_curve_state={},
+            landing_latency=latency or LandingLatency(),
+        )
+        desk.hazard = SimpleNamespace(signals=signals)
+        return desk
+
+    def test_all_seven_mechanisms_reach_the_curve(self):
+        desk = self._desk([])
+        position = {"size_tokens": 1_000, "risk_object": SimpleNamespace(
+            data_status="OK", can_mint=True, can_freeze=False)}
+        signals = [SimpleNamespace(trigger=SimpleNamespace(value=name),
+                                   strength=0.6, confidence=0.9)
+                   for name in TRIGGER_MECHANISMS]
+        hazard = SimpleNamespace(signals=signals)
+        MemecoinQuantDesk._estimate_escape(desk, "mint", position, hazard)
+        reported = position["hazard_mechanisms"]["mechanisms"]
+        for mechanism in HazardMechanism:
+            self.assertIn(mechanism.value, reported, mechanism.value)
+
+    def test_a_measured_latency_replaces_the_configured_one(self):
+        measured = LandingLatency()
+        for value in range(1_000, 2_200, 50):
+            measured.record(value, landed=True)
+        desk = self._desk([], latency=measured)
+        position = {"size_tokens": 1_000}
+        MemecoinQuantDesk._estimate_escape(
+            desk, "mint", position,
+            SimpleNamespace(signals=[SimpleNamespace(
+                trigger=SimpleNamespace(value="creator_transfer"),
+                strength=0.5, confidence=0.9)]))
+        self.assertEqual(position["exit_latency"]["status"], "OK")
+        # The measured tail is seconds, not the configured 0.4.
+        self.assertGreater(position["exit_latency"]["seconds"], 1.0)
+
+    def test_an_unmeasured_latency_falls_back_but_says_so(self):
+        desk = self._desk([])
+        position = {"size_tokens": 1_000}
+        MemecoinQuantDesk._estimate_escape(
+            desk, "mint", position,
+            SimpleNamespace(signals=[SimpleNamespace(
+                trigger=SimpleNamespace(value="creator_transfer"),
+                strength=0.5, confidence=0.9)]))
+        self.assertEqual(position["exit_latency"]["status"], "DATA_BLOCKED")

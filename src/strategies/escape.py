@@ -32,9 +32,10 @@ distinction the exit needs.
 
 import logging
 import math
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -299,3 +300,183 @@ def liquidation_ladder(
         "sellable_at_impact": sellable, "rungs": rungs,
         "hazard": hazard.report(),
     }
+
+
+# Which way of dying each live hazard trigger is evidence for.
+#
+# Only triggers that name a MECHANISM appear here. Buy deceleration, volume
+# collapse and social velocity collapse are decay, not death: a token can fade
+# for an hour and still be sellable the whole way down, and folding them into
+# a mechanism would tell the escape race that a quiet chart is a rug in
+# progress. Sell acceleration is deliberately absent too -- it says somebody
+# is leaving without saying who, and inventing the attribution would let an
+# ordinary exit wave read as an insider cluster.
+#
+# The horizon is the window the trigger speaks about, and it is what turns a
+# probability into a rate. Getting it wrong is not a rounding error: the same
+# 0.4 over 30 seconds and over 5 minutes are two very different hazards.
+TRIGGER_MECHANISMS: Dict[str, Tuple[HazardMechanism, float]] = {
+    "creator_transfer": (HazardMechanism.CREATOR_SELLING, 30.0),
+    "dev_wallet_activation": (HazardMechanism.CREATOR_SELLING, 30.0),
+    "insider_sell": (HazardMechanism.INSIDER_CLUSTER_EXIT, 300.0),
+    "smart_wallet_exit": (HazardMechanism.INSIDER_CLUSTER_EXIT, 300.0),
+    "bundle_detection": (HazardMechanism.FUNDER_LINKED_SELLING, 300.0),
+    "holder_distribution": (HazardMechanism.FUNDER_LINKED_SELLING, 300.0),
+    "concentration_change": (HazardMechanism.FUNDER_LINKED_SELLING, 300.0),
+    "liquidity_withdrawal": (HazardMechanism.LIQUIDITY_REMOVAL, 30.0),
+    "route_degradation": (HazardMechanism.SELLABILITY_LOSS, 30.0),
+    "failed_migration": (HazardMechanism.MIGRATION_FAILURE, 300.0),
+}
+
+
+@dataclass
+class MechanismDecomposition:
+    """Per-mechanism probabilities, plus what could not be attributed."""
+
+    mechanisms: Dict[HazardMechanism, Tuple[float, float]] = field(default_factory=dict)
+    unattributed_triggers: List[str] = field(default_factory=list)
+    contributing_signals: int = 0
+
+    def report(self) -> Dict[str, Any]:
+        return {
+            "mechanisms": {mechanism.value: {"probability": probability, "horizon_s": horizon}
+                           for mechanism, (probability, horizon) in self.mechanisms.items()},
+            "unattributed_triggers": sorted(set(self.unattributed_triggers)),
+            "contributing_signals": self.contributing_signals,
+        }
+
+
+def mechanisms_from_signals(
+    signals: Sequence[Any],
+    *,
+    authority_live: Optional[bool] = None,
+    sellability_lost: bool = False,
+) -> MechanismDecomposition:
+    """Decompose the hazard model's live signals into ways of dying.
+
+    Escape used to be estimated from two hand-rolled mechanisms built out of
+    the AGGREGATE hazard -- creator selling from `hazard_30s`, insider exit
+    from `hazard_5m` -- which meant the same number was fed in twice under two
+    names, and the four other mechanisms the hazard model actually detects
+    reached the race not at all. Three of those four are unescapable, so the
+    ones being dropped were exactly the ones speed cannot answer.
+
+    Several signals for one mechanism combine as independent evidence: the
+    mechanism survives only if every signal is wrong about it. That is the
+    same complement-product the coordination miner uses, and it is
+    deliberately not a max -- two separate observations of liquidity leaving
+    are more than one.
+
+    ``authority_live`` comes from the safety report, not the hazard stream:
+    a mint or freeze authority that was never renounced is a standing
+    unescapable mechanism whether or not anything has happened yet, and no
+    trigger fires for a capability that is simply present.
+    """
+    survival: Dict[HazardMechanism, float] = {}
+    horizons: Dict[HazardMechanism, float] = {}
+    unattributed: List[str] = []
+    contributing = 0
+    for signal in signals:
+        trigger = getattr(getattr(signal, "trigger", None), "value", None)
+        if trigger is None:
+            continue
+        mapped = TRIGGER_MECHANISMS.get(trigger)
+        if mapped is None:
+            unattributed.append(trigger)
+            continue
+        mechanism, horizon = mapped
+        strength = float(np.clip(getattr(signal, "strength", 0.0), 0.0, 1.0))
+        confidence = float(np.clip(getattr(signal, "confidence", 0.0), 0.0, 1.0))
+        evidence = float(np.clip(strength * confidence, 0.0, 0.99))
+        if evidence <= 0:
+            continue
+        contributing += 1
+        survival[mechanism] = survival.get(mechanism, 1.0) * (1.0 - evidence)
+        # The shortest horizon any signal spoke about wins: a mechanism
+        # evidenced at 30 seconds does not become a five-minute problem
+        # because a slower signal also mentioned it.
+        horizons[mechanism] = min(horizons.get(mechanism, horizon), horizon)
+
+    mechanisms = {mechanism: (1.0 - value, horizons[mechanism])
+                  for mechanism, value in survival.items()}
+    if authority_live:
+        # Certain in the sense that matters: the capability exists, and no
+        # amount of speed sells into a frozen mint.
+        mechanisms[HazardMechanism.AUTHORITY_ABUSE] = (0.99, 30.0)
+    if sellability_lost:
+        mechanisms[HazardMechanism.SELLABILITY_LOSS] = (
+            max(0.5, mechanisms.get(HazardMechanism.SELLABILITY_LOSS, (0.0, 30.0))[0]), 30.0)
+    return MechanismDecomposition(mechanisms=mechanisms,
+                                  unattributed_triggers=unattributed,
+                                  contributing_signals=contributing)
+
+
+# Below this many landed fills the observed distribution is not a distribution.
+MIN_LATENCY_OBSERVATIONS = 12
+# Escape assumes a SLOW fill, not a typical one. A median latency prices the
+# race we usually run; the race that matters is the one we run while something
+# is collapsing, and that is the tail.
+LATENCY_QUANTILE = 0.9
+
+
+@dataclass
+class LatencyEstimate:
+    status: str
+    seconds: Optional[float] = None
+    observations: int = 0
+    quantile: float = LATENCY_QUANTILE
+    detail: str = ""
+
+    def report(self) -> Dict[str, Any]:
+        return {"status": self.status, "seconds": self.seconds,
+                "observations": self.observations, "quantile": self.quantile,
+                "detail": self.detail}
+
+
+class LandingLatency:
+    """How long our sells actually take to land, measured rather than assumed.
+
+    The escape race was run against a config constant. A constant is fine
+    right up until the moment it matters -- congestion, a degraded relay, a
+    priority fee that stopped clearing -- and those are precisely the moments
+    a position needs to be out. A latency that never moves cannot tell the
+    difference between a market we can escape and one we cannot.
+
+    Sells only. A buy that lands slowly costs a worse entry; a sell that lands
+    slowly costs the position, and the two distributions are not the same
+    because they are submitted under different urgency and different fees.
+    """
+
+    def __init__(self, capacity: int = 512,
+                 minimum_observations: int = MIN_LATENCY_OBSERVATIONS):
+        self.capacity = max(1, int(capacity))
+        self.minimum_observations = max(1, int(minimum_observations))
+        self._observations: Deque[float] = deque(maxlen=self.capacity)
+
+    def record(self, latency_ms: Any, *, landed: bool, simulated: bool = False) -> bool:
+        """One landed sell. Returns whether it was counted.
+
+        A simulated fill is not evidence about the network, and a submission
+        that never landed has no latency at all -- counting it as its timeout
+        would make a failing relay look merely slow.
+        """
+        if simulated or not landed:
+            return False
+        try:
+            seconds = float(latency_ms) / 1000.0
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(seconds) or seconds <= 0:
+            return False
+        self._observations.append(seconds)
+        return True
+
+    def estimate(self) -> LatencyEstimate:
+        count = len(self._observations)
+        if count < self.minimum_observations:
+            return LatencyEstimate(
+                status="DATA_BLOCKED", observations=count,
+                detail=f"need {self.minimum_observations} landed sells, have {count}")
+        seconds = float(np.quantile(np.asarray(self._observations, dtype=float),
+                                    LATENCY_QUANTILE))
+        return LatencyEstimate(status="OK", seconds=seconds, observations=count)

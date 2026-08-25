@@ -130,6 +130,14 @@ POSITION_CONTRIBUTORS: Tuple[Contributor, ...] = (
     Contributor("strategies.escape", "escape",
                 "The probability the exit lands before the collapse it is "
                 "running from."),
+    Contributor("strategies.escape", "hazard_mechanisms",
+                "WHICH way the position dies. Speed answers a seller and does "
+                "not answer a frozen mint, so the race is only meaningful "
+                "once the hazard is decomposed."),
+    Contributor("strategies.escape", "exit_latency",
+                "How long our sells actually take to land. A constant here "
+                "prices the race we usually run, not the one we run while "
+                "something is collapsing."),
     Contributor("execution.tradeability", "exit_capacity",
                 "What share of the position the venue can actually absorb."),
     Contributor("strategies.action_value", "action_value",

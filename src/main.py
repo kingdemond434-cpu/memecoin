@@ -76,8 +76,8 @@ from src.execution.tradeability import curve_tradeability, exit_capacity_ratio
 from src.strategies.distribution import DistributionDetector
 from src.strategies.mega_event import MegaEventReserve
 from src.strategies.escape import (
-    EscapeEstimate, HazardMechanism, escape_probability,
-    hazard_curve_from_probabilities,
+    EscapeEstimate, HazardMechanism, LandingLatency, escape_probability,
+    hazard_curve_from_probabilities, mechanisms_from_signals,
 )
 from src.strategies.monster import (
     MonsterEvidence, MonsterState, MonsterStateMachine, hold_versus_exit,
@@ -181,6 +181,12 @@ class MemecoinQuantDesk:
         self.trade_count = 0
         self.successful_exits = 0
         self.total_pnl = 0.0
+        # How long our sells actually take to land. Constructed here rather
+        # than in prediction setup because `_execute_exit` feeds it, and an
+        # exit path that depends on a setup step is an exit path that can be
+        # unavailable. Fed only by landed, real sells, so a paper run cannot
+        # teach the escape race a latency that was never paid.
+        self.landing_latency = LandingLatency()
         self._market_observed_at: Dict[str, float] = {}
         self._market_observation_cohort: set[str] = set()
         self._market_entry_price: Dict[str, float] = {}
@@ -1252,6 +1258,10 @@ class MemecoinQuantDesk:
             or {"status": "DATA_BLOCKED", "reason": "state machine not consulted"},
             "escape": position.get("escape")
             or {"status": "DATA_BLOCKED", "reason": "escape not estimated"},
+            "hazard_mechanisms": position.get("hazard_mechanisms")
+            or {"status": "DATA_BLOCKED", "reason": "hazard not decomposed"},
+            "exit_latency": position.get("exit_latency")
+            or {"status": "DATA_BLOCKED", "reason": "latency not estimated"},
             "exit_capacity": {"status": position.get("exit_capacity_status", "DATA_BLOCKED"),
                               "ratio": position.get("exit_capacity_ratio")},
             "action_value": position.get("action_value")
@@ -1772,19 +1782,24 @@ class MemecoinQuantDesk:
         """
         if hazard is None:
             return EscapeEstimate(status="DATA_BLOCKED", detail="no hazard state for this token")
-        mechanisms: Dict[HazardMechanism, Tuple[float, float]] = {}
-        for mechanism, horizon, value in (
-            (HazardMechanism.CREATOR_SELLING, 30.0, getattr(hazard, "hazard_30s", None)),
-            (HazardMechanism.INSIDER_CLUSTER_EXIT, 300.0, getattr(hazard, "hazard_5m", None)),
-        ):
-            if value is not None and 0 <= float(value) < 1.0:
-                mechanisms[mechanism] = (float(value), horizon)
         route = (self.rug_hazard.observations.get(token) or [])
-        if any(item.get("type") == "route" and item.get("feasible") is False
-               for item in list(route)[-20:]):
-            # A route that has stopped quoting is a sellability signal, and
-            # speed is no answer to it.
-            mechanisms[HazardMechanism.SELLABILITY_LOSS] = (0.5, 30.0)
+        sellability_lost = any(item.get("type") == "route" and item.get("feasible") is False
+                               for item in list(route)[-20:])
+        # The hazard model detects seven mechanisms; the race used to see two,
+        # both built from the same aggregate number under different names. The
+        # four it dropped included three that speed cannot answer at all, so
+        # the mechanisms being ignored were exactly the ones that decide
+        # whether running is even the right move.
+        risk = position.get("risk_object")
+        authority_live = None
+        if risk is not None and getattr(risk, "data_status", "") == "OK":
+            authority_live = bool(getattr(risk, "can_mint", False)
+                                  or getattr(risk, "can_freeze", False))
+        decomposition = mechanisms_from_signals(
+            getattr(hazard, "signals", ()) or (),
+            authority_live=authority_live, sellability_lost=sellability_lost)
+        position["hazard_mechanisms"] = decomposition.report()
+        mechanisms = dict(decomposition.mechanisms)
         curve = hazard_curve_from_probabilities(mechanisms)
         position["hazard_curve"] = curve.report()
         if curve.status != "OK":
@@ -1796,10 +1811,21 @@ class MemecoinQuantDesk:
             report = curve_tradeability(state, quote_buy, quote_sell)
             sellable = report.exit.size_at(
                 float(self.global_config.get("acceptable_exit_impact", 0.10)))
+        # Latency measured from our own landed sells, not assumed. A constant
+        # is fine right up until the moment it matters -- congestion, a
+        # degraded relay, a priority fee that stopped clearing -- and those
+        # are precisely the moments a position needs to be out. Below the
+        # sample floor the configured value is used AND LABELLED, so an
+        # escape priced on an assumption is distinguishable from one priced
+        # on evidence.
+        latency = self.landing_latency.estimate()
+        position["exit_latency"] = latency.report()
+        expected_latency_s = (latency.seconds if latency.status == "OK"
+                              else float(self.global_config.get("expected_exit_latency_s", 0.4)))
         return escape_probability(
             position_size=int(position.get("size_tokens", 0) or 0),
             sellable_size=sellable,
-            expected_latency_s=float(self.global_config.get("expected_exit_latency_s", 0.4)),
+            expected_latency_s=expected_latency_s,
             hazard=curve,
         )
 
@@ -2126,6 +2152,13 @@ class MemecoinQuantDesk:
         sold_tokens = min(current_tokens, max(1, int(current_tokens * min(max(exit_pct, 0), 1))))
         result = await self.execution_engine.execute_sell(token, sold_tokens, slippage_bps=500, use_jito=True,
                                                           decision_id=position.get("decision_id"))
+        # Only landed, non-simulated sells. A paper fill is not evidence about
+        # the network, and a submission that never landed has no latency at
+        # all -- counting it as its timeout would make a failing relay look
+        # merely slow, which is the direction that gets a position trapped.
+        self.landing_latency.record(getattr(result, "latency_ms", 0),
+                                    landed=bool(getattr(result, "landed", False)),
+                                    simulated=bool(result.simulated))
         attempt = {**_jsonable(result), "exit_reason": reason, "exit_pct": sold_tokens / max(current_tokens, 1)}
         self._record_ops_event("execution_attempts", {
             "token": token, "side": "sell", "success": bool(result.success),
@@ -2466,6 +2499,7 @@ class MemecoinQuantDesk:
                             "measured_pairs": self.independence_report.observed_pairs,
                             "scored_wallets": len(self.independence_report.scores)},
             "reentry": self.reentry_book.report(),
+            "exit_latency": self.landing_latency.estimate().report(),
             # Which declared modules actually reached a decision. A rate that
             # falls to zero between two audit packs means a component was
             # disconnected, and no test will say so.
