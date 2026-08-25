@@ -42,6 +42,15 @@ from src.execution.jupiter_jito import (
 from src.research.dataset_builder import PointInTimeDatasetBuilder
 from src.research.feature_engine import build_features
 from src.research.global_research_miner import GlobalResearchMiner
+from src.research.attribution import EdgeDecayMonitor
+from src.runtime.hot_state import HotState, HotStateBudget
+from src.strategies.action_value import (
+    Action as ActionValue, ActionValuePolicy, Decision as ActionDecision,
+    PositionState as ActionState,
+)
+from src.strategies.actor_graph import (
+    Entry, IndependenceReport, WalletIndependence,
+)
 from src.strategies.champion_challenger import ChampionChallengerFramework, HypothesisSpec, TrialResult
 from src.strategies.exit_policy import ExitPolicy, evaluate_exit, load_latest_exit_policy
 from src.strategies.genealogy_graph import GenealogyGraph
@@ -367,6 +376,27 @@ class MemecoinQuantDesk:
         )
         self.last_slate_report: Dict[str, Any] = {}
         self.mega_event_reserve_state: Dict[str, Any] = {}
+        self.action_policy = ActionValuePolicy(
+            min_edge=float(self.global_config.get("action_min_edge", 1e-4)),
+            max_add_fraction=float(setting("max_position_pct", 0.05)),
+        )
+        self.wallet_independence = WalletIndependence()
+        self.independence_report = IndependenceReport(status="DATA_BLOCKED")
+        self._actor_seen: Dict[str, set] = {}
+        self._independence_computed_at = 0.0
+        self._independence_interval = 300.0
+        self.edge_decay = EdgeDecayMonitor(
+            min_trades=int(self.global_config.get("edge_decay_min_trades", 30)))
+        self._mechanism_growth: Dict[str, List[float]] = {}
+        self._attribution_published_at = 0.0
+        self._attribution_interval = 900.0
+        self.hot_state = HotState(
+            HotStateBudget(
+                max_active_tokens=int(self.global_config.get("max_active_tokens", 4_000)),
+                max_hot_wallets=int(self.global_config.get("max_hot_wallets", 20_000)),
+            ),
+            archive_root=Path(self.global_config.get("ops_state_dir", "data/state")) / "spool",
+        )
         self.champion_challenger = ChampionChallengerFramework(
             state_path=os.getenv("CHAMPION_STATE_PATH", "data/research/champion_state.json")
         )
@@ -802,6 +832,22 @@ class MemecoinQuantDesk:
                                          f"monster_{monster.reason}")
                 continue
 
+            # The action-value policy is asked first, because it is the only
+            # component that prices every move against one forward
+            # distribution. The threshold policy below remains the fallback for
+            # states it cannot price -- an unmeasured capacity, a missing
+            # distribution -- rather than being deleted while nothing validated
+            # has replaced it.
+            action_decision = self._score_actions(token, position, multiple, distribution)
+            position["action_value"] = {
+                "status": action_decision.status, "action": action_decision.action.value,
+                "q": action_decision.q, "detail": action_decision.detail,
+            }
+            if action_decision.status == "OK" and action_decision.action is not ActionValue.HOLD:
+                handled = await self._apply_action(token, position, action_decision, multiple)
+                if handled:
+                    continue
+
             decision = evaluate_exit(
                 self.exit_policy, multiple, float(position["high_water_multiple"]), continuation,
                 set(stages), time.time() - float(position["entry_time"]),
@@ -972,6 +1018,75 @@ class MemecoinQuantDesk:
             int(position.get("size_tokens", 0) or 0), report.exit,
             acceptable_impact=float(self.global_config.get("acceptable_exit_impact", 0.10)),
         )
+
+    def _score_actions(self, token: str, position: Dict[str, Any], multiple: float,
+                       distribution: Any):
+        """Price every move this position can make against one distribution.
+
+        Assembled from the numbers already computed this cycle -- the refreshed
+        prediction, the measured exit capacity, the escape estimate, the
+        allocator's best alternative -- so the action-value policy cannot
+        disagree with the components that produced them.
+        """
+        prediction = position.get("prediction_object")
+        if prediction is None:
+            return ActionDecision(status="DATA_BLOCKED", detail="no current prediction")
+        capacity_status = position.get("exit_capacity_status", "")
+        if not str(capacity_status).startswith("OK"):
+            return ActionDecision(status="DATA_BLOCKED",
+                                  detail=f"exit capacity {capacity_status or 'unmeasured'}")
+
+        equity = max(self.wallet_equity_usd, 1e-9)
+        held_cost = float(position.get("remaining_cost_usd", 0.0) or 0.0)
+        held_fraction = min(1.0, held_cost / equity)
+        liquidity = float(position.get("liquidity_usd", 0.0) or 0.0)
+
+        # The forward distribution from HERE. `probability_bins` returns
+        # (name, probability, gross) already normalised.
+        bins = [(probability, gross)
+                for _, probability, gross in self.elogw_engine.probability_bins(prediction)]
+        if not bins:
+            return ActionDecision(status="DATA_BLOCKED", detail="no probability bins")
+
+        add_fraction = None
+        if liquidity > 0:
+            planned, gain = self.elogw_engine.plan_scale_in(
+                prediction, held_cost, multiple, liquidity, portfolio_value=equity)
+            add_fraction = planned if planned > 0 and gain > 0 else None
+
+        escape = position.get("escape") or {}
+        state = ActionState(
+            held_fraction=held_fraction,
+            current_multiple=max(0.0, multiple),
+            forward_bins=tuple(bins),
+            exit_cost=float(self.global_config.get("assumed_exit_cost", 0.02)),
+            entry_cost=float(self.global_config.get("assumed_entry_cost", 0.02)),
+            exit_capacity_ratio=float(position.get("exit_capacity_ratio", 0.0) or 0.0),
+            escape_probability=(float(escape["probability"])
+                                if escape.get("status") == "OK" else None),
+            expected_remaining_seconds=max(
+                1.0, float(getattr(prediction, "expected_hold_time", 0.0) or 0.0)
+                - (time.time() - float(position.get("entry_time", time.time())))),
+            alternative_growth_per_second=(self.last_slate_report or {}).get("best_score"),
+            add_fraction=add_fraction,
+            add_capacity_fraction=(self.elogw_engine.exposure_cap(liquidity) - held_fraction
+                                   if liquidity > 0 else None),
+        )
+        return self.action_policy.score(state)
+
+    async def _apply_action(self, token: str, position: Dict[str, Any],
+                            decision: Any, multiple: float) -> bool:
+        """Execute a chosen action. Returns True when the position is done for this cycle."""
+        action = decision.action
+        if action is ActionValue.ADD:
+            await self._consider_scale_in(token, position, multiple)
+            return True
+        fraction = action.bank_fraction
+        if fraction <= 0:
+            return False
+        logger.info("ACTION %s %s q=%.6f at %.2fx", action.value, token, decision.q, multiple)
+        await self._execute_exit(token, position, fraction, f"action_{action.value}")
+        return True
 
     def _publish_attribution(self) -> None:
         """Write the edge-decay and ledger state the weekly audit pack reads.
@@ -1690,6 +1805,12 @@ class MemecoinQuantDesk:
                        "sol_price_usd": self.sol_price_usd},
             "execution": {"dry_run": self.execution_engine.dry_run if self.execution_engine else True},
             "native_fastpath": NATIVE_FASTPATH_STATUS,
+            "action_policy": {"trained": self.action_policy.is_trained,
+                              "min_edge": self.action_policy.min_edge},
+            "actor_graph": {"independence_status": self.independence_report.status,
+                            "measured_pairs": self.independence_report.observed_pairs,
+                            "scored_wallets": len(self.independence_report.scores)},
+            "hot_state": self.hot_state.report(),
             "mega_event_reserve": self.mega_event_reserve_state,
             "portfolio": self.elogw_engine.get_portfolio_state() if self.elogw_engine else {},
             "rug_hazard": self.rug_hazard.get_stats() if self.rug_hazard else {},

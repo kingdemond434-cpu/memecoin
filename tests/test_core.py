@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import base64
 import gzip
@@ -37,6 +38,10 @@ from src.execution.jupiter_jito import (
 from src.main import CAPACITY_REJECTIONS, MemecoinQuantDesk, _jsonable
 from src.strategies.information_graph import CounterfactualExecutionLab
 from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPrediction, MultiHeadPredictor, PredictionFeatures
+from src.strategies.action_value import (
+    Action, ActionValuePolicy, Decision, Decision as ActionDecision,
+    PositionState, PositionState as ActionState,
+)
 from src.strategies.actor_graph import (
     BuyerDNA, BuyerFingerprint, Entry, IndependenceReport, SwarmPredictor,
     WalletIndependence, aggregate_smart_flow, build_fingerprint,
@@ -2803,6 +2808,13 @@ class TestPositionPredictionRefresh(unittest.IsolatedAsyncioTestCase):
         desk._exit_capacity = (
             lambda token, pos: MemecoinQuantDesk._exit_capacity(desk, token, pos))
         desk.min_escape_probability = 0.05
+        desk.action_policy = ActionValuePolicy()
+        desk._score_actions = (
+            lambda token, pos, mult, dist:
+            MemecoinQuantDesk._score_actions(desk, token, pos, mult, dist))
+        desk._apply_action = (
+            lambda token, pos, dec, mult:
+            MemecoinQuantDesk._apply_action(desk, token, pos, dec, mult))
         desk._estimate_escape = (
             lambda token, pos, hazard: MemecoinQuantDesk._estimate_escape(
                 desk, token, pos, hazard))
@@ -3474,6 +3486,13 @@ class TestDistributionExitWiring(unittest.IsolatedAsyncioTestCase):
         desk._exit_capacity = (
             lambda token, pos: MemecoinQuantDesk._exit_capacity(desk, token, pos))
         desk.min_escape_probability = 0.05
+        desk.action_policy = ActionValuePolicy()
+        desk._score_actions = (
+            lambda token, pos, mult, dist:
+            MemecoinQuantDesk._score_actions(desk, token, pos, mult, dist))
+        desk._apply_action = (
+            lambda token, pos, dec, mult:
+            MemecoinQuantDesk._apply_action(desk, token, pos, dec, mult))
         desk._estimate_escape = (
             lambda token, pos, hazard: MemecoinQuantDesk._estimate_escape(
                 desk, token, pos, hazard))
@@ -3791,6 +3810,13 @@ class TestMonsterHoldWiring(unittest.IsolatedAsyncioTestCase):
         desk._exit_capacity = (
             lambda token, pos: MemecoinQuantDesk._exit_capacity(desk, token, pos))
         desk.min_escape_probability = 0.05
+        desk.action_policy = ActionValuePolicy()
+        desk._score_actions = (
+            lambda token, pos, mult, dist:
+            MemecoinQuantDesk._score_actions(desk, token, pos, mult, dist))
+        desk._apply_action = (
+            lambda token, pos, dec, mult:
+            MemecoinQuantDesk._apply_action(desk, token, pos, dec, mult))
         desk._estimate_escape = (
             lambda token, pos, hazard: MemecoinQuantDesk._estimate_escape(
                 desk, token, pos, hazard))
@@ -5883,3 +5909,236 @@ class TestRustPythonQuoteParity(unittest.TestCase):
             self.assertEqual(len(digest), expected_len)
         self.assertNotEqual(hashlib.sha256(b"global:buy_v2").digest()[:8],
                             hashlib.sha256(b"global:sell_v2").digest()[:8])
+
+
+class TestActionValuePolicy(unittest.TestCase):
+    """A monster detector and an unrelated exit rule is how a 30x sells at 2x.
+
+    These tests pin that every action prices the SAME forward distribution, so
+    two components cannot disagree about a number they both read from one
+    place.
+    """
+
+    @staticmethod
+    def _state(**kwargs):
+        base = dict(
+            held_fraction=0.05, current_multiple=3.0,
+            forward_bins=((0.55, -0.40), (0.30, 1.00), (0.15, 6.00)),
+            exit_cost=0.02, entry_cost=0.02, exit_capacity_ratio=1.0,
+        )
+        base.update(kwargs)
+        return PositionState(**base)
+
+    def _policy(self, **kwargs):
+        return ActionValuePolicy(**kwargs)
+
+    def test_holding_is_the_baseline_and_scores_exactly_zero(self):
+        decision = self._policy().score(self._state())
+        self.assertEqual(decision.status, "OK")
+        self.assertEqual(decision.score_of(Action.HOLD), 0.0)
+
+    def test_a_strong_forward_distribution_holds(self):
+        decision = self._policy().score(self._state(
+            forward_bins=((0.20, -0.30), (0.40, 2.00), (0.40, 9.00))))
+        self.assertEqual(decision.action, Action.HOLD)
+        # Nothing about the current multiple appears in that verdict.
+        for action in (Action.BANK_50, Action.BANK_75, Action.EXIT):
+            self.assertLess(decision.score_of(action), 0.0)
+
+    def test_a_collapsed_forward_distribution_banks_or_exits(self):
+        decision = self._policy().score(self._state(
+            forward_bins=((0.90, -0.60), (0.09, 0.10), (0.01, 1.00))))
+        self.assertIn(decision.action,
+                      {Action.BANK_50, Action.BANK_75, Action.EXIT})
+        self.assertGreater(decision.q, 0.0)
+
+    def test_the_same_position_at_thirty_x_still_holds_on_a_strong_distribution(self):
+        """The failure this whole module exists to prevent."""
+        low = self._policy().score(self._state(
+            current_multiple=1.2,
+            forward_bins=((0.30, -0.40), (0.30, 3.00), (0.40, 20.00))))
+        high = self._policy().score(self._state(
+            current_multiple=30.0,
+            forward_bins=((0.30, -0.40), (0.30, 3.00), (0.40, 20.00))))
+        # A ratchet sells the 30x hardest. This does not, because the multiple
+        # is not an input to the decision -- the forward distribution is.
+        self.assertEqual(low.action, Action.HOLD)
+        self.assertEqual(high.action, Action.HOLD)
+
+    def test_banking_is_never_free(self):
+        """A free bank always beats holding and turns a runner into fees."""
+        costless = self._policy().score(self._state(exit_cost=0.0))
+        costly = self._policy().score(self._state(exit_cost=0.05))
+        self.assertGreater(costless.score_of(Action.BANK_50),
+                           costly.score_of(Action.BANK_50))
+        # And the sold slice stops participating in the upside, so even at
+        # zero cost banking is not automatically better than holding.
+        self.assertLess(costless.score_of(Action.BANK_50), 0.0)
+
+    def test_upside_that_cannot_be_sold_is_not_priced_as_upside(self):
+        policy = self._policy()
+        liquid = policy._hold_value(self._state(exit_capacity_ratio=1.0))
+        trapped = policy._hold_value(self._state(exit_capacity_ratio=0.05))
+        # Every action reads the same capacity, so none of them can be priced
+        # on a return the position could not have realised.
+        self.assertGreater(liquid, trapped)
+
+        # And a trapped position is more willing to leave than a liquid one.
+        liquid_exit = policy.score(self._state(exit_capacity_ratio=1.0))
+        trapped_exit = policy.score(self._state(exit_capacity_ratio=0.05))
+        self.assertGreater(trapped_exit.score_of(Action.EXIT),
+                           liquid_exit.score_of(Action.EXIT))
+
+    def test_a_low_escape_probability_discounts_the_hold(self):
+        safe = self._policy()._hold_value(self._state(escape_probability=0.95))
+        trapped = self._policy()._hold_value(self._state(escape_probability=0.02))
+        self.assertGreater(safe, trapped)
+
+    def test_adding_needs_a_size_and_respects_the_capacity_ceiling(self):
+        no_size = self._policy().score(self._state())
+        self.assertIsNone(no_size.score_of(Action.ADD))
+
+        sized = self._policy().score(self._state(
+            add_fraction=0.01, add_capacity_fraction=0.02,
+            forward_bins=((0.20, -0.30), (0.40, 2.00), (0.40, 9.00))))
+        self.assertIsNotNone(sized.score_of(Action.ADD))
+
+        over = self._policy().score(self._state(
+            add_fraction=0.05, add_capacity_fraction=0.001))
+        self.assertIsNone(over.score_of(Action.ADD))
+
+    def test_adding_wins_only_on_a_strong_distribution(self):
+        strong = self._policy().score(self._state(
+            add_fraction=0.02, add_capacity_fraction=0.05, held_fraction=0.01,
+            current_multiple=1.1,
+            forward_bins=((0.15, -0.30), (0.35, 3.00), (0.50, 12.00))))
+        weak = self._policy().score(self._state(
+            add_fraction=0.02, add_capacity_fraction=0.05, held_fraction=0.01,
+            current_multiple=1.1,
+            forward_bins=((0.85, -0.50), (0.14, 0.20), (0.01, 1.00))))
+        self.assertEqual(strong.action, Action.ADD)
+        self.assertLess(weak.score_of(Action.ADD), 0.0)
+
+    def test_opportunity_cost_can_take_the_capital(self):
+        patient = self._policy().score(self._state(
+            alternative_growth_per_second=0.0, expected_remaining_seconds=300.0))
+        contested = self._policy().score(self._state(
+            alternative_growth_per_second=0.05, expected_remaining_seconds=300.0))
+        self.assertGreater(contested.score_of(Action.EXIT),
+                           patient.score_of(Action.EXIT))
+        self.assertEqual(contested.action, Action.EXIT)
+
+    def test_reentry_is_scored_on_its_own_distribution(self):
+        # Still holding: re-entry is not the question being asked.
+        open_position = self._policy().score(self._state(
+            add_fraction=0.02, reentry_bins=((0.5, -0.3), (0.5, 4.0))))
+        self.assertIsNone(open_position.score_of(Action.REENTER))
+
+        flat = self._policy().score(self._state(
+            held_fraction=0.0, current_multiple=1.0, add_fraction=0.02,
+            forward_bins=((1.0, 0.0),),
+            reentry_bins=((0.30, -0.40), (0.30, 2.00), (0.40, 8.00))))
+        self.assertEqual(flat.action, Action.REENTER)
+        self.assertGreater(flat.score_of(Action.REENTER), 0.0)
+
+    def test_a_weak_second_wave_does_not_re_enter(self):
+        flat = self._policy().score(self._state(
+            held_fraction=0.0, current_multiple=1.0, add_fraction=0.02,
+            forward_bins=((1.0, 0.0),),
+            reentry_bins=((0.90, -0.50), (0.10, 0.30))))
+        self.assertEqual(flat.action, Action.HOLD)
+
+    def test_hold_wins_ties_and_anything_inside_the_noise_margin(self):
+        policy = self._policy(min_edge=0.01)
+        # A distribution where banking is a hair better than holding.
+        decision = policy.score(self._state(
+            exit_cost=0.0, forward_bins=((0.500001, -0.0001), (0.499999, 0.0001))))
+        self.assertEqual(decision.action, Action.HOLD)
+
+    def test_a_malformed_distribution_blocks_rather_than_renormalising(self):
+        for bins in ((), ((0.5, 1.0), (0.2, 2.0))):
+            decision = self._policy().score(self._state(forward_bins=bins))
+            # Quietly renormalising a distribution that does not sum to one
+            # hides whichever producer is dropping mass.
+            self.assertEqual(decision.status, "DATA_BLOCKED")
+
+    def test_unmeasured_exit_capacity_blocks_every_action(self):
+        decision = self._policy().score(self._state(exit_capacity_ratio=None))
+        self.assertEqual(decision.status, "DATA_BLOCKED")
+        self.assertIn("capacity", decision.detail)
+
+    def test_bank_fractions_and_capital_release_are_declared_on_the_action(self):
+        self.assertEqual(Action.BANK_25.bank_fraction, 0.25)
+        self.assertEqual(Action.EXIT.bank_fraction, 1.0)
+        self.assertEqual(Action.HOLD.bank_fraction, 0.0)
+        # A partial bank frees cash but keeps the slot; only a full exit
+        # releases it, which is what the opportunity-cost term prices.
+        self.assertFalse(Action.BANK_75.frees_capital)
+        self.assertTrue(Action.EXIT.frees_capital)
+        self.assertTrue(Action.REPLACE.frees_capital)
+
+    def test_a_model_without_predict_is_refused_at_load(self):
+        policy = self._policy()
+        self.assertFalse(policy.load_model(object(), "v1"))
+        self.assertFalse(policy.is_trained)
+
+
+class TestDeskWiringIsComplete(unittest.TestCase):
+    """Catch a component that was built but never actually attached.
+
+    Every desk collaborator is used inside a method, so a missing import or a
+    missing `__init__` assignment does not fail at import time -- it fails on
+    the VPS, at the moment the code path first runs. And because the unit
+    tests bind their own fakes onto a SimpleNamespace desk, they cannot catch
+    it either: they exercise the logic while the real desk has no such
+    attribute. Both of those held simultaneously here, and four components
+    were reported as wired while their imports and constructor lines had
+    silently failed to apply.
+
+    These two checks close that gap from opposite sides.
+    """
+
+    def test_no_name_used_in_main_is_undefined(self):
+        """A static check that a runtime-only NameError cannot hide behind."""
+        import builtins
+
+        source = Path(__file__).resolve().parents[1] / "src" / "main.py"
+        tree = ast.parse(source.read_text())
+        defined = set(dir(builtins))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    defined.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.add(node.name)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                defined.add(node.id)
+            elif isinstance(node, ast.arg):
+                defined.add(node.arg)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                defined.add(node.name)
+
+        used = {node.id for node in ast.walk(tree)
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+        undefined = sorted(name for name in used - defined if name[0].isupper())
+        self.assertEqual(undefined, [], f"names used but never imported: {undefined}")
+
+    def test_every_wired_component_is_constructed_on_the_real_desk(self):
+        """The fakes prove the logic; this proves the desk actually has them."""
+        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        # Each of these was reported as wired at some point; each is only
+        # reachable if it is both imported and assigned in __init__.
+        for attribute in (
+            "action_policy", "wallet_independence", "independence_report",
+            "edge_decay", "hot_state", "mega_event_reserve", "opportunity_allocator",
+            "distribution_detector", "monster_machine", "min_escape_probability",
+        ):
+            self.assertIn(f"self.{attribute} = ", source,
+                          f"{attribute} is used but never constructed on the desk")
+
+    def test_the_readiness_surface_exposes_the_new_components(self):
+        """A component absent from readiness is invisible to the monitor."""
+        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        for key in ("action_policy", "actor_graph", "hot_state", "mega_event_reserve"):
+            self.assertIn(f'"{key}":', source,
+                          f"{key} is not reported in readiness, so nothing can monitor it")
