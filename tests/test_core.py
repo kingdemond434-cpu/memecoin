@@ -35,6 +35,10 @@ from src.execution.jupiter_jito import (
 from src.main import CAPACITY_REJECTIONS, MemecoinQuantDesk, _jsonable
 from src.strategies.information_graph import CounterfactualExecutionLab
 from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPrediction, MultiHeadPredictor, PredictionFeatures
+from src.strategies.distribution import (
+    DISTRIBUTION_FEATURE_NAMES, DISTRIBUTION_HORIZONS, DistributionDetector,
+    distribution_features,
+)
 from src.strategies.opportunity_allocator import Opportunity, OpportunityAllocator
 from src.strategies.public_coordination import PublicCoordinationMiner
 from src.strategies.wallet_intelligence import WalletIntelligenceEngine, WalletRegime
@@ -2734,8 +2738,11 @@ class TestPositionPredictionRefresh(unittest.IsolatedAsyncioTestCase):
 
         desk._refresh_position_prediction = (
             lambda token, pos: MemecoinQuantDesk._refresh_position_prediction(desk, token, pos))
+        desk.rug_hazard = SimpleNamespace(should_exit=lambda t, p: (False, "", 0.0),
+                                          observations={})
+        desk.distribution_detector = DistributionDetector()
+        desk._read_distribution = lambda token: MemecoinQuantDesk._read_distribution(desk, token)
         desk.elogw_engine = SimpleNamespace(open_positions={"mint": position})
-        desk.rug_hazard = SimpleNamespace(should_exit=lambda t, p: (False, "", 0.0))
         desk._mark_position = mark
         desk.exit_policy = ExitPolicy.default()
         desk._execute_exit = lambda token, pos, pct, reason: exits.append((reason, pct)) or _async_none()
@@ -3193,3 +3200,270 @@ class TestPumpFeeSchedule(unittest.TestCase):
         self.assertTrue(schedule.quote(at_utc=self.JUST_BEFORE).ok)
         self.assertEqual(schedule.quote(at_utc=self.AT_ACTIVATION,
                                         market_cap_lamports=1).status, "DATA_BLOCKED")
+
+
+class TestDistributionDetector(unittest.TestCase):
+    """The top forming is a change in who is buying, not a change in price.
+
+    A trailing stop fires on price decline, so it can only bank after the
+    decline. On a token whose top forms in four seconds that is most of the
+    giveback. These tests pin the distinction.
+    """
+
+    NOW = 1_700_000_000.0
+
+    def _trade(self, offset, side, notional, **kwargs):
+        return {"type": "trade", "timestamp": self.NOW - offset, "side": side,
+                "notional_usd": notional, **kwargs}
+
+    def _healthy(self):
+        """Rising demand: bigger buys, better buyers, sells absorbed."""
+        stream = []
+        for index in range(12):
+            stream.append(self._trade(70 - index * 4, "buy", 40.0,
+                                      wallet_skill=0.4, first_time_buyer=True))
+        for index in range(12):
+            stream.append(self._trade(14 - index, "buy", 160.0,
+                                      wallet_skill=0.8, first_time_buyer=False))
+        stream.append(self._trade(30, "sell", 50.0, wallet_skill=0.3, creator_linked=False))
+        stream.append(self._trade(6, "sell", 45.0, wallet_skill=0.2, creator_linked=False))
+        stream.append({"type": "absorption", "timestamp": self.NOW - 5, "recovered": True})
+        return stream
+
+    def _distributing(self):
+        """Same price story, opposite composition: skilled money leaving into
+        a crowd of small first-time buyers, sells no longer absorbed."""
+        stream = []
+        for index in range(20):
+            stream.append(self._trade(70 - index * 3, "buy", 200.0,
+                                      wallet_skill=0.85, first_time_buyer=False))
+        for index in range(30):
+            stream.append(self._trade(14 - index * 0.4, "buy", 12.0,
+                                      wallet_skill=0.1, first_time_buyer=True))
+        for index in range(4):
+            stream.append(self._trade(60 - index * 10, "sell", 30.0,
+                                      wallet_skill=0.2, creator_linked=False))
+        for index in range(6):
+            stream.append(self._trade(12 - index * 2, "sell", 400.0,
+                                      wallet_skill=0.9, creator_linked=True))
+        stream.append({"type": "absorption", "timestamp": self.NOW - 9, "recovered": False})
+        stream.append({"type": "absorption", "timestamp": self.NOW - 4, "recovered": False})
+        return stream
+
+    def test_healthy_flow_produces_almost_no_evidence(self):
+        detector = DistributionDetector()
+        reading = detector.evaluate(self._healthy(), self.NOW)
+        self.assertLess(reading.evidence_score, 0.10, reading.contributions)
+
+    def test_composition_change_produces_strong_evidence(self):
+        detector = DistributionDetector()
+        healthy = detector.evaluate(self._healthy(), self.NOW)
+        turning = detector.evaluate(self._distributing(), self.NOW)
+        self.assertGreater(turning.evidence_score, healthy.evidence_score * 3)
+        drivers = dict(DistributionDetector.top_contributors(turning, limit=4))
+        # The reading is driven by who is trading, not by how much.
+        self.assertIn("smart_wallet_exit_rate", drivers)
+        self.assertIn("creator_linked_sell_share", drivers)
+
+    def test_price_collapse_alone_is_not_distribution(self):
+        """The detector must not become a trailing stop with extra steps.
+
+        Drawdown is the single most predictive feature of "price is about to
+        be lower", so a model allowed to see it learns to wait for the decline
+        -- which is exactly the lagging behaviour being replaced.
+        """
+        self.assertNotIn("drawdown", " ".join(DISTRIBUTION_FEATURE_NAMES))
+        collapsing = self._healthy() + [
+            {"type": "route", "timestamp": self.NOW - index, "price_multiple": 4.0 - index * 0.3}
+            for index in range(10)
+        ]
+        reading = DistributionDetector().evaluate(collapsing, self.NOW)
+        healthy = DistributionDetector().evaluate(self._healthy(), self.NOW)
+        self.assertAlmostEqual(reading.evidence_score, healthy.evidence_score, places=12)
+
+    def test_more_buyers_buying_less_is_the_exhaustion_pattern(self):
+        """Neither half of the conjunction fires on its own."""
+        base = [self._trade(70 - index * 4, "buy", 100.0) for index in range(10)]
+        more_and_smaller = base + [self._trade(14 - index * 0.4, "buy", 10.0)
+                                   for index in range(30)]
+        # Genuinely fewer: one buy in the 15s window against ten in the prior
+        # 60s is a lower arrival rate, not a higher one.
+        fewer_and_smaller = base + [self._trade(7, "buy", 10.0)]
+        more_and_bigger = base + [self._trade(14 - index * 0.4, "buy", 300.0)
+                                  for index in range(30)]
+
+        def signal(stream):
+            features, _ = distribution_features(stream, self.NOW)
+            return features["buyer_count_growth_with_shrinking_size"]
+
+        self.assertGreater(signal(more_and_smaller), 0.2)
+        self.assertEqual(signal(more_and_bigger), 0.0)
+        self.assertEqual(signal(fewer_and_smaller), 0.0)
+
+    def test_rollover_requires_prior_acceleration(self):
+        """Slowing from flat is not a rollover; slowing from a climb is."""
+        steady = [self._trade(70 - index * 1.0, "buy", 50.0) for index in range(70)]
+        # Prior 60s: 12 buys (0.20/s). Older half of the window: 20 buys in
+        # 7.5s (2.67/s) -- a real climb. Newer half: 3 buys (0.40/s) -- a real
+        # roll.
+        climbing = ([self._trade(70 - index * 4.5, "buy", 50.0) for index in range(12)]
+                    + [self._trade(15 - index * 0.37, "buy", 50.0) for index in range(20)]
+                    + [self._trade(7 - index * 2.0, "buy", 50.0) for index in range(3)])
+
+        def signal(stream):
+            features, _ = distribution_features(stream, self.NOW)
+            return features["buy_acceleration_rollover"]
+
+        self.assertEqual(signal(steady), 0.0)
+        self.assertGreater(signal(climbing), 0.0)
+
+    def test_an_untrained_detector_reports_no_probability(self):
+        reading = DistributionDetector().evaluate(self._distributing(), self.NOW)
+        self.assertEqual(reading.status, "DATA_BLOCKED")
+        self.assertFalse(reading.calibrated)
+        # Strong evidence must still not be readable as a probability: that is
+        # how an unvalidated number acquires a position size.
+        self.assertGreater(reading.evidence_score, 0.2)
+        self.assertIsNone(reading.probability(3.0))
+
+    def test_sparse_observations_block_rather_than_reading_as_calm(self):
+        reading = DistributionDetector().evaluate(
+            [self._trade(5, "buy", 10.0)], self.NOW)
+        self.assertEqual(reading.status, "DATA_BLOCKED")
+        self.assertIn("coverage", reading.detail)
+        # "Nothing was recorded" and "nothing is happening" produce the same
+        # evidence score, so coverage is what tells them apart.
+        self.assertLess(reading.coverage, 0.3)
+
+    def test_a_trained_model_yields_monotone_horizons(self):
+        class FakeModel:
+            def predict_proba(self, matrix):
+                return np.asarray([[0.7, 0.3]])
+
+        detector = DistributionDetector()
+        self.assertTrue(detector.load_model(FakeModel(), DISTRIBUTION_FEATURE_NAMES, "v1"))
+        reading = detector.evaluate(self._distributing(), self.NOW)
+        self.assertEqual(reading.status, "OK")
+        self.assertTrue(reading.calibrated)
+        one, three, ten = (reading.probability(h) for h in DISTRIBUTION_HORIZONS)
+        self.assertAlmostEqual(one, 0.3)
+        self.assertLess(one, three)
+        self.assertLess(three, ten)
+        self.assertLessEqual(ten, 1.0)
+
+    def test_a_model_trained_on_other_features_is_refused(self):
+        class FakeModel:
+            def predict_proba(self, matrix):
+                return np.asarray([[0.5, 0.5]])
+
+        detector = DistributionDetector()
+        self.assertFalse(detector.load_model(FakeModel(), ("a", "b"), "v1"))
+        self.assertFalse(detector.is_trained)
+        # A model without the inference method it will be called through is
+        # refused at load, not at the moment an exit depends on it.
+        self.assertFalse(detector.load_model(object(), DISTRIBUTION_FEATURE_NAMES, "v1"))
+
+    def test_features_are_point_in_time_only(self):
+        stream = self._distributing() + [
+            self._trade(-5, "sell", 5_000.0, wallet_skill=1.0, creator_linked=True),
+        ]
+        with_future, _ = distribution_features(stream, self.NOW)
+        without_future, _ = distribution_features(self._distributing(), self.NOW)
+        self.assertEqual(with_future, without_future)
+
+
+class TestDistributionExitWiring(unittest.IsolatedAsyncioTestCase):
+    """A calibrated distribution reading may exit early; an uncalibrated one may not."""
+
+    def _desk(self, detector, observations):
+        position = {
+            "size_tokens": 1_000, "remaining_cost_usd": 100.0, "entry_time": time.time() - 60,
+            "high_water_multiple": 3.0, "ratchet_stages": ["cost_recovery"],
+            "prediction": {"p_5x": 0.9, "p_10x": 0.9}, "candidate": None, "risk_object": None,
+        }
+        exits = []
+        desk = SimpleNamespace(
+            elogw_engine=SimpleNamespace(open_positions={"mint": position}),
+            rug_hazard=SimpleNamespace(should_exit=lambda t, p: (False, "", 0.0),
+                                       observations={"mint": observations}),
+            distribution_detector=detector,
+            exit_policy=ExitPolicy.default(),
+            predictor=SimpleNamespace(_is_trained=False),
+            global_config={"distribution_exit_p3s": 0.60, "distribution_exit_fraction": 0.6},
+            position=position, exits=exits,
+        )
+        desk._read_distribution = lambda token: MemecoinQuantDesk._read_distribution(desk, token)
+        desk._refresh_position_prediction = (
+            lambda token, pos: MemecoinQuantDesk._refresh_position_prediction(desk, token, pos))
+        desk._mark_position = lambda token, pos: _async_value((2.9, 290.0))
+        desk._execute_exit = lambda token, pos, pct, reason: (
+            exits.append((reason, pct)) or _async_none())
+        desk._consider_scale_in = lambda token, pos, mult: _async_none()
+        return desk
+
+    @staticmethod
+    def _turning_flow():
+        now = time.time()
+        stream = []
+        for index in range(20):
+            stream.append({"type": "trade", "timestamp": now - (70 - index * 3), "side": "buy",
+                           "notional_usd": 200.0, "wallet_skill": 0.85, "first_time_buyer": False})
+        for index in range(30):
+            stream.append({"type": "trade", "timestamp": now - (14 - index * 0.4), "side": "buy",
+                           "notional_usd": 12.0, "wallet_skill": 0.1, "first_time_buyer": True})
+        for index in range(4):
+            stream.append({"type": "trade", "timestamp": now - (60 - index * 10), "side": "sell",
+                           "notional_usd": 30.0, "wallet_skill": 0.2, "creator_linked": False})
+        for index in range(6):
+            stream.append({"type": "trade", "timestamp": now - (12 - index * 2), "side": "sell",
+                           "notional_usd": 400.0, "wallet_skill": 0.9, "creator_linked": True})
+        stream.append({"type": "absorption", "timestamp": now - 4, "recovered": False})
+        return stream
+
+    class _Model:
+        def __init__(self, probability):
+            self.probability = probability
+
+        def predict_proba(self, matrix):
+            return np.asarray([[1 - self.probability, self.probability]])
+
+    async def test_a_calibrated_high_reading_banks_before_the_trail_would(self):
+        detector = DistributionDetector()
+        detector.load_model(self._Model(0.75), DISTRIBUTION_FEATURE_NAMES, "v1")
+        desk = self._desk(detector, self._turning_flow())
+
+        # At 2.9x off a 3.0x high water with continuation 0.9, the trailing
+        # stop is nowhere near firing -- price has barely moved.
+        self.assertIsNone(evaluate_exit(ExitPolicy.default(), 2.9, 3.0, 0.9,
+                                        {"cost_recovery"}, 60.0))
+
+        await MemecoinQuantDesk._manage_positions(desk)
+
+        self.assertEqual(len(desk.exits), 1)
+        self.assertEqual(desk.exits[0][0], "distribution_detected")
+        self.assertAlmostEqual(desk.exits[0][1], 0.6)
+
+    async def test_an_uncalibrated_reading_never_moves_capital(self):
+        """Identical flow, identical evidence, no trained model: no exit."""
+        desk = self._desk(DistributionDetector(), self._turning_flow())
+        await MemecoinQuantDesk._manage_positions(desk)
+
+        self.assertEqual(desk.exits, [])
+        recorded = desk.position["distribution"]
+        self.assertEqual(recorded["status"], "DATA_BLOCKED")
+        # The evidence is still recorded on the position, because that is what
+        # the training set for this model is going to be built from.
+        self.assertGreater(recorded["evidence"], 0.2)
+        self.assertIn("smart_wallet_exit_rate", recorded["drivers"])
+
+    async def test_a_calibrated_low_reading_holds_the_runner(self):
+        detector = DistributionDetector()
+        detector.load_model(self._Model(0.02), DISTRIBUTION_FEATURE_NAMES, "v1")
+        desk = self._desk(detector, self._turning_flow())
+        await MemecoinQuantDesk._manage_positions(desk)
+        self.assertEqual(desk.exits, [])
+        self.assertEqual(desk.position["distribution"]["status"], "OK")
+
+
+async def _async_value(value):
+    return value

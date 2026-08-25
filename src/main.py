@@ -51,6 +51,7 @@ from src.strategies.information_graph import (
     LeadEventType,
 )
 from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPredictor, PredictionFeatures
+from src.strategies.distribution import DistributionDetector
 from src.strategies.opportunity_allocator import Opportunity, OpportunityAllocator
 from src.strategies.prelaunch_intent import PrelaunchIntentModel
 from src.strategies.public_coordination import PublicCoordinationMiner
@@ -309,6 +310,8 @@ class MemecoinQuantDesk:
             daily_giveback_arm_pct=float(self.global_config.get("daily_giveback_arm_pct", 0.5)),
             max_liquidity_fraction=float(self.global_config.get("max_liquidity_fraction", 0.01)),
         )
+        self.distribution_detector = DistributionDetector(
+            min_coverage=float(self.global_config.get("distribution_min_coverage", 0.3)))
         self.opportunity_allocator = OpportunityAllocator(
             replacement_cost_pct=float(self.global_config.get("replacement_cost_pct", 0.02)),
             min_displacement_gain_ratio=float(
@@ -723,10 +726,28 @@ class MemecoinQuantDesk:
             prediction = position.get("prediction") or {}
             continuation = max(float(prediction.get("p_5x", 0)),
                                float(prediction.get("p_10x", 0)))
+            distribution = self._read_distribution(token)
+            position["distribution"] = {
+                "status": distribution.status, "evidence": distribution.evidence_score,
+                "coverage": distribution.coverage,
+                "drivers": dict(DistributionDetector.top_contributors(distribution)),
+                "probabilities": {str(k): v for k, v in distribution.probabilities.items()},
+            }
             decision = evaluate_exit(
                 self.exit_policy, multiple, float(position["high_water_multiple"]), continuation,
                 set(stages), time.time() - float(position["entry_time"]),
             )
+            if not decision and distribution.calibrated:
+                # Only a calibrated reading may pull an exit forward. The
+                # uncalibrated evidence score is recorded on the position for
+                # research either way, but it never moves capital: an
+                # unvalidated number with a position attached is exactly the
+                # fabrication this repository is meant not to contain.
+                p_3s = distribution.probability(3.0) or 0.0
+                threshold = float(self.global_config.get("distribution_exit_p3s", 0.60))
+                if p_3s >= threshold:
+                    decision = ("distribution_detected", float(
+                        self.global_config.get("distribution_exit_fraction", 0.60)))
             if not decision:
                 await self._consider_scale_in(token, position, multiple)
                 continue
@@ -833,6 +854,11 @@ class MemecoinQuantDesk:
                 held_multiple=multiple,
             ))
         return opportunities
+
+    def _read_distribution(self, token: str):
+        """Evaluate the distribution detector on this token's observed flow."""
+        observations = list(getattr(self.rug_hazard, "observations", {}).get(token, ()))
+        return self.distribution_detector.evaluate(observations, time.time())
 
     async def _refresh_position_prediction(self, token: str, position: Dict[str, Any]) -> None:
         """Re-price the open position on current evidence.
