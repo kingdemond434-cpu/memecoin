@@ -35,6 +35,11 @@ from src.execution.jupiter_jito import (
 from src.main import CAPACITY_REJECTIONS, MemecoinQuantDesk, _jsonable
 from src.strategies.information_graph import CounterfactualExecutionLab
 from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPrediction, MultiHeadPredictor, PredictionFeatures
+from src.strategies.authenticity import (
+    AuthenticityResolver, AuthenticityVerdict, EntityRegistry, ProofLevel,
+    SourceSignal, WatchedEntity, extract_mints, host_matches, looks_like_mint,
+    rank_copycats,
+)
 from src.strategies.distribution import (
     DISTRIBUTION_FEATURE_NAMES, DISTRIBUTION_HORIZONS, DistributionDetector,
     distribution_features,
@@ -3776,3 +3781,214 @@ class TestMonsterHoldWiring(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(desk.exits), 1)
         self.assertEqual(desk.exits[0], ("rug_hazard_high", 0.75))
+
+
+class TestAuthenticityResolver(unittest.TestCase):
+    """A ticker-matching bot is the reliable buyer of every copycat.
+
+    When a globally-followed account says "coin", dozens of impostor mints
+    exist within seconds, most named exactly what a name-matching bot looks
+    for. These tests pin the parsing rules where the obvious implementation is
+    exploitable.
+    """
+
+    REAL = "So11111111111111111111111111111111111111112"
+    FAKE = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+    def _registry(self):
+        return EntityRegistry([
+            WatchedEntity(
+                entity_id="figure", display_name="Some Figure",
+                # Platform-agnostic on purpose: these are stable account ids,
+                # not display names, and the resolver never assumes which
+                # network a signal arrived on.
+                accounts={"telegram": {"1001"}, "bluesky": {"did:plc:abc"},
+                          "youtube": {"UC_official"}},
+                official_domains={"figure.com"},
+                known_wallets={"WaLLeT1111111111111111111111111111111111111"},
+                aliases={"The Figure"},
+            ),
+            WatchedEntity(entity_id="newsdesk", display_name="News Desk",
+                          accounts={"rss": {"newsdesk.example/feed"}},
+                          official_domains={"newsdesk.example"}),
+        ])
+
+    def _resolver(self, **kwargs):
+        return AuthenticityResolver(self._registry(), **kwargs)
+
+    # --- mint validation -------------------------------------------------
+
+    def test_a_mint_must_decode_to_thirty_two_bytes(self):
+        self.assertTrue(looks_like_mint(self.REAL))
+        # A long base58-looking word is not an address. Loose matching turns
+        # any 40-character token in a post into a purchase candidate.
+        self.assertFalse(looks_like_mint("A" * 40))
+        self.assertFalse(looks_like_mint("z" * 44))
+        self.assertFalse(looks_like_mint("short"))
+        self.assertFalse(looks_like_mint(self.REAL + "1"))
+        # 0, O, I and l are not in the base58 alphabet.
+        self.assertFalse(looks_like_mint("0" + self.REAL[1:]))
+
+    def test_mints_are_extracted_from_text_and_from_urls(self):
+        text = f"launch {self.REAL} see https://pump.fun/coin/{self.FAKE}"
+        self.assertEqual(extract_mints(text), [self.REAL, self.FAKE])
+        self.assertEqual(extract_mints("no addresses here at all"), [])
+
+    # --- domain matching -------------------------------------------------
+
+    def test_domain_matching_is_never_a_substring(self):
+        self.assertTrue(host_matches("figure.com", "figure.com"))
+        self.assertTrue(host_matches("www.figure.com", "figure.com"))
+        self.assertTrue(host_matches("https://token.figure.com/x?y=1", "figure.com"))
+        # Both of these are registrable by an attacker for the price of a
+        # domain, so substring matching here is equivalent to no matching.
+        self.assertFalse(host_matches("figure.com.attacker.io", "figure.com"))
+        self.assertFalse(host_matches("notfigure.com", "figure.com"))
+        self.assertFalse(host_matches("figure.com.co", "figure.com"))
+        self.assertFalse(host_matches("", "figure.com"))
+
+    def test_userinfo_and_ports_do_not_smuggle_a_host(self):
+        self.assertFalse(host_matches("https://figure.com@attacker.io/x", "figure.com"))
+        self.assertTrue(host_matches("https://figure.com:8443/x", "figure.com"))
+
+    # --- level A: direct mint --------------------------------------------
+
+    def test_a_canonical_account_publishing_the_mint_is_the_strongest_proof(self):
+        verdict = self._resolver().resolve_signal(SourceSignal(
+            "telegram", "1001", f"our official token: {self.REAL}", 1.0))
+        self.assertEqual(verdict.level, ProofLevel.DIRECT_MINT)
+        self.assertEqual(verdict.mint, self.REAL)
+        self.assertTrue(verdict.tradeable)
+
+    def test_an_impostor_account_saying_the_name_proves_nothing(self):
+        verdict = self._resolver().resolve_signal(SourceSignal(
+            "telegram", "9999", f"Some Figure official coin {self.REAL}", 1.0))
+        self.assertEqual(verdict.level, ProofLevel.NAME_ONLY)
+        self.assertIsNone(verdict.mint)
+        self.assertFalse(verdict.tradeable)
+
+    def test_two_mints_in_one_official_post_is_refused_not_guessed(self):
+        """Ambiguity is the state an impostor wants to create."""
+        verdict = self._resolver().resolve_signal(SourceSignal(
+            "telegram", "1001", f"{self.REAL} or maybe {self.FAKE}", 1.0))
+        self.assertIsNone(verdict.mint)
+        self.assertEqual(verdict.level, ProofLevel.NAME_ONLY)
+        self.assertEqual(verdict.rejected[0][0], "multiple_mints_in_one_post")
+
+    # --- level B: official domain ----------------------------------------
+
+    def test_an_official_domain_link_resolves_the_mint(self):
+        verdict = self._resolver().resolve_signal(
+            SourceSignal("bluesky", "did:plc:abc", "details at https://www.figure.com/token", 1.0),
+            domain_published_mints={"figure.com": self.REAL})
+        self.assertEqual(verdict.level, ProofLevel.OFFICIAL_DOMAIN)
+        self.assertEqual(verdict.mint, self.REAL)
+
+    def test_a_lookalike_domain_is_not_an_official_domain(self):
+        verdict = self._resolver().resolve_signal(
+            SourceSignal("bluesky", "did:plc:abc", "https://figure.com.attacker.io/token", 1.0),
+            domain_published_mints={"figure.com.attacker.io": self.FAKE})
+        self.assertIsNone(verdict.mint)
+        self.assertEqual(verdict.level, ProofLevel.NAME_ONLY)
+
+    # --- level C: creator wallet -----------------------------------------
+
+    def test_a_known_wallet_creating_the_token_is_chain_side_proof(self):
+        verdict = self._resolver().resolve_creator(
+            self.REAL, "WaLLeT1111111111111111111111111111111111111")
+        self.assertEqual(verdict.level, ProofLevel.CREATOR_WALLET)
+        self.assertEqual(verdict.entity_id, "figure")
+
+    def test_a_known_wallet_funding_the_creator_also_counts(self):
+        verdict = self._resolver().resolve_creator(
+            self.REAL, "UnknownCreator11111111111111111111111111111",
+            funders=["WaLLeT1111111111111111111111111111111111111"])
+        self.assertEqual(verdict.level, ProofLevel.CREATOR_WALLET)
+
+    def test_an_unknown_creator_proves_nothing(self):
+        verdict = self._resolver().resolve_creator(
+            self.REAL, "UnknownCreator11111111111111111111111111111")
+        self.assertEqual(verdict.level, ProofLevel.NONE)
+        self.assertFalse(verdict.tradeable)
+
+    # --- level D: cross-source -------------------------------------------
+
+    def test_two_independent_entities_agreeing_promotes_to_cross_source(self):
+        resolver = self._resolver()
+        combined = resolver.combine([
+            AuthenticityVerdict(self.REAL, ProofLevel.NAME_ONLY, "figure",
+                                supporting_sources=["telegram:1001"]),
+            AuthenticityVerdict(self.REAL, ProofLevel.NAME_ONLY, "newsdesk",
+                                supporting_sources=["rss:newsdesk.example/feed"]),
+        ])
+        self.assertEqual(combined.level, ProofLevel.CROSS_SOURCE)
+        self.assertEqual(combined.mint, self.REAL)
+        self.assertTrue(combined.tradeable)
+
+    def test_one_account_posting_three_times_is_one_source(self):
+        """Otherwise a single compromised account manufactures its own quorum."""
+        resolver = self._resolver()
+        combined = resolver.combine([
+            AuthenticityVerdict(self.FAKE, ProofLevel.NAME_ONLY, "figure",
+                                supporting_sources=["telegram:1001"])
+            for _ in range(3)
+        ])
+        self.assertIsNone(combined.mint)
+        self.assertFalse(combined.tradeable)
+
+    def test_disagreement_lowers_confidence_rather_than_taking_a_majority(self):
+        resolver = self._resolver()
+        combined = resolver.combine([
+            AuthenticityVerdict(self.REAL, ProofLevel.NAME_ONLY, "a"),
+            AuthenticityVerdict(self.REAL, ProofLevel.NAME_ONLY, "b"),
+            AuthenticityVerdict(self.FAKE, ProofLevel.NAME_ONLY, "c"),
+            AuthenticityVerdict(self.FAKE, ProofLevel.NAME_ONLY, "d"),
+        ])
+        # Sources disagreeing means an impostor is in the set. Resolving that
+        # by majority buys whichever mint the impostors flooded hardest.
+        self.assertIsNone(combined.mint)
+        self.assertEqual(combined.rejected[0][0], "conflicting_mints")
+
+    def test_a_strong_single_proof_outranks_a_weak_quorum(self):
+        resolver = self._resolver()
+        combined = resolver.combine([
+            AuthenticityVerdict(self.REAL, ProofLevel.DIRECT_MINT, "figure"),
+            AuthenticityVerdict(self.FAKE, ProofLevel.NAME_ONLY, "b"),
+            AuthenticityVerdict(self.FAKE, ProofLevel.NAME_ONLY, "c"),
+        ])
+        self.assertEqual((combined.mint, combined.level), (self.REAL, ProofLevel.DIRECT_MINT))
+
+    # --- level E and the trading gate ------------------------------------
+
+    def test_name_only_is_never_tradeable(self):
+        for level in (ProofLevel.NONE, ProofLevel.NAME_ONLY):
+            self.assertFalse(
+                AuthenticityVerdict(self.REAL, level, "figure").tradeable,
+                f"{level} must not authorise a trade")
+        for level in (ProofLevel.CROSS_SOURCE, ProofLevel.CREATOR_WALLET,
+                      ProofLevel.OFFICIAL_DOMAIN, ProofLevel.DIRECT_MINT):
+            self.assertTrue(AuthenticityVerdict(self.REAL, level, "figure").tradeable)
+
+    def test_a_verdict_with_no_mint_is_never_tradeable(self):
+        self.assertFalse(
+            AuthenticityVerdict(None, ProofLevel.DIRECT_MINT, "figure").tradeable)
+
+    def test_alias_matching_is_whole_word_only(self):
+        registry = self._registry()
+        self.assertTrue(registry.match_name("what did Some Figure say"))
+        # Substring matching would resolve every word containing the name.
+        self.assertFalse(registry.match_name("configurehandsome"))
+
+    # --- copycat swarm ---------------------------------------------------
+
+    def test_copycats_rank_by_independent_capital_not_by_ticker(self):
+        ranked = rank_copycats([
+            {"mint": "first", "independent_buyers": 2, "independent_capital_usd": 50.0},
+            {"mint": "later", "independent_buyers": 400, "independent_capital_usd": 9_000.0},
+            {"mint": "unmeasured"},
+        ])
+        # The token worth anything is whichever is accumulating capital from
+        # wallets that are not the creator's -- frequently neither the first
+        # nor the best-named.
+        self.assertEqual([item["mint"] for item in ranked], ["later", "first"])
+        self.assertNotIn("unmeasured", [item["mint"] for item in ranked])
