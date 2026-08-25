@@ -418,3 +418,45 @@ def rank_copycats(candidates: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         scored.append({**item, "independent_score": float(buyers) * float(capital)})
     scored.sort(key=lambda item: item["independent_score"], reverse=True)
     return scored
+
+
+def load_entities(path: str) -> List[WatchedEntity]:
+    """Parse the watched-entity registry from YAML.
+
+    A malformed entry is skipped with its id reported rather than raising, for
+    the same reason the source registry does it: one bad line must not take
+    the whole resolver offline. The asymmetry that matters is the other way
+    round anyway -- a MISSING entity makes an official token look unverified,
+    which costs a trade, while a WRONG entity makes an impersonator look
+    verified, which costs the position. So the parse is strict about the
+    fields that assert identity and forgiving about everything else.
+    """
+    import yaml  # local: keeps the resolver importable without a YAML runtime
+
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = yaml.safe_load(handle) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        logger.error("entity registry unreadable at %s: %s", path, exc)
+        return []
+    entities: List[WatchedEntity] = []
+    for entry in raw.get("entities") or []:
+        try:
+            accounts = {
+                str(platform).lower(): {str(account) for account in (ids or ())}
+                for platform, ids in (entry.get("accounts") or {}).items()
+            }
+            entities.append(WatchedEntity(
+                entity_id=str(entry["entity_id"]),
+                display_name=str(entry["display_name"]),
+                accounts=accounts,
+                official_domains={normalise_host(host)
+                                  for host in (entry.get("official_domains") or ())
+                                  if normalise_host(host)},
+                known_wallets={str(wallet) for wallet in (entry.get("known_wallets") or ())},
+                aliases={str(alias) for alias in (entry.get("aliases") or ())},
+                metadata=dict(entry.get("metadata") or {}),
+            ))
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            logger.error("skipping malformed entity declaration %r: %s", entry, exc)
+    return entities

@@ -68,6 +68,9 @@ from src.strategies.information_graph import (
 )
 from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPredictor, PredictionFeatures
 from src.chains.pump_curve import BondingCurveState, quote_buy, quote_sell
+from src.execution.pump_fees import (
+    DEFAULT_SCHEDULE as PUMP_FEE_SCHEDULE, VENUE_BONDING_CURVE,
+)
 from src.execution.tradeability import curve_tradeability, exit_capacity_ratio
 from src.strategies.distribution import DistributionDetector
 from src.strategies.mega_event import MegaEventReserve
@@ -79,8 +82,15 @@ from src.strategies.monster import (
     MonsterEvidence, MonsterState, MonsterStateMachine, hold_versus_exit,
 )
 from src.strategies.opportunity_allocator import Opportunity, OpportunityAllocator
+from src.runtime.intelligence_manifest import CoverageTracker, audit as audit_intelligence
 from src.strategies.prelaunch_intent import PrelaunchIntentModel
+from src.strategies.authenticity import (
+    AuthenticityResolver, EntityRegistry, ProofLevel, SourceSignal, load_entities,
+)
 from src.strategies.reentry import ReentryBook, ReentryPolicy, ReentryVerdict
+from src.strategies.source_genealogy import (
+    SourceGenealogy, SourcePost, build_source_dna,
+)
 from src.strategies.public_coordination import PublicCoordinationMiner
 from src.strategies.rug_hazard import ContinuousRugHazardModel
 from src.strategies.social_intelligence import SocialIntelligenceEngine
@@ -392,6 +402,26 @@ class MemecoinQuantDesk:
         # position can take: `Action.REENTER` is only scorable at zero held
         # fraction, so the book lives outside the position loop and gates
         # the ordinary entry path instead of running a parallel one.
+        # Whether a token is the entity it claims to be. The registry ships
+        # empty on purpose -- an entity entry asserts that an account or
+        # wallet canonically IS a named public figure, and a wrong one makes
+        # an impersonator look verified. Until entries are filled in from
+        # each entity's own published account, every verdict is DATA_BLOCKED,
+        # which is the honest reading of an empty registry: not "nothing is a
+        # copycat" but "we cannot tell".
+        self._watched_entities = load_entities(
+            self.global_config.get("entities_path", "config/entities.yaml"))
+        self.entity_registry = EntityRegistry(self._watched_entities)
+        self.authenticity = AuthenticityResolver(self.entity_registry)
+        # Which source spoke first, and whether its posts have historically
+        # been tradeable or merely a place distributors advertise.
+        self.source_genealogy = SourceGenealogy()
+        self._source_outcomes: Dict[str, List[Any]] = {}
+        # The fee actually charged, versioned by date and market cap, rather
+        # than a constant that stops being true on the first of September.
+        self.fee_schedule = PUMP_FEE_SCHEDULE
+        self.entry_coverage = CoverageTracker("entry")
+        self.position_coverage = CoverageTracker("position")
         self.reentry_book = ReentryBook(ReentryPolicy(
             cooldown_seconds=float(self.global_config.get("reentry_cooldown_seconds", 90.0)),
             window_seconds=float(self.global_config.get("reentry_window_seconds", 1800.0)),
@@ -695,10 +725,14 @@ class MemecoinQuantDesk:
         should_trade, trade_info = self.elogw_engine.should_trade(
             prediction, self.sol_price_usd, liquidity, self.wallet_equity_usd,
         )
+        intelligence = self._entry_intelligence(
+            token, candidate, risk, prediction, trade_info, liquidity)
+        coverage = self.entry_coverage.record(intelligence)
         decision = {"should_trade": should_trade, "trade_info": trade_info,
                     "authority": "shadow" if self.dry_run else "champion",
-                    "actor_intelligence": self.actor_intelligence(token),
-                    "source_intelligence": self.source_intelligence(token)}
+                    "intelligence": intelligence, "coverage": coverage.to_dict(),
+                    "actor_intelligence": intelligence["actors"],
+                    "source_intelligence": intelligence["sources"]}
         # A re-entry that has cleared the ordinary hurdle has still not paid
         # for itself: holding through would have cost nothing, and the round
         # trip costs an exit and an entry. The premium is charged here, on the
@@ -706,7 +740,7 @@ class MemecoinQuantDesk:
         # conviction that existed before the exit.
         if should_trade and self.reentry_book.get(token) is not None:
             verdict = self._price_reentry(token, prediction, liquidity, trade_info)
-            decision["reentry"] = verdict.as_dict()
+            decision["reentry"] = intelligence["reentry"] = verdict.as_dict()
             if not verdict.admitted:
                 should_trade = False
                 trade_info = {**trade_info, "reason": f"reentry_{verdict.status.lower()}",
@@ -911,87 +945,112 @@ class MemecoinQuantDesk:
 
     async def _manage_positions(self):
         for token, position in list(self.elogw_engine.open_positions.items()):
-            should_hazard_exit, urgency, pct = self.rug_hazard.should_exit(token, position)
-            if should_hazard_exit:
-                await self._execute_exit(token, position, pct, f"rug_hazard_{urgency}")
-                continue
-            marked = await self._mark_position(token, position)
-            if marked is None:
-                continue
-            multiple, current_value = marked
-            position["high_water_multiple"] = max(float(position.get("high_water_multiple", 1)), multiple)
-            stages = position.setdefault("ratchet_stages", [])
-            # Refresh before the exit decision, not after it. The continuation
-            # probability decides whether a runner is held through a drawdown;
-            # answering it from the entry-time prediction means holding on
-            # evidence that has since been contradicted by every trade that
-            # arrived after entry -- which is precisely the evidence that
-            # distinguishes a 20x from a distribution phase.
-            await self._refresh_position_prediction(token, position)
-            prediction = position.get("prediction") or {}
-            continuation = max(float(prediction.get("p_5x", 0)),
-                               float(prediction.get("p_10x", 0)))
-            distribution = self._read_distribution(token)
-            position["distribution"] = {
-                "status": distribution.status, "evidence": distribution.evidence_score,
-                "coverage": distribution.coverage,
-                "drivers": dict(DistributionDetector.top_contributors(distribution)),
-                "probabilities": {str(k): v for k, v in distribution.probabilities.items()},
-            }
-            monster = self._update_monster_state(token, position, distribution, multiple)
-            if monster.action == "emergency_exit":
-                await self._execute_exit(token, position, 1.0, f"monster_{monster.reason}")
-                continue
-            if monster.action == "bank" and monster.bank_fraction > 0:
-                await self._execute_exit(token, position, monster.bank_fraction,
-                                         f"monster_{monster.reason}")
-                continue
+            # Coverage is recorded in `finally` so it reflects what this cycle
+            # ACTUALLY consulted, including the paths that exit early. Recording
+            # it mid-body would have measured the manifest against a half-filled
+            # position and reported modules as orphaned that simply had not been
+            # reached yet -- which is the same false alarm as reporting a live
+            # module missing, and would have trained an operator to ignore it.
+            try:
+                await self._manage_one_position(token, position)
+            finally:
+                try:
+                    position["intelligence"] = self._position_intelligence(token, position)
+                    position["coverage"] = self.position_coverage.record(
+                        position["intelligence"]).to_dict()
+                except Exception as exc:  # pragma: no cover - reporting only
+                    # Coverage is a report about trading, not a part of it.
+                    # Letting it raise from a `finally` would abort the
+                    # position loop for every remaining position, which is a
+                    # far worse failure than a missing coverage row.
+                    logger.warning("position coverage failed for %s: %s", token, exc)
 
-            # The action-value policy is asked first, because it is the only
-            # component that prices every move against one forward
-            # distribution. The threshold policy below remains the fallback for
-            # states it cannot price -- an unmeasured capacity, a missing
-            # distribution -- rather than being deleted while nothing validated
-            # has replaced it.
-            action_decision = self._score_actions(token, position, multiple, distribution)
-            position["action_value"] = {
-                "status": action_decision.status, "action": action_decision.action.value,
-                "q": action_decision.q, "detail": action_decision.detail,
-            }
-            if action_decision.status == "OK" and action_decision.action is not ActionValue.HOLD:
-                handled = await self._apply_action(token, position, action_decision, multiple)
-                if handled:
-                    continue
+    async def _manage_one_position(self, token: str, position: Dict[str, Any]) -> None:
+        """One position, one cycle. Returns early where the cycle is resolved."""
+        should_hazard_exit, urgency, pct = self.rug_hazard.should_exit(token, position)
+        if should_hazard_exit:
+            await self._execute_exit(token, position, pct, f"rug_hazard_{urgency}")
+            return
+        marked = await self._mark_position(token, position)
+        if marked is None:
+            return
+        multiple, current_value = marked
+        position["high_water_multiple"] = max(float(position.get("high_water_multiple", 1)), multiple)
+        stages = position.setdefault("ratchet_stages", [])
+        # Refresh before the exit decision, not after it. The continuation
+        # probability decides whether a runner is held through a drawdown;
+        # answering it from the entry-time prediction means holding on
+        # evidence that has since been contradicted by every trade that
+        # arrived after entry -- which is precisely the evidence that
+        # distinguishes a 20x from a distribution phase.
+        await self._refresh_position_prediction(token, position)
+        prediction = position.get("prediction") or {}
+        continuation = max(float(prediction.get("p_5x", 0)),
+                           float(prediction.get("p_10x", 0)))
+        distribution = self._read_distribution(token)
+        position["distribution"] = {
+            "status": distribution.status, "evidence": distribution.evidence_score,
+            "coverage": distribution.coverage,
+            "drivers": dict(DistributionDetector.top_contributors(distribution)),
+            "probabilities": {str(k): v for k, v in distribution.probabilities.items()},
+        }
+        monster = self._update_monster_state(token, position, distribution, multiple)
+        if monster.action == "emergency_exit":
+            await self._execute_exit(token, position, 1.0, f"monster_{monster.reason}")
+            return
+        if monster.action == "bank" and monster.bank_fraction > 0:
+            await self._execute_exit(token, position, monster.bank_fraction,
+                                     f"monster_{monster.reason}")
+            return
 
-            decision = evaluate_exit(
-                self.exit_policy, multiple, float(position["high_water_multiple"]), continuation,
-                set(stages), time.time() - float(position["entry_time"]),
-            )
-            if decision and self.monster_machine.overrides_ordinary_exit(token):
-                # A ratchet banks harder the higher a position goes, which is
-                # right for ordinary winners and exactly wrong for the rare one
-                # that would carry the account: it sells that one first and
-                # hardest. Inside a monster state -- reachable only from a
-                # CALIBRATED monster probability -- the ratchet and trail stand
-                # down. The hazard exit above is not stood down, and never is.
-                logger.info("MONSTER_HOLD %s suppressing %s at %.2fx", token, decision[0], multiple)
-                position.setdefault("suppressed_exits", []).append(
-                    {"reason": decision[0], "multiple": multiple, "at": time.time()})
-                decision = None
-            # A calibrated distribution reading reaches the exit through the
-            # monster machine above, which is the single path that owns
-            # conviction state. Two independent branches deciding the same
-            # thing on the same input is how they end up disagreeing.
-            if not decision:
-                await self._consider_scale_in(token, position, multiple)
-                continue
-            reason, exit_pct = decision
-            stage_name = {"profit_ratchet_cost_recovery": "cost_recovery",
-                          "profit_ratchet_5x": "bank_5x",
-                          "profit_ratchet_10x": "bank_10x"}.get(reason)
-            if stage_name:
-                stages.append(stage_name)
-            await self._execute_exit(token, position, exit_pct, reason)
+        # The action-value policy is asked first, because it is the only
+        # component that prices every move against one forward
+        # distribution. The threshold policy below remains the fallback for
+        # states it cannot price -- an unmeasured capacity, a missing
+        # distribution -- rather than being deleted while nothing validated
+        # has replaced it.
+        action_decision = self._score_actions(token, position, multiple, distribution)
+        position["action_value"] = {
+            "status": action_decision.status, "action": action_decision.action.value,
+            "q": action_decision.q, "detail": action_decision.detail,
+        }
+        if action_decision.status == "OK" and action_decision.action is not ActionValue.HOLD:
+            handled = await self._apply_action(token, position, action_decision, multiple)
+            if handled:
+                return
+
+        decision = evaluate_exit(
+            self.exit_policy, multiple, float(position["high_water_multiple"]), continuation,
+            set(stages), time.time() - float(position["entry_time"]),
+        )
+        position["ratchet"] = ({"status": "OK", "reason": decision[0],
+                                "exit_pct": decision[1]} if decision
+                               else {"status": "OK", "reason": "no threshold reached"})
+        if decision and self.monster_machine.overrides_ordinary_exit(token):
+            # A ratchet banks harder the higher a position goes, which is
+            # right for ordinary winners and exactly wrong for the rare one
+            # that would carry the account: it sells that one first and
+            # hardest. Inside a monster state -- reachable only from a
+            # CALIBRATED monster probability -- the ratchet and trail stand
+            # down. The hazard exit above is not stood down, and never is.
+            logger.info("MONSTER_HOLD %s suppressing %s at %.2fx", token, decision[0], multiple)
+            position.setdefault("suppressed_exits", []).append(
+                {"reason": decision[0], "multiple": multiple, "at": time.time()})
+            decision = None
+        # A calibrated distribution reading reaches the exit through the
+        # monster machine above, which is the single path that owns
+        # conviction state. Two independent branches deciding the same
+        # thing on the same input is how they end up disagreeing.
+        if not decision:
+            await self._consider_scale_in(token, position, multiple)
+            return
+        reason, exit_pct = decision
+        stage_name = {"profit_ratchet_cost_recovery": "cost_recovery",
+                      "profit_ratchet_5x": "bank_5x",
+                      "profit_ratchet_10x": "bank_10x"}.get(reason)
+        if stage_name:
+            stages.append(stage_name)
+        await self._execute_exit(token, position, exit_pct, reason)
 
     async def _contest_for_capital(
         self, token: str, candidate: TokenCandidate, prediction: Any,
@@ -1115,6 +1174,200 @@ class MemecoinQuantDesk:
             quality=float(best.elogw) / hurdle,
             uncertainty=float(blocked) / float(total),
         )
+
+    def _entry_intelligence(self, token: str, candidate: Any, risk: Any,
+                            prediction: Any, trade_info: Dict[str, Any],
+                            liquidity: float) -> Dict[str, Any]:
+        """One slot per module that must be visible in an entry decision.
+
+        Assembled in ONE place on purpose. The four modules that were reported
+        wired and were not went missing because the evidence they produce was
+        read at their own call sites, so removing a call removed the evidence
+        and nothing downstream could tell. A single flat map, checked against a
+        declared manifest, makes a disconnected module fail loudly: the slot
+        goes MISSING, which is distinguishable from DATA_BLOCKED -- consulted
+        and unable to answer -- and only one of the two is a bug.
+        """
+        hazard = self.rug_hazard.get_hazard(token)
+        reentry = self.reentry_book.get(token)
+        return {
+            "safety": {"status": getattr(risk, "data_status", "DATA_BLOCKED"),
+                       "ownership_renounced": bool(getattr(risk, "ownership_renounced", False)),
+                       "risk_score": getattr(risk, "risk_score", None)},
+            "hazard": ({"status": hazard.data_status, "hazard_30s": hazard.hazard_30s,
+                        "hazard_5m": hazard.hazard_5m, "urgency": hazard.exit_urgency,
+                        "reason": hazard.blocked_reason}
+                       if hazard is not None
+                       else {"status": "DATA_BLOCKED", "reason": "token not registered"}),
+            "prediction": ({"status": "OK", "p_5x": getattr(prediction, "p_5x", None),
+                            "p_10x": getattr(prediction, "p_10x", None),
+                            "expected_hold_time": getattr(prediction, "expected_hold_time", None)}
+                           if prediction is not None
+                           else {"status": "DATA_BLOCKED", "reason": "no prediction"}),
+            "actors": self.actor_intelligence(token),
+            "sources": self.source_intelligence(token),
+            "source_dna": self._source_dna(token),
+            "authenticity": self._authenticity(token, candidate),
+            "cost_model": self._cost_model(token),
+            "prelaunch": (self._prelaunch_context(candidate.deployer or "", candidate.timestamp)
+                          or {"status": "DATA_BLOCKED", "reason": "no deployer profile"}),
+            "coordination": self.public_coordination.get_features(token),
+            "social": self.social_intel.get_token_social_signal(token),
+            "information": {"status": "OK", "lead_sequence": len(
+                self.info_graph.get_lead_sequence(token))} if self.info_graph else {
+                "status": "DATA_BLOCKED", "reason": "information graph not constructed"},
+            "opportunity": (self.last_slate_report
+                            or {"status": "DATA_BLOCKED", "reason": "no slate ranked yet"}),
+            "reentry": (self.reentry_book.admits(token).as_dict() if reentry is not None
+                        else {"status": "NOT_A_REENTRY", "detail": "never held"}),
+            "mega_event": (self.mega_event_reserve_state
+                           or {"status": "DATA_BLOCKED", "reason": "equity not refreshed yet"}),
+            "authority": {"status": "OK" if self.champion_challenger.is_live(MODEL_HYPOTHESIS_ID)
+                          else "SHADOW", **self.champion_challenger.get_stats()},
+            "sizing": {"status": "OK" if trade_info.get("position_size_sol") else "DATA_BLOCKED",
+                       **{key: value for key, value in trade_info.items()
+                          if key in ("position_size_sol", "position_value_usd",
+                                     "risk_contribution", "reason")}},
+        }
+
+    def _position_intelligence(self, token: str, position: Dict[str, Any]) -> Dict[str, Any]:
+        """One slot per module that must be visible in an open-position decision."""
+        hazard = self.rug_hazard.get_hazard(token)
+        return {
+            "distribution": position.get("distribution")
+            or {"status": "DATA_BLOCKED", "reason": "not read this cycle"},
+            "monster": position.get("monster")
+            or {"status": "DATA_BLOCKED", "reason": "state machine not consulted"},
+            "escape": position.get("escape")
+            or {"status": "DATA_BLOCKED", "reason": "escape not estimated"},
+            "exit_capacity": {"status": position.get("exit_capacity_status", "DATA_BLOCKED"),
+                              "ratio": position.get("exit_capacity_ratio")},
+            "action_value": position.get("action_value")
+            or {"status": "DATA_BLOCKED", "reason": "action policy not consulted"},
+            "ratchet": position.get("ratchet")
+            or {"status": "DATA_BLOCKED", "reason": "threshold policy not consulted"},
+            "hazard": ({"status": hazard.data_status, "hazard_30s": hazard.hazard_30s,
+                        "urgency": hazard.exit_urgency}
+                       if hazard is not None
+                       else {"status": "DATA_BLOCKED", "reason": "token not registered"}),
+        }
+
+    def _cost_model(self, token: str, at_utc: Optional[float] = None) -> Dict[str, Any]:
+        """The round-trip protocol cost of this token, priced rather than assumed.
+
+        The desk used two config constants for entry and exit cost. They were
+        right until 2026-09-01, when Pump replaced the flat 100 bps with a
+        market-cap tier schedule -- and a constant that silently stops being
+        true is worse than one that was never trusted, because every E[log W]
+        downstream keeps quoting it with full confidence.
+
+        Where the schedule can answer, it does. Where it cannot -- the tier
+        table is published as an image, so it is only loadable from an
+        operator transcription -- the config constant is used AND LABELLED as
+        an assumption, so a decision made on an unpriced fee is distinguishable
+        after the fact from one made on a measured one.
+        """
+        at_utc = time.time() if at_utc is None else float(at_utc)
+        market_cap = None
+        state = self._latest_curve_state.get(token)
+        if state is not None and state.virtual_sol_reserves > 0:
+            # Market cap in lamports at the marginal curve price: total supply
+            # priced off the virtual reserves, which is the quantity the tier
+            # table is indexed on.
+            market_cap = int(state.token_total_supply * state.virtual_sol_reserves
+                             // max(1, state.virtual_token_reserves))
+        status, round_trip_bps, detail = self.fee_schedule.round_trip_bps(
+            venue=VENUE_BONDING_CURVE,
+            entry_market_cap_lamports=market_cap, exit_market_cap_lamports=market_cap,
+            entry_utc=at_utc, exit_utc=at_utc,
+        )
+        if status == "OK":
+            leg = round_trip_bps / 2 / 10_000
+            return {"status": "OK", "assumed": False, "entry_cost": leg, "exit_cost": leg,
+                    "round_trip_bps": round_trip_bps,
+                    "schedule_version": detail["entry"].schedule_version,
+                    "market_cap_lamports": market_cap}
+        return {
+            "status": "DATA_BLOCKED_FEE_SCHEDULE", "assumed": True,
+            "entry_cost": float(self.global_config.get("assumed_entry_cost", 0.02)),
+            "exit_cost": float(self.global_config.get("assumed_exit_cost", 0.02)),
+            "reason": detail["entry"].reason or detail["exit"].reason,
+            "schedule_version": self.fee_schedule.version,
+            "market_cap_lamports": market_cap,
+        }
+
+    def _authenticity(self, token: str, candidate: Any) -> Dict[str, Any]:
+        """Is this token the entity it claims to be, and how do we know.
+
+        Both proofs available without private access are used: the chain-side
+        one (a wallet already known to be the entity created or funded it) and
+        the publication-side one (a message from a canonical account of that
+        entity naming this mint). They are combined rather than raced, because
+        a single strong proof should win outright while several weak
+        independent ones should only count if they are genuinely independent.
+        """
+        if not self._watched_entities:
+            return {"status": "DATA_BLOCKED", "reason": "no watched entities declared",
+                    "registry_size": 0}
+        # Funders as well as the creator: an entity that funded the deployer
+        # is chain-side proof too, and a launch is routinely made from a wallet
+        # one hop from the one anybody has heard of.
+        funders = list(dict.fromkeys(
+            str(item.get("funder", "")) for item
+            in list(self.public_coordination.funding.get(token, ()))[:64]
+            if item.get("funder")))
+        verdicts = [self.authenticity.resolve_creator(
+            token, candidate.deployer or "", funders)]
+        for event in list(self._source_events.get(token, ()))[-20:]:
+            verdicts.append(self.authenticity.resolve_signal(SourceSignal(
+                platform=event.source_id, account_id=str(event.author_id or ""),
+                text=event.text or "", timestamp=event.observed_at,
+                url=(list(event.urls) or [""])[0])))
+        combined = self.authenticity.combine(verdicts)
+        return {
+            "status": "OK", "level": combined.level.value,
+            "rank": combined.level.rank, "entity_id": combined.entity_id,
+            "tradeable": bool(combined.tradeable),
+            "sources": list(combined.supporting_sources)[:8],
+            "detail": combined.detail,
+            "registry_size": len(self._watched_entities),
+        }
+
+    def _source_dna(self, token: str) -> Dict[str, Any]:
+        """Whether the sources that named this token have historically paid.
+
+        A source can be a superb predictor of flow and a terrible thing to
+        trade directly -- that is what a distributor looks like from the
+        outside: reliably followed by a move, reliably followed by a dump.
+        The two properties are reported separately rather than collapsed into
+        one score, because collapsing them is how the desk ends up buying into
+        the exit liquidity it correctly predicted.
+        """
+        events = self._source_events.get(token) or []
+        if not events:
+            return {"status": "DATA_BLOCKED", "reason": "no source named this token"}
+        profiles = []
+        for source_id in dict.fromkeys(event.source_id for event in events):
+            outcomes = self._source_outcomes.get(source_id) or []
+            dna = build_source_dna(source_id, outcomes)
+            profiles.append({
+                "source_id": source_id, "status": dna.status,
+                "posts": dna.posts,
+                "median_observation_lag": dna.median_observation_lag,
+                "tradeable_directly": bool(dna.tradeable_directly),
+                "useful_as_flow_signal": bool(dna.useful_as_flow_signal),
+                "is_distributor": bool(dna.is_distributor),
+                "upstream_of": [lead.follower for lead in
+                                self.source_genealogy.upstream_of(source_id)][:5],
+            })
+        measured = [profile for profile in profiles if profile["status"] == "MEASURED"]
+        return {
+            "status": "OK" if measured else "MEASURING",
+            "reason": "" if measured else "no source has enough resolved posts for a verdict",
+            "sources": profiles[:8],
+            "any_distributor": any(profile["is_distributor"] for profile in measured),
+            "any_tradeable": any(profile["tradeable_directly"] for profile in measured),
+        }
 
     def _price_reentry(self, token: str, prediction: Any, liquidity: float,
                        trade_info: Dict[str, Any]):
@@ -1393,6 +1646,13 @@ class MemecoinQuantDesk:
                 # and only the earliest few carry lead information.
                 if len(observations) > 50:
                     observations.pop(0)
+                # The genealogy learns which source leads which from the same
+                # stream, so the lead-lag graph is built from what we actually
+                # observed rather than from publication timestamps a source
+                # controls and can backdate.
+                self.source_genealogy.record(SourcePost(
+                    source_id=event.source_id, token=token,
+                    posted_at=event.source_at, observed_at=event.observed_at))
         for stale in [key for key in self._source_events
                       if key not in self.hot_state.active_tokens]:
             self._source_events.pop(stale, None)
@@ -2191,6 +2451,12 @@ class MemecoinQuantDesk:
                             "measured_pairs": self.independence_report.observed_pairs,
                             "scored_wallets": len(self.independence_report.scores)},
             "reentry": self.reentry_book.report(),
+            # Which declared modules actually reached a decision. A rate that
+            # falls to zero between two audit packs means a component was
+            # disconnected, and no test will say so.
+            "intelligence_coverage": {"entry": self.entry_coverage.report(),
+                                      "position": self.position_coverage.report()},
+            "authenticity": {"watched_entities": len(self._watched_entities)},
             "hot_state": self.hot_state.report(),
             "mega_event_reserve": self.mega_event_reserve_state,
             "portfolio": self.elogw_engine.get_portfolio_state() if self.elogw_engine else {},

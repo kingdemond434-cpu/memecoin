@@ -391,6 +391,42 @@ def check_sources(readiness: Dict[str, Any]) -> List[Check]:
     return checks
 
 
+def check_intelligence_coverage(readiness: Dict[str, Any]) -> List[Check]:
+    """Whether every declared module is still reaching the decision.
+
+    This is the check that would have caught four components being reported
+    wired while their imports had silently failed to apply. A disconnected
+    module raises nothing and logs nothing; the only thing that changes is
+    that its slot stops appearing in decisions. So an orphan rate above zero
+    is a FAIL, not a warning -- capital is being committed by a brain that is
+    missing a lobe it believes it has.
+    """
+    checks: List[Check] = []
+    coverage = readiness.get("intelligence_coverage") or {}
+    if not coverage:
+        return [Check("intelligence_coverage", State.DATA_BLOCKED,
+                      "desk reported no coverage tracking")]
+    for stage in ("entry", "position"):
+        report = coverage.get(stage) or {}
+        name = f"intelligence_coverage_{stage}"
+        decisions = int(report.get("decisions", 0) or 0)
+        if not decisions:
+            checks.append(Check(name, State.DATA_BLOCKED,
+                                f"no {stage} decisions observed yet"))
+            continue
+        orphaned = list(report.get("orphaned") or [])
+        if orphaned:
+            checks.append(Check(name, State.CRITICAL,
+                                f"{len(orphaned)} {stage} modules never reached a decision",
+                                {"orphaned": orphaned, "decisions": decisions}))
+        else:
+            checks.append(Check(name, State.OK,
+                                f"every declared {stage} module reached all "
+                                f"{decisions} decisions",
+                                {"decisions": decisions}))
+    return checks
+
+
 def check_champions(readiness: Dict[str, Any]) -> Check:
     """Promotion state. Champions decaying without replacement is a slow failure."""
     champions = readiness.get("champions") or {}
@@ -476,6 +512,7 @@ def run_health_checks(
         checks.append(check_data_freshness(readiness, now, thresholds))
         checks.extend(check_models(readiness, model_dir, now, thresholds))
         checks.extend(check_sources(readiness))
+        checks.extend(check_intelligence_coverage(readiness))
         checks.append(check_champions(readiness))
     else:
         # Everything that reads the snapshot degrades together, and says so.

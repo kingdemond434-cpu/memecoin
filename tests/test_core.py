@@ -32,12 +32,12 @@ from src.chains.yellowstone_grpc import (
     extract_system_transfers,
 )
 from src.detection.rug_detector import TOKEN_2022_PROGRAM, TOKEN_PROGRAM, RugDetector
-from src.detection.token_detector import DetectionSource
+from src.detection.token_detector import DetectionSource, TokenCandidate
 from src.execution.jupiter_jito import (
     ExecutionEngine, ExecutionResult, JitoClient, JupiterClient, RouteType, SolanaTransactionBuilder, SwapQuote,
     SwapTransaction, TransactionStatus,
 )
-from src.main import CAPACITY_REJECTIONS, MemecoinQuantDesk, _jsonable
+from src.main import CAPACITY_REJECTIONS, WSOL_MINT, MemecoinQuantDesk, _jsonable
 from src.strategies.information_graph import CounterfactualExecutionLab
 from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPrediction, MultiHeadPredictor, PredictionFeatures
 from src.collectors.registry import (
@@ -92,6 +92,9 @@ from src.strategies.monster import (
     hold_versus_exit, premature_exit_rates, tail_capture_ratio,
 )
 from src.strategies.opportunity_allocator import Opportunity, OpportunityAllocator
+from src.runtime.intelligence_manifest import (
+    ENTRY_CONTRIBUTORS, POSITION_CONTRIBUTORS, CoverageTracker, audit as audit_intelligence,
+)
 from src.strategies.reentry import (
     BARRED_DISPOSITIONS, ExitDisposition, ReentryBook, ReentryPolicy, classify_exit,
 )
@@ -118,7 +121,9 @@ from src.chains.pump_curve import (
     DEFAULT_FEE_BPS, BondingCurveState, quote_buy, quote_sell, resolve_fee_bps,
 )
 from ops.audit_pack import build_audit_pack
-from ops.health import Check, HealthReport, State, run_health_checks
+from ops.health import (
+    Check, HealthReport, State, check_intelligence_coverage, run_health_checks,
+)
 from ops.monitor import main as monitor_main
 from src.runtime.hot_state import (
     AsyncArchiveWriter, CompactWalletDNA, EconomicCache, HotState, HotStateBudget,
@@ -763,6 +768,25 @@ class FakeDatasetBuilderForExit:
 class FakeCounterfactualLabForExit:
     def resolve_decision(self, decision_id, pnl):
         return []
+
+
+
+def _attach_manifest(desk):
+    """Give a partial fixture desk what the coverage tracker needs.
+
+    `_manage_positions` records manifest coverage in a `finally`, so every
+    fixture that drives it needs the tracker and the per-position helper bound.
+    Attaching them here rather than in each fixture means a new declared
+    contributor breaks one place, not eight.
+    """
+    desk.position_coverage = CoverageTracker("position")
+    desk._position_intelligence = (
+        lambda token, position:
+        MemecoinQuantDesk._position_intelligence(desk, token, position))
+    desk._manage_one_position = (
+        lambda token, position:
+        MemecoinQuantDesk._manage_one_position(desk, token, position))
+    return desk
 
 
 class TestPartialExitAccounting(unittest.IsolatedAsyncioTestCase):
@@ -2845,6 +2869,7 @@ class TestPositionPredictionRefresh(unittest.IsolatedAsyncioTestCase):
         desk.distribution_detector = DistributionDetector()
         desk.monster_machine = MonsterStateMachine()
         desk.last_slate_report = {}
+        _attach_manifest(desk)
         desk._read_distribution = lambda token: MemecoinQuantDesk._read_distribution(desk, token)
         desk._latest_curve_state = getattr(desk, "_latest_curve_state", {})
         desk.ops_events = []
@@ -3525,6 +3550,7 @@ class TestDistributionExitWiring(unittest.IsolatedAsyncioTestCase):
             global_config={},
             position=position, exits=exits,
         )
+        _attach_manifest(desk)
         desk._read_distribution = lambda token: MemecoinQuantDesk._read_distribution(desk, token)
         desk._latest_curve_state = getattr(desk, "_latest_curve_state", {})
         desk.ops_events = []
@@ -3851,6 +3877,7 @@ class TestMonsterHoldWiring(unittest.IsolatedAsyncioTestCase):
             predictor=SimpleNamespace(_is_trained=False),
             global_config={}, position=position, exits=exits,
         )
+        _attach_manifest(desk)
         desk._read_distribution = lambda token: MemecoinQuantDesk._read_distribution(desk, token)
         desk._latest_curve_state = getattr(desk, "_latest_curve_state", {})
         desk.ops_events = []
@@ -3917,7 +3944,9 @@ class TestMonsterHoldWiring(unittest.IsolatedAsyncioTestCase):
         machine.update("mint", MonsterEvidence(
             monster_probability=0.4, monster_probability_calibrated=True,
             independent_buyer_acceleration=0.4, smart_wallet_net_accumulation=0.3))
-        hazard = SimpleNamespace(urgency="critical", hazard_5m=0.9)
+        hazard = SimpleNamespace(urgency="critical", hazard_5m=0.9, hazard_30s=0.8,
+                                 exit_urgency="critical", data_status="OK",
+                                 blocked_reason="")
 
         desk = self._desk(machine, hazard=hazard)
         await MemecoinQuantDesk._manage_positions(desk)
@@ -7720,6 +7749,7 @@ class TestSourceIntelligenceIsLiveWired(unittest.IsolatedAsyncioTestCase):
         desk = SimpleNamespace(
             source_mesh=SourceMesh(list(sources)),
             _source_events={},
+            source_genealogy=SourceGenealogy(),
             hot_state=HotState(HotStateBudget(), archive_root=Path("/tmp")),
         )
         return desk
@@ -8133,3 +8163,188 @@ class TestPartialExitIsNotAFinalOutcome(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(outcomes[0]["realized_pnl_usd"], 87.5)
         self.assertEqual(len(desk._mechanism_growth["t0_sniper"]), 1)
         self.assertIsNotNone(desk.reentry_book.get("mint"))
+
+
+class TestOrphanIntelligence(unittest.IsolatedAsyncioTestCase):
+    """One launch through the whole chain, with every module made to answer.
+
+    Four components were once reported wired and were not: the edits that
+    should have added their imports silently failed to match, the tests bound
+    fakes into every collaborator slot so the real constructor was never
+    exercised, and the modules sat fully built and completely unreachable
+    while the suite stayed green. Nothing raises when a module is simply never
+    called, which is why nothing caught it.
+
+    This is the detector. A real desk is constructed -- no fakes in the slots
+    that matter -- one launch is pushed through it, and every contributor the
+    manifest declares must show up in the decision. MISSING fails. DATA_BLOCKED
+    passes, because a source mesh with no transport and a fee table published
+    as an image are honest silences, and demanding numbers from them is how
+    fabricated inputs get in.
+    """
+
+    MINT = "So11111111111111111111111111111111111111112"
+
+    async def _desk(self):
+        desk = MemecoinQuantDesk("config/chains.yaml", dry_run_override=True, offline=True)
+        await desk.initialize()
+        return desk
+
+    @staticmethod
+    def _candidate(mint):
+        return TokenCandidate(
+            address=mint, chain="solana", source=DetectionSource.FACTORY, block_number=0,
+            deployer="Deployer1111111111111111111111111111111",
+            factory="pump", pair="Pair111111111111111111111111111111111111",
+            base_token=WSOL_MINT, timestamp=time.time(),
+        )
+
+    async def test_a_bare_launch_leaves_no_module_unconsulted(self):
+        desk = await self._desk()
+        intelligence = desk._entry_intelligence(
+            self.MINT, self._candidate(self.MINT), None, None, {}, 0.0)
+        report = audit_intelligence("entry", intelligence)
+
+        # The assertion that matters. Every declared contributor answered, even
+        # if the answer was "I cannot measure that".
+        self.assertEqual(report.orphans, [], f"orphaned intelligence: {report.orphans}")
+        self.assertEqual(report.unknown_keys, [])
+        self.assertEqual(report.coverage, 1.0)
+
+    async def test_every_declared_contributor_has_a_slot(self):
+        desk = await self._desk()
+        intelligence = desk._entry_intelligence(
+            self.MINT, self._candidate(self.MINT), None, None, {}, 0.0)
+        for contributor in ENTRY_CONTRIBUTORS:
+            self.assertIn(contributor.key, intelligence,
+                          f"{contributor.module} has no slot: {contributor.why}")
+
+    async def test_evidence_actually_flows_when_the_modules_have_something_to_say(self):
+        """Coverage without evidence would be a manifest of empty boxes."""
+        desk = await self._desk()
+        candidate = self._candidate(self.MINT)
+
+        # Public sources named the token, and one of them was first.
+        desk.hot_state.touch_token(self.MINT)
+        for index, source in enumerate(("regional-a", "regional-b")):
+            event = Event(source_id=source, source_class=SourceClass.CHAT,
+                          source_at=1_000.0 + index, observed_at=1_000.5 + index,
+                          text=f"call {self.MINT}", language="en",
+                          token_addresses=(self.MINT,))
+            desk._source_events.setdefault(self.MINT, []).append(event)
+            desk.source_genealogy.record(SourcePost(
+                source_id=source, token=self.MINT,
+                posted_at=event.source_at, observed_at=event.observed_at))
+
+        # Buyers arrived, and some of them are scored.
+        desk.rug_hazard.register_token(self.MINT, {"deployer": candidate.deployer})
+        for index in range(6):
+            desk.public_coordination.record_trade(self.MINT, {
+                "wallet": f"buyer{index}", "side": "buy", "notional_usd": 100.0,
+                "timestamp": 1_000.0 + index})
+            desk._record_actor_entry(
+                self.MINT, {"wallet": f"buyer{index}", "side": "buy",
+                            "timestamp": 1_000.0 + index},
+                {"notional_usd": 100.0})
+
+        prediction = MultiHeadPrediction(self.MINT, "solana", 0, p_2x=0.6, p_5x=0.4, p_10x=0.2)
+        trade_info = {"position_size_sol": 0.5, "position_value_usd": 75.0,
+                      "risk_contribution": 0.01}
+        intelligence = desk._entry_intelligence(
+            self.MINT, candidate, None, prediction, trade_info, 50_000.0)
+        report = audit_intelligence("entry", intelligence)
+
+        self.assertEqual(report.orphans, [])
+        for key in ("prediction", "sources", "coordination", "sizing", "cost_model"):
+            self.assertIn(key, report.contributing,
+                          f"{key} was consulted but contributed nothing: {intelligence[key]}")
+        # The source mesh knows who spoke first and how late we were to it.
+        self.assertEqual(intelligence["sources"]["first_source"], "regional-a")
+        self.assertGreater(intelligence["sources"]["first_observation_lag_s"], 0.0)
+
+    async def test_the_record_is_serialisable_because_the_audit_pack_reads_it(self):
+        desk = await self._desk()
+        intelligence = desk._entry_intelligence(
+            self.MINT, self._candidate(self.MINT), None, None, {}, 0.0)
+        json.dumps(_jsonable(intelligence))
+
+    async def test_an_unwired_module_is_reported_as_an_orphan_not_as_blocked(self):
+        """The distinction the whole manifest exists to draw."""
+        desk = await self._desk()
+        intelligence = desk._entry_intelligence(
+            self.MINT, self._candidate(self.MINT), None, None, {}, 0.0)
+        # Disconnecting a module looks like this: the slot is simply absent.
+        intelligence.pop("actors")
+        report = audit_intelligence("entry", intelligence)
+        self.assertEqual(report.orphans, ["actors"])
+        self.assertLess(report.coverage, 1.0)
+        # Whereas a module that ran and could not answer is not an orphan.
+        intelligence["actors"] = {"status": "DATA_BLOCKED", "reason": "no scored buyers"}
+        self.assertEqual(audit_intelligence("entry", intelligence).orphans, [])
+
+    async def test_position_decisions_declare_their_contributors_too(self):
+        desk = await self._desk()
+        position = {"size_tokens": 1_000, "remaining_cost_usd": 100.0,
+                    "entry_time": time.time(), "high_water_multiple": 1.0}
+        intelligence = desk._position_intelligence(self.MINT, position)
+        report = audit_intelligence("position", intelligence)
+        self.assertEqual(report.orphans, [])
+        for contributor in POSITION_CONTRIBUTORS:
+            self.assertIn(contributor.key, intelligence, contributor.why)
+
+    async def test_coverage_is_tracked_across_decisions_for_the_audit_pack(self):
+        desk = await self._desk()
+        intelligence = desk._entry_intelligence(
+            self.MINT, self._candidate(self.MINT), None, None, {}, 0.0)
+        tracker = CoverageTracker("entry")
+        tracker.record(intelligence)
+        intelligence.pop("cost_model")
+        tracker.record(intelligence)
+        report = tracker.report()
+        self.assertEqual(report["status"], "ORPHANED")
+        self.assertEqual(report["orphaned"], ["cost_model"])
+        # Half the decisions reached it; the trend is the signal, not the state.
+        self.assertAlmostEqual(report["rates"]["cost_model"]["orphaned"], 0.5)
+
+    async def test_the_fee_engine_prices_the_round_trip_rather_than_assuming_it(self):
+        """Two config constants used to stand in for a schedule that changes."""
+        desk = await self._desk()
+        legacy = desk._cost_model(self.MINT, at_utc=1_760_000_000.0)
+        self.assertEqual(legacy["status"], "OK")
+        self.assertFalse(legacy["assumed"])
+        self.assertEqual(legacy["round_trip_bps"], 2 * LEGACY_TOTAL_FEE_BPS)
+        # Past the dynamic activation the tier table is published only as an
+        # image, so the constant is used AND LABELLED, never quoted as measured.
+        dynamic = desk._cost_model(self.MINT, at_utc=DYNAMIC_FEE_ACTIVATION_UTC + 1.0)
+        self.assertEqual(dynamic["status"], "DATA_BLOCKED_FEE_SCHEDULE")
+        self.assertTrue(dynamic["assumed"])
+
+    async def test_an_empty_entity_registry_blocks_rather_than_clears(self):
+        """No watched entities means 'we cannot tell', not 'nothing is a copycat'."""
+        desk = await self._desk()
+        verdict = desk._authenticity(self.MINT, self._candidate(self.MINT))
+        self.assertEqual(verdict["status"], "DATA_BLOCKED")
+        self.assertEqual(verdict["registry_size"], 0)
+
+
+class TestIntelligenceCoverageHealthCheck(unittest.TestCase):
+    """An orphaned module is a failure, not a warning."""
+
+    def test_an_orphan_is_critical_because_capital_moves_without_it(self):
+        checks = check_intelligence_coverage({"intelligence_coverage": {
+            "entry": {"decisions": 40, "orphaned": ["actors", "cost_model"]},
+            "position": {"decisions": 40, "orphaned": []},
+        }})
+        by_name = {check.name: check for check in checks}
+        self.assertEqual(by_name["intelligence_coverage_entry"].state, State.CRITICAL)
+        self.assertEqual(by_name["intelligence_coverage_position"].state, State.OK)
+
+    def test_no_decisions_yet_is_blocked_not_healthy(self):
+        checks = check_intelligence_coverage({"intelligence_coverage": {
+            "entry": {"decisions": 0}, "position": {"decisions": 0}}})
+        self.assertTrue(all(check.state is State.DATA_BLOCKED for check in checks))
+
+    def test_a_desk_that_reports_nothing_is_blocked(self):
+        checks = check_intelligence_coverage({})
+        self.assertEqual(len(checks), 1)
+        self.assertIs(checks[0].state, State.DATA_BLOCKED)
