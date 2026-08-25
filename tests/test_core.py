@@ -72,6 +72,11 @@ from src.execution.pump_fees import (
 from src.chains.pump_curve import (
     DEFAULT_FEE_BPS, BondingCurveState, quote_buy, quote_sell, resolve_fee_bps,
 )
+from src.research.attribution import (
+    EdgeDecayMonitor, Leak, alpha_ledger, execution_miss, find_leaks,
+    missed_monster, premature_exit, rank_research, rug_loss, sizing_leak,
+    tail_contribution,
+)
 from src.research.feature_engine import build_features
 from src.research import hazard_trainer
 from src.research.exit_policy_trainer import simulate, train_exit_policy
@@ -4557,3 +4562,223 @@ class TestSwarmPredictor(unittest.TestCase):
         reading = SwarmPredictor().evaluate(self._entries(3), self._report(3),
                                             self.NOW + 10_000)
         self.assertEqual(reading.status, "DATA_BLOCKED")
+
+
+class TestLeakAttribution(unittest.TestCase):
+    """Accuracy is the wrong objective when returns are tail-dominated.
+
+    A thousand ordinary rejections weigh the same as the one 30x that was
+    passed on, and the 30x cost more geometric growth than the thousand
+    produced.
+    """
+
+    EQUITY = 10_000.0
+
+    def test_a_missed_monster_is_measured_in_log_wealth(self):
+        finding = missed_monster(
+            {"token": "moon", "entered": False, "max_feasible_multiple": 30.0,
+             "capacity_usd": 500.0, "rejection_reason": "insufficient_upside"},
+            self.EQUITY, 0.05)
+        self.assertEqual(finding.leak, Leak.MISSED_MONSTER)
+        # 5% of the book at 30x: log(0.95 + 0.05*30).
+        self.assertAlmostEqual(finding.forgone_log_growth, math.log(0.95 + 0.05 * 30.0))
+        self.assertEqual(finding.evidence["rejection_reason"], "insufficient_upside")
+
+    def test_a_leak_is_capped_by_what_was_actually_executable(self):
+        """Blaming the book for a size the venue could not fill is fantasy."""
+        thin = missed_monster(
+            {"token": "thin", "entered": False, "max_feasible_multiple": 30.0,
+             "capacity_usd": 100.0}, self.EQUITY, 0.05)
+        deep = missed_monster(
+            {"token": "deep", "entered": False, "max_feasible_multiple": 30.0,
+             "capacity_usd": 500.0}, self.EQUITY, 0.05)
+        # Same multiple, five times the fillable size: the deep one is the
+        # larger leak, because the thin one was never a $500 opportunity.
+        self.assertLess(thin.forgone_log_growth, deep.forgone_log_growth)
+
+        # And capacity beyond the position ceiling earns no extra credit: the
+        # book was never going to put more than 5% into one token.
+        unlimited = missed_monster(
+            {"token": "deep2", "entered": False, "max_feasible_multiple": 30.0,
+             "capacity_usd": 5_000_000.0}, self.EQUITY, 0.05)
+        self.assertAlmostEqual(unlimited.forgone_log_growth, deep.forgone_log_growth)
+
+    def test_a_thin_monster_can_still_outrank_a_deep_mediocrity(self):
+        """Log wealth, not multiples: the ranking has to survive both cases."""
+        thin_monster = missed_monster(
+            {"token": "thin", "entered": False, "max_feasible_multiple": 50.0,
+             "capacity_usd": 200.0}, self.EQUITY, 0.05)
+        deep_mediocrity = missed_monster(
+            {"token": "deep", "entered": False, "max_feasible_multiple": 1.2,
+             "capacity_usd": 50_000.0}, self.EQUITY, 0.05)
+        self.assertGreater(thin_monster.forgone_log_growth,
+                           deep_mediocrity.forgone_log_growth)
+
+    def test_unobserved_capacity_produces_no_finding_rather_than_a_guess(self):
+        self.assertIsNone(missed_monster(
+            {"token": "x", "entered": False, "max_feasible_multiple": 30.0},
+            self.EQUITY, 0.05))
+
+    def test_a_premature_exit_is_the_gap_between_realized_and_feasible(self):
+        finding = premature_exit(
+            {"token": "runner", "entered": True, "realized_multiple": 3.0,
+             "max_feasible_multiple": 30.0, "capacity_usd": 5_000.0,
+             "position_fraction": 0.05, "exit_reason": "profit_ratchet_5x"},
+            self.EQUITY, 0.05)
+        self.assertEqual(finding.leak, Leak.PREMATURE_EXIT)
+        self.assertAlmostEqual(finding.evidence["tail_capture"], 0.1)
+        self.assertGreater(finding.forgone_log_growth, 0)
+
+    def test_capturing_the_whole_move_is_not_a_leak(self):
+        self.assertIsNone(premature_exit(
+            {"token": "clean", "entered": True, "realized_multiple": 30.0,
+             "max_feasible_multiple": 30.0, "capacity_usd": 5_000.0,
+             "position_fraction": 0.05}, self.EQUITY, 0.05))
+
+    def test_a_rug_loss_records_how_early_it_was_knowable(self):
+        finding = rug_loss({"token": "rug", "entered": True, "rugged": True,
+                            "realized_multiple": 0.05, "position_fraction": 0.02,
+                            "earliest_warning_seconds": 4.0})
+        self.assertEqual(finding.leak, Leak.RUG_LOSS)
+        self.assertGreater(finding.forgone_log_growth, 0)
+        self.assertEqual(finding.evidence["earliest_warning_seconds"], 4.0)
+
+    def test_under_sizing_a_correct_call_is_its_own_leak(self):
+        finding = sizing_leak(
+            {"token": "small", "entered": True, "realized_multiple": 12.0,
+             "position_fraction": 0.002, "capacity_usd": 5_000.0}, self.EQUITY, 0.05)
+        self.assertEqual(finding.leak, Leak.UNDER_SIZED)
+        self.assertGreater(finding.forgone_log_growth, 0)
+
+    def test_over_sizing_beyond_capacity_is_also_a_leak(self):
+        finding = sizing_leak(
+            {"token": "big", "entered": True, "realized_multiple": 2.0,
+             "position_fraction": 0.05, "capacity_usd": 100.0}, self.EQUITY, 0.05)
+        self.assertEqual(finding.leak, Leak.OVER_SIZED)
+
+    def test_an_execution_miss_is_distinct_from_a_prediction_failure(self):
+        finding = execution_miss(
+            {"token": "missed", "entered": False, "attempted": True,
+             "max_feasible_multiple": 8.0, "capacity_usd": 5_000.0,
+             "failure_reason": "bundle_not_landed"}, self.EQUITY, 0.05)
+        self.assertEqual(finding.leak, Leak.EXECUTION_MISS)
+        # One is fixed with a model, the other with tips, regions and code.
+        self.assertEqual(finding.evidence["failure_reason"], "bundle_not_landed")
+
+    def test_a_token_never_attempted_is_not_an_execution_miss(self):
+        self.assertIsNone(execution_miss(
+            {"token": "skipped", "entered": False, "attempted": False,
+             "max_feasible_multiple": 8.0, "capacity_usd": 5_000.0}, self.EQUITY, 0.05))
+
+    def test_research_ranking_points_at_the_cause_not_the_category(self):
+        trades = [
+            {"token": f"m{i}", "entered": False, "max_feasible_multiple": 25.0,
+             "capacity_usd": 5_000.0, "rejection_reason": "insufficient_upside"}
+            for i in range(5)
+        ] + [
+            {"token": "r", "entered": True, "rugged": True, "realized_multiple": 0.05,
+             "position_fraction": 0.01},
+        ]
+        report = rank_research(find_leaks(trades, self.EQUITY))
+        self.assertGreater(report["total_forgone_log_growth"], 0)
+        top = report["top_causes"][0]
+        # "We lose most to missed monsters" is not actionable; "...rejected for
+        # insufficient_upside" is.
+        self.assertEqual((top["leak"], top["reason"]),
+                         ("missed_monster", "insufficient_upside"))
+        self.assertEqual(len(report["worst_tokens"]), 5)
+
+
+class TestAlphaLedger(unittest.TestCase):
+    """An attribution that does not reconcile is a story."""
+
+    def test_the_ledger_sums_to_the_books_pnl(self):
+        trades = [
+            {"entered": True, "mechanism": "smart_wallet_swarm", "realized_pnl_usd": 180.0},
+            {"entered": True, "mechanism": "smart_wallet_swarm", "realized_pnl_usd": -30.0},
+            {"entered": True, "mechanism": "creator_dna", "realized_pnl_usd": 42.0},
+            {"entered": True, "mechanism": "exit_policy", "realized_pnl_usd": -64.0},
+        ]
+        ledger = alpha_ledger(trades)
+        self.assertTrue(ledger["reconciles"])
+        self.assertAlmostEqual(ledger["total_usd"], 128.0)
+        self.assertEqual(ledger["entries"][0]["mechanism"], "smart_wallet_swarm")
+
+    def test_unattributed_trades_are_bucketed_not_dropped(self):
+        ledger = alpha_ledger([
+            {"entered": True, "realized_pnl_usd": 50.0},
+            {"entered": True, "mechanism": "creator_dna", "realized_pnl_usd": 50.0},
+        ])
+        # Silently dropping them is how the sum stops reconciling.
+        self.assertTrue(ledger["reconciles"])
+        self.assertIn("unattributed", [e["mechanism"] for e in ledger["entries"]])
+
+    def test_concentration_shows_a_book_leaning_on_one_mechanism(self):
+        ledger = alpha_ledger([
+            {"entered": True, "mechanism": "one_trick", "realized_pnl_usd": 900.0},
+            {"entered": True, "mechanism": "other", "realized_pnl_usd": 100.0},
+        ])
+        self.assertAlmostEqual(ledger["concentration"], 0.9)
+
+
+class TestTailContribution(unittest.TestCase):
+    def test_the_top_decile_share_is_reported(self):
+        trades = ([{"entered": True, "wealth_multiple": 1.01} for _ in range(90)]
+                  + [{"entered": True, "wealth_multiple": 3.0} for _ in range(10)])
+        report = tail_contribution(trades)
+        self.assertEqual(report["status"], "OK")
+        self.assertGreater(report["top_10pct_share"], 0.5)
+
+    def test_a_population_too_small_for_a_top_tenth_of_a_percent_reports_none(self):
+        report = tail_contribution([{"entered": True, "wealth_multiple": 2.0}
+                                    for _ in range(50)])
+        # 0.0 would read as "the top 0.1% contributed nothing" about a
+        # population that has no top 0.1%.
+        self.assertIsNone(report["top_01pct_share"])
+        self.assertIsNotNone(report["top_10pct_share"])
+
+    def test_no_positive_trades_blocks(self):
+        self.assertEqual(
+            tail_contribution([{"entered": True, "wealth_multiple": 0.5}])["status"],
+            "DATA_BLOCKED")
+
+
+class TestEdgeDecay(unittest.TestCase):
+    """A quiet edge is not a dead edge."""
+
+    def test_a_small_sample_is_measuring_never_degraded(self):
+        monitor = EdgeDecayMonitor(min_trades=30)
+        monitor.set_baseline("swarm", 0.02)
+        for _ in range(8):
+            monitor.record("swarm", -0.01)
+        health = monitor.health("swarm")
+        # Retiring an edge on eight trades retires exactly the regime-specific
+        # edges that go quiet and come back.
+        self.assertEqual(health["status"], EdgeDecayMonitor.MEASURING)
+
+    def test_sustained_underperformance_against_the_baseline_degrades(self):
+        monitor = EdgeDecayMonitor(min_trades=30)
+        monitor.set_baseline("swarm", 0.02)
+        for _ in range(30):
+            monitor.record("swarm", -0.005)
+        self.assertEqual(monitor.health("swarm")["status"], EdgeDecayMonitor.DEGRADED)
+
+    def test_partial_underperformance_is_weakening_not_degraded(self):
+        monitor = EdgeDecayMonitor(min_trades=30, weakening_ratio=0.5)
+        monitor.set_baseline("swarm", 0.02)
+        for _ in range(30):
+            monitor.record("swarm", 0.006)
+        self.assertEqual(monitor.health("swarm")["status"], EdgeDecayMonitor.WEAKENING)
+
+    def test_performance_at_the_baseline_stays_healthy(self):
+        monitor = EdgeDecayMonitor(min_trades=30)
+        monitor.set_baseline("swarm", 0.02)
+        for _ in range(30):
+            monitor.record("swarm", 0.021)
+        self.assertEqual(monitor.health("swarm")["status"], EdgeDecayMonitor.HEALTHY)
+
+    def test_a_mechanism_with_no_baseline_is_judged_on_sign(self):
+        monitor = EdgeDecayMonitor(min_trades=5)
+        for _ in range(5):
+            monitor.record("new", 0.01)
+        self.assertEqual(monitor.health("new")["status"], EdgeDecayMonitor.HEALTHY)
