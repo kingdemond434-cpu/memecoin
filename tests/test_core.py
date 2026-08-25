@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import gzip
+import hashlib
 import json
 import math
 import struct
@@ -35,6 +36,10 @@ from src.strategies.public_coordination import PublicCoordinationMiner
 from src.strategies.wallet_intelligence import WalletIntelligenceEngine, WalletRegime
 from src.research.dataset_builder import LaunchEpisode, PointInTimeDatasetBuilder, SnapshotTimepoint
 from src.research.shadow_trainer import chronological_episode_split, train_shadow
+from src.chains.pump_curve import (
+    BONDING_CURVE_DISCRIMINATOR, observation_from_state, parse_bonding_curve,
+    quote_buy, quote_sell, sell_capacity_lamports,
+)
 from src.research.feature_engine import build_features
 from src.research.hazard_trainer import train_hazard_calibration
 from src.research.exit_policy_trainer import simulate, train_exit_policy
@@ -675,6 +680,107 @@ class _FakeAsyncResponse:
 
     async def json(self, **kwargs):
         return self._payload
+
+
+class TestPumpCurve(unittest.TestCase):
+    """Local curve pricing removes Jupiter from the first seconds of a launch.
+
+    A newborn Pump token is tradeable on its own curve well before any
+    aggregator indexes it; asking Jupiter first turned "not indexed yet" into
+    "no executable evidence, do not trade".
+    """
+
+    @staticmethod
+    def curve_bytes(virtual_token=1_073_000_000_000_000, virtual_sol=30_000_000_000,
+                    real_token=793_100_000_000_000, real_sol=0,
+                    total_supply=1_000_000_000_000_000, complete=0, creator=None):
+        raw = bytearray(BONDING_CURVE_DISCRIMINATOR)
+        raw += struct.pack("<QQQQQ", virtual_token, virtual_sol, real_token, real_sol, total_supply)
+        raw.append(complete)
+        if creator is not None:
+            raw += creator
+        return bytes(raw)
+
+    def test_discriminator_matches_the_anchor_account_hash(self):
+        self.assertEqual(
+            BONDING_CURVE_DISCRIMINATOR,
+            hashlib.sha256(b"account:BondingCurve").digest()[:8],
+        )
+
+    def test_parses_reserves_and_creator(self):
+        state = parse_bonding_curve(self.curve_bytes(creator=bytes(range(1, 33))))
+        self.assertEqual(state.virtual_sol_reserves, 30_000_000_000)
+        self.assertEqual(state.virtual_token_reserves, 1_073_000_000_000_000)
+        self.assertFalse(state.complete)
+        self.assertTrue(state.tradeable)
+        self.assertEqual(state.creator, b58encode(bytes(range(1, 33))))
+
+    def test_rejects_a_foreign_account_rather_than_mispricing_it(self):
+        raw = bytearray(self.curve_bytes())
+        raw[0] ^= 0xFF
+        with self.assertRaises(ValueError):
+            parse_bonding_curve(bytes(raw))
+
+    def test_completed_curve_is_not_tradeable_on_the_curve(self):
+        state = parse_bonding_curve(self.curve_bytes(complete=1))
+        self.assertFalse(state.tradeable)
+        self.assertIsNone(state.price_sol_per_token)
+        self.assertEqual(quote_buy(state, 10_000_000).data_status, "DATA_BLOCKED")
+
+    def test_buy_conserves_the_constant_product_and_charges_the_fee(self):
+        state = parse_bonding_curve(self.curve_bytes())
+        quote = quote_buy(state, 1_000_000_000)
+        self.assertEqual(quote.data_status, "OK")
+        self.assertEqual(quote.fee_amount, 10_000_000)
+        net = 1_000_000_000 - quote.fee_amount
+        expected = (net * state.virtual_token_reserves) // (state.virtual_sol_reserves + net)
+        self.assertEqual(quote.output_amount, expected)
+        self.assertGreater(quote.output_amount, 0)
+
+    def test_larger_buys_get_strictly_worse_average_prices(self):
+        state = parse_bonding_curve(self.curve_bytes())
+        small = quote_buy(state, 100_000_000)
+        large = quote_buy(state, 10_000_000_000)
+        self.assertLess(small.price_impact_pct, large.price_impact_pct)
+        self.assertLess(small.average_price_sol_per_token, large.average_price_sol_per_token)
+        self.assertLess(large.output_amount, small.output_amount * 100)
+
+    def test_round_trip_loses_only_fees_and_impact_never_gains(self):
+        state = parse_bonding_curve(self.curve_bytes(real_sol=50_000_000_000))
+        spend = 500_000_000
+        bought = quote_buy(state, spend)
+        back = quote_sell(state, bought.output_amount)
+        self.assertEqual(back.data_status, "OK")
+        self.assertLess(back.output_amount, spend)
+
+    def test_sell_cannot_pay_out_more_than_real_sol_reserves(self):
+        state = parse_bonding_curve(self.curve_bytes(real_sol=1_000_000))
+        quote = quote_sell(state, 10_000_000_000_000)
+        self.assertEqual(quote.data_status, "OK")
+        self.assertLessEqual(quote.output_amount, 1_000_000)
+
+    def test_capacity_is_the_largest_size_within_the_impact_bound(self):
+        state = parse_bonding_curve(self.curve_bytes(real_sol=50_000_000_000))
+        capacity = sell_capacity_lamports(state, max_impact_pct=0.15)
+        self.assertGreater(capacity, 0)
+        self.assertLessEqual(quote_sell(state, capacity).price_impact_pct, 0.15)
+        beyond = quote_sell(state, int(capacity * 1.5))
+        self.assertGreater(beyond.price_impact_pct, 0.15)
+
+    def test_quotes_are_never_marked_execution_verified(self):
+        state = parse_bonding_curve(self.curve_bytes())
+        self.assertFalse(quote_buy(state, 1_000_000_000).verified)
+        self.assertFalse(quote_sell(state, 1_000_000).verified)
+        self.assertFalse(observation_from_state(state)["execution_verified"])
+
+    def test_observation_marks_price_without_any_aggregator_call(self):
+        state = parse_bonding_curve(self.curve_bytes(real_sol=50_000_000_000))
+        observation = observation_from_state(state)
+        self.assertTrue(observation["feasible"])
+        self.assertEqual(observation["measurement"], "pump_curve_local")
+        self.assertGreater(observation["price_sol_per_token"], 0)
+        self.assertLess(observation["round_trip_retention"], 1.0)
+        self.assertIsNotNone(observation["curve_progress"])
 
 
 class TestFeatureParity(unittest.IsolatedAsyncioTestCase):
