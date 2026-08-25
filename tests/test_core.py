@@ -9963,3 +9963,130 @@ class TestActionValueIsAuthoritative(unittest.TestCase):
         for key in ("priced_holds", "unpriced_cycles", "suppressed_monster_banks"):
             self.assertIn(f'"{key}"', source)
         self.assertIn('"action_authority"', source)
+
+
+class TestNativeRouteIsActuallyTaken(unittest.IsolatedAsyncioTestCase):
+    """Preparing an instruction and then submitting someone else's transaction
+    is the worst of both: it pays the construction cost, keeps the round trips,
+    and looks finished.
+
+    `execute_swap` built the native Pump instruction and then unconditionally
+    called Jupiter for a quote, asked Jupiter to build a transaction, signed
+    that, and submitted it. The native instruction was telemetry.
+    """
+
+    MINT = "So11111111111111111111111111111111111111112"
+    OTHER = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+
+    @staticmethod
+    def _curve(creator=""):
+        return BondingCurveState(
+            virtual_token_reserves=1_000_000_000_000,
+            virtual_sol_reserves=30_000_000_000,
+            real_token_reserves=800_000_000_000,
+            real_sol_reserves=0, token_total_supply=1_000_000_000_000_000,
+            complete=False, creator=creator)
+
+    def _engine(self, curve=None):
+        engine = ExecutionEngine.__new__(ExecutionEngine)
+        engine.pump_route = NativePumpRoute()
+        engine.curve_state_provider = (lambda token: curve) if curve else None
+        engine.tx_builder = SimpleNamespace(public_key=self.OTHER)
+        engine.native_route_attempts = defaultdict(int)
+        engine.native_compute_unit_limit = 400_000
+        engine.dry_run = True
+        engine.execution_history = deque(maxlen=16)
+        engine.route_performance = defaultdict(
+            lambda: {"total": 0, "landed": 0, "filled": 0, "failed": 0, "avg_latency": 0})
+        engine.counterfactual_lab = SimpleNamespace(
+            record_execution=lambda *args, **kwargs: None)
+        engine.jupiter = SimpleNamespace(
+            get_quote=lambda *args, **kwargs: self.fail("asked Jupiter for a quote"))
+        return engine
+
+    async def test_a_buildable_native_route_never_calls_jupiter(self):
+        engine = self._engine(curve=self._curve(creator=self.MINT))
+        result = await ExecutionEngine.execute_swap(
+            engine, self.MINT, self.OTHER, 1_000_000_000, slippage_bps=100)
+        self.assertTrue(result.success)
+        self.assertIs(result.route_type, RouteType.PUMP_NATIVE)
+        self.assertTrue(result.simulated)
+        self.assertEqual(engine.native_route_attempts["simulated"], 1)
+
+    async def test_an_unbuildable_native_route_falls_back_rather_than_failing(self):
+        """Jupiter keeps the jobs it is better at, including being the fallback."""
+        engine = self._engine(curve=None)
+        engine.jupiter = SimpleNamespace(
+            get_quote=self._quote_stub())
+        result = await ExecutionEngine.execute_swap(
+            engine, self.MINT, self.OTHER, 1_000_000_000, slippage_bps=100)
+        self.assertTrue(result.success)
+        self.assertIs(result.route_type, RouteType.JUPITER_V1)
+
+    @staticmethod
+    def _quote_stub():
+        async def get_quote(*args, **kwargs):
+            return SimpleNamespace(output_amount=123, route_type=RouteType.JUPITER_V1)
+        return get_quote
+
+    async def test_the_dry_run_gate_guards_the_native_path_too(self):
+        """A path whose safety gate is only on the other branch will one day
+        be the branch taken."""
+        source = Path("src/execution/jupiter_jito.py").read_text()
+        tree = ast.parse(source)
+        native = next(node for node in ast.walk(tree)
+                      if isinstance(node, ast.AsyncFunctionDef)
+                      and node.name == "_execute_native")
+        text = ast.unparse(native)
+        self.assertIn("self.dry_run", text)
+        self.assertIn("ALLOW_LIVE_TRADING", text)
+
+    async def test_hard_invariants_still_run_before_any_route(self):
+        engine = self._engine(curve=self._curve(creator=self.MINT))
+        for amount, slippage in ((0, 100), (100, 0), (100, 5_000)):
+            result = await ExecutionEngine.execute_swap(
+                engine, self.MINT, self.OTHER, amount, slippage_bps=slippage)
+            self.assertIs(result.status, TransactionStatus.REJECTED)
+
+
+class TestStreamedCurveStateIsBuildable(unittest.TestCase):
+    """The native route blocked itself: streamed state carried no creator.
+
+    A trade event carries virtual reserves only. Static facts about the curve
+    -- who created it, how large the supply is -- arrive once, on the creation
+    event, and never change. Not carrying them forward meant the route refused
+    every trade for want of a creator it had already been told.
+    """
+
+    def test_the_creation_event_records_what_trade_events_lack(self):
+        source = Path("src/main.py").read_text()
+        self.assertIn("_curve_static[token]", source)
+        tree = ast.parse(source)
+        handler = next(node for node in ast.walk(tree)
+                       if isinstance(node, ast.AsyncFunctionDef)
+                       and node.name == "_on_pump_event")
+        text = ast.unparse(handler)
+        # The static record is written on creation and read on every trade.
+        self.assertIn("_curve_static", text)
+        self.assertIn('static.get(\'creator\'', text.replace('"', "'"))
+
+    def test_an_account_update_replaces_rather_than_merges(self):
+        """Mixing a measured field into a reconstructed record produces a row
+        that is neither, and nothing downstream can tell which parts to trust."""
+        source = Path("src/main.py").read_text()
+        tree = ast.parse(source)
+        ingest = next(node for node in ast.walk(tree)
+                      if isinstance(node, ast.FunctionDef)
+                      and node.name == "ingest_curve_account")
+        text = ast.unparse(ingest)
+        self.assertIn("parse_bonding_curve", text)
+        self.assertIn("_latest_curve_state[token] = state", text)
+        self.assertIn("request_redecision", text)
+
+    def test_static_facts_are_pruned_against_the_hot_state(self):
+        desk = SimpleNamespace(
+            _curve_static={"live": {}, "stale": {}},
+            hot_state=SimpleNamespace(active_tokens={"live"}))
+        dropped = MemecoinQuantDesk._prune_curve_static(desk)
+        self.assertEqual(dropped, 1)
+        self.assertEqual(set(desk._curve_static), {"live"})

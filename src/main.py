@@ -71,7 +71,9 @@ from src.strategies.information_graph import (
 )
 from src.strategies.age_banded import AgeBandedPredictor
 from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPredictor, PredictionFeatures
-from src.chains.pump_curve import BondingCurveState, quote_buy, quote_sell
+from src.chains.pump_curve import (
+    BondingCurveState, parse_bonding_curve, quote_buy, quote_sell,
+)
 from src.chains.idl import report as idl_report
 from src.chains.pump_route import (
     TOKEN_2022_PROGRAM, TOKEN_PROGRAM, NativePumpRoute, PumpRouteConfig,
@@ -212,6 +214,10 @@ class MemecoinQuantDesk:
         self._priced_holds = 0
         self._unpriced_cycles = 0
         self._suppressed_monster_banks = 0
+        # Facts about a curve that never change and never arrive twice.
+        # Bounded against the hot-state token set, because a day of launches
+        # would otherwise accumulate every creator we have ever seen.
+        self._curve_static: Dict[str, Dict[str, Any]] = {}
         self._redecision_tasks: List[asyncio.Task] = []
         self._safety_task: Optional[asyncio.Task] = None
         self._intelligence_task: Optional[asyncio.Task] = None
@@ -1522,6 +1528,44 @@ class MemecoinQuantDesk:
                        else {"status": "DATA_BLOCKED", "reason": "token not registered"}),
         }
 
+    def ingest_curve_account(self, token: str, data: bytes) -> bool:
+        """Adopt a full bonding-curve account when the raw bytes are available.
+
+        A trade event carries virtual reserves only, so a state built from one
+        is complete enough to price and to build a transaction, but its real
+        reserves are unknown -- which is what makes every frontier derived
+        from it an upper bound rather than a measurement. An account update
+        carries all of it, so when one arrives it replaces the reconstruction
+        rather than being merged into it: mixing a measured field into a
+        reconstructed record produces a row that is neither, and nothing
+        downstream can tell which parts to trust.
+
+        Returns whether the account was adopted, so a caller can distinguish
+        "no account available" from "the bytes were not a bonding curve".
+        """
+        state = parse_bonding_curve(data)
+        if state is None or not state.tradeable:
+            return False
+        self._latest_curve_state[token] = state
+        if state.creator:
+            self._curve_static[token] = {
+                "creator": state.creator,
+                "token_total_supply": int(state.token_total_supply or 0),
+            }
+        self.state_sequencer.bump(token)
+        # An account update is a market change like any other, and the
+        # position holding it should think again on the same terms.
+        self.request_redecision(token)
+        return True
+
+    def _prune_curve_static(self) -> int:
+        """Drop static facts for tokens the hot state no longer tracks."""
+        stale = [key for key in self._curve_static
+                 if key not in self.hot_state.active_tokens]
+        for key in stale:
+            self._curve_static.pop(key, None)
+        return len(stale)
+
     def _cost_model(self, token: str, at_utc: Optional[float] = None) -> Dict[str, Any]:
         """The round-trip protocol cost of this token, priced rather than assumed.
 
@@ -2585,6 +2629,7 @@ class MemecoinQuantDesk:
         self.last_intelligence_update = time.time()
         await self._refresh_portfolio_state()
         await self.genealogy.build_clusters()
+        self._prune_curve_static()
         self._refresh_independence()
         self._publish_attribution()
         if self.dry_run:
@@ -2617,6 +2662,13 @@ class MemecoinQuantDesk:
             if hasattr(self.genealogy, "record_token_creation"):
                 self.genealogy.record_token_creation(token, event.get("creator", ""), event)
             self._spawn_background(self.wallet_intel.analyze_token_early_buyers(token))
+            # Recorded before the candidate is dispatched, so the pipeline can
+            # already build a transaction on the first trade that arrives.
+            if event.get("creator"):
+                self._curve_static[token] = {
+                    "creator": str(event["creator"]),
+                    "token_total_supply": int(event.get("token_total_supply", 0) or 0),
+                }
             self._spawn_background(self.social_intel.scan_token(token))
             await self.detection_engine._on_candidate(TokenCandidate(
                 address=token, chain="solana", source=DetectionSource.FACTORY, block_number=int(event.get("slot", 0)),
@@ -2635,13 +2687,22 @@ class MemecoinQuantDesk:
                 # is stale. Bumping here rather than on a timer is what makes
                 # staleness mean "the market changed" instead of "time passed".
                 self.state_sequencer.bump(token)
+                # Static facts about the curve -- who created it, how large
+                # the supply is -- do not arrive on trade events and do not
+                # change. Carrying them forward from the creation event is
+                # what lets a trade event produce a state complete enough to
+                # build a transaction from. Without it the native route
+                # refused every trade for want of a creator it had already
+                # been told once.
+                static = self._curve_static.get(token, {})
                 self._latest_curve_state[token] = BondingCurveState(
                     virtual_token_reserves=virtual_token, virtual_sol_reserves=virtual_sol,
                     # The TradeEvent carries no real reserves. Leaving these at
                     # zero is what marks every frontier derived from this state
                     # as an upper bound rather than a measurement.
-                    real_token_reserves=0, real_sol_reserves=0, token_total_supply=0,
-                    complete=False, creator="",
+                    real_token_reserves=0, real_sol_reserves=0,
+                    token_total_supply=int(static.get("token_total_supply", 0) or 0),
+                    complete=False, creator=str(static.get("creator", "") or ""),
                 )
             curve_multiple = None
             if curve_price > 0:

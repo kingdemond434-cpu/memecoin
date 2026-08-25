@@ -16,8 +16,12 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 import aiohttp
+from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
+from solders.hash import Hash
+from solders.instruction import AccountMeta as SoldersAccountMeta, Instruction
 from solders.keypair import Keypair
-from solders.message import to_bytes_versioned
+from solders.message import MessageV0, to_bytes_versioned
+from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
 from src.chains.pump_curve import quote_buy, quote_sell
@@ -477,6 +481,49 @@ class SolanaTransactionBuilder:
         self.keypair = keypair
         self.public_key = str(keypair.pubkey())
 
+    async def build_and_sign(self, instructions: List[Any], *,
+                             compute_unit_limit: int = 0,
+                             compute_unit_price_micro_lamports: int = 0) -> str:
+        """Assemble a v0 transaction from our own instructions and sign it.
+
+        The counterpart to `sign_versioned_transaction`, which signs somebody
+        else's bytes. Here the message is built locally, so the signer is the
+        fee payer by construction and there is no question of whether the
+        wallet is a required signer of a transaction it did not compose.
+
+        The compute budget instructions go first because the runtime reads
+        them positionally, and they are set explicitly rather than left to the
+        default: a Pump buy that lands with the default limit is a Pump buy
+        that risks running out of compute in the middle of an init_if_needed,
+        and paying for headroom is cheaper than losing the fill.
+        """
+        blockhash = await self._recent_blockhash()
+        payer = self.keypair.pubkey()
+        program_instructions: List[Instruction] = []
+        if compute_unit_limit > 0:
+            program_instructions.append(set_compute_unit_limit(int(compute_unit_limit)))
+        if compute_unit_price_micro_lamports > 0:
+            program_instructions.append(
+                set_compute_unit_price(int(compute_unit_price_micro_lamports)))
+        program_instructions.extend(instructions)
+        message = MessageV0.try_compile(payer, program_instructions, [], blockhash)
+        signed = VersionedTransaction(message, [self.keypair])
+        return base64.b64encode(bytes(signed)).decode("ascii")
+
+    async def _recent_blockhash(self) -> Hash:
+        """A blockhash fresh enough to land.
+
+        Fetched per transaction rather than cached: a stale blockhash is a
+        transaction the cluster silently refuses, which looks exactly like a
+        transaction that lost a race.
+        """
+        response = await self.rpc.request(
+            "getLatestBlockhash", [{"commitment": "confirmed"}])
+        value = ((response or {}).get("value") or {}).get("blockhash")
+        if not value:
+            raise ValueError("no recent blockhash available")
+        return Hash.from_string(str(value))
+
     def sign_versioned_transaction(self, versioned_tx_bytes: bytes) -> str:
         tx = VersionedTransaction.from_bytes(versioned_tx_bytes)
         required = tx.message.header.num_required_signatures
@@ -529,6 +576,10 @@ class ExecutionEngine:
         # source of truth about the price we are about to trade at.
         self.curve_state_provider: Optional[Any] = None
         self.native_route_attempts: Dict[str, int] = defaultdict(int)
+        # Set explicitly rather than left to the runtime default: a Pump buy
+        # that runs out of compute in the middle of an init_if_needed is a
+        # lost fill, and headroom is cheaper than the fill.
+        self.native_compute_unit_limit = 400_000
         self.execution_history: deque = deque(maxlen=10_000)
         self.route_performance: Dict[RouteType, Dict[str, float]] = defaultdict(
             lambda: {"total": 0, "landed": 0, "filled": 0, "failed": 0, "avg_latency": 0}
@@ -603,6 +654,78 @@ class ExecutionEngine:
                 "status": "DATA_BLOCKED", "detail": "no native route configured"},
         }
 
+    def _native_quote(self, input_mint: str, output_mint: str, amount: int):
+        """The local quote backing a native trade. None when the curve cannot answer."""
+        if self.curve_state_provider is None:
+            return None
+        buying = input_mint == WSOL_MINT
+        curve = self.curve_state_provider(output_mint if buying else input_mint)
+        if curve is None:
+            return None
+        quote = quote_buy(curve, amount) if buying else quote_sell(curve, amount)
+        if quote.data_status != "OK" or quote.output_amount <= 0:
+            return None
+        return quote
+
+    async def _execute_native(self, native: PreparedInstruction, quote: Any,
+                              amount: int, slippage_bps: int, started: float, *,
+                              priority_fee: int, jito_tip: int, use_jito: bool,
+                              decision_id: Optional[str],
+                              input_mint: str = "", output_mint: str = "") -> ExecutionResult:
+        """Sign and submit our own instruction. No quote call, no third-party build.
+
+        The dry-run and live-lock gates sit here as well as on the Jupiter
+        path, and deliberately AFTER construction: building the transaction is
+        the part worth exercising in dry run, and a path whose safety gate is
+        only on the other branch is a path that will one day be the branch
+        taken.
+        """
+        if self.dry_run:
+            result = ExecutionResult(
+                success=True, status=TransactionStatus.SIMULATED,
+                input_amount=amount, actual_input_amount=amount,
+                quoted_output_amount=quote.output_amount, slippage_bps=slippage_bps,
+                latency_ms=int((time.time() - started) * 1000),
+                route_type=RouteType.PUMP_NATIVE, simulated=True,
+            )
+            self.native_route_attempts["simulated"] += 1
+            self._record(result, decision_id)
+            return result
+
+        if os.getenv("ALLOW_LIVE_TRADING", "").lower() != "yes-i-understand":
+            return ExecutionResult(
+                False, TransactionStatus.REJECTED,
+                error="live submission is locked; ALLOW_LIVE_TRADING acknowledgement absent")
+
+        try:
+            instruction = Instruction(
+                Pubkey.from_string(native.program_id),
+                bytes(native.data),
+                [SoldersAccountMeta(Pubkey.from_string(meta.pubkey),
+                                    meta.is_signer, meta.is_writable)
+                 for meta in native.accounts],
+            )
+            signed = await self.tx_builder.build_and_sign(
+                [instruction],
+                compute_unit_limit=self.native_compute_unit_limit,
+                # Jito bids through the tip account rather than the fee market,
+                # so paying both would be paying twice for one race.
+                compute_unit_price_micro_lamports=0 if use_jito else priority_fee,
+            )
+        except Exception as exc:
+            self.native_route_attempts["build_failed"] += 1
+            return ExecutionResult(False, TransactionStatus.REJECTED,
+                                   error=f"native build failed: {exc}")
+
+        self.native_route_attempts["submitted"] += 1
+        result = await self._submit_signed(signed, amount, slippage_bps, started,
+                                           jito_tip=jito_tip, use_jito=use_jito,
+                                           route_type=RouteType.PUMP_NATIVE,
+                                           input_mint=input_mint, output_mint=output_mint)
+        result.quoted_output_amount = quote.output_amount
+        self._record(result, decision_id)
+        return result
+
     async def execute_swap(
         self,
         input_mint: str,
@@ -626,6 +749,21 @@ class ExecutionEngine:
             # it was supposed to have stopped paying, and nothing else would
             # say so.
             self.native_route_attempts[f"blocked:{native.status}"] += 1
+        # The native route is taken when it builds, not merely prepared and
+        # then ignored. Preparing an instruction and submitting somebody
+        # else's transaction is the worst of both: it pays the construction
+        # cost, keeps the round trips, and looks finished.
+        if native is not None and native.ok:
+            quote = self._native_quote(input_mint, output_mint, amount)
+            if quote is None:
+                self.native_route_attempts["blocked:no_local_quote"] += 1
+            else:
+                return await self._execute_native(
+                    native, quote, amount, slippage_bps, started,
+                    priority_fee=priority_fee, jito_tip=jito_tip,
+                    use_jito=use_jito, decision_id=decision_id,
+                    input_mint=input_mint, output_mint=output_mint)
+
         quote = await self.jupiter.get_quote(input_mint, output_mint, amount, slippage_bps)
         if not quote or quote.output_amount <= 0:
             return ExecutionResult(False, TransactionStatus.REJECTED, error="no executable quote")
@@ -723,6 +861,55 @@ class ExecutionEngine:
         )
         self._record(result, decision_id)
         return result
+
+    async def _submit_signed(self, signed_tx: str, amount: int, slippage_bps: int,
+                             started: float, *, jito_tip: int, use_jito: bool,
+                             route_type: RouteType,
+                             input_mint: str = "", output_mint: str = "") -> ExecutionResult:
+        """Submit an already-signed transaction and reconcile what landed.
+
+        Shared by the native route and anything else that composes its own
+        transaction, so the submission, confirmation and fill-verification
+        rules are written once. A second copy of this logic is a second place
+        for "submitted" to drift away from "filled".
+        """
+        signature: Optional[str] = None
+        bundle_id: Optional[str] = None
+        if use_jito:
+            bundle_id = await self.jito.send_bundle([signed_tx])
+            if not bundle_id:
+                return ExecutionResult(False, TransactionStatus.FAILED,
+                                       error="Jito bundle rejected")
+            signature = await self._wait_for_bundle(bundle_id)
+        else:
+            signature = await self._send_raw_transaction(signed_tx)
+        if not signature:
+            return ExecutionResult(
+                False, TransactionStatus.TIMEOUT, bundle_id=bundle_id,
+                submitted=bool(bundle_id),
+                error="submitted but no landed transaction was confirmed")
+
+        fill = await self._wait_for_fill(signature, input_mint, output_mint)
+        status = (
+            TransactionStatus.FILLED if fill.get("filled")
+            else TransactionStatus.LANDED if fill.get("landed")
+            else TransactionStatus.TIMEOUT
+        )
+        return ExecutionResult(
+            success=bool(fill.get("filled")), status=status, signature=signature,
+            bundle_id=bundle_id, input_amount=amount,
+            actual_input_amount=int(fill.get("input_amount", 0)),
+            filled_output_amount=int(fill.get("output_amount", 0)),
+            native_balance_delta_lamports=int(fill.get("native_balance_delta_lamports", 0)),
+            slippage_bps=slippage_bps, fees_paid=int(fill.get("fee", 0)),
+            jito_tip=jito_tip if use_jito else 0,
+            latency_ms=int((time.time() - started) * 1000),
+            route_type=RouteType.JITO_BUNDLE if use_jito else route_type,
+            submitted=True, landed=bool(fill.get("landed")),
+            filled=bool(fill.get("filled")), slot=fill.get("slot"),
+            error=None if fill.get("filled")
+            else "landed transaction had no verified output balance delta",
+        )
 
     async def _send_raw_transaction(self, signed_tx: str) -> Optional[str]:
         try:
