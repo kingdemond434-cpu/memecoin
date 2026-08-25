@@ -79,6 +79,11 @@ class SourceDeclaration:
     tier: int = 3
     requires_env: Sequence[str] = ()
     options: Dict[str, Any] = field(default_factory=dict)
+    # Expected cadence. A push channel and a regional daily are not the same
+    # kind of silence, and one universal clock either calls the healthy feed
+    # dead or lets the dead one look healthy.
+    degraded_after_seconds: Optional[float] = None
+    dead_after_seconds: Optional[float] = None
 
     def missing_credentials(self) -> List[str]:
         """Which required environment variables are absent.
@@ -139,6 +144,12 @@ def load_declarations(path: str) -> List[SourceDeclaration]:
                 tier=int(entry.get("tier", 3)),
                 requires_env=tuple(entry.get("requires_env", ()) or ()),
                 options=dict(entry.get("options", {}) or {}),
+                degraded_after_seconds=(float(entry["degraded_after_seconds"])
+                                        if entry.get("degraded_after_seconds") is not None
+                                        else None),
+                dead_after_seconds=(float(entry["dead_after_seconds"])
+                                    if entry.get("dead_after_seconds") is not None
+                                    else None),
             ))
         except (KeyError, TypeError, ValueError) as exc:
             logger.error("skipping malformed source declaration %r: %s", entry, exc)
@@ -188,7 +199,12 @@ def build_sources(
             continue
 
         try:
-            sources.append(factory(declaration.source_id, fetch, **declaration.options))
+            source = factory(declaration.source_id, fetch, **declaration.options)
+            if declaration.degraded_after_seconds is not None:
+                source.degraded_after_seconds = declaration.degraded_after_seconds
+            if declaration.dead_after_seconds is not None:
+                source.dead_after_seconds = declaration.dead_after_seconds
+            sources.append(source)
         except TypeError as exc:
             mark(DeclarationState.NO_FETCHER, f"adapter rejected its options: {exc}")
             continue

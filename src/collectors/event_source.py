@@ -19,6 +19,7 @@ therefore required to declare when it last successfully polled, separately
 from when it last produced an event.
 """
 
+import asyncio
 import hashlib
 import logging
 import time
@@ -125,17 +126,36 @@ class EventSource(ABC):
     that scores it.
     """
 
-    #: How long without a successful poll before the source is considered dead.
+    #: Default cadence expectations. Overridden per source, because five
+    #: minutes without a Telegram push connection and five minutes without a
+    #: regional RSS story are not the same fact, and one universal clock calls
+    #: the healthy feed dead or lets the dead one look healthy.
     dead_after_seconds: float = 900.0
-    #: How long without a successful poll before it is merely degraded.
     degraded_after_seconds: float = 300.0
 
-    def __init__(self, source_id: str, source_class: SourceClass):
+    def __init__(self, source_id: str, source_class: SourceClass,
+                 degraded_after_seconds: Optional[float] = None,
+                 dead_after_seconds: Optional[float] = None):
         self.source_id = source_id
         self.source_class = source_class
+        if degraded_after_seconds is not None:
+            self.degraded_after_seconds = float(degraded_after_seconds)
+        if dead_after_seconds is not None:
+            self.dead_after_seconds = float(dead_after_seconds)
         self._last_poll_ok_at: Optional[float] = None
         self._last_event_at: Optional[float] = None
         self._consecutive_failures = 0
+        self._timeouts = 0
+
+    def note_timeout(self) -> None:
+        """Record that a poll exceeded its budget.
+
+        Counted with failures rather than separately: from the mesh's point of
+        view a source that never answers and one that answers too late are the
+        same problem.
+        """
+        self._timeouts += 1
+        self._consecutive_failures += 1
 
     @abstractmethod
     async def poll(self) -> List[Event]:
@@ -184,16 +204,37 @@ class EventSource(ABC):
             consecutive_failures=self._consecutive_failures,
             # Stated explicitly, because a dead feed and a quiet one produce
             # the same event count and the difference is the whole point.
-            detail=f"{silence:.0f}s since last successful poll")
+            detail=(f"{silence:.0f}s since last successful poll "
+                    f"(degraded at {self.degraded_after_seconds:.0f}s, "
+                    f"dead at {self.dead_after_seconds:.0f}s, "
+                    f"{self._timeouts} timeouts)"))
 
 
 class SourceMesh:
-    """Every adapter, one event stream, one health surface."""
+    """Every adapter, one event stream, one health surface.
+
+    Sources are polled CONCURRENTLY into a bounded queue. Awaiting them one
+    after another means a single slow endpoint delays every source behind it,
+    which is exactly backwards for a system whose value is being first: a
+    stalled regional RSS feed must have no effect on Telegram or chain
+    latency. With hundreds of sources the serial version's worst case is the
+    sum of every timeout.
+
+    The queue is bounded and drops the OLDEST on overflow, for the same reason
+    the archive writer does: a queue that blocks converts a slow source into a
+    stalled mesh, and one that grows without bound converts it into an OOM.
+    """
 
     def __init__(self, sources: Optional[Sequence[EventSource]] = None,
-                 dedupe_window: float = 300.0):
+                 dedupe_window: float = 300.0, max_queue: int = 10_000,
+                 poll_timeout: float = 5.0):
         self.sources: List[EventSource] = list(sources or ())
         self.dedupe_window = dedupe_window
+        self.max_queue = max(1, max_queue)
+        # A source that has not answered in this long is not worth waiting
+        # for; it is worth marking unhealthy and moving on.
+        self.poll_timeout = poll_timeout
+        self.dropped = 0
         # content_hash -> (first_seen_at, [source_ids in arrival order]).
         # Kept rather than discarded, because who saw it FIRST is the signal.
         self._seen: Dict[str, Any] = {}
@@ -207,23 +248,52 @@ class SourceMesh:
         for key in stale:
             self._seen.pop(key, None)
 
+    async def _collect_one(self, source: "EventSource", now: float) -> List[Event]:
+        """Poll one source under a timeout, never propagating its failure."""
+        try:
+            return await asyncio.wait_for(source.collect(now), timeout=self.poll_timeout)
+        except asyncio.TimeoutError:
+            logger.warning("source %s exceeded the %.1fs poll timeout",
+                           source.source_id, self.poll_timeout)
+            source.note_timeout()
+            return []
+        except Exception as exc:  # pragma: no cover - collect already guards
+            logger.warning("source %s raised past its own guard: %s",
+                           source.source_id, exc)
+            return []
+
     async def collect(self, now: Optional[float] = None) -> List[Event]:
-        """Poll every source, returning first-observations only.
+        """Poll every source concurrently, returning first-observations only.
 
         A repeat of content already seen is not returned as a new event, but
         its source IS recorded against the original. Dropping the repeat
         outright would throw away exactly the lead-lag evidence that says
         which source is upstream of which.
+
+        Results are merged in completion order, so a source that answered in
+        5ms is not held behind one that took 4 seconds -- and the arrival
+        order recorded for lead-lag is the order things actually arrived.
         """
         now = time.time() if now is None else now
         self._expire(now)
+        if not self.sources:
+            return []
+
+        batches = await asyncio.gather(
+            *(self._collect_one(source, now) for source in self.sources))
+
         fresh: List[Event] = []
-        for source in self.sources:
-            for event in await source.collect(now):
+        for batch in batches:
+            for event in batch:
                 key = event.content_hash
                 if key in self._seen:
                     self._seen[key][1].append(event.source_id)
                     continue
+                if len(fresh) >= self.max_queue:
+                    # Oldest first: the newest observation is the one a
+                    # decision might still depend on.
+                    fresh.pop(0)
+                    self.dropped += 1
                 self._seen[key] = (now, [event.source_id])
                 fresh.append(event)
         return fresh
@@ -247,5 +317,6 @@ class SourceMesh:
             # The failure mode of a large mesh is six adapters going silent
             # while the dashboard stays green, so the silent ones are named.
             "unhealthy": unhealthy,
+            "dropped_events": self.dropped,
             "coverage": (by_state.get("OK", 0) / len(reports)) if reports else None,
         }

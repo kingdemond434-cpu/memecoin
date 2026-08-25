@@ -33,6 +33,8 @@ sources:
   - id: telegram:calls-en-1
     kind: telegram
     tier: 1
+    degraded_after_seconds: 60
+    dead_after_seconds: 300
     language: en
     region: global
     requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
@@ -104,6 +106,8 @@ sources:
   - id: rss:kr-local
     kind: rss
     tier: 1
+    degraded_after_seconds: 3600
+    dead_after_seconds: 21600
     language: ko
     region: kr
     options: {language: ko}

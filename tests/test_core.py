@@ -7511,3 +7511,110 @@ class TestScaleInExecutesTheDecidedSize(unittest.IsolatedAsyncioTestCase):
         await MemecoinQuantDesk._consider_scale_in(desk, "mint", self._position(), 1.5)
         self.assertEqual(len(desk.execution_engine.buys), 1)
         self.assertEqual(desk.replans, [1])
+
+
+class TestConcurrentSourceMesh(unittest.IsolatedAsyncioTestCase):
+    """One slow endpoint must not delay every source behind it."""
+
+    NOW = 1_800_000_000.0
+
+    class _Slow(EventSource):
+        def __init__(self, source_id, delay, events=None):
+            super().__init__(source_id, SourceClass.FEED)
+            self.delay = delay
+            self._events = events or []
+
+        async def poll(self):
+            await asyncio.sleep(self.delay)
+            return list(self._events)
+
+    def _event(self, source_id, text):
+        return Event(source_id=source_id, source_class=SourceClass.FEED,
+                     source_at=self.NOW, observed_at=self.NOW, text=text)
+
+    async def test_a_slow_source_does_not_hold_up_the_others(self):
+        slow = self._Slow("slow_rss", 0.30, [self._event("slow_rss", "late")])
+        fast = [self._Slow(f"fast{index}", 0.0, [self._event(f"fast{index}", f"x{index}")])
+                for index in range(20)]
+        mesh = SourceMesh([slow, *fast])
+
+        started = time.monotonic()
+        events = await mesh.collect(self.NOW)
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(len(events), 21)
+        # Serial would be the SUM of every source's latency; concurrent is the
+        # max. With hundreds of sources the serial worst case is the sum of
+        # every timeout.
+        self.assertLess(elapsed, 0.30 * 3)
+
+    async def test_a_hanging_source_is_timed_out_and_marked_unhealthy(self):
+        hanging = self._Slow("hangs", 5.0)
+        alive = self._Slow("alive", 0.0, [self._event("alive", "here")])
+        mesh = SourceMesh([hanging, alive], poll_timeout=0.05)
+
+        started = time.monotonic()
+        events = await mesh.collect(self.NOW)
+        elapsed = time.monotonic() - started
+
+        self.assertEqual([event.source_id for event in events], ["alive"])
+        self.assertLess(elapsed, 1.0)
+        # A source that answers too late and one that never answers are the
+        # same problem from the mesh's point of view.
+        self.assertGreater(hanging.health(self.NOW).consecutive_failures, 0)
+
+    async def test_the_queue_is_bounded_and_drops_are_counted(self):
+        many = self._Slow("flood", 0.0,
+                          [self._event("flood", f"msg{index}") for index in range(50)])
+        mesh = SourceMesh([many], max_queue=10)
+        events = await mesh.collect(self.NOW)
+        self.assertEqual(len(events), 10)
+        self.assertEqual(mesh.health(self.NOW)["dropped_events"], 40)
+
+    async def test_arrival_order_is_still_recorded_for_lead_lag(self):
+        text = "same story"
+        first = self._Slow("regional", 0.0, [self._event("regional", text)])
+        second = self._Slow("big", 0.05, [self._event("big", text)])
+        mesh = SourceMesh([first, second])
+        events = await mesh.collect(self.NOW)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(mesh.repeaters_of(events[0].content_hash), ["regional", "big"])
+
+    async def test_an_empty_mesh_returns_nothing_without_erroring(self):
+        self.assertEqual(await SourceMesh([]).collect(self.NOW), [])
+
+
+class TestPerSourceCadence(unittest.IsolatedAsyncioTestCase):
+    """One universal clock calls a healthy feed dead or lets a dead one pass."""
+
+    NOW = 1_800_000_000.0
+
+    class _Fake(EventSource):
+        async def poll(self):
+            return []
+
+    async def test_a_push_source_can_be_held_to_a_tighter_clock(self):
+        push = self._Fake("telegram", SourceClass.CHAT,
+                          degraded_after_seconds=30, dead_after_seconds=90)
+        await push.collect(self.NOW)
+        self.assertEqual(push.health(self.NOW + 10).state, SourceState.OK)
+        # Half a minute without a Telegram push connection is a real problem.
+        self.assertEqual(push.health(self.NOW + 45).state, SourceState.DEGRADED)
+        self.assertEqual(push.health(self.NOW + 120).state, SourceState.DEAD)
+
+    async def test_a_slow_feed_keeps_a_looser_clock(self):
+        feed = self._Fake("regional_rss", SourceClass.FEED,
+                          degraded_after_seconds=3_600, dead_after_seconds=21_600)
+        await feed.collect(self.NOW)
+        # An hour without a regional story is normal, and the tight clock
+        # would have called this dead four times over.
+        self.assertEqual(feed.health(self.NOW + 1_800).state, SourceState.OK)
+        self.assertEqual(feed.health(self.NOW + 7_200).state, SourceState.DEGRADED)
+
+    async def test_the_thresholds_are_stated_in_the_health_detail(self):
+        source = self._Fake("s", SourceClass.CHAT,
+                            degraded_after_seconds=30, dead_after_seconds=90)
+        await source.collect(self.NOW)
+        detail = source.health(self.NOW + 5).detail
+        self.assertIn("degraded at 30s", detail)
+        self.assertIn("dead at 90s", detail)
