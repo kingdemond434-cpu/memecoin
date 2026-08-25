@@ -17,6 +17,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The audit pack reads the repository's own history, so a shallow
+          # checkout makes it report DATA_BLOCKED and fails a test that is
+          # correct. Full history here is not a workaround: it is the state
+          # the pack is built against on a real node.
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -33,6 +39,12 @@ jobs:
           ALLOW_LIVE_TRADING: ""
           SOLANA_PRIVATE_KEY: ""
         run: python -m unittest discover -s tests -q
+
+      - name: Assert the vendored IDL tables are current
+        # The Rust account-flag tables are generated from the IDLs. A hand
+        # edit that drifts from them builds transactions the program rejects,
+        # so drift fails here rather than on chain.
+        run: python tools/gen_account_flags.py --check
 
       - name: Smoke test the desk
         env:
