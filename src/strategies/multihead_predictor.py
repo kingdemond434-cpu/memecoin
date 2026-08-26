@@ -67,6 +67,21 @@ SURVIVAL_LEVELS: Tuple[Tuple[PredictionTarget, float], ...] = (
 REGIME_NAMES: Tuple[str, ...] = ("bull", "bear", "chop", "euphoria")
 
 
+#: The age bands, and the number of models the desk maintains.
+#:
+#: Four, and not five. Splitting a band makes each sub-band's model see a more
+#: homogeneous world AND halves the rows it is fitted on, and below a certain
+#: amount of evidence the second effect wins outright -- two confidently wrong
+#: models where there was one honestly uncertain one. The split will still
+#: look justified, because any partition of a finite sample shows some
+#: difference between its halves.
+#:
+#: So this table does not grow on intuition. `src/research/band_split.py`
+#: answers whether a cut is warranted -- both sides clearing the training
+#: floor on their own, and their outcomes differing beyond noise on the target
+#: the entry decision turns on -- and the shadow trainer reports its verdict
+#: on every run under `split_warrants`. Adding a band means recording that
+#: report next to the edit.
 AGE_BANDS: Tuple[Tuple[str, float, float], ...] = (
     ("flash", 0.0, 0.5),
     ("early", 0.5, 5.0),

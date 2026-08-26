@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import struct
 import subprocess
 import sys
@@ -139,6 +140,8 @@ from src.chains.pump_fee_config import (
     FEE_CONFIG_DISCRIMINATOR, bonding_curve_market_cap, calculate_fee_tier,
     fee_config_address, parse_fee_config, pool_market_cap,
 )
+from src.research.band_split import evaluate_cuts, split_warrant
+from src.strategies import multihead_predictor as multihead_predictor_module
 from src.strategies.wallet_value import (
     FollowOutcome, WalletValue, WalletValueModel, executable_multiple,
 )
@@ -10873,6 +10876,97 @@ class TestTheDeskMeasuresWhatFollowingReturns(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["open_follows"], 1)
         self.assertEqual(report["resolved"], 0)
         self.assertEqual(report["model"]["status"], "DATA_BLOCKED")
+
+
+class TestAgeBandsDoNotSplitOnIntuition(unittest.TestCase):
+    """Every extra band looks like more precision. It usually is not.
+
+    Splitting halves the rows each model is fitted on, and any partition of a
+    finite sample shows some difference between its halves -- so a split that
+    looks justified usually is not.
+    """
+
+    def test_a_split_with_too_few_rows_a_side_is_blocked_however_different(self):
+        """A side fed from its neighbour is the pooled model with a band's name."""
+        warrant = split_warrant([0.0] * 10, [1.0] * 500, min_side_samples=60)
+        self.assertEqual(warrant.status, "DATA_BLOCKED")
+        self.assertIn("neighbour", warrant.detail)
+        self.assertFalse(warrant.warranted)
+
+    def test_two_halves_of_one_distribution_are_not_a_split(self):
+        rng = random.Random(7)
+        left = [rng.gauss(0.3, 0.2) for _ in range(400)]
+        right = [rng.gauss(0.3, 0.2) for _ in range(400)]
+        warrant = split_warrant(left, right)
+        self.assertEqual(warrant.status, "NOT_WARRANTED")
+        self.assertGreater(warrant.p_value, 0.01)
+        self.assertIn("two copies of one model", warrant.detail)
+
+    def test_a_real_step_with_enough_rows_is_warranted(self):
+        rng = random.Random(11)
+        left = [rng.gauss(0.15, 0.1) for _ in range(400)]
+        right = [rng.gauss(0.45, 0.1) for _ in range(400)]
+        warrant = split_warrant(left, right)
+        self.assertEqual(warrant.status, "WARRANTED")
+        self.assertLess(warrant.p_value, 0.01)
+        self.assertGreater(warrant.difference, 0.2)
+
+    def test_a_real_difference_still_needs_rows_on_both_sides(self):
+        """Neither condition alone is enough."""
+        rng = random.Random(13)
+        big = [rng.gauss(0.15, 0.1) for _ in range(400)]
+        tiny = [rng.gauss(0.45, 0.1) for _ in range(20)]
+        self.assertEqual(split_warrant(big, tiny).status, "DATA_BLOCKED")
+
+    def test_identical_constants_are_not_a_difference(self):
+        warrant = split_warrant([0.5] * 100, [0.5] * 100)
+        self.assertEqual(warrant.status, "NOT_WARRANTED")
+        self.assertEqual(warrant.p_value, 1.0)
+
+    def test_a_step_between_two_constants_is(self):
+        warrant = split_warrant([0.0] * 100, [1.0] * 100)
+        self.assertEqual(warrant.status, "WARRANTED")
+
+    def test_testing_many_cuts_corrects_the_threshold(self):
+        """Eight cuts at p<0.01, best reported, is p<0.08 called 0.01."""
+        rng = random.Random(3)
+        rows = [(age, rng.gauss(0.3, 0.2))
+                for age in [rng.uniform(0, 10) for _ in range(1_000)]]
+        report = evaluate_cuts(rows, band="early", cuts=(2.0, 5.0, 8.0), target="p_2x")
+        self.assertAlmostEqual(report["corrected_alpha"], 0.01 / 3)
+        self.assertEqual(report["status"], "NOT_WARRANTED")
+        self.assertIsNone(report["recommended_cut"])
+        self.assertIn("leave it as one model", report["detail"])
+
+    def test_a_genuine_boundary_is_found_and_named_once(self):
+        rng = random.Random(5)
+        rows = []
+        for _ in range(1_000):
+            age = rng.uniform(0, 10)
+            outcome = rng.gauss(0.15 if age < 5 else 0.5, 0.1)
+            rows.append((age, outcome))
+        report = evaluate_cuts(rows, band="early", cuts=(2.5, 5.0, 7.5), target="p_2x")
+        self.assertEqual(report["status"], "WARRANTED")
+        # Singular: a band that "could" be split three ways at once is a band
+        # whose evidence has not been read.
+        self.assertEqual(report["recommended_cut"], 5.0)
+
+    def test_the_shipped_table_is_four_bands_and_covers_every_age(self):
+        """The table does not grow on intuition; it grows on a recorded warrant."""
+        self.assertEqual(len(AGE_BANDS), 4)
+        self.assertEqual(AGE_BANDS[0][1], 0.0)
+        self.assertEqual(AGE_BANDS[-1][2], float("inf"))
+        for (_, _, high), (_, low, _) in zip(AGE_BANDS, AGE_BANDS[1:]):
+            # No gap and no overlap: every age belongs to exactly one brain.
+            self.assertEqual(high, low)
+        for age in (0.0, 0.4, 0.5, 4.9, 5.0, 59.9, 60.0, 10_000.0):
+            self.assertIn(band_for(age), {name for name, _, _ in AGE_BANDS})
+
+    def test_the_band_table_carries_the_rule_for_changing_it(self):
+        """A convention nobody wrote down is a convention that lapses."""
+        source = Path(multihead_predictor_module.__file__).read_text()
+        self.assertIn("band_split", source)
+        self.assertIn("split_warrants", source)
 
 class TestPumpSwapConstruction(unittest.TestCase):
     """The last DATA_BLOCKED that was never about missing information.

@@ -16,6 +16,7 @@ from src.strategies.multihead_predictor import (
     PredictionTarget, band_for,
 )
 from src.strategies.age_banded import BAND_NAMES
+from src.strategies.multihead_predictor import AGE_BANDS
 
 
 # The rows a shadow model trains on, earliest first. The sub-second rungs come
@@ -287,6 +288,50 @@ def train_age_bands(train_samples, oos_samples, model_dir: Path,
               if entry.get("status") == "PASSED"]
     report["status"] = "PASSED" if passed else "DATA_BLOCKED"
     report["passed_bands"] = passed
+    # Whether the data would support cutting any band further. Reported, never
+    # acted on: adding a band is an edit to AGE_BANDS with this report
+    # recorded beside it, because a split the code performs on its own is a
+    # split nobody reviewed.
+    report["split_warrants"] = band_split_warrants(train_samples + oos_samples)
+    return report
+
+
+def band_split_warrants(samples, min_side_samples: int = 60) -> Dict[str, Any]:
+    """Per-band verdicts on the candidate cuts inside each band.
+
+    The outcome tested is realised survival past 2x, which is the target the
+    entry decision turns on. A band whose sides do not differ on THAT is a
+    band whose split would not change any decision, however different its
+    sides look on something else.
+    """
+    from src.research.band_split import evaluate_cuts
+
+    report: Dict[str, Any] = {"bands": {}}
+    for name, low, high in AGE_BANDS:
+        rows = [(float(features.time_since_launch),
+                 float(labels.get(PredictionTarget.P_2X, 0.0)))
+                for features, labels, _ in samples
+                if low <= float(features.time_since_launch) < high
+                and PredictionTarget.P_2X in labels]
+        if not rows:
+            report["bands"][name] = {"status": "DATA_BLOCKED",
+                                     "detail": "no labelled rows in this band"}
+            continue
+        span_high = high if high != float("inf") else max(age for age, _ in rows)
+        # Cuts at the quarter points of the band, which is where an operator
+        # would think to split it. Fixed rather than searched: searching every
+        # boundary and reporting the best is how a p-value gets manufactured.
+        cuts = [low + (span_high - low) * fraction for fraction in (0.25, 0.5, 0.75)]
+        report["bands"][name] = evaluate_cuts(
+            rows, band=name, cuts=[cut for cut in cuts if cut > low],
+            target="p_2x", min_side_samples=min_side_samples)
+    warranted = [name for name, entry in report["bands"].items()
+                 if entry.get("status") == "WARRANTED"]
+    report["status"] = "WARRANTED" if warranted else "NOT_WARRANTED"
+    report["bands_worth_splitting"] = warranted
+    report["detail"] = ("" if warranted else
+                        "no band's outcomes separate at any candidate cut; the "
+                        "current four bands are as many as the data supports")
     return report
 
 
