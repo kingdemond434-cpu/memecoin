@@ -8575,6 +8575,11 @@ class TestOrphanIntelligence(unittest.IsolatedAsyncioTestCase):
     async def test_an_empty_entity_registry_blocks_rather_than_clears(self):
         """No watched entities means 'we cannot tell', not 'nothing is a copycat'."""
         desk = await self._desk()
+        # Make the premise explicit. Production nodes legitimately generate a
+        # gitignored verified overlay, so this test must not depend on whether
+        # that operator-owned file happens to exist in the working tree.
+        desk.entity_registry = EntityRegistry()
+        desk.authenticity = AuthenticityResolver(desk.entity_registry)
         verdict = desk._authenticity(self.MINT, self._candidate(self.MINT))
         self.assertEqual(verdict["status"], "DATA_BLOCKED")
         self.assertEqual(verdict["registry_size"], 0)
