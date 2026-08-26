@@ -28,10 +28,12 @@ try:
         b58decode as _native_b58decode,
         b58encode as _native_b58encode,
         looks_like_pool_creation as _native_looks_like_pool_creation,
+        t0_decide as native_t0_decide,
     )
     NATIVE_FASTPATH_STATUS = "OK: rust-pyo3-abi3"
 except ImportError:
     _native_b58decode = _native_b58encode = _native_looks_like_pool_creation = None
+    native_t0_decide = None
     NATIVE_FASTPATH_STATUS = "DEGRADED: Python fallback"
 
 B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"

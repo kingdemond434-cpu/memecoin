@@ -111,6 +111,7 @@ pub struct Position {
     pub alternative_growth_per_second: Option<f64>,
     pub expected_remaining_seconds: Option<f64>,
     pub add_fraction: Option<f64>,
+    pub add_capacity_fraction: Option<f64>,
     pub probe_fraction: Option<f64>,
 }
 
@@ -268,7 +269,8 @@ fn add_value(position: &Position, bins: &[Bin], max_add: f64) -> f64 {
         Some(value) if value > 0.0 => value,
         _ => return f64::NEG_INFINITY,
     };
-    if added > max_add {
+    let capacity_ceiling = position.add_capacity_fraction.unwrap_or(max_add);
+    if added > max_add.min(capacity_ceiling) {
         return f64::NEG_INFINITY;
     }
     let held = position.held_fraction;
@@ -447,6 +449,7 @@ mod tests {
             alternative_growth_per_second: None,
             expected_remaining_seconds: None,
             add_fraction: None,
+            add_capacity_fraction: None,
             probe_fraction: None,
         }
     }
@@ -492,6 +495,25 @@ mod tests {
         assert!(score(&other, &survival([0.5; 8]), 1e-4, 0.05)
             .blocked
             .is_some());
+    }
+
+    #[test]
+    fn add_respects_the_live_liquidity_capacity_ceiling() {
+        let mut capped = position();
+        capped.add_fraction = Some(0.04);
+        capped.add_capacity_fraction = Some(0.02);
+        let decision = score(
+            &capped,
+            &survival([0.9, 0.7, 0.5, 0.3, 0.1, 0.03, 0.01, 0.004]),
+            1e-4,
+            0.05,
+        );
+        let add = decision
+            .scores
+            .iter()
+            .find(|score| score.action == Action::Add)
+            .expect("ADD score exists");
+        assert!(!add.feasible);
     }
 
     #[test]

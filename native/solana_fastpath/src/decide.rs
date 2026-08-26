@@ -187,6 +187,7 @@ mod tests {
                 alternative_growth_per_second: None,
                 expected_remaining_seconds: None,
                 add_fraction: None,
+                add_capacity_fraction: None,
                 probe_fraction: Some(0.02),
             },
             survival: Survival {

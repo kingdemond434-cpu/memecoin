@@ -1,0 +1,39 @@
+# Official domains to verify with tools/verify_entities.py.
+#
+# The verifier fetches each organisation's own pages and stamps the resulting
+# overlay with page hashes and the verification date. It never invents a
+# wallet or treats a display handle as a stable platform account id.
+candidates:
+  - entity_id: solana-foundation
+    display_name: Solana Foundation
+    domain: solana.org
+    aliases: [Solana]
+  - entity_id: pump-fun
+    display_name: Pump.fun
+    domain: pump.fun
+    aliases: [Pumpfun, Pump Fun]
+  - entity_id: jupiter-exchange
+    display_name: Jupiter Exchange
+    domain: jup.ag
+    aliases: [Jupiter, Jupiter Aggregator]
+  - entity_id: raydium
+    display_name: Raydium
+    domain: raydium.io
+  - entity_id: phantom
+    display_name: Phantom
+    domain: phantom.com
+    aliases: [Phantom Wallet]
+  - entity_id: coinbase
+    display_name: Coinbase
+    domain: coinbase.com
+  - entity_id: binance
+    display_name: Binance
+    domain: binance.com
+  - entity_id: circle
+    display_name: Circle
+    domain: circle.com
+    aliases: [USDC]
+  - entity_id: tether
+    display_name: Tether
+    domain: tether.to
+    aliases: [USDT]

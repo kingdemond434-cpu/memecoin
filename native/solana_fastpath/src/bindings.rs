@@ -260,7 +260,8 @@ fn pumpswap_account_list_status() -> &'static str {
     expected_feasible_multiple, held_fraction, current_multiple, exit_cost,
     entry_cost, exit_capacity_ratio, escape_probability,
     alternative_growth_per_second, expected_remaining_seconds, add_fraction,
-    probe_fraction, min_edge, max_add_fraction, live, max_position_fraction,
+    add_capacity_fraction, probe_fraction, min_edge, max_add_fraction, live,
+    max_position_fraction,
     max_single_commit_fraction, min_commit_fraction, min_exit_capacity,
     live_unlocked
 ))]
@@ -281,6 +282,7 @@ fn t0_decide(
     alternative_growth_per_second: Option<f64>,
     expected_remaining_seconds: Option<f64>,
     add_fraction: Option<f64>,
+    add_capacity_fraction: Option<f64>,
     probe_fraction: Option<f64>,
     min_edge: f64,
     max_add_fraction: f64,
@@ -325,6 +327,7 @@ fn t0_decide(
             alternative_growth_per_second,
             expected_remaining_seconds,
             add_fraction,
+            add_capacity_fraction,
             probe_fraction,
         },
         survival: crate::policy::Survival {

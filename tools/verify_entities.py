@@ -96,6 +96,13 @@ def handles_in(body: str) -> Dict[str, List[str]]:
             groups = [group for group in match.groups() if group]
             if not groups:
                 continue
+            if platform == "mastodon" and groups[0].lower().removeprefix("www.") in {
+                "youtube.com", "tiktok.com", "x.com", "twitter.com", "instagram.com",
+            }:
+                # Those sites also use /@handle URLs, but they are not
+                # ActivityPub identities. Treating one as Mastodon creates a
+                # false canonical account from a syntactic coincidence.
+                continue
             handle = "@".join(reversed(groups)) if platform == "mastodon" else groups[0]
             bucket = found.setdefault(platform, [])
             if handle not in bucket:

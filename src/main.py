@@ -28,7 +28,7 @@ from src.chains.provider_credentials import normalize_provider_environment
 from src.chains.rpc_manager import ChainRegistry, RPCManager
 from src.chains.yellowstone_grpc import (
     NATIVE_FASTPATH_STATUS, PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
-    create_combined_subscription,
+    create_combined_subscription, native_t0_decide,
 )
 from src.detection.rug_detector import RugDetector
 from src.detection.token_detector import DetectionSource, TokenCandidate, TokenDetectionEngine
@@ -50,7 +50,7 @@ from src.research.contribution import (
 from src.research.attribution import EdgeDecayMonitor
 from src.runtime.hot_state import HotState, HotStateBudget
 from src.strategies.action_value import (
-    Action as ActionValue, ActionValuePolicy, Decision as ActionDecision,
+    Action as ActionValue, ActionScore, ActionValuePolicy, Decision as ActionDecision,
     PositionState as ActionState,
 )
 from src.collectors.event_source import Event, SourceMesh
@@ -251,6 +251,13 @@ class MemecoinQuantDesk:
         self._market_entry_price: Dict[str, float] = {}
         self._curve_entry_price: Dict[str, float] = {}
         self._latest_stream_mark: Dict[str, Dict[str, float]] = {}
+        self._router_mark_cache: Dict[str, Dict[str, float]] = {}
+        self._router_mark_inflight: Set[str] = set()
+        self._router_mark_checked_at: Dict[str, float] = {}
+        self._native_decisions = 0
+        self._native_parity_matches = 0
+        self._native_parity_mismatches = 0
+        self._native_decision_fallbacks = 0
         # Latest bonding-curve reserves decoded straight off the trade
         # stream, so exit capacity is answerable locally in the window a
         # decision actually has, with no RPC round trip.
@@ -1841,7 +1848,8 @@ class MemecoinQuantDesk:
             quote = quote_buy(curve, lamports)
             return quote if quote.data_status == "OK" else None
         pool = self._latest_pool_state.get(token)
-        if pool is not None and pool.blocked_reason() is None:
+        if (pool is not None and pool.quote_mint == WSOL_MINT
+                and pool.blocked_reason() is None):
             quote = pool_quote_buy(pool, lamports)
             return quote if quote.data_status == "OK" else None
         return None
@@ -2141,7 +2149,7 @@ class MemecoinQuantDesk:
                                 if escape.status == "OK" else None),
             probe_fraction=min(1.0, size_usd / equity),
         )
-        return self.action_policy.score(entry_state)
+        return self._canonical_action_score(token, prediction, entry_state)
 
     def _price_reentry(self, token: str, prediction: Any, liquidity: float,
                        trade_info: Dict[str, Any]):
@@ -2275,7 +2283,7 @@ class MemecoinQuantDesk:
             add_capacity_fraction=(self.elogw_engine.exposure_cap(liquidity) - held_fraction
                                    if liquidity > 0 else None),
         )
-        decision = self.action_policy.score(state)
+        decision = self._canonical_action_score(token, prediction, state, position)
         # Cheap: a handful of pure evaluations over bins already built. Run on
         # every decision rather than on a sample, because the decisions worth
         # attributing are the rare ones and a sample misses exactly those.
@@ -2287,6 +2295,101 @@ class MemecoinQuantDesk:
             decision.snapshot = self._freeze_decision(
                 token, position, decision, state, add_fraction)
         return decision
+
+    @staticmethod
+    def _survival_levels(prediction: Any) -> List[float]:
+        return [float(getattr(prediction, name, 0.0) or 0.0) for name in (
+            "p_2x", "p_5x", "p_10x", "p_20x", "p_50x", "p_100x", "p_250x", "p_500x")]
+
+    def _native_reserves(self, token: str) -> Optional[Tuple[int, int]]:
+        curve = getattr(self, "_latest_curve_state", {}).get(token)
+        if curve is not None and getattr(curve, "tradeable", False):
+            return int(curve.virtual_sol_reserves), int(curve.virtual_token_reserves)
+        pool = getattr(self, "_latest_pool_state", {}).get(token)
+        if pool is not None and pool.blocked_reason() is None:
+            return int(pool.effective_quote_reserves), int(pool.base_reserves)
+        return None
+
+    def _token_age_seconds(self, token: str, position: Optional[Dict[str, Any]]) -> float:
+        if position is not None and position.get("entry_time") is not None:
+            return max(0.0, time.time() - float(position["entry_time"]))
+        episode = getattr(getattr(self, "dataset_builder", None), "active_episodes", {}).get(token)
+        created_at = getattr(episode, "created_at", None)
+        return max(0.0, time.time() - float(created_at)) if created_at is not None else 0.0
+
+    def _increment_native_stat(self, name: str) -> None:
+        setattr(self, name, int(getattr(self, name, 0)) + 1)
+
+    def _canonical_action_score(self, token: str, prediction: Any, state: ActionState,
+                                position: Optional[Dict[str, Any]] = None) -> ActionDecision:
+        """Rust owns the decision; Python runs continuously as a parity oracle.
+
+        A disagreement blocks entry/ordinary position action and is surfaced,
+        rather than quietly selecting whichever implementation is more
+        permissive. Catastrophic hazard exits run before this method and are
+        therefore never blocked by a parity fault.
+        """
+        shadow = self.action_policy.score(state)
+        reserves = self._native_reserves(token)
+        if native_t0_decide is None or reserves is None or self.action_policy.is_trained:
+            self._increment_native_stat("_native_decision_fallbacks")
+            return shadow
+        try:
+            raw = native_t0_decide(
+                self._token_age_seconds(token, position), reserves[0], reserves[1],
+                self._survival_levels(prediction),
+                float(getattr(prediction, "p_rug_30s", 0.0) or 0.0),
+                float(getattr(prediction, "p_rug_5m", 0.0) or 0.0),
+                float(getattr(prediction, "expected_feasible_multiple", 0.0) or 0.0),
+                float(state.held_fraction), float(state.current_multiple),
+                float(state.exit_cost), float(state.entry_cost),
+                state.exit_capacity_ratio, state.escape_probability,
+                state.alternative_growth_per_second, state.expected_remaining_seconds,
+                state.add_fraction, state.add_capacity_fraction, state.probe_fraction,
+                float(self.action_policy.min_edge), float(self.action_policy.max_add_fraction),
+                not self.dry_run, float(self.elogw_engine.max_position_pct),
+                float(getattr(self, "global_config", {}).get("max_single_commit_fraction",
+                                             self.elogw_engine.max_position_pct)),
+                float(getattr(self, "global_config", {}).get("min_commit_fraction", 0.0005)),
+                float(getattr(self, "global_config", {}).get("min_exit_capacity", 0.10)),
+                os.getenv("ALLOW_LIVE_TRADING", "").lower() == "yes-i-understand",
+            )
+        except Exception as exc:
+            self._increment_native_stat("_native_decision_fallbacks")
+            logger.error("native decision failed closed for %s: %s", token, exc)
+            return ActionDecision(status="DATA_BLOCKED", detail=f"native decision failed: {exc}")
+
+        self._increment_native_stat("_native_decisions")
+        action = ActionValue(raw[0])
+        scores = [ActionScore(ActionValue(name), float(q),
+                              status="OK" if feasible else "DATA_BLOCKED")
+                  for name, q, feasible in raw[7]]
+        status = "DATA_BLOCKED" if raw[4] else "OK"
+        native = ActionDecision(status=status, action=action, q=float(raw[1]),
+                                scores=scores, detail=str(raw[4] or raw[5] or "rust_t0"))
+        shadow_scores = {score.action: score for score in shadow.scores}
+        native_scores = {score.action: score for score in native.scores}
+        scores_match = shadow_scores.keys() == native_scores.keys() and all(
+            shadow_scores[key].feasible == native_scores[key].feasible
+            and (not shadow_scores[key].feasible
+                 or math.isclose(shadow_scores[key].q, native_scores[key].q,
+                                 rel_tol=1e-9, abs_tol=1e-9))
+            for key in shadow_scores)
+        same = (shadow.status == native.status
+                and (shadow.status != "OK" or (shadow.action is native.action
+                                                and math.isclose(shadow.q, native.q,
+                                                                 rel_tol=1e-9, abs_tol=1e-9)
+                                                and scores_match)))
+        if not same:
+            self._increment_native_stat("_native_parity_mismatches")
+            logger.error("RUST/PYTHON ACTION PARITY mismatch %s rust=%s/%.12f python=%s/%.12f",
+                         token, native.action.value, native.q, shadow.action.value, shadow.q)
+            return ActionDecision(status="DATA_BLOCKED", detail="rust_python_action_parity_mismatch")
+        self._increment_native_stat("_native_parity_matches")
+        if not raw[3]:
+            return ActionDecision(status="REFUSED", action=action, q=float(raw[1]), scores=scores,
+                                  detail=str(raw[5] or raw[4] or "native safety refused action"))
+        return native
 
     def _freeze_decision(self, token: str, position: Dict[str, Any], decision: Any,
                          state: Any, add_fraction: Optional[float]):
@@ -2837,6 +2940,8 @@ class MemecoinQuantDesk:
             priority_fee=self.fee_optimizer.get_optimal_fee(add_usd, 0.5),
             jito_tip=self.fee_optimizer.get_jito_tip(add_usd, "MEDIUM"),
             use_jito=True, decision_id=position.get("decision_id"),
+            expected_edge_usd=max(0.0, float(gain) * max(self.wallet_equity_usd, 0.0)),
+            sol_price_usd=float(self.sol_price_usd or 0.0),
         )
         attempt = {**_jsonable(result), "scale_in": True, "marginal_elogw": gain,
                    "added_fraction": fraction, "at_multiple": multiple}
@@ -2862,30 +2967,69 @@ class MemecoinQuantDesk:
                     "PAPER" if self.dry_run else "LIVE", token, added_cost, multiple, gain)
 
     async def _mark_position(self, token: str, position: Dict[str, Any]):
+        now = time.time()
         stream_mark = self._latest_stream_mark.get(token)
-        if self.dry_run and stream_mark and time.time() - stream_mark["timestamp"] <= 3.0:
-            multiple = float(stream_mark["multiple"])
-            current_value = max(0.0, float(position["remaining_cost_usd"]) * multiple)
-            observation = {"type": "stream_mark", "feasible": True, "value_usd": current_value,
-                           "price_multiple": multiple, "timestamp": stream_mark["timestamp"],
-                           "measurement": "decoded_onchain_reserve_event", "data_status": "OK"}
-            self.rug_hazard.record_observation(token, observation)
-            self.dataset_builder.record_market_observation(token, observation)
-            self.counterfactual_lab.record_market_observation(token, multiple, observation["timestamp"])
-            return multiple, current_value
-        quote = await self.jupiter.get_quote(token, USDC_MINT, int(position["size_tokens"]), slippage_bps=500)
-        if not quote:
-            self.rug_hazard.record_observation(token, {"type": "route", "feasible": False, "timestamp": time.time()})
-            return None
-        current_value = quote.output_amount / 1_000_000
+        quote = None
+        measurement = ""
+        curve = self._latest_curve_state.get(token)
+        if curve is not None and stream_mark and now - stream_mark["timestamp"] <= 3.0:
+            candidate = quote_sell(curve, int(position["size_tokens"]))
+            if candidate.data_status == "OK" and candidate.output_amount > 0:
+                quote, measurement = candidate, "local_pump_executable_sell"
+        if quote is None:
+            pool = self._latest_pool_state.get(token)
+            if (pool is not None and pool.quote_mint == WSOL_MINT
+                    and pool.blocked_reason(now=now) is None):
+                candidate = pool_quote_sell(pool, int(position["size_tokens"]), now=now)
+                if candidate.data_status == "OK" and candidate.output_amount > 0:
+                    quote, measurement = candidate, "local_pumpswap_executable_sell"
+
+        crosscheck_interval = float(self.global_config.get("router_mark_crosscheck_seconds", 15.0))
+        if (self.jupiter is not None and token not in self._router_mark_inflight
+                and now - self._router_mark_checked_at.get(token, 0.0) >= crosscheck_interval):
+            self._router_mark_inflight.add(token)
+            self._router_mark_checked_at[token] = now
+            self._spawn_background(self._crosscheck_router_mark(
+                token, int(position.get("size_tokens", 0))))
+
+        if quote is not None:
+            current_value = quote.output_amount / LAMPORTS_PER_SOL * self.sol_price_usd
+            impact = float(quote.price_impact_pct)
+        else:
+            cached = self._router_mark_cache.get(token)
+            if not cached or now - cached["timestamp"] > 3.0:
+                return None
+            current_value = float(cached["value_usd"])
+            impact = float(cached.get("price_impact_pct", 0.0))
+            measurement = "async_jupiter_crosscheck_fallback"
         remaining_cost = max(float(position["remaining_cost_usd"]), 1e-9)
         multiple = current_value / remaining_cost
-        observation = {"type": "route", "feasible": True, "price_impact_pct": quote.price_impact_pct,
-                       "value_usd": current_value, "price_multiple": multiple, "timestamp": time.time()}
+        observation = {"type": "route", "feasible": True, "price_impact_pct": impact,
+                       "value_usd": current_value, "price_multiple": multiple, "timestamp": now,
+                       "measurement": measurement, "data_status": "OK"}
         self.rug_hazard.record_observation(token, observation)
         self.dataset_builder.record_market_observation(token, observation)
         self.counterfactual_lab.record_market_observation(token, multiple, observation["timestamp"])
         return multiple, current_value
+
+    async def _crosscheck_router_mark(self, token: str, size_tokens: int) -> None:
+        try:
+            quote = await self.jupiter.get_quote(
+                token, USDC_MINT, size_tokens, slippage_bps=500)
+            if quote and quote.output_amount > 0:
+                self._router_mark_cache[token] = {
+                    "value_usd": quote.output_amount / 1_000_000,
+                    "price_impact_pct": float(quote.price_impact_pct),
+                    "timestamp": time.time(),
+                }
+            else:
+                self.rug_hazard.record_observation(
+                    token, {"type": "route", "feasible": False, "timestamp": time.time(),
+                            "measurement": "async_jupiter_crosscheck"})
+        except Exception as exc:
+            logger.debug("async Jupiter mark crosscheck failed for %s: %s", token, exc)
+        finally:
+            self._router_mark_inflight.discard(token)
 
     async def _observe_active_markets(self):
         """Collect outcome paths independently of prediction/trade authority.
@@ -3373,7 +3517,13 @@ class MemecoinQuantDesk:
             "pumpswap_execution": self.pool_route_report(),
             "idl": idl_report(),
             "action_policy": {"trained": self.action_policy.is_trained,
-                              "min_edge": self.action_policy.min_edge},
+                              "min_edge": self.action_policy.min_edge,
+                              "canonical": ("rust_t0_with_python_parity"
+                                            if native_t0_decide is not None else "python_fallback"),
+                              "native_decisions": self._native_decisions,
+                              "parity_matches": self._native_parity_matches,
+                              "parity_mismatches": self._native_parity_mismatches,
+                              "fallbacks": self._native_decision_fallbacks},
             # An empty registry is not "nothing is a copycat". It is "we
             # cannot tell", and a status page that stays silent about it lets
             # an operator read silence as safety.

@@ -30,44 +30,9 @@ sources:
     region: global
     options: {repo: pump-fun/pump-public-docs}
 
-  # ---- Telegram: crypto-native, where a CA usually appears first -----------
-  - id: telegram:calls-en-1
-    kind: telegram
-    tier: 1
-    degraded_after_seconds: 60
-    dead_after_seconds: 300
-    language: en
-    region: global
-    requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
-    options: {channel: example_calls_en}
-  - id: telegram:calls-zh-1
-    kind: telegram
-    tier: 1
-    language: zh
-    region: cn
-    requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
-    options: {channel: example_calls_zh}
-  - id: telegram:calls-ru-1
-    kind: telegram
-    tier: 1
-    language: ru
-    region: cis
-    requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
-    options: {channel: example_calls_ru}
-  - id: telegram:calls-tr-1
-    kind: telegram
-    tier: 1
-    language: tr
-    region: tr
-    requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
-    options: {channel: example_calls_tr}
-  - id: telegram:calls-ko-1
-    kind: telegram
-    tier: 1
-    language: ko
-    region: kr
-    requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
-    options: {channel: example_calls_ko}
+  # Telegram sources come from TELEGRAM_CHANNELS at runtime. This keeps the
+  # operator's real joined watchlist active without committing private choices
+  # or shipping fake example usernames that collect nothing.
 
   # ---- open social firehoses: free, filtered locally -----------------------
   - id: bluesky:jetstream
@@ -138,6 +103,12 @@ sources:
     language: tr
     region: tr
     options: {language: tr}
+  - id: rss:ru-local
+    kind: rss
+    tier: 2
+    language: ru
+    region: cis
+    options: {language: ru}
   - id: rss:mena-local
     kind: rss
     tier: 2

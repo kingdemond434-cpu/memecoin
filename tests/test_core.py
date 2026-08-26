@@ -1662,6 +1662,9 @@ class TestScaleInWiring(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(position["remaining_cost_usd"], 100.0)
         self.assertEqual(len(position["scale_ins"]), 1)
         self.assertEqual(position["scale_ins"][0]["elogw_gain"], 0.5)
+        kwargs = desk.execution_engine.buys[0][3]
+        self.assertEqual(kwargs["expected_edge_usd"], 5_000.0)
+        self.assertEqual(kwargs["sol_price_usd"], 150.0)
 
     async def test_no_add_when_marginal_growth_is_not_positive(self):
         result = ExecutionResult(success=True, status=TransactionStatus.SIMULATED, simulated=True,
@@ -2622,6 +2625,83 @@ class TestRpcFallback(unittest.IsolatedAsyncioTestCase):
 
 
 class TestShadowMarketObservation(unittest.IsolatedAsyncioTestCase):
+    async def test_live_position_mark_uses_local_executable_curve_without_jupiter(self):
+        class Recorder:
+            def __init__(self):
+                self.items = []
+
+            def record_market_observation(self, token, observation):
+                self.items.append(observation)
+
+            def record_observation(self, token, observation):
+                self.items.append(observation)
+
+        desk = MemecoinQuantDesk()
+        desk.dry_run = False
+        desk.sol_price_usd = 150.0
+        desk.global_config = {"router_mark_crosscheck_seconds": 60.0}
+        desk._router_mark_checked_at = {"mint": time.time()}
+        desk._latest_stream_mark = {"mint": {"multiple": 1.0, "timestamp": time.time()}}
+        desk._latest_curve_state = {"mint": BondingCurveState(
+            virtual_token_reserves=1_000_000_000_000,
+            virtual_sol_reserves=30_000_000_000,
+            real_token_reserves=500_000_000_000,
+            real_sol_reserves=10_000_000_000,
+            token_total_supply=1_000_000_000_000,
+            complete=False,
+        )}
+        desk._latest_pool_state = {}
+        desk._router_mark_cache = {}
+        desk._router_mark_inflight = set()
+        desk.rug_hazard = Recorder()
+        desk.dataset_builder = Recorder()
+        desk.counterfactual_lab = CounterfactualExecutionLab()
+        desk.jupiter = SimpleNamespace(get_quote=lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("live hot path must not await Jupiter")))
+
+        marked = await desk._mark_position(
+            "mint", {"size_tokens": 1_000_000_000, "remaining_cost_usd": 4.0})
+        self.assertIsNotNone(marked)
+        self.assertGreater(marked[1], 0.0)
+        self.assertEqual(desk.dataset_builder.items[-1]["measurement"],
+                         "local_pump_executable_sell")
+
+    async def test_live_position_mark_uses_local_pumpswap_after_graduation(self):
+        class Recorder:
+            def __init__(self):
+                self.items = []
+
+            def record_market_observation(self, token, observation):
+                self.items.append(observation)
+
+            def record_observation(self, token, observation):
+                self.items.append(observation)
+
+        desk = MemecoinQuantDesk()
+        desk.dry_run = False
+        desk.sol_price_usd = 150.0
+        desk.global_config = {"router_mark_crosscheck_seconds": 60.0}
+        desk._router_mark_checked_at = {"mint": time.time()}
+        desk._latest_stream_mark = {}
+        desk._latest_curve_state = {}
+        desk._latest_pool_state = {"mint": PumpSwapPoolState(
+            pool="pool", base_mint="mint", quote_mint=WSOL_MINT,
+            base_reserves=1_000_000_000_000,
+            quote_reserves=30_000_000_000,
+            total_fee_bps=100, updated_at=time.time(),
+        )}
+        desk._router_mark_cache = {}
+        desk._router_mark_inflight = set()
+        desk.rug_hazard = Recorder()
+        desk.dataset_builder = Recorder()
+        desk.counterfactual_lab = CounterfactualExecutionLab()
+
+        marked = await desk._mark_position(
+            "mint", {"size_tokens": 1_000_000_000, "remaining_cost_usd": 4.0})
+        self.assertIsNotNone(marked)
+        self.assertEqual(desk.dataset_builder.items[-1]["measurement"],
+                         "local_pumpswap_executable_sell")
+
     async def test_social_candidate_requires_verified_spl_mint(self):
         class Rpc:
             async def request(self, method, params):
@@ -10322,6 +10402,13 @@ class TestEntityProvenanceIsRequired(unittest.TestCase):
         self.assertEqual(entities[0].verified_from, "https://figure.com/press")
         self.assertGreater(entities[0].verified_at, 0)
 
+    def test_centralised_at_handle_urls_are_not_misread_as_mastodon(self):
+        found = verify_entities.handles_in(
+            '<a href="https://www.youtube.com/@official">video</a>'
+            '<a href="https://social.example/@real">fediverse</a>')
+        self.assertEqual(found.get("mastodon"), ["real@social.example"])
+        self.assertEqual(found.get("youtube"), ["official"])
+
     def test_an_entity_without_a_source_is_refused_not_flagged(self):
         """A flag on a record that still confers proof is not a control."""
         entry = self._entry()
@@ -12385,6 +12472,7 @@ class TestRustPythonPolicyParity(unittest.TestCase):
                                     self._prediction(levels, rug, rug))),
                             exit_cost=0.02, entry_cost=0.02,
                             exit_capacity_ratio=capacity, escape_probability=escape,
+                            add_capacity_fraction=None,
                             probe_fraction=probe)
                         python = ActionValuePolicy(min_edge=1e-4,
                                                    max_add_fraction=0.05).score(python_state)
@@ -12392,7 +12480,7 @@ class TestRustPythonPolicyParity(unittest.TestCase):
                             0.1, 30_000_000_000, 1_000_000_000_000,
                             list(levels), rug, rug, 0.0,
                             held, multiple, 0.02, 0.02, capacity, escape,
-                            None, None, None, probe,
+                            None, None, None, None, probe,
                             1e-4, 0.05, False, 0.25, 0.05, 0.0005, 0.10, False)
                         self.assertEqual(python.status, "OK")
                         self.assertEqual(
@@ -12413,10 +12501,32 @@ class TestRustPythonPolicyParity(unittest.TestCase):
                 0.1, 30_000_000_000, 1_000_000_000_000,
                 [0.5, 0.3, 0.2, 0.1, 0.05, 0.0, 0.0, 0.0], 0.0, 0.0, 0.0,
                 0.3, 2.0, 0.02, 0.02, capacity, escape,
-                None, None, None, None,
+                None, None, None, None, None,
                 1e-4, 0.05, False, 0.25, 0.05, 0.0005, 0.10, False)
             self.assertEqual(python.status, "DATA_BLOCKED")
             self.assertIsNotNone(native[4])
+
+    def test_add_capacity_is_identical_in_python_and_rust(self):
+        levels = self.LEVELS[1]
+        state = ActionState(
+            held_fraction=0.10, current_multiple=1.5,
+            forward_bins=tuple((probability, gross) for _, probability, gross
+                               in ElogwEngine.probability_bins(self._prediction(levels))),
+            exit_cost=0.02, entry_cost=0.02, exit_capacity_ratio=0.9,
+            escape_probability=0.9, add_fraction=0.04,
+            add_capacity_fraction=0.02,
+        )
+        python = ActionValuePolicy(max_add_fraction=0.05).score(state)
+        native = self.rust.t0_decide(
+            0.1, 30_000_000_000, 1_000_000_000_000,
+            list(levels), 0.0, 0.0, 0.0,
+            0.10, 1.5, 0.02, 0.02, 0.9, 0.9,
+            None, None, 0.04, 0.02, None,
+            1e-4, 0.05, False, 0.25, 0.05, 0.0005, 0.10, False)
+        python_add = next(score for score in python.scores if score.action is Action.ADD)
+        rust_add = next(score for score in native[7] if score[0] == "add")
+        self.assertFalse(python_add.feasible)
+        self.assertFalse(rust_add[2])
 
     def test_the_age_bands_agree(self):
         for age in (0.0, 0.05, 0.49, 0.5, 4.9, 5.0, 59.9, 60.0, 3_600.0):
@@ -12451,7 +12561,7 @@ class TestRustT0Safety(unittest.TestCase):
             held_fraction=0.0, current_multiple=1.0, exit_cost=0.02,
             entry_cost=0.02, exit_capacity_ratio=0.9, escape_probability=0.9,
             alternative_growth_per_second=None, expected_remaining_seconds=None,
-            add_fraction=None, probe_fraction=0.02, min_edge=1e-4,
+            add_fraction=None, add_capacity_fraction=None, probe_fraction=0.02, min_edge=1e-4,
             max_add_fraction=0.05, live=False, max_position_fraction=0.25,
             max_single_commit_fraction=0.05, min_commit_fraction=0.0005,
             min_exit_capacity=0.10, live_unlocked=False)
@@ -12461,7 +12571,7 @@ class TestRustT0Safety(unittest.TestCase):
             "p_rug_5m", "expected_feasible_multiple", "held_fraction",
             "current_multiple", "exit_cost", "entry_cost", "exit_capacity_ratio",
             "escape_probability", "alternative_growth_per_second",
-            "expected_remaining_seconds", "add_fraction", "probe_fraction",
+            "expected_remaining_seconds", "add_fraction", "add_capacity_fraction", "probe_fraction",
             "min_edge", "max_add_fraction", "live", "max_position_fraction",
             "max_single_commit_fraction", "min_commit_fraction",
             "min_exit_capacity", "live_unlocked")])
