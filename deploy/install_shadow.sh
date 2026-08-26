@@ -76,7 +76,7 @@ cat <<'NOTE'
 
 Started in DRY RUN. To confirm:
 
-  curl -s localhost:8080/status | python3 -m json.tool | head -20
+  curl -s localhost:18080/status | python3 -m json.tool | head -20
 
 Watch the forward-evidence ledger fill:
 

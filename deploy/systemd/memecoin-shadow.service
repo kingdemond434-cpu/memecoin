@@ -22,6 +22,11 @@ EnvironmentFile=-%h/.config/memecoin-shadow/env
 Environment=ALLOW_LIVE_TRADING=
 Environment=SOLANA_PRIVATE_KEY=
 Environment=PYTHONUNBUFFERED=1
+# Loopback, and the port the runbook and the health checks use. The status
+# endpoint serves the desk's whole interior, so it does not go on an
+# interface anything else can reach.
+Environment=HEALTH_HOST=127.0.0.1
+Environment=HEALTH_PORT=18080
 
 ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.main --dry-run
 

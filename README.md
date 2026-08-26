@@ -132,6 +132,20 @@ curl http://127.0.0.1:18080/status
 journalctl -u memecoin-shadow -f
 ```
 
+Or, as a user service that needs no privileges (a trading process running as
+root is one whose blast radius is the machine):
+
+```bash
+bash deploy/install_shadow.sh
+systemctl --user is-active memecoin-shadow.service
+```
+
+`RUNBOOK.md` is the operational path end to end: install, credentials and
+coverage, accumulating the forward ledger, reading the distance to the next
+promotion stage, and what has to be true before a tiny canary. The status
+endpoint binds loopback -- it serves the desk's whole interior, so putting it
+on a public interface publishes all of it.
+
 ## Source mesh: verifying endpoints on the node
 
 `config/sources.yaml` is a SEED. Every declaration in it names a lawful public

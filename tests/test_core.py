@@ -10968,6 +10968,98 @@ class TestAgeBandsDoNotSplitOnIntuition(unittest.TestCase):
         self.assertIn("band_split", source)
         self.assertIn("split_warrants", source)
 
+
+class TestTheRunbookMatchesTheSystem(unittest.TestCase):
+    """A runbook whose commands error is worse than no runbook.
+
+    Every key these snippets read has to exist in the payload the desk
+    actually serves, and the unit has to point at a file that is there.
+    """
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def _runbook(self) -> str:
+        return (self.ROOT / "RUNBOOK.md").read_text(encoding="utf-8")
+
+    def test_the_runbook_the_unit_documents_exists(self):
+        unit = (self.ROOT / "deploy" / "systemd" / "memecoin-shadow.service").read_text()
+        self.assertIn("RUNBOOK.md", unit)
+        self.assertTrue((self.ROOT / "RUNBOOK.md").exists())
+
+    def test_every_status_key_the_runbook_reads_is_a_key_the_desk_serves(self):
+        text = self._runbook()
+        # The top-level sections the snippets index into.
+        for key in ("source_mesh", "entity_registry", "forward_evidence",
+                    "native_route"):
+            self.assertIn(f"['{key}']", text, key)
+        source = (self.ROOT / "src" / "main.py").read_text(encoding="utf-8")
+        for key in ("source_mesh", "entity_registry", "forward_evidence",
+                    "native_route"):
+            self.assertIn(f'"{key}":', source, key)
+
+    def test_the_forward_evidence_shape_the_runbook_reads_is_the_shape_reported(self):
+        ledger = ForwardEvidence(os.path.join(tempfile.mkdtemp(), "evidence.json"))
+        report = ledger.report()
+        self.assertIn("evidence", report)
+        distance = report["distance"]
+        for key in ("stage", "next_stage", "progress", "slowest", "verdict"):
+            self.assertIn(key, distance, key)
+        for row in distance["progress"].values():
+            self.assertEqual(set(row), {"have", "need", "fraction"})
+        self.assertIn("failures", distance["verdict"])
+
+    def test_the_native_route_shape_the_runbook_reads_is_the_shape_reported(self):
+        engine = ExecutionEngine.__new__(ExecutionEngine)
+        engine.pump_route = None
+        engine.pumpswap_route = None
+        engine.pool_state_provider = None
+        engine.pool_account_provider = None
+        engine.native_route_attempts = defaultdict(int)
+        engine.landing_model = LandingModel()
+        engine.last_bid = {}
+        engine.stream_confirmations = 0
+        engine.poll_confirmations = 0
+        engine._signature_waiters = {}
+        engine.reconcile_min_interval = 0.01
+        engine.tx_builder = SimpleNamespace()
+        report = engine.native_route_report()
+        for key in ("prepared_share", "blockhash", "outcomes",
+                    "pool_state_wired", "pool_account_wired"):
+            self.assertIn(key, report, key)
+
+    def test_the_ports_agree_across_the_unit_the_installer_and_the_runbook(self):
+        """A runbook curling the wrong port reads as a dead desk."""
+        unit = (self.ROOT / "deploy" / "systemd" / "memecoin-shadow.service").read_text()
+        installer = (self.ROOT / "deploy" / "install_shadow.sh").read_text()
+        self.assertIn("HEALTH_PORT=18080", unit)
+        self.assertIn("18080", installer)
+        self.assertIn("localhost:18080", self._runbook())
+
+    def test_the_status_endpoint_binds_loopback_by_default(self):
+        """/status serves the desk's interior; 0.0.0.0 publishes all of it."""
+        source = (self.ROOT / "src" / "main.py").read_text(encoding="utf-8")
+        self.assertIn('os.getenv("HEALTH_HOST", "127.0.0.1")', source)
+        self.assertNotIn('web.TCPSite(self._web_runner, "0.0.0.0"', source)
+        unit = (self.ROOT / "deploy" / "systemd" / "memecoin-shadow.service").read_text()
+        self.assertIn("HEALTH_HOST=127.0.0.1", unit)
+
+    def test_the_shadow_unit_never_carries_a_live_acknowledgement(self):
+        unit = (self.ROOT / "deploy" / "systemd" / "memecoin-shadow.service").read_text()
+        # Cleared AFTER the environment file, so a stale env cannot promote a
+        # shadow run into a live one.
+        self.assertLess(unit.index("EnvironmentFile"),
+                        unit.index("Environment=ALLOW_LIVE_TRADING="))
+        self.assertIn("Environment=SOLANA_PRIVATE_KEY=", unit)
+        self.assertIn("--dry-run", unit)
+
+    def test_the_start_limit_directives_are_where_systemd_reads_them(self):
+        """Under [Service] systemd silently ignores them."""
+        unit = (self.ROOT / "deploy" / "systemd" / "memecoin-shadow.service").read_text()
+        # The SECTION HEADER, not the comment above it that names the trap.
+        head = unit[:unit.index("\n[Service]\n")]
+        self.assertIn("StartLimitIntervalSec", head)
+        self.assertIn("StartLimitBurst", head)
+
 class TestPumpSwapConstruction(unittest.TestCase):
     """The last DATA_BLOCKED that was never about missing information.
 

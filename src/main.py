@@ -3560,7 +3560,15 @@ class MemecoinQuantDesk:
         app.router.add_get("/status", self._status_endpoint)
         self._web_runner = web.AppRunner(app)
         await self._web_runner.setup()
-        await web.TCPSite(self._web_runner, "0.0.0.0", int(os.getenv("HEALTH_PORT", "8080"))).start()
+        # Loopback by default. /status serves the desk's whole interior --
+        # open positions, watched wallets, model reports, the wallet the
+        # keypair belongs to -- and binding that to every interface publishes
+        # it to whatever else can reach the box. An operator who wants it
+        # remote sets HEALTH_HOST deliberately and puts something in front.
+        host = os.getenv("HEALTH_HOST", "127.0.0.1")
+        await web.TCPSite(self._web_runner, host,
+                          int(os.getenv("HEALTH_PORT", "8080"))).start()
+        logger.info("health server on %s:%s", host, os.getenv("HEALTH_PORT", "8080"))
 
     async def _health_endpoint(self, request):
         return web.json_response({"status": "healthy" if self._running else "stopping", "dry_run": self.dry_run,
