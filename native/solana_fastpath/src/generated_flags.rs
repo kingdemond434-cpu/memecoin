@@ -133,4 +133,3 @@ pub const PUMPSWAP_SELL_NAMES: [&str; 21] = [
     "fee_config",
     "fee_program",
 ];
-

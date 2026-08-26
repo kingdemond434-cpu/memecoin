@@ -37,13 +37,15 @@ pub struct L0Filter {
 }
 
 impl L0Filter {
-    pub fn new(
-        program_id: [u8; 32],
-        create: [u8; 8],
-        trade: [u8; 8],
-        complete: [u8; 8],
-    ) -> Self {
-        Self { create, trade, complete, program_id, passed: 0, rejected: 0 }
+    pub fn new(program_id: [u8; 32], create: [u8; 8], trade: [u8; 8], complete: [u8; 8]) -> Self {
+        Self {
+            create,
+            trade,
+            complete,
+            program_id,
+            passed: 0,
+            rejected: 0,
+        }
     }
 
     /// Classify one program-data payload, or say why it was dropped.
@@ -112,7 +114,10 @@ mod tests {
         let mut f = filter();
         let mut payload = TRADE.to_vec();
         payload.extend_from_slice(&[0u8; 64]);
-        assert_eq!(f.classify(&[1u8; 32], &payload), Err(Reject::ForeignProgram));
+        assert_eq!(
+            f.classify(&[1u8; 32], &payload),
+            Err(Reject::ForeignProgram)
+        );
         assert_eq!(f.passed, 0);
     }
 
@@ -126,7 +131,10 @@ mod tests {
     fn an_unknown_discriminator_is_dropped() {
         let mut f = filter();
         let payload = [0xAAu8; 32];
-        assert_eq!(f.classify(&PROGRAM, &payload), Err(Reject::UnknownDiscriminator));
+        assert_eq!(
+            f.classify(&PROGRAM, &payload),
+            Err(Reject::UnknownDiscriminator)
+        );
     }
 
     #[test]

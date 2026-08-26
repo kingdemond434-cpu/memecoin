@@ -172,8 +172,10 @@ pub fn probability_bins(survival: &Survival) -> Vec<Bin> {
     }
 
     if survival.expected_feasible_multiple > 0.0 {
-        let ceiling = (survival.expected_feasible_multiple - 1.0)
-            .clamp(-0.98, SURVIVAL_MULTIPLES[SURVIVAL_MULTIPLES.len() - 1] - 1.0);
+        let ceiling = (survival.expected_feasible_multiple - 1.0).clamp(
+            -0.98,
+            SURVIVAL_MULTIPLES[SURVIVAL_MULTIPLES.len() - 1] - 1.0,
+        );
         for bin in raw.iter_mut() {
             if bin.gross > 0.0 {
                 bin.gross = bin.gross.min(ceiling);
@@ -357,14 +359,15 @@ pub fn score(position: &Position, survival: &Survival, min_edge: f64, max_add: f
         if flat { baseline } else { f64::NEG_INFINITY },
     );
 
-    let best = scores
-        .iter()
-        .filter(|score| score.feasible)
-        .copied()
-        .fold(None::<Score>, |best, score| match best {
-            Some(current) if current.q >= score.q => Some(current),
-            _ => Some(score),
-        });
+    let best =
+        scores
+            .iter()
+            .filter(|score| score.feasible)
+            .copied()
+            .fold(None::<Score>, |best, score| match best {
+                Some(current) if current.q >= score.q => Some(current),
+                _ => Some(score),
+            });
 
     // Doing nothing wins ties and wins anything inside the noise margin.
     // Which "nothing" it is depends on whether anything is held: recording
@@ -586,7 +589,12 @@ mod tests {
     fn probing_is_unavailable_once_a_position_is_open() {
         let mut open = position();
         open.probe_fraction = Some(0.02);
-        let decision = score(&open, &survival([0.5, 0.3, 0.2, 0.1, 0.0, 0.0, 0.0, 0.0]), 1e-4, 0.05);
+        let decision = score(
+            &open,
+            &survival([0.5, 0.3, 0.2, 0.1, 0.0, 0.0, 0.0, 0.0]),
+            1e-4,
+            0.05,
+        );
         let probe = decision
             .scores
             .iter()
@@ -613,7 +621,12 @@ mod tests {
     fn an_add_beyond_the_ceiling_is_infeasible() {
         let mut adding = position();
         adding.add_fraction = Some(0.5);
-        let decision = score(&adding, &survival([0.6, 0.4, 0.2, 0.1, 0.0, 0.0, 0.0, 0.0]), 1e-4, 0.05);
+        let decision = score(
+            &adding,
+            &survival([0.6, 0.4, 0.2, 0.1, 0.0, 0.0, 0.0, 0.0]),
+            1e-4,
+            0.05,
+        );
         let add = decision
             .scores
             .iter()

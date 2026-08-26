@@ -103,9 +103,19 @@ impl Pool {
             i128::from_le_bytes(data.get(offset..offset + 16)?.try_into().ok()?);
 
         Some(Self {
-            pool_bump, index, creator, base_mint, quote_mint, lp_mint,
-            pool_base_token_account, pool_quote_token_account, lp_supply,
-            coin_creator, is_mayhem_mode, is_cashback_coin, virtual_quote_reserves,
+            pool_bump,
+            index,
+            creator,
+            base_mint,
+            quote_mint,
+            lp_mint,
+            pool_base_token_account,
+            pool_quote_token_account,
+            lp_supply,
+            coin_creator,
+            is_mayhem_mode,
+            is_cashback_coin,
+            virtual_quote_reserves,
         })
     }
 }
@@ -144,8 +154,7 @@ impl PoolReserves {
         }
         // u128 throughout: base reserves routinely exceed 10^12 and the
         // product overflows u64 on ordinary size.
-        let out = ((net as u128 * self.base as u128)
-            / (self.quote as u128 + net as u128)) as u64;
+        let out = ((net as u128 * self.base as u128) / (self.quote as u128 + net as u128)) as u64;
         if out == 0 {
             return Err(PoolQuoteError::RoundsToZero);
         }
@@ -168,8 +177,8 @@ impl PoolReserves {
         if self.base == 0 || self.quote == 0 {
             return Err(PoolQuoteError::EmptyReserves);
         }
-        let gross = ((base_in as u128 * self.quote as u128)
-            / (self.base as u128 + base_in as u128)) as u64;
+        let gross =
+            ((base_in as u128 * self.quote as u128) / (self.base as u128 + base_in as u128)) as u64;
         if gross == 0 {
             return Err(PoolQuoteError::RoundsToZero);
         }
@@ -197,7 +206,11 @@ impl PoolReserves {
             return 0;
         }
         let average = (quote_amount as u128 * 1_000_000_000u128) / base_amount as u128;
-        let (high, low) = if is_buy { (average, spot) } else { (spot, average) };
+        let (high, low) = if is_buy {
+            (average, spot)
+        } else {
+            (spot, average)
+        };
         if high <= low {
             return 0;
         }
@@ -254,10 +267,18 @@ mod tests {
 
     fn pool() -> Pool {
         Pool {
-            pool_bump: 254, index: 0, creator: [1; 32], base_mint: [2; 32],
-            quote_mint: [3; 32], lp_mint: [4; 32], pool_base_token_account: [5; 32],
-            pool_quote_token_account: [6; 32], lp_supply: 1_000_000,
-            coin_creator: [7; 32], is_mayhem_mode: false, is_cashback_coin: true,
+            pool_bump: 254,
+            index: 0,
+            creator: [1; 32],
+            base_mint: [2; 32],
+            quote_mint: [3; 32],
+            lp_mint: [4; 32],
+            pool_base_token_account: [5; 32],
+            pool_quote_token_account: [6; 32],
+            lp_supply: 1_000_000,
+            coin_creator: [7; 32],
+            is_mayhem_mode: false,
+            is_cashback_coin: true,
             virtual_quote_reserves: 42,
         }
     }
@@ -267,8 +288,12 @@ mod tests {
         data.push(pool.pool_bump);
         data.extend_from_slice(&pool.index.to_le_bytes());
         for key in [
-            pool.creator, pool.base_mint, pool.quote_mint, pool.lp_mint,
-            pool.pool_base_token_account, pool.pool_quote_token_account,
+            pool.creator,
+            pool.base_mint,
+            pool.quote_mint,
+            pool.lp_mint,
+            pool.pool_base_token_account,
+            pool.pool_quote_token_account,
         ] {
             data.extend_from_slice(&key);
         }
@@ -281,7 +306,10 @@ mod tests {
     }
 
     fn reserves() -> PoolReserves {
-        PoolReserves { base: 200_000_000_000_000, quote: 85_000_000_000 }
+        PoolReserves {
+            base: 200_000_000_000_000,
+            quote: 85_000_000_000,
+        }
     }
 
     #[test]
@@ -308,11 +336,16 @@ mod tests {
         negative.virtual_quote_reserves = -1;
         // Coercing to unsigned would read this as an enormous reserve and
         // price a trade against liquidity that is not there.
-        assert_eq!(Pool::decode(&encode(&negative)).unwrap().virtual_quote_reserves, -1);
+        assert_eq!(
+            Pool::decode(&encode(&negative))
+                .unwrap()
+                .virtual_quote_reserves,
+            -1
+        );
     }
 
     #[test]
-    fn mayhem_and_cashback_flags_round_trip(){
+    fn mayhem_and_cashback_flags_round_trip() {
         let mut flagged = pool();
         flagged.is_mayhem_mode = true;
         flagged.is_cashback_coin = false;
@@ -331,17 +364,29 @@ mod tests {
     #[test]
     fn impact_rises_with_size_on_both_sides() {
         let r = reserves();
-        assert!(r.quote_buy(10_000_000_000, 100).unwrap().price_impact_bps
-            > r.quote_buy(100_000_000, 100).unwrap().price_impact_bps);
-        assert!(r.quote_sell(50_000_000_000_000, 100).unwrap().price_impact_bps
-            > r.quote_sell(100_000_000, 100).unwrap().price_impact_bps);
+        assert!(
+            r.quote_buy(10_000_000_000, 100).unwrap().price_impact_bps
+                > r.quote_buy(100_000_000, 100).unwrap().price_impact_bps
+        );
+        assert!(
+            r.quote_sell(50_000_000_000_000, 100)
+                .unwrap()
+                .price_impact_bps
+                > r.quote_sell(100_000_000, 100).unwrap().price_impact_bps
+        );
     }
 
     #[test]
     fn an_empty_pool_prices_nothing() {
         let empty = PoolReserves { base: 0, quote: 0 };
-        assert_eq!(empty.quote_buy(1_000, 100), Err(PoolQuoteError::EmptyReserves));
-        assert_eq!(empty.quote_sell(1_000, 100), Err(PoolQuoteError::EmptyReserves));
+        assert_eq!(
+            empty.quote_buy(1_000, 100),
+            Err(PoolQuoteError::EmptyReserves)
+        );
+        assert_eq!(
+            empty.quote_sell(1_000, 100),
+            Err(PoolQuoteError::EmptyReserves)
+        );
         assert_eq!(empty.sell_capacity(500, 100), 0);
     }
 

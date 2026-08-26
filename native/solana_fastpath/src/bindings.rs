@@ -1,11 +1,11 @@
 //! Python bindings. Gated behind the `python` feature so the pricing,
 //! decoding and construction logic can be tested with no Python linked.
 
-use pyo3::exceptions::PyValueError;
-use pyo3::prelude::*;
 use crate::curve::{BondingCurve, LEGACY_FEE_BPS};
 use crate::instruction;
 use crate::pumpswap::{Pool, PoolReserves};
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
 
 #[pyfunction]
 fn b58encode(raw: &[u8]) -> String {
@@ -46,7 +46,11 @@ fn quote_buy_from_account(
     let quote = curve
         .quote_buy(lamports, fee_bps)
         .map_err(|err| PyValueError::new_err(format!("{err:?}")))?;
-    Ok((quote.output_amount, quote.fee_amount, quote.price_impact_bps))
+    Ok((
+        quote.output_amount,
+        quote.fee_amount,
+        quote.price_impact_bps,
+    ))
 }
 
 #[pyfunction]
@@ -61,7 +65,11 @@ fn quote_sell_from_account(
     let quote = curve
         .quote_sell(tokens, fee_bps)
         .map_err(|err| PyValueError::new_err(format!("{err:?}")))?;
-    Ok((quote.output_amount, quote.fee_amount, quote.price_impact_bps))
+    Ok((
+        quote.output_amount,
+        quote.fee_amount,
+        quote.price_impact_bps,
+    ))
 }
 
 /// Executable exit size at each impact bound, from one decode.
@@ -121,16 +129,33 @@ fn account_flags(instruction_name: &str) -> PyResult<Vec<(bool, bool)>> {
     match instruction_name {
         "buy_v2" => {
             let accounts = instruction::BuyAccounts {
-                global: zero, base_mint: zero, quote_mint: zero, base_token_program: zero,
-                quote_token_program: zero, associated_token_program: zero, fee_recipient: zero,
-                associated_quote_fee_recipient: zero, buyback_fee_recipient: zero,
-                associated_quote_buyback_fee_recipient: zero, bonding_curve: zero,
-                associated_base_bonding_curve: zero, associated_quote_bonding_curve: zero,
-                user: zero, associated_base_user: zero, associated_quote_user: zero,
-                creator_vault: zero, associated_creator_vault: zero, sharing_config: zero,
-                global_volume_accumulator: zero, user_volume_accumulator: zero,
-                associated_user_volume_accumulator: zero, fee_config: zero, fee_program: zero,
-                system_program: zero, event_authority: zero, program: zero,
+                global: zero,
+                base_mint: zero,
+                quote_mint: zero,
+                base_token_program: zero,
+                quote_token_program: zero,
+                associated_token_program: zero,
+                fee_recipient: zero,
+                associated_quote_fee_recipient: zero,
+                buyback_fee_recipient: zero,
+                associated_quote_buyback_fee_recipient: zero,
+                bonding_curve: zero,
+                associated_base_bonding_curve: zero,
+                associated_quote_bonding_curve: zero,
+                user: zero,
+                associated_base_user: zero,
+                associated_quote_user: zero,
+                creator_vault: zero,
+                associated_creator_vault: zero,
+                sharing_config: zero,
+                global_volume_accumulator: zero,
+                user_volume_accumulator: zero,
+                associated_user_volume_accumulator: zero,
+                fee_config: zero,
+                fee_program: zero,
+                system_program: zero,
+                event_authority: zero,
+                program: zero,
             };
             Ok(instruction::build_buy_v2(&accounts, 0, 0)
                 .accounts
@@ -140,16 +165,32 @@ fn account_flags(instruction_name: &str) -> PyResult<Vec<(bool, bool)>> {
         }
         "sell_v2" => {
             let accounts = instruction::SellAccounts {
-                global: zero, base_mint: zero, quote_mint: zero, base_token_program: zero,
-                quote_token_program: zero, associated_token_program: zero, fee_recipient: zero,
-                associated_quote_fee_recipient: zero, buyback_fee_recipient: zero,
-                associated_quote_buyback_fee_recipient: zero, bonding_curve: zero,
-                associated_base_bonding_curve: zero, associated_quote_bonding_curve: zero,
-                user: zero, associated_base_user: zero, associated_quote_user: zero,
-                creator_vault: zero, associated_creator_vault: zero, sharing_config: zero,
-                user_volume_accumulator: zero, associated_user_volume_accumulator: zero,
-                fee_config: zero, fee_program: zero, system_program: zero,
-                event_authority: zero, program: zero,
+                global: zero,
+                base_mint: zero,
+                quote_mint: zero,
+                base_token_program: zero,
+                quote_token_program: zero,
+                associated_token_program: zero,
+                fee_recipient: zero,
+                associated_quote_fee_recipient: zero,
+                buyback_fee_recipient: zero,
+                associated_quote_buyback_fee_recipient: zero,
+                bonding_curve: zero,
+                associated_base_bonding_curve: zero,
+                associated_quote_bonding_curve: zero,
+                user: zero,
+                associated_base_user: zero,
+                associated_quote_user: zero,
+                creator_vault: zero,
+                associated_creator_vault: zero,
+                sharing_config: zero,
+                user_volume_accumulator: zero,
+                associated_user_volume_accumulator: zero,
+                fee_config: zero,
+                fee_program: zero,
+                system_program: zero,
+                event_authority: zero,
+                program: zero,
             };
             Ok(instruction::build_sell_v2(&accounts, 0, 0)
                 .accounts
@@ -157,13 +198,17 @@ fn account_flags(instruction_name: &str) -> PyResult<Vec<(bool, bool)>> {
                 .map(|meta| (meta.is_signer, meta.is_writable))
                 .collect())
         }
-        other => Err(PyValueError::new_err(format!("unknown instruction: {other}"))),
+        other => Err(PyValueError::new_err(format!(
+            "unknown instruction: {other}"
+        ))),
     }
 }
 
 /// Decoded PumpSwap pool fields, or None when the account is not a pool.
 #[pyfunction]
-fn decode_pumpswap_pool(account_data: &[u8]) -> Option<(u8, u16, Vec<u8>, Vec<u8>, u64, bool, bool, i128)> {
+fn decode_pumpswap_pool(
+    account_data: &[u8],
+) -> Option<(u8, u16, Vec<u8>, Vec<u8>, u64, bool, bool, i128)> {
     Pool::decode(account_data).map(|pool| {
         (
             pool.pool_bump,
@@ -191,11 +236,18 @@ fn pumpswap_quote_buy(
     quote_in: u64,
     fee_bps: u64,
 ) -> PyResult<(u64, u64, u64)> {
-    let reserves = PoolReserves { base: base_reserves, quote: quote_reserves };
+    let reserves = PoolReserves {
+        base: base_reserves,
+        quote: quote_reserves,
+    };
     let quote = reserves
         .quote_buy(quote_in, fee_bps)
         .map_err(|err| PyValueError::new_err(format!("{err:?}")))?;
-    Ok((quote.output_amount, quote.fee_amount, quote.price_impact_bps))
+    Ok((
+        quote.output_amount,
+        quote.fee_amount,
+        quote.price_impact_bps,
+    ))
 }
 
 #[pyfunction]
@@ -206,11 +258,18 @@ fn pumpswap_quote_sell(
     base_in: u64,
     fee_bps: u64,
 ) -> PyResult<(u64, u64, u64)> {
-    let reserves = PoolReserves { base: base_reserves, quote: quote_reserves };
+    let reserves = PoolReserves {
+        base: base_reserves,
+        quote: quote_reserves,
+    };
     let quote = reserves
         .quote_sell(base_in, fee_bps)
         .map_err(|err| PyValueError::new_err(format!("{err:?}")))?;
-    Ok((quote.output_amount, quote.fee_amount, quote.price_impact_bps))
+    Ok((
+        quote.output_amount,
+        quote.fee_amount,
+        quote.price_impact_bps,
+    ))
 }
 
 #[pyfunction]
@@ -221,8 +280,11 @@ fn pumpswap_sell_capacity(
     max_impact_bps: u64,
     fee_bps: u64,
 ) -> u64 {
-    PoolReserves { base: base_reserves, quote: quote_reserves }
-        .sell_capacity(max_impact_bps, fee_bps)
+    PoolReserves {
+        base: base_reserves,
+        quote: quote_reserves,
+    }
+    .sell_capacity(max_impact_bps, fee_bps)
 }
 
 /// PumpSwap `buy` / `sell` instruction DATA. Accounts are deliberately absent.
@@ -292,8 +354,16 @@ fn t0_decide(
     min_commit_fraction: f64,
     min_exit_capacity: f64,
     live_unlocked: bool,
-) -> PyResult<(String, f64, String, bool, Option<String>, Option<String>, f64, Vec<(String, f64, bool)>)>
-{
+) -> PyResult<(
+    String,
+    f64,
+    String,
+    bool,
+    Option<String>,
+    Option<String>,
+    f64,
+    Vec<(String, f64, bool)>,
+)> {
     if levels.len() != crate::policy::SURVIVAL_MULTIPLES.len() {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "expected {} survival levels, got {}",
@@ -422,4 +492,3 @@ fn solana_fastpath(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("IMPLEMENTATION", "rust-pyo3-abi3")?;
     Ok(())
 }
-
