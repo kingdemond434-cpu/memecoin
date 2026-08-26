@@ -29,8 +29,15 @@ mkdir -p "$ROOT" "$UNITS" "$HOME/.config/memecoin-shadow"
 # rsync rather than a copy so a reinstall over a running node does not
 # clobber the accumulated evidence, which is the one thing here that cannot
 # be regenerated.
+# The *.verified.yaml files are excluded for the same reason data/ is: they
+# are produced ON THIS HOST by probing endpoints and reading published pages,
+# they are not in the repository, and --delete would remove them on every
+# reinstall. Losing them silently un-configures the source mesh and empties
+# the entity registry, and the desk would keep running and report less
+# coverage without anything saying why.
 rsync -a --delete \
   --exclude 'data/' --exclude '.git/' --exclude '.venv/' \
+  --exclude 'config/*.verified.yaml' \
   --exclude 'native/solana_fastpath/target/' \
   "$SOURCE/" "$ROOT/"
 mkdir -p "$ROOT/data/state" "$ROOT/models"

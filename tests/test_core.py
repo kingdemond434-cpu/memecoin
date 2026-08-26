@@ -11055,6 +11055,22 @@ class TestTheRunbookMatchesTheSystem(unittest.TestCase):
         unit = (self.ROOT / "deploy" / "systemd" / "memecoin-shadow.service").read_text()
         self.assertIn("HEALTH_HOST=127.0.0.1", unit)
 
+    def test_a_reinstall_does_not_delete_what_was_verified_on_the_host(self):
+        """They are produced here, are not in the repo, and --delete removes them.
+
+        Losing them silently un-configures the source mesh and empties the
+        entity registry, and the desk keeps running and reports less coverage
+        with nothing saying why.
+        """
+        installer = (self.ROOT / "deploy" / "install_shadow.sh").read_text()
+        self.assertIn("--delete", installer)
+        self.assertIn("--exclude 'config/*.verified.yaml'", installer)
+        # And the same files are out of version control, so the exclusion is
+        # the only thing protecting them.
+        ignored = (self.ROOT / ".gitignore").read_text()
+        self.assertIn("config/sources.verified.yaml", ignored)
+        self.assertIn("config/entities.verified.yaml", ignored)
+
     def test_the_shadow_unit_never_carries_a_live_acknowledgement(self):
         unit = (self.ROOT / "deploy" / "systemd" / "memecoin-shadow.service").read_text()
         # Cleared AFTER the environment file, so a stale env cannot promote a
