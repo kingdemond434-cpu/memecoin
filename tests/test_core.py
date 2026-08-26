@@ -139,6 +139,7 @@ from src.chains.pump_fee_config import (
     FEE_CONFIG_DISCRIMINATOR, bonding_curve_market_cap, calculate_fee_tier,
     fee_config_address, parse_fee_config, pool_market_cap,
 )
+from src.chains.blockhash import BlockhashCache, BlockhashState
 from src.chains.pumpswap_curve import (
     PumpSwapPoolState, sell_capacity_base,
 )
@@ -10487,6 +10488,129 @@ class TestEntityVerifierReadsPublishedPages(unittest.TestCase):
         self.assertEqual(entities[0].accounts, {})
         self.assertEqual(entities[0].known_wallets, set())
         self.assertEqual(entities[0].official_domains, {"example.org"})
+
+
+class TestBlockhashIsNotFetchedOnTheHotPath(unittest.IsolatedAsyncioTestCase):
+    """An RPC round trip sat between the decision and the signature.
+
+    Caching it naively would be worse than the round trip: a stale blockhash
+    is a transaction the cluster silently refuses, and that looks exactly like
+    a transaction that lost a race. So the cache refuses what it cannot vouch
+    for, and a refusal costs the round trip rather than the fill.
+    """
+
+    HASH = "GfVcyD4kkTrj4bKc7WA9sZCin9JDbdT4Zkd3o4uGFvNn"
+    OTHER = "11111111111111111111111111111111"
+
+    def _rpc(self, *responses, fail=False):
+        calls = []
+
+        async def request(method, params):
+            calls.append(method)
+            if fail:
+                raise ConnectionError("rpc down")
+            if responses:
+                return responses[min(len(calls) - 1, len(responses) - 1)]
+            return {"value": {"blockhash": self.HASH, "lastValidBlockHeight": 300}}
+
+        return SimpleNamespace(request=request, calls=calls)
+
+    async def test_a_fresh_cache_serves_without_an_rpc_call(self):
+        rpc = self._rpc()
+        cache = BlockhashCache(rpc)
+        self.assertTrue(await cache.refresh())
+        self.assertEqual(len(rpc.calls), 1)
+        for _ in range(50):
+            state = cache.current()
+            self.assertTrue(state.ok)
+            self.assertEqual(state.blockhash, self.HASH)
+        # Fifty signings, one call. That is the whole point.
+        self.assertEqual(len(rpc.calls), 1)
+        self.assertEqual(cache.report()["cache_hit_rate"], 1.0)
+
+    async def test_a_stalled_refresher_refuses_rather_than_serving_a_stale_hash(self):
+        cache = BlockhashCache(self._rpc(), max_age_s=5.0)
+        await cache.refresh()
+        state = cache.current(now=time.time() + 60)
+        self.assertFalse(state.ok)
+        self.assertIn("stalled", state.detail)
+        # The hash is still reported, so an operator can see what was rejected.
+        self.assertEqual(state.blockhash, self.HASH)
+
+    async def test_a_hash_near_expiry_refuses_before_the_age_bound_bites(self):
+        """Two different failures; one is not a substitute for the other."""
+        cache = BlockhashCache(self._rpc(), max_age_s=300.0, min_slots_remaining=30)
+        await cache.refresh()
+        # 50s at ~0.4s/slot consumes 125 of 150 slots: 25 remain, below 30.
+        state = cache.current(now=time.time() + 50)
+        self.assertFalse(state.ok)
+        self.assertIn("slots of validity", state.detail)
+        self.assertLess(state.slots_remaining, 30)
+
+    async def test_nothing_fetched_yet_is_blocked_not_an_empty_hash(self):
+        state = BlockhashCache(self._rpc()).current()
+        self.assertFalse(state.ok)
+        self.assertEqual(state.blockhash, "")
+
+    async def test_a_failed_refresh_keeps_the_previous_hash(self):
+        """A transient hiccup must not become a round trip on every trade."""
+        rpc = self._rpc()
+        cache = BlockhashCache(rpc)
+        await cache.refresh()
+        cache.rpc = self._rpc(fail=True)
+        self.assertFalse(await cache.refresh())
+        self.assertTrue(cache.current().ok)
+        self.assertEqual(cache.failures, 1)
+
+    async def test_a_response_with_no_blockhash_is_a_failure_not_an_empty_state(self):
+        cache = BlockhashCache(self._rpc({"value": {}}))
+        self.assertFalse(await cache.refresh())
+        self.assertIn("no blockhash", cache.last_error)
+
+    async def test_the_builder_signs_from_cache_and_falls_back_when_refused(self):
+        rpc = self._rpc()
+        cache = BlockhashCache(rpc)
+        await cache.refresh()
+        builder = SolanaTransactionBuilder.__new__(SolanaTransactionBuilder)
+        builder.rpc = rpc
+        builder.blockhash_cache = cache
+        builder.blockhash_fallbacks = 0
+        builder.last_blockhash_status = ""
+
+        from solders.hash import Hash as SoldersHash
+
+        served = await builder._recent_blockhash()
+        self.assertIsInstance(served, SoldersHash)
+        self.assertEqual(len(rpc.calls), 1)
+        self.assertEqual(builder.blockhash_fallbacks, 0)
+
+        # Expire it, and the round trip is paid rather than a rejection risked.
+        cache._fetched_at = time.time() - 600
+        await builder._recent_blockhash()
+        self.assertEqual(builder.blockhash_fallbacks, 1)
+        self.assertEqual(len(rpc.calls), 2)
+
+    async def test_the_report_says_whether_the_cache_is_doing_its_job(self):
+        """A cache serving 40% is a hot path still paying for the other 60%."""
+        cache = BlockhashCache(self._rpc(), max_age_s=5.0)
+        await cache.refresh()
+        cache.current()
+        cache.current(now=time.time() + 600)
+        report = cache.report()
+        self.assertEqual(report["served_from_cache"], 1)
+        self.assertEqual(report["refused"], 1)
+        self.assertEqual(report["cache_hit_rate"], 0.5)
+        self.assertEqual(report["refreshes"], 1)
+
+    async def test_start_awaits_the_first_fetch_then_refreshes_in_the_background(self):
+        rpc = self._rpc()
+        cache = BlockhashCache(rpc, refresh_interval_s=0.1)
+        self.assertTrue(await cache.start())
+        # Already usable before any trade has been decided.
+        self.assertTrue(cache.current().ok)
+        await asyncio.sleep(0.35)
+        await cache.stop()
+        self.assertGreater(cache.refreshes, 1)
 
 class TestPumpSwapConstruction(unittest.TestCase):
     """The last DATA_BLOCKED that was never about missing information.

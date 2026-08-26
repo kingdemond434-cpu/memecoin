@@ -26,6 +26,7 @@ from solders.transaction import VersionedTransaction
 
 from src.chains.pump_curve import quote_buy, quote_sell
 from src.execution.landing_model import Attempt, LandingModel
+from src.chains.blockhash import BlockhashCache
 from src.chains.pump_route import NativePumpRoute, PreparedInstruction, WSOL_MINT
 from src.chains.pumpswap_curve import PumpSwapPoolState
 from src.chains.pumpswap_curve import quote_buy as pool_quote_buy
@@ -482,10 +483,20 @@ class JitoClient:
 
 
 class SolanaTransactionBuilder:
-    def __init__(self, rpc: RPCManager, keypair: Keypair):
+    def __init__(self, rpc: RPCManager, keypair: Keypair,
+                 blockhash_cache: Optional[BlockhashCache] = None):
         self.rpc = rpc
         self.keypair = keypair
         self.public_key = str(keypair.pubkey())
+        # Continuously refreshed in the background. Fetching per transaction
+        # put an RPC round trip inside the window the system exists to win,
+        # and did it after the decision while the opportunity aged.
+        self.blockhash_cache = blockhash_cache or BlockhashCache(rpc)
+        # How often the cache could not vouch for its hash and the synchronous
+        # fetch was paid anyway. Counted rather than hidden: a cache that
+        # refuses on every trade has removed nothing.
+        self.blockhash_fallbacks = 0
+        self.last_blockhash_status = ""
 
     async def build_and_sign(self, instructions: List[Any], *,
                              compute_unit_limit: int = 0,
@@ -517,18 +528,35 @@ class SolanaTransactionBuilder:
         return base64.b64encode(bytes(signed)).decode("ascii")
 
     async def _recent_blockhash(self) -> Hash:
-        """A blockhash fresh enough to land.
+        """A blockhash fresh enough to land, from cache when it can be vouched for.
 
-        Fetched per transaction rather than cached: a stale blockhash is a
-        transaction the cluster silently refuses, which looks exactly like a
-        transaction that lost a race.
+        A stale blockhash is a transaction the cluster silently refuses, and
+        that looks exactly like a transaction that lost a race -- so the cache
+        does not merely hold the last value it saw. It refuses one it cannot
+        vouch for (too old, or too near its lastValidBlockHeight), and a
+        refusal falls through to the synchronous fetch. Slow is a cost;
+        silently unlanded is a loss.
         """
+        state = self.blockhash_cache.current()
+        self.last_blockhash_status = state.status
+        if state.ok:
+            return Hash.from_string(state.blockhash)
+        self.blockhash_fallbacks += 1
+        if state.detail:
+            logger.debug("blockhash cache refused (%s); fetching synchronously",
+                         state.detail)
         response = await self.rpc.request(
             "getLatestBlockhash", [{"commitment": "confirmed"}])
         value = ((response or {}).get("value") or {}).get("blockhash")
         if not value:
             raise ValueError("no recent blockhash available")
         return Hash.from_string(str(value))
+
+    def blockhash_report(self) -> Dict[str, Any]:
+        """Whether the hot path is actually being served from cache."""
+        return {**self.blockhash_cache.report(),
+                "synchronous_fallbacks": self.blockhash_fallbacks,
+                "last_status": self.last_blockhash_status}
 
     def sign_versioned_transaction(self, versioned_tx_bytes: bytes) -> str:
         tx = VersionedTransaction.from_bytes(versioned_tx_bytes)
@@ -625,10 +653,19 @@ class ExecutionEngine:
     async def start(self):
         await self.jupiter.start()
         await self.jito.start()
+        # Started with the engine, not lazily on the first trade: a cache
+        # whose first fetch happens under a decision has not moved the round
+        # trip anywhere.
+        cache = getattr(self.tx_builder, "blockhash_cache", None)
+        if cache is not None:
+            await cache.start()
 
     async def stop(self):
         await self.jupiter.stop()
         await self.jito.stop()
+        cache = getattr(self.tx_builder, "blockhash_cache", None)
+        if cache is not None:
+            await cache.stop()
 
     def prepare_native_route(self, input_mint: str, output_mint: str, amount: int,
                              slippage_bps: int) -> Optional[PreparedInstruction]:
@@ -750,6 +787,10 @@ class ExecutionEngine:
                 "status": "DATA_BLOCKED", "detail": "no pumpswap route configured"},
             "pool_state_wired": self.pool_state_provider is not None,
             "pool_account_wired": self.pool_account_provider is not None,
+            "blockhash": (self.tx_builder.blockhash_report()
+                          if hasattr(self.tx_builder, "blockhash_report")
+                          else {"status": "DATA_BLOCKED",
+                                "detail": "builder holds no blockhash cache"}),
         }
 
     def _native_quote(self, input_mint: str, output_mint: str, amount: int,
