@@ -33,6 +33,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -59,6 +60,31 @@ ADAPTER_KINDS: Dict[str, Callable[..., EventSource]] = {
     "code_repo": adapters.code_repository_source,
     "metadata": adapters.metadata_artifact_source,
 }
+
+
+def _adapter_options(declaration: "SourceDeclaration") -> Dict[str, Any]:
+    """Translate declaration metadata to normaliser options.
+
+    A declaration's ``options`` primarily configure its network transport
+    (URL, relay, repository, instance).  Adapter factories normalise records
+    already fetched by that transport and intentionally do not accept those
+    connection parameters.  Passing the whole mapping made every real RSS,
+    Mastodon, Nostr and repository transport look like ``NO_FETCHER`` even
+    while it was running.  Keep the two interfaces explicit.
+    """
+    options = declaration.options
+    if declaration.kind == "rss":
+        return {"language": declaration.language}
+    if declaration.kind == "telegram":
+        return {"channel": str(options.get("channel", ""))}
+    if declaration.kind == "discord":
+        return {"guild": str(options.get("guild", ""))}
+    if declaration.kind == "official_site":
+        domain = str(options.get("domain", "")).strip()
+        if not domain:
+            domain = (urlsplit(str(options.get("url", ""))).hostname or "").lower()
+        return {"domain": domain}
+    return {}
 
 
 class DeclarationState(Enum):
@@ -218,7 +244,7 @@ def build_sources(
             continue
 
         try:
-            source = factory(declaration.source_id, fetch, **declaration.options)
+            source = factory(declaration.source_id, fetch, **_adapter_options(declaration))
             if declaration.degraded_after_seconds is not None:
                 source.degraded_after_seconds = declaration.degraded_after_seconds
             if declaration.dead_after_seconds is not None:

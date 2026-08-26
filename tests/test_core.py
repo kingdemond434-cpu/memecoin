@@ -7253,6 +7253,23 @@ class TestSourceRegistry(unittest.TestCase):
         self.assertEqual(report.ready, 1)
         self.assertEqual(report.by_state["READY"], 1)
 
+    def test_transport_options_do_not_leak_into_record_adapters(self):
+        declarations = [
+            self._declaration(source_id="feed", options={"url": "https://feed.test/rss"}),
+            self._declaration(source_id="social", kind="mastodon",
+                              options={"instance": "https://social.test"}),
+            self._declaration(source_id="relay", kind="nostr",
+                              options={"relay": "wss://relay.test"}),
+            self._declaration(source_id="repo", kind="code_repo",
+                              options={"repo": "owner/name"}),
+        ]
+        sources, report = build_sources(
+            declarations, self._fetchers("feed", "social", "relay", "repo"))
+        self.assertEqual(len(sources), 4)
+        self.assertEqual(report.ready, 4)
+        self.assertNotIn("NO_FETCHER", report.by_state)
+        self.assertEqual(sources[0].language, "ko")
+
     def test_a_missing_credential_is_named_not_silently_skipped(self):
         declaration = self._declaration(source_id="tg:a", kind="telegram",
                                         requires_env=("NO_SUCH_KEY_12345",))
