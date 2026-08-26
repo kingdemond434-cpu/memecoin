@@ -40,6 +40,27 @@ def snapshot_labels(
     snapshot: Dict[str, Any], episode: Dict[str, Any], outcome: Dict[str, Any]
 ) -> Dict[PredictionTarget, float]:
     labels = snapshot.get("labels") or {}
+    # Older persisted episodes predate one or more survival rungs. Reading a
+    # missing historical label with ``bool(None)`` turns "not recorded" into
+    # a negative class. That produced an impossible training set on the live
+    # node: more 50x positives than 20x positives, and blocked the entire
+    # predictor even though every episode still carried its authoritative
+    # final maximum. Rebuild the complete nested target vector from that one
+    # maximum whenever it is available. This is a lossless schema migration,
+    # not an inferred outcome: the maximum is the value from which the labels
+    # were originally written.
+    peak = labels.get("max_multiple", outcome.get("max_multiple"))
+    peak_is_known = (
+        isinstance(peak, (int, float))
+        and not isinstance(peak, bool)
+        and np.isfinite(peak)
+        and float(peak) >= 0
+    )
+    survival_labels = {
+        target: (float(float(peak) >= multiple) if peak_is_known
+                 else float(bool(labels.get(f"label_{multiple:g}x"))))
+        for target, multiple in SURVIVAL_LEVELS
+    }
     rug_time = outcome.get("rug_time")
     if rug_time is not None:
         rug_time = (_number(episode, "created_at") + float(rug_time)
@@ -49,8 +70,7 @@ def snapshot_labels(
     result = {
         # Every survival rung, read from one table so a rung added to the
         # curve cannot be silently left untrained here.
-        **{target: float(bool(labels.get(f"label_{multiple:g}x")))
-           for target, multiple in SURVIVAL_LEVELS},
+        **survival_labels,
         PredictionTarget.P_MIGRATION: float(bool(outcome.get("migrated"))),
         PredictionTarget.P_RUG_30S: float(rugged and rug_time is not None and float(rug_time) <= 30),
         PredictionTarget.P_RUG_5M: float(rugged and rug_time is not None and float(rug_time) <= 300),

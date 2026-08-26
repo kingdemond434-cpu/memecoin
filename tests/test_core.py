@@ -1760,6 +1760,35 @@ class TestShadowTrainer(unittest.TestCase):
         self.assertEqual(unknown[PredictionTarget.P_RUG_30S], 0.0)
         self.assertEqual(unknown[PredictionTarget.P_RUG_5M], 0.0)
 
+    def test_legacy_tail_labels_are_rebuilt_from_the_recorded_maximum(self):
+        """Missing old rungs must never become false observations.
+
+        The tail schema grew over time.  A legacy snapshot can therefore
+        contain ``label_50x`` but no ``label_20x`` while still carrying the
+        final ``max_multiple``.  Treating the absent value as false creates a
+        non-nested survival curve and can starve an otherwise valid head of
+        its positive class.
+        """
+        from src.research.shadow_trainer import snapshot_labels
+        from src.strategies.multihead_predictor import PredictionTarget
+
+        snapshot = {
+            "timestamp": 1_000.0,
+            "labels": {"label_2x": True, "label_50x": True,
+                       "label_20x": None, "max_multiple": 75.0},
+            "liquidity_features": {},
+        }
+        labels = snapshot_labels(
+            snapshot, {"created_at": 1_000.0},
+            {"max_multiple": 75.0, "rugged": False, "migrated": False},
+        )
+        self.assertEqual(labels[PredictionTarget.P_2X], 1.0)
+        self.assertEqual(labels[PredictionTarget.P_20X], 1.0)
+        self.assertEqual(labels[PredictionTarget.P_50X], 1.0)
+        self.assertEqual(labels[PredictionTarget.P_100X], 0.0)
+        ordered = [labels[target] for target, _ in SURVIVAL_LEVELS]
+        self.assertEqual(ordered, sorted(ordered, reverse=True))
+
     def test_insufficient_history_remains_explicitly_data_blocked(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
