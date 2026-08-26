@@ -8578,6 +8578,7 @@ class TestOrphanIntelligence(unittest.IsolatedAsyncioTestCase):
         # Make the premise explicit. Production nodes legitimately generate a
         # gitignored verified overlay, so this test must not depend on whether
         # that operator-owned file happens to exist in the working tree.
+        desk._watched_entities = []
         desk.entity_registry = EntityRegistry()
         desk.authenticity = AuthenticityResolver(desk.entity_registry)
         verdict = desk._authenticity(self.MINT, self._candidate(self.MINT))
