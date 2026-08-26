@@ -287,10 +287,11 @@ fn pumpswap_sell_capacity(
     .sell_capacity(max_impact_bps, fee_bps)
 }
 
-/// PumpSwap `buy` / `sell` instruction DATA. Accounts are deliberately absent.
+/// PumpSwap `buy` / `sell` instruction data.
 #[pyfunction]
-fn pumpswap_buy_data(base_out: u64, max_quote_in: u64) -> Vec<u8> {
-    crate::pumpswap::buy_data(base_out, max_quote_in)
+#[pyo3(signature = (base_out, max_quote_in, track_volume = false))]
+fn pumpswap_buy_data(base_out: u64, max_quote_in: u64, track_volume: bool) -> Vec<u8> {
+    crate::pumpswap::buy_data(base_out, max_quote_in, track_volume)
 }
 
 #[pyfunction]
@@ -298,7 +299,74 @@ fn pumpswap_sell_data(base_in: u64, min_quote_out: u64) -> Vec<u8> {
     crate::pumpswap::sell_data(base_in, min_quote_out)
 }
 
-/// Why PumpSwap transaction construction stops at instruction data.
+type PyInstruction = (Vec<u8>, Vec<(Vec<u8>, bool, bool)>, Vec<u8>);
+
+fn instruction_to_python(value: instruction::Instruction) -> PyInstruction {
+    (
+        value.program_id.to_vec(),
+        value
+            .accounts
+            .into_iter()
+            .map(|meta| (meta.pubkey.to_vec(), meta.is_signer, meta.is_writable))
+            .collect(),
+        value.data,
+    )
+}
+
+fn parse_account_keys(raw: Vec<Vec<u8>>) -> PyResult<Vec<instruction::Pubkey>> {
+    raw.into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value.try_into().map_err(|value: Vec<u8>| {
+                PyValueError::new_err(format!(
+                    "account {} is {} bytes, expected 32",
+                    index + 1,
+                    value.len()
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Build the complete PumpSwap buy instruction in Rust from IDL-ordered keys.
+#[pyfunction]
+#[pyo3(signature = (accounts, base_out, max_quote_in, track_volume = false))]
+fn pumpswap_build_buy(
+    accounts: Vec<Vec<u8>>,
+    base_out: u64,
+    max_quote_in: u64,
+    track_volume: bool,
+) -> PyResult<PyInstruction> {
+    let keys = parse_account_keys(accounts)?;
+    crate::pumpswap::build_buy(&keys, base_out, max_quote_in, track_volume)
+        .map(instruction_to_python)
+        .ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "PumpSwap buy requires {} IDL-ordered accounts",
+                crate::generated_flags::PUMPSWAP_BUY_ACCOUNT_COUNT
+            ))
+        })
+}
+
+/// Build the complete PumpSwap sell instruction in Rust from IDL-ordered keys.
+#[pyfunction]
+fn pumpswap_build_sell(
+    accounts: Vec<Vec<u8>>,
+    base_in: u64,
+    min_quote_out: u64,
+) -> PyResult<PyInstruction> {
+    let keys = parse_account_keys(accounts)?;
+    crate::pumpswap::build_sell(&keys, base_in, min_quote_out)
+        .map(instruction_to_python)
+        .ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "PumpSwap sell requires {} IDL-ordered accounts",
+                crate::generated_flags::PUMPSWAP_SELL_ACCOUNT_COUNT
+            ))
+        })
+}
+
+/// Provenance for the native PumpSwap account table.
 #[pyfunction]
 fn pumpswap_account_list_status() -> &'static str {
     crate::pumpswap::ACCOUNT_LIST_STATUS
@@ -481,6 +549,8 @@ fn solana_fastpath(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(pumpswap_sell_capacity, module)?)?;
     module.add_function(wrap_pyfunction!(pumpswap_buy_data, module)?)?;
     module.add_function(wrap_pyfunction!(pumpswap_sell_data, module)?)?;
+    module.add_function(wrap_pyfunction!(pumpswap_build_buy, module)?)?;
+    module.add_function(wrap_pyfunction!(pumpswap_build_sell, module)?)?;
     module.add_function(wrap_pyfunction!(pumpswap_account_list_status, module)?)?;
     module.add_function(wrap_pyfunction!(b58encode, module)?)?;
     module.add_function(wrap_pyfunction!(b58decode, module)?)?;

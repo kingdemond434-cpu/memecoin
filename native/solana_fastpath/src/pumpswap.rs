@@ -7,13 +7,15 @@
 //! priced by the same shape of arithmetic as the curve, and the state machine
 //! above carries across the boundary rather than restarting behind it.
 //!
-//! Deliberately partial, and the partition is the point. Pump publishes the
-//! Pool layout and the buy/sell argument lists as text; it does NOT publish
-//! the ordered account lists with their writable/signer flags. So this module
-//! decodes pools, quotes both sides, computes capacity and encodes instruction
-//! DATA -- all verifiable -- and refuses to construct accounts. A guessed
-//! account list is a transaction that fails, or worse, succeeds against the
-//! wrong account.
+//! The ordered buy/sell account lists and flags are generated from the
+//! vendored official Pump AMM IDL. They are not transcribed from prose and are
+//! guarded by the same regeneration test as the Pump curve instructions.
+
+use crate::generated_flags::{
+    PUMPSWAP_BUY_ACCOUNT_COUNT, PUMPSWAP_BUY_SIGNERS, PUMPSWAP_BUY_WRITABLE,
+    PUMPSWAP_SELL_ACCOUNT_COUNT, PUMPSWAP_SELL_SIGNERS, PUMPSWAP_SELL_WRITABLE,
+};
+use crate::instruction::{AccountMeta, Instruction, Pubkey};
 
 /// `sha256("account:Pool")[..8]`.
 pub const POOL_DISCRIMINATOR: [u8; 8] = [241, 154, 109, 4, 17, 177, 109, 188];
@@ -235,21 +237,17 @@ impl PoolReserves {
     }
 }
 
-/// Why PumpSwap transaction construction is not implemented here.
 pub const ACCOUNT_LIST_STATUS: &str =
-    "DATA_BLOCKED: pump publishes the PumpSwap Pool layout and the buy/sell \
-     argument lists, but not the ordered account lists with writable/signer \
-     flags. A guessed account list is a transaction that fails, or worse, \
-     succeeds against the wrong account.";
+    "OK: PumpSwap account order and flags generated from idl/pump_amm.json";
 
 /// `buy(base_out, max_quote_in)` instruction data.
 ///
-/// Data only. The arguments are published and verifiable; the accounts are
-/// not, so this deliberately stops short of a full instruction.
-pub fn buy_data(base_out: u64, max_quote_in: u64) -> Vec<u8> {
+pub fn buy_data(base_out: u64, max_quote_in: u64, track_volume: bool) -> Vec<u8> {
     let mut data = crate::instruction::anchor_instruction_discriminator("buy").to_vec();
     data.extend_from_slice(&base_out.to_le_bytes());
     data.extend_from_slice(&max_quote_in.to_le_bytes());
+    // The IDL's OptionBool wrapper is one Borsh bool byte.
+    data.push(u8::from(track_volume));
     data
 }
 
@@ -259,6 +257,67 @@ pub fn sell_data(base_in: u64, min_quote_out: u64) -> Vec<u8> {
     data.extend_from_slice(&base_in.to_le_bytes());
     data.extend_from_slice(&min_quote_out.to_le_bytes());
     data
+}
+
+fn build_metas(
+    keys: &[Pubkey],
+    expected: usize,
+    writable: &[usize],
+    signers: &[usize],
+) -> Option<Vec<AccountMeta>> {
+    if keys.len() != expected {
+        return None;
+    }
+    Some(
+        keys.iter()
+            .enumerate()
+            .map(|(offset, key)| {
+                let position = offset + 1;
+                AccountMeta {
+                    pubkey: *key,
+                    is_signer: signers.contains(&position),
+                    is_writable: writable.contains(&position),
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Complete PumpSwap buy instruction from the IDL-ordered account keys.
+pub fn build_buy(
+    keys: &[Pubkey],
+    base_out: u64,
+    max_quote_in: u64,
+    track_volume: bool,
+) -> Option<Instruction> {
+    let accounts = build_metas(
+        keys,
+        PUMPSWAP_BUY_ACCOUNT_COUNT,
+        &PUMPSWAP_BUY_WRITABLE,
+        &PUMPSWAP_BUY_SIGNERS,
+    )?;
+    // `program` is account 17 in the published buy account order.
+    Some(Instruction {
+        program_id: keys[16],
+        accounts,
+        data: buy_data(base_out, max_quote_in, track_volume),
+    })
+}
+
+/// Complete PumpSwap sell instruction from the IDL-ordered account keys.
+pub fn build_sell(keys: &[Pubkey], base_in: u64, min_quote_out: u64) -> Option<Instruction> {
+    let accounts = build_metas(
+        keys,
+        PUMPSWAP_SELL_ACCOUNT_COUNT,
+        &PUMPSWAP_SELL_WRITABLE,
+        &PUMPSWAP_SELL_SIGNERS,
+    )?;
+    // `program` is account 17 in the published sell account order too.
+    Some(Instruction {
+        program_id: keys[16],
+        accounts,
+        data: sell_data(base_in, min_quote_out),
+    })
 }
 
 #[cfg(test)]
@@ -431,17 +490,44 @@ mod tests {
 
     #[test]
     fn instruction_data_is_published_arguments_only() {
-        let buy = buy_data(0x0102030405060708, 0x1112131415161718);
-        assert_eq!(buy.len(), 24);
+        let buy = buy_data(0x0102030405060708, 0x1112131415161718, false);
+        assert_eq!(buy.len(), 25);
         assert_eq!(&buy[8..16], &0x0102030405060708u64.to_le_bytes());
-        assert_ne!(buy_data(1, 1)[..8], sell_data(1, 1)[..8]);
+        assert_eq!(buy[24], 0);
+        assert_eq!(buy_data(1, 1, true)[24], 1);
+        assert_ne!(buy_data(1, 1, false)[..8], sell_data(1, 1)[..8]);
     }
 
     #[test]
-    fn account_construction_is_explicitly_blocked() {
-        // The published docs give the Pool layout and the argument lists, and
-        // not the account lists. Guessing them is the one thing this module
-        // must not do.
-        assert!(ACCOUNT_LIST_STATUS.starts_with("DATA_BLOCKED"));
+    fn native_buy_uses_the_idl_generated_flags() {
+        let keys: Vec<Pubkey> = (1..=PUMPSWAP_BUY_ACCOUNT_COUNT)
+            .map(|index| [index as u8; 32])
+            .collect();
+        let instruction = build_buy(&keys, 10, 20, false).unwrap();
+        assert_eq!(instruction.accounts.len(), PUMPSWAP_BUY_ACCOUNT_COUNT);
+        assert_eq!(instruction.program_id, keys[16]);
+        let writable: Vec<usize> = instruction
+            .accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, meta)| meta.is_writable)
+            .map(|(index, _)| index + 1)
+            .collect();
+        let signers: Vec<usize> = instruction
+            .accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, meta)| meta.is_signer)
+            .map(|(index, _)| index + 1)
+            .collect();
+        assert_eq!(writable, PUMPSWAP_BUY_WRITABLE);
+        assert_eq!(signers, PUMPSWAP_BUY_SIGNERS);
+        assert!(ACCOUNT_LIST_STATUS.starts_with("OK"));
+    }
+
+    #[test]
+    fn native_sell_refuses_the_wrong_account_count() {
+        let short = vec![[0u8; 32]; PUMPSWAP_SELL_ACCOUNT_COUNT - 1];
+        assert!(build_sell(&short, 10, 20).is_none());
     }
 }
