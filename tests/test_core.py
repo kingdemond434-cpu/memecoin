@@ -10710,6 +10710,18 @@ class TestEntityStableIdResolver(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(document["entities"][0]["accounts"], {})
         self.assertEqual(document["entities"][1]["accounts"], {})
 
+    async def test_multiple_profiles_on_one_official_page_are_ambiguous(self):
+        document = {"entities": [{
+            "entity_id": "marketplace", "accounts": {},
+            "metadata": {"published_handles": {"x": ["partner", "marketplace"]}},
+        }]}
+        with patch.object(resolve_entity_ids, "resolve_public") as resolver:
+            report = await resolve_entity_ids.resolve_document(
+                document, Path("unused"))
+        resolver.assert_not_called()
+        self.assertEqual(document["entities"][0]["accounts"], {})
+        self.assertIn("ambiguous", report["unresolved"][0]["detail"])
+
 
 class TestBlockhashIsNotFetchedOnTheHotPath(unittest.IsolatedAsyncioTestCase):
     """An RPC round trip sat between the decision and the signature.

@@ -137,7 +137,17 @@ async def resolve_document(document: Dict[str, Any], session: Path) -> Dict[str,
     for entity in entities:
         published = ((entity.get("metadata") or {}).get("published_handles") or {})
         for platform, handles in published.items():
-            for handle in handles or []:
+            unique_handles = sorted({str(handle) for handle in (handles or []) if str(handle)})
+            if len(unique_handles) != 1:
+                if unique_handles:
+                    report["unresolved"].append({
+                        "entity_id": entity.get("entity_id"), "platform": platform,
+                        "handle": None,
+                        "detail": (f"ambiguous official pages link to "
+                                   f"{len(unique_handles)} {platform} profiles"),
+                    })
+                continue
+            for handle in unique_handles:
                 value, detail = (telegram.get(str(handle), (None, "not resolved"))
                                  if platform == "telegram"
                                  else resolve_public(str(platform), str(handle)))
