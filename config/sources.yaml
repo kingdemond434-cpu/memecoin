@@ -50,12 +50,6 @@ sources:
     tier: 2
     region: global
     requires_env: [NEYNAR_API_KEY]
-  - id: mastodon:mastodon-social
-    kind: mastodon
-    tier: 3
-    region: global
-    options: {instance: "https://mastodon.social"}
-
   # ---- live video and audio: spoken before written ------------------------
   - id: youtube:websub-watchlist
     kind: youtube
