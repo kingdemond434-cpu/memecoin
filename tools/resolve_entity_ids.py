@@ -171,7 +171,13 @@ async def resolve_document(document: Dict[str, Any], session: Path) -> Dict[str,
                 "entities": sorted(set(conflicts[(platform, value)])),
             })
             continue
-        accounts = entity.setdefault("accounts", {})
+        accounts = entity.get("accounts")
+        if not isinstance(accounts, dict):
+            # YAML parses an empty `accounts:` block (only comments beneath
+            # it) as null. It still means "no authoritative ids yet", not a
+            # malformed entity and not an object on which setdefault works.
+            accounts = {}
+            entity["accounts"] = accounts
         bucket = accounts.setdefault(platform, [])
         bucket = [str(item) for item in (bucket or [])]
         if value not in bucket:

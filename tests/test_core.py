@@ -10696,6 +10696,18 @@ class TestEntityStableIdResolver(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["resolved"], 2)
         self.assertEqual(report["unresolved"][0]["platform"], "x")
 
+    async def test_yaml_null_accounts_is_an_empty_registry_not_a_crash(self):
+        document = {"entities": [{
+            "entity_id": "example", "accounts": None,
+            "metadata": {"published_handles": {"github": ["example"]}},
+        }]}
+        with patch.object(resolve_entity_ids, "resolve_public",
+                          return_value=("202", "OK")):
+            report = await resolve_entity_ids.resolve_document(
+                document, Path("unused"))
+        self.assertEqual(report["resolved"], 1)
+        self.assertEqual(document["entities"][0]["accounts"], {"github": ["202"]})
+
     async def test_a_cross_entity_id_collision_is_never_assigned(self):
         document = {"entities": [
             {"entity_id": name, "accounts": {},
