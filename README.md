@@ -168,6 +168,38 @@ page change detection. Telegram uses the operator's own registered API
 credentials against public channels. Twitch, Discord and token metadata are
 push-fed queues: something else in the process produces the records.
 
+## Entity registry: provenance is required
+
+`config/entities.yaml` is EMPTY and stays that way until entries are verified.
+An entity declared there asserts that a specific account, domain or wallet
+canonically IS a named person or organisation, and a wrong entry does not
+degrade gracefully -- it makes an impersonator look verified, which is the most
+expensive error this system can make.
+
+So `verified_from` (where the fact was read) and `verified_at` (when) are
+required fields. An entry without both is REFUSED at load, not loaded with a
+warning: a flag on a record that still confers OFFICIAL_DOMAIN proof is not a
+control. A verification older than 180 days is treated as a claim about the
+past -- accounts get renamed, sold and abandoned -- so a stale entity keeps
+NAME_ONLY and loses every level that authorises a position.
+
+Fill it from what the entity itself publishes, not from memory:
+
+```bash
+.venv/bin/python tools/verify_entities.py --domain example.org     --id example-org --name "Example Organisation"     --out config/entities.verified.yaml
+```
+
+It fetches the domain's own pages, extracts the profile links those pages
+publish, and records each page's URL and content hash. It emits the handles as
+COMMENTS: `accounts` holds stable platform ids, and a display handle there
+would let a renamed or resold account keep an entity's proof level. Resolving
+each handle to its numeric id, and confirming any wallet claim, is a person's
+job and deliberately not automated.
+
+`GET /status` reports the registry under `entity_registry`, including which
+entities have gone stale, so an empty or ageing registry is visible rather than
+silent.
+
 ## Data credentials and honest blockers
 
 - `YELLOWSTONE_GRPC_URL` and token: lowest-latency program stream. Without it,

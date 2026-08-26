@@ -85,10 +85,11 @@ from src.strategies.actor_graph import (
     WalletIndependence, aggregate_smart_flow, build_fingerprint,
 )
 from src.strategies.authenticity import (
-    AuthenticityResolver, AuthenticityVerdict, EntityRegistry, ProofLevel,
-    SourceSignal, WatchedEntity, extract_mints, host_matches, looks_like_mint,
-    rank_copycats,
+    ENTITY_STALE_AFTER_DAYS, AuthenticityResolver, AuthenticityVerdict,
+    EntityRegistry, ProofLevel, SourceSignal, WatchedEntity, extract_mints,
+    host_matches, load_entities, looks_like_mint, rank_copycats,
 )
+from tools import verify_entities
 from src.strategies.escape import (
     HAZARD_HORIZONS, TRIGGER_MECHANISMS, UNESCAPABLE_MECHANISMS, HazardCurve,
     HazardMechanism, LandingLatency, escape_probability,
@@ -4129,10 +4130,16 @@ class TestAuthenticityResolver(unittest.TestCase):
                 official_domains={"figure.com"},
                 known_wallets={"WaLLeT1111111111111111111111111111111111111"},
                 aliases={"The Figure"},
+                # Provenance, as production requires: the loader refuses an
+                # entity without it, so a fixture without it is testing a
+                # shape the desk can never actually hold.
+                verified_from="https://figure.com/press", verified_at=time.time(),
             ),
             WatchedEntity(entity_id="newsdesk", display_name="News Desk",
                           accounts={"rss": {"newsdesk.example/feed"}},
-                          official_domains={"newsdesk.example"}),
+                          official_domains={"newsdesk.example"},
+                          verified_from="https://newsdesk.example/about",
+                          verified_at=time.time()),
         ])
 
     def _resolver(self, **kwargs):
@@ -10276,6 +10283,210 @@ class TestTransportsAreBuiltFromDeclarations(unittest.TestCase):
         transport.push({"any": "thing"})
         asyncio.run(transport())
         self.assertEqual(transport_report({"q": transport})["status"], "OK")
+
+
+class TestEntityProvenanceIsRequired(unittest.TestCase):
+    """An identity assertion nobody can trace is the expensive error.
+
+    A missing entity makes an official token look unverified and costs a
+    trade. A WRONG entity makes an impersonator look verified and costs the
+    position -- so the parse is strict about exactly the fields that assert
+    identity.
+    """
+
+    def _write(self, entries) -> str:
+        path = os.path.join(tempfile.mkdtemp(), "entities.yaml")
+        with open(path, "w", encoding="utf-8") as handle:
+            yaml.safe_dump({"entities": entries}, handle)
+        return path
+
+    def _entry(self, **overrides):
+        entry = {"entity_id": "figure", "display_name": "Some Figure",
+                 "official_domains": ["figure.com"],
+                 "accounts": {"telegram": ["1001"]},
+                 "verified_from": "https://figure.com/press",
+                 "verified_at": "2026-06-01"}
+        entry.update(overrides)
+        return entry
+
+    def test_an_entity_with_provenance_loads(self):
+        entities = load_entities(self._write([self._entry()]))
+        self.assertEqual(len(entities), 1)
+        self.assertEqual(entities[0].verified_from, "https://figure.com/press")
+        self.assertGreater(entities[0].verified_at, 0)
+
+    def test_an_entity_without_a_source_is_refused_not_flagged(self):
+        """A flag on a record that still confers proof is not a control."""
+        entry = self._entry()
+        del entry["verified_from"]
+        self.assertEqual(load_entities(self._write([entry])), [])
+
+    def test_an_entity_without_a_date_is_refused(self):
+        entry = self._entry()
+        del entry["verified_at"]
+        self.assertEqual(load_entities(self._write([entry])), [])
+
+    def test_an_unreadable_date_is_refused_rather_than_stamped_now(self):
+        """Defaulting to now makes every entry permanently fresh."""
+        self.assertEqual(
+            load_entities(self._write([self._entry(verified_at="whenever")])), [])
+
+    def test_provenance_is_accepted_from_the_metadata_block_the_schema_documents(self):
+        entry = self._entry()
+        del entry["verified_from"]
+        del entry["verified_at"]
+        entry["metadata"] = {"verified_from": "https://figure.com/about",
+                             "verified_at": "2026-06-01"}
+        self.assertEqual(len(load_entities(self._write([entry]))), 1)
+
+    def test_one_bad_entry_does_not_take_the_registry_offline(self):
+        bad = self._entry(entity_id="bad")
+        del bad["verified_from"]
+        entities = load_entities(self._write([self._entry(), bad]))
+        self.assertEqual([entity.entity_id for entity in entities], ["figure"])
+
+    def test_a_verified_overlay_wins_over_the_seed(self):
+        seed = self._write([self._entry(display_name="Stale Name")])
+        overlay = self._write([self._entry(display_name="Current Name")])
+        entities = load_entities(f"{seed},{overlay}")
+        self.assertEqual(len(entities), 1)
+        self.assertEqual(entities[0].display_name, "Current Name")
+
+    def test_a_missing_overlay_is_not_an_error_when_there_are_several_paths(self):
+        seed = self._write([self._entry()])
+        entities = load_entities(f"{seed},/nonexistent/entities.yaml")
+        self.assertEqual(len(entities), 1)
+
+    def test_the_shipped_registry_is_empty_and_says_why(self):
+        """Empty is not 'nothing is a copycat'. It is 'we cannot tell'."""
+        self.assertEqual(load_entities("config/entities.yaml"), [])
+        report = EntityRegistry([]).report()
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertIn("cannot tell", report["detail"])
+        self.assertEqual(report["entities"], 0)
+
+
+class TestStaleEntitiesLoseTheirProof(unittest.TestCase):
+    """A handle verified two years ago is a claim about the past."""
+
+    MINT = "So11111111111111111111111111111111111111112"
+    WALLET = "WaLLeT1111111111111111111111111111111111111"
+
+    def _entity(self, age_days: float):
+        return WatchedEntity(
+            entity_id="figure", display_name="Some Figure",
+            accounts={"telegram": {"1001"}}, official_domains={"figure.com"},
+            known_wallets={self.WALLET},
+            verified_from="https://figure.com/press",
+            verified_at=time.time() - age_days * 86_400)
+
+    def _resolver(self, age_days: float):
+        return AuthenticityResolver(EntityRegistry([self._entity(age_days)]))
+
+    def _signal(self, text: str):
+        return SourceSignal(platform="telegram", account_id="1001", text=text,
+                            timestamp=time.time())
+
+    def test_a_fresh_entity_still_gets_the_strongest_proof(self):
+        verdict = self._resolver(1).resolve_signal(self._signal(f"launching {self.MINT}"))
+        self.assertEqual(verdict.level, ProofLevel.DIRECT_MINT)
+        self.assertEqual(verdict.mint, self.MINT)
+
+    def test_a_stale_entity_is_capped_at_name_only_and_carries_no_mint(self):
+        verdict = self._resolver(400).resolve_signal(self._signal(f"launching {self.MINT}"))
+        self.assertEqual(verdict.level, ProofLevel.NAME_ONLY)
+        self.assertIsNone(verdict.mint)
+        self.assertFalse(verdict.tradeable)
+        self.assertIn("re-verified", verdict.detail)
+
+    def test_a_stale_wallet_claim_does_not_authorise_a_position(self):
+        verdict = self._resolver(400).resolve_creator(self.MINT, self.WALLET)
+        self.assertEqual(verdict.level, ProofLevel.NAME_ONLY)
+        self.assertFalse(verdict.tradeable)
+        fresh = self._resolver(1).resolve_creator(self.MINT, self.WALLET)
+        self.assertEqual(fresh.level, ProofLevel.CREATOR_WALLET)
+
+    def test_a_stale_official_domain_link_is_capped_too(self):
+        signal = self._signal("announcement at https://figure.com/token")
+        published = {"figure.com": self.MINT}
+        stale = self._resolver(400).resolve_signal(signal, published)
+        self.assertEqual(stale.level, ProofLevel.NAME_ONLY)
+        self.assertIsNone(stale.mint)
+        fresh = self._resolver(1).resolve_signal(signal, published)
+        self.assertEqual(fresh.level, ProofLevel.OFFICIAL_DOMAIN)
+        self.assertEqual(fresh.mint, self.MINT)
+
+    def test_an_entity_with_no_verification_date_is_treated_as_stale(self):
+        registry = EntityRegistry([WatchedEntity(
+            entity_id="x", display_name="X", accounts={"telegram": {"1001"}})])
+        verdict = AuthenticityResolver(registry).resolve_signal(
+            self._signal(f"launching {self.MINT}"))
+        self.assertEqual(verdict.level, ProofLevel.NAME_ONLY)
+
+    def test_the_report_names_which_entities_have_gone_stale(self):
+        registry = EntityRegistry([self._entity(400)])
+        report = registry.report()
+        self.assertEqual(report["status"], "OK")
+        self.assertEqual(report["stale"], ["figure"])
+        self.assertEqual(report["fresh"], 0)
+        self.assertGreater(report["oldest_verification_days"], 180)
+
+
+class TestEntityVerifierReadsPublishedPages(unittest.TestCase):
+    """Filling the registry from memory is the failure the empty file prevents."""
+
+    PAGE = """<html><body>
+      <a href="https://t.me/example_official">Telegram</a>
+      <a href="https://www.youtube.com/channel/UCabcdefghijklmnopqrstuv">YouTube</a>
+      <a href="https://bsky.app/profile/example.org">Bluesky</a>
+      <a href="https://github.com/exampleorg">Code</a>
+      <a href="https://t.me/example_official/4321">a post, not a profile</a>
+    </body></html>"""
+
+    def test_only_profile_links_become_handles(self):
+        found = verify_entities.handles_in(self.PAGE)
+        self.assertEqual(found["telegram"], ["example_official"])
+        self.assertEqual(found["youtube"], ["UCabcdefghijklmnopqrstuv"])
+        self.assertEqual(found["bluesky"], ["example.org"])
+        self.assertEqual(found["github"], ["exampleorg"])
+
+    def test_a_page_that_links_nothing_yields_nothing(self):
+        self.assertEqual(verify_entities.handles_in("<p>no links here</p>"), {})
+
+    def test_handles_are_emitted_as_comments_never_as_account_ids(self):
+        """`accounts` holds stable ids; a display handle there is impersonable."""
+        result = {"domain": "example.org", "reachable": True,
+                  "pages": [{"url": "https://example.org/", "sha256": "abc",
+                             "detail": "HTTP 200"}],
+                  "handles": {"telegram": ["example_official"]}}
+        lines = verify_entities.declaration("example-org", "Example Org", result)
+        rendered = "\n".join(lines)
+        self.assertIn("# telegram: example_official", rendered)
+        self.assertIn("verified_from: \"https://example.org/\"", rendered)
+        self.assertIn("verified_at:", rendered)
+        # The emitted accounts block must not carry the handle uncommented.
+        account_lines = [line for line in lines
+                         if line.strip().startswith("telegram:")]
+        self.assertEqual(account_lines, [])
+
+    def test_what_it_emits_is_refused_until_a_person_fills_in_the_ids(self):
+        """Provenance is present, so the refusal is about ids, not paperwork."""
+        result = {"domain": "example.org", "reachable": True,
+                  "pages": [{"url": "https://example.org/", "sha256": "abc",
+                             "detail": "HTTP 200"}],
+                  "handles": {"telegram": ["example_official"]}}
+        rendered = "entities:\n" + "\n".join(
+            verify_entities.declaration("example-org", "Example Org", result))
+        path = os.path.join(tempfile.mkdtemp(), "emitted.yaml")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(rendered + "\n")
+        entities = load_entities(path)
+        self.assertEqual(len(entities), 1)
+        # It loads -- provenance is there -- and it vouches for no account, so
+        # it can never make an impersonator look verified.
+        self.assertEqual(entities[0].accounts, {})
+        self.assertEqual(entities[0].known_wallets, set())
+        self.assertEqual(entities[0].official_domains, {"example.org"})
 
 class TestPumpSwapConstruction(unittest.TestCase):
     """The last DATA_BLOCKED that was never about missing information.

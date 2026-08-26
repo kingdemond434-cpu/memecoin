@@ -493,7 +493,10 @@ class MemecoinQuantDesk:
         # which is the honest reading of an empty registry: not "nothing is a
         # copycat" but "we cannot tell".
         self._watched_entities = load_entities(
-            self.global_config.get("entities_path", "config/entities.yaml"))
+            # Schema and policy in the repository; verified entities on the
+            # node that could actually reach their pages.
+            self.global_config.get(
+                "entities_path", "config/entities.yaml,config/entities.verified.yaml"))
         self.entity_registry = EntityRegistry(self._watched_entities)
         self.authenticity = AuthenticityResolver(self.entity_registry)
         # Which source spoke first, and whether its posts have historically
@@ -3235,6 +3238,10 @@ class MemecoinQuantDesk:
             "idl": idl_report(),
             "action_policy": {"trained": self.action_policy.is_trained,
                               "min_edge": self.action_policy.min_edge},
+            # An empty registry is not "nothing is a copycat". It is "we
+            # cannot tell", and a status page that stays silent about it lets
+            # an operator read silence as safety.
+            "entity_registry": self.entity_registry.report(),
             "source_mesh": {**self.source_mesh.health(),
                             "registry": self.source_registry_report.to_dict(),
                             # What is wired, what answered, and what could not

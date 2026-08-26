@@ -58,3 +58,4 @@ var/
 venv/
 wheels/
 config/sources.verified.yaml
+config/entities.verified.yaml

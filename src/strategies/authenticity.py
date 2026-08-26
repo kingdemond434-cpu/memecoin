@@ -37,6 +37,7 @@ and a candidate mint is one step from a purchase.
 
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -80,6 +81,12 @@ _PROOF_RANK = {
 # Below this, the event is observed and logged but never sized on. Name-only
 # agreement is where essentially every impostor sits.
 MIN_TRADEABLE_PROOF = ProofLevel.CROSS_SOURCE
+
+# How long an identity verification is relied on before it is treated as a
+# claim about the past. Six months: long enough that maintaining the registry
+# is not a weekly chore, short enough that a sold or renamed account does not
+# keep conferring the strongest proof level indefinitely.
+ENTITY_STALE_AFTER_DAYS = 180.0
 
 
 def decode_base58(value: str) -> Optional[bytes]:
@@ -173,12 +180,34 @@ class WatchedEntity:
     known_wallets: Set[str] = field(default_factory=set)
     aliases: Set[str] = field(default_factory=set)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # WHERE this identity was read and WHEN. Not metadata: an entity asserts
+    # that a specific account canonically IS a named person, and an assertion
+    # nobody can trace is exactly the error that makes an impersonator look
+    # verified. An entity without both is refused at load.
+    verified_from: str = ""
+    verified_at: float = 0.0
 
     def owns_account(self, platform: str, account_id: str) -> bool:
         return str(account_id) in self.accounts.get(str(platform).lower(), set())
 
     def owns_host(self, host: str) -> bool:
         return any(host_matches(host, domain) for domain in self.official_domains)
+
+    def age_days(self, now: Optional[float] = None) -> float:
+        if self.verified_at <= 0:
+            return float("inf")
+        return max(0.0, ((now if now is not None else time.time())
+                         - self.verified_at) / 86_400.0)
+
+    def is_stale(self, max_age_days: float = ENTITY_STALE_AFTER_DAYS,
+                 now: Optional[float] = None) -> bool:
+        """Whether the identity claim is older than we are willing to rely on.
+
+        Accounts get renamed, sold and abandoned. A handle verified two years
+        ago and never rechecked is a claim about the past, and the strongest
+        proof levels are exactly where that matters.
+        """
+        return self.age_days(now) > max_age_days
 
 
 @dataclass
@@ -246,6 +275,34 @@ class EntityRegistry:
                 return entity
         return None
 
+    def report(self, stale_after_days: float = ENTITY_STALE_AFTER_DAYS,
+               now: Optional[float] = None) -> Dict[str, Any]:
+        """What the registry can currently vouch for.
+
+        An empty registry is not "nothing is a copycat" -- it is "we cannot
+        tell", and a status surface that does not say so lets an operator read
+        silence as safety.
+        """
+        entities = list(self._entities.values())
+        stale = [entity.entity_id for entity in entities
+                 if entity.is_stale(stale_after_days, now)]
+        return {
+            "status": "OK" if entities else "DATA_BLOCKED",
+            "detail": ("" if entities else
+                       "registry is empty: this is not 'nothing is a copycat', it is "
+                       "'we cannot tell' -- every token resolves DATA_BLOCKED and no "
+                       "mega-event can be authenticated"),
+            "entities": len(entities),
+            "fresh": len(entities) - len(stale),
+            "stale": sorted(stale),
+            "stale_after_days": stale_after_days,
+            "accounts": len(self._by_account),
+            "wallets": len(self._by_wallet),
+            "domains": sum(len(entity.official_domains) for entity in entities),
+            "oldest_verification_days": (
+                max((entity.age_days(now) for entity in entities), default=None)),
+        }
+
     def match_name(self, text: str) -> List[WatchedEntity]:
         """Entities whose name or alias appears in the text as a whole word.
 
@@ -272,12 +329,32 @@ class AuthenticityResolver:
     is the correct outcome far more often than it feels like it should be.
     """
 
-    def __init__(self, registry: EntityRegistry, min_independent_sources: int = 2):
+    def __init__(self, registry: EntityRegistry, min_independent_sources: int = 2,
+                 stale_after_days: float = ENTITY_STALE_AFTER_DAYS):
         self.registry = registry
         # "Independent" means distinct entities, not distinct posts: one
         # compromised or impersonated account posting three times is one
         # source, and treating it as three is exactly the attack.
         self.min_independent_sources = max(2, min_independent_sources)
+        self.stale_after_days = float(stale_after_days)
+
+    def _capped(self, entity: WatchedEntity, level: ProofLevel,
+                now: Optional[float] = None) -> Tuple[ProofLevel, str]:
+        """The level this entity can still support, and why if it was lowered.
+
+        An identity claim nobody has rechecked in six months is a claim about
+        the past. Accounts get renamed, sold and abandoned, so a stale record
+        keeps NAME_ONLY -- the level that says "something here is worth
+        watching" -- and loses the levels that authorise a position.
+        """
+        if not entity.is_stale(self.stale_after_days, now):
+            return level, ""
+        if level.rank <= ProofLevel.NAME_ONLY.rank:
+            return level, ""
+        return ProofLevel.NAME_ONLY, (
+            f"entity verification is {entity.age_days(now):.0f} days old "
+            f"(stale after {self.stale_after_days:.0f}); "
+            "proof capped at name-only until re-verified")
 
     def resolve_signal(
         self,
@@ -299,10 +376,12 @@ class AuthenticityResolver:
 
         mints = extract_mints(signal.text)
         if len(mints) == 1:
+            level, capped = self._capped(entity, ProofLevel.DIRECT_MINT)
             return AuthenticityVerdict(
-                mint=mints[0], level=ProofLevel.DIRECT_MINT, entity_id=entity.entity_id,
+                mint=mints[0] if not capped else None, level=level,
+                entity_id=entity.entity_id,
                 supporting_sources=[f"{signal.platform}:{signal.account_id}"],
-                detail="canonical account published the mint directly",
+                detail=capped or "canonical account published the mint directly",
             )
         if len(mints) > 1:
             # Several addresses in one official post is ambiguous, and
@@ -317,10 +396,13 @@ class AuthenticityResolver:
                 continue
             for domain, mint in published.items():
                 if host_matches(host, domain) and looks_like_mint(mint):
+                    level, capped = self._capped(entity, ProofLevel.OFFICIAL_DOMAIN)
                     return AuthenticityVerdict(
-                        mint=mint, level=ProofLevel.OFFICIAL_DOMAIN, entity_id=entity.entity_id,
+                        mint=mint if not capped else None, level=level,
+                        entity_id=entity.entity_id,
                         supporting_sources=[f"{signal.platform}:{signal.account_id}", host],
-                        detail=f"canonical account linked to official domain {host}",
+                        detail=(capped
+                                or f"canonical account linked to official domain {host}"),
                         rejected=rejected,
                     )
 
@@ -347,10 +429,12 @@ class AuthenticityResolver:
         if entity is None:
             return AuthenticityVerdict(mint=mint, level=ProofLevel.NONE, entity_id=None,
                                        detail="creator and funders are not known entity wallets")
+        level, capped = self._capped(entity, ProofLevel.CREATOR_WALLET)
         return AuthenticityVerdict(
-            mint=mint, level=ProofLevel.CREATOR_WALLET, entity_id=entity.entity_id,
+            mint=mint if not capped else None, level=level, entity_id=entity.entity_id,
             supporting_sources=[f"wallet:{source}"],
-            detail=f"token created or funded by a known wallet of {entity.display_name}",
+            detail=(capped
+                    or f"token created or funded by a known wallet of {entity.display_name}"),
         )
 
     def combine(self, verdicts: Sequence[AuthenticityVerdict]) -> AuthenticityVerdict:
@@ -431,7 +515,23 @@ def load_entities(path: str) -> List[WatchedEntity]:
     verified, which costs the position. So the parse is strict about the
     fields that assert identity and forgiving about everything else.
     """
+    import os
+
     import yaml  # local: keeps the resolver importable without a YAML runtime
+
+    paths = [item.strip() for item in str(path).split(",") if item.strip()]
+    if len(paths) > 1:
+        # Seed plus the operator's verified overlay, later winning by
+        # entity_id. Verification happens on the node with outbound access and
+        # its output does not belong in version control alongside the schema.
+        merged: Dict[str, WatchedEntity] = {}
+        for one in paths:
+            if not os.path.exists(one):
+                logger.info("entity registry overlay %s absent; skipping", one)
+                continue
+            for entity in load_entities(one):
+                merged[entity.entity_id] = entity
+        return list(merged.values())
 
     try:
         with open(path, encoding="utf-8") as handle:
@@ -446,6 +546,20 @@ def load_entities(path: str) -> List[WatchedEntity]:
                 str(platform).lower(): {str(account) for account in (ids or ())}
                 for platform, ids in (entry.get("accounts") or {}).items()
             }
+            metadata = dict(entry.get("metadata") or {})
+            # Provenance is required, and read from either the top level or
+            # the metadata block the seed file's schema documents. An entity
+            # nobody can trace back to a published page is refused rather than
+            # loaded and flagged: a flag on a record that still confers
+            # OFFICIAL_DOMAIN proof is not a control.
+            verified_from = str(entry.get("verified_from")
+                                or metadata.get("verified_from") or "").strip()
+            verified_at = parse_verified_at(
+                entry.get("verified_at") or metadata.get("verified_at"))
+            if not verified_from or verified_at is None:
+                raise ValueError(
+                    "entity asserts an identity with no provenance; "
+                    "verified_from (a URL) and verified_at (a date) are both required")
             entities.append(WatchedEntity(
                 entity_id=str(entry["entity_id"]),
                 display_name=str(entry["display_name"]),
@@ -455,8 +569,38 @@ def load_entities(path: str) -> List[WatchedEntity]:
                                   if normalise_host(host)},
                 known_wallets={str(wallet) for wallet in (entry.get("known_wallets") or ())},
                 aliases={str(alias) for alias in (entry.get("aliases") or ())},
-                metadata=dict(entry.get("metadata") or {}),
+                metadata=metadata,
+                verified_from=verified_from, verified_at=verified_at,
             ))
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             logger.error("skipping malformed entity declaration %r: %s", entry, exc)
     return entities
+
+
+def parse_verified_at(value: Any) -> Optional[float]:
+    """Epoch seconds from a date, or None when it is absent or unreadable.
+
+    Returns None rather than "now" for an unparseable date. Defaulting to now
+    would make every entry permanently fresh, which is the direction that
+    keeps a two-year-old identity claim conferring the strongest proof.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    import datetime
+
+    text = str(value).strip()
+    for candidate in (text, text.replace("Z", "+00:00")):
+        try:
+            parsed = datetime.datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed.timestamp()
+    try:
+        return datetime.datetime.strptime(text, "%Y-%m-%d").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        return None
