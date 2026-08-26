@@ -63,6 +63,8 @@ DEFAULT_PATHS: Tuple[str, ...] = ("/", "/about", "/contact", "/press", "/social"
 _END = r"/?(?=[\s\"'<>)\]]|$)"
 
 HANDLE_PATTERNS: Dict[str, re.Pattern] = {
+    "x": re.compile(r"https?://(?:www\.)?(?:x\.com|twitter\.com)/"
+                    r"([A-Za-z0-9_]{1,15})" + _END),
     "telegram": re.compile(r"https?://(?:t\.me|telegram\.me)/([A-Za-z0-9_]{5,32})" + _END),
     "youtube": re.compile(r"https?://(?:www\.)?youtube\.com/(?:@([A-Za-z0-9_.-]{3,30})"
                           r"|channel/(UC[A-Za-z0-9_-]{22}))" + _END),
@@ -102,6 +104,15 @@ def handles_in(body: str) -> Dict[str, List[str]]:
                 # Those sites also use /@handle URLs, but they are not
                 # ActivityPub identities. Treating one as Mastodon creates a
                 # false canonical account from a syntactic coincidence.
+                continue
+            if platform == "x" and groups[0].lower() in {
+                "home", "explore", "search", "notifications", "messages",
+                "compose", "intent", "share", "i",
+            }:
+                # X reserves these paths for product routes. Treating
+                # https://x.com/home as an organisation's canonical account
+                # would emit a plausible-looking identity assertion from a
+                # generic navigation link.
                 continue
             handle = "@".join(reversed(groups)) if platform == "mastodon" else groups[0]
             bucket = found.setdefault(platform, [])
@@ -169,6 +180,11 @@ def declaration(entity_id: str, display_name: str, result: Dict[str, Any],
     lines.append(f"    verified_from: {json.dumps(result['pages'][0]['url'] if result['pages'] else '')}")
     lines.append(f"    verified_at: \"{now.date().isoformat()}\"")
     lines.append("    metadata:")
+    # Machine-readable but explicitly non-authoritative. A second resolver
+    # can turn these domain-published handles into platform-stable IDs; the
+    # registry itself still trusts only `accounts`, so a failed/incomplete
+    # resolution never promotes a display name into identity proof.
+    lines.append(f"      published_handles: {json.dumps(result['handles'], sort_keys=True)}")
     lines.append(f"      verified_pages: {json.dumps([page['url'] for page in result['pages']])}")
     lines.append(f"      page_hashes: {json.dumps({page['url']: page['sha256'] for page in result['pages']})}")
     return lines

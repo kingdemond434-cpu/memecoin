@@ -251,8 +251,30 @@ class SocialIntelligenceEngine:
                 if value.strip()
             ]
             for channel in channels:
+                # Resolve the public username through Telegram itself before
+                # storing identity. A display handle is mutable; chat.id is
+                # the stable identifier carried by incoming events and by the
+                # verified entity registry. The old code pre-created every
+                # account with account_id=handle, so the push handler found an
+                # existing record and never upgraded it to event.chat_id.
+                account_id = channel
+                display_name = channel
+                try:
+                    entity = await self._telegram_client.get_entity(channel)
+                    account_id = str(getattr(entity, "id", "") or channel)
+                    display_name = str(
+                        getattr(entity, "title", "")
+                        or getattr(entity, "first_name", "")
+                        or channel
+                    )
+                except Exception as exc:
+                    # Polling will record the unavailable channel explicitly;
+                    # one optional bad username must not stop healthy channels
+                    # from starting.
+                    self._telegram_poll_failures[channel] = str(exc)
                 await self._add_account({
-                    "platform": "telegram", "handle": channel, "account_id": channel,
+                    "platform": "telegram", "handle": channel,
+                    "account_id": account_id, "display_name": display_name,
                 })
             self._telegram_handles = {channel.casefold() for channel in channels}
             if events is not None:
@@ -567,6 +589,17 @@ class SocialIntelligenceEngine:
             return
         key = f"{data['platform']}:{data['handle']}"
         if key in self.accounts:
+            # A collector can discover a handle before it resolves the
+            # platform's stable id. Upgrade only that placeholder; never
+            # overwrite one stable id with another because that is an
+            # identity conflict requiring investigation, not a rename.
+            existing = self.accounts[key]
+            incoming = str(data.get("account_id", "") or "")
+            placeholders = {key, str(data["handle"]), ""}
+            if incoming and existing.account_id in placeholders and incoming not in placeholders:
+                existing.account_id = incoming
+                if data.get("display_name"):
+                    existing.display_name = str(data["display_name"])
             return
         
         platform = SocialPlatform(data["platform"]) if isinstance(data["platform"], str) else data["platform"]

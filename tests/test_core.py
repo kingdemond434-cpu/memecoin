@@ -90,7 +90,7 @@ from src.strategies.authenticity import (
     EntityRegistry, ProofLevel, SourceSignal, WatchedEntity, extract_mints,
     host_matches, load_entities, looks_like_mint, rank_copycats,
 )
-from tools import verify_entities
+from tools import resolve_entity_ids, verify_entities
 from src.strategies.escape import (
     HAZARD_HORIZONS, TRIGGER_MECHANISMS, UNESCAPABLE_MECHANISMS, HazardCurve,
     HazardMechanism, LandingLatency, escape_probability,
@@ -636,13 +636,33 @@ class TestOfficialSocialCollectors(unittest.IsolatedAsyncioTestCase):
             "telegram_channels": "@alpha, https://t.me/beta ,gamma",
         })
         fake_client = FakeTelegramClient("path", 123, "hash")
+        fake_client.entities_by_handle = {
+            "alpha": SimpleNamespace(id=101, title="Alpha"),
+            "beta": SimpleNamespace(id=102, title="Beta"),
+            "gamma": SimpleNamespace(id=103, title="Gamma"),
+        }
         with patch("src.strategies.social_intelligence.TelegramClient", return_value=fake_client):
             await engine._setup_telegram()
         self.assertIn(engine.data_status["telegram"], {"OK_PUSH", "OK_POLLING"})
         self.assertTrue(fake_client.connected)
         self.assertEqual(set(engine.accounts), {"telegram:alpha", "telegram:beta", "telegram:gamma"})
-        for handle in ("alpha", "beta", "gamma"):
+        for expected_id, handle in enumerate(("alpha", "beta", "gamma"), 101):
             self.assertEqual(engine.accounts[f"telegram:{handle}"].handle, handle)
+            self.assertEqual(engine.accounts[f"telegram:{handle}"].account_id,
+                             str(expected_id))
+
+    async def test_a_resolved_stable_id_upgrades_a_handle_placeholder(self):
+        engine = self.make_engine()
+        await engine._add_account({
+            "platform": "telegram", "handle": "alpha", "account_id": "alpha",
+        })
+        await engine._add_account({
+            "platform": "telegram", "handle": "alpha", "account_id": "101",
+            "display_name": "Alpha",
+        })
+        account = engine.accounts["telegram:alpha"]
+        self.assertEqual(account.account_id, "101")
+        self.assertEqual(account.display_name, "Alpha")
 
     async def test_fetch_telegram_posts_extracts_contract_and_dedupes_read_only(self):
         engine = self.make_engine()
@@ -2192,6 +2212,7 @@ class FakeTelegramClient:
         self.disconnected = False
         self.authorized = True
         self.messages_by_entity = {}
+        self.entities_by_handle = {}
         self.event_handlers = []
 
     def add_event_handler(self, callback, event):
@@ -2205,6 +2226,11 @@ class FakeTelegramClient:
 
     async def is_user_authorized(self):
         return self.authorized
+
+    async def get_entity(self, entity):
+        if entity in self.entities_by_handle:
+            return self.entities_by_handle[entity]
+        raise ValueError(f"unknown public Telegram entity {entity}")
 
     async def disconnect(self):
         self.disconnected = True
@@ -10582,6 +10608,9 @@ class TestEntityVerifierReadsPublishedPages(unittest.TestCase):
     """Filling the registry from memory is the failure the empty file prevents."""
 
     PAGE = """<html><body>
+      <a href="https://x.com/exampleofficial">X</a>
+      <a href="https://x.com/home">X home, not a profile</a>
+      <a href="https://x.com/exampleofficial/status/123">an X post, not a profile</a>
       <a href="https://t.me/example_official">Telegram</a>
       <a href="https://www.youtube.com/channel/UCabcdefghijklmnopqrstuv">YouTube</a>
       <a href="https://bsky.app/profile/example.org">Bluesky</a>
@@ -10591,6 +10620,7 @@ class TestEntityVerifierReadsPublishedPages(unittest.TestCase):
 
     def test_only_profile_links_become_handles(self):
         found = verify_entities.handles_in(self.PAGE)
+        self.assertEqual(found["x"], ["exampleofficial"])
         self.assertEqual(found["telegram"], ["example_official"])
         self.assertEqual(found["youtube"], ["UCabcdefghijklmnopqrstuv"])
         self.assertEqual(found["bluesky"], ["example.org"])
@@ -10608,6 +10638,7 @@ class TestEntityVerifierReadsPublishedPages(unittest.TestCase):
         lines = verify_entities.declaration("example-org", "Example Org", result)
         rendered = "\n".join(lines)
         self.assertIn("# telegram: example_official", rendered)
+        self.assertIn('published_handles: {"telegram": ["example_official"]}', rendered)
         self.assertIn("verified_from: \"https://example.org/\"", rendered)
         self.assertIn("verified_at:", rendered)
         # The emitted accounts block must not carry the handle uncommented.
@@ -10633,6 +10664,51 @@ class TestEntityVerifierReadsPublishedPages(unittest.TestCase):
         self.assertEqual(entities[0].accounts, {})
         self.assertEqual(entities[0].known_wallets, set())
         self.assertEqual(entities[0].official_domains, {"example.org"})
+
+
+class TestEntityStableIdResolver(unittest.IsolatedAsyncioTestCase):
+    async def test_only_platform_resolved_ids_enter_the_authoritative_accounts(self):
+        document = {"entities": [{
+            "entity_id": "example", "display_name": "Example",
+            "accounts": {},
+            "metadata": {"published_handles": {
+                "telegram": ["exampletg"], "github": ["examplegh"],
+                "x": ["examplex"],
+            }},
+        }]}
+
+        async def telegram(handles, session):
+            return {"exampletg": ("101", "OK")}
+
+        def public(platform, handle):
+            if platform == "github":
+                return "202", "OK"
+            return None, "credential unavailable"
+
+        with patch.object(resolve_entity_ids, "resolve_telegram", telegram), \
+             patch.object(resolve_entity_ids, "resolve_public", public):
+            report = await resolve_entity_ids.resolve_document(
+                document, Path("unused"))
+
+        self.assertEqual(document["entities"][0]["accounts"], {
+            "telegram": ["101"], "github": ["202"],
+        })
+        self.assertEqual(report["resolved"], 2)
+        self.assertEqual(report["unresolved"][0]["platform"], "x")
+
+    async def test_a_cross_entity_id_collision_is_never_assigned(self):
+        document = {"entities": [
+            {"entity_id": name, "accounts": {},
+             "metadata": {"published_handles": {"github": [name]}}}
+            for name in ("first", "second")
+        ]}
+        with patch.object(resolve_entity_ids, "resolve_public",
+                          return_value=("same-id", "OK")):
+            report = await resolve_entity_ids.resolve_document(
+                document, Path("unused"))
+        self.assertTrue(report["conflicts"])
+        self.assertEqual(document["entities"][0]["accounts"], {})
+        self.assertEqual(document["entities"][1]["accounts"], {})
 
 
 class TestBlockhashIsNotFetchedOnTheHotPath(unittest.IsolatedAsyncioTestCase):

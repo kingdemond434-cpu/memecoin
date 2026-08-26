@@ -43,12 +43,18 @@ fi
 "$ROOT/.venv/bin/pip" install --quiet -r "$ROOT/requirements.txt"
 
 # The native extension is optional: the Python path is the reference
-# implementation and runs without it. Built when cargo is present, skipped
-# with a note when it is not, because a missing toolchain should not stop a
-# shadow run from accumulating evidence.
-if command -v cargo >/dev/null 2>&1; then
+# implementation and runs without it. rustup installs cargo in ~/.cargo/bin,
+# which a non-interactive SSH/systemd install commonly omits from PATH. The
+# node had a working toolchain but this check declared it absent and silently
+# left the deployment on the Python path, so resolve the standard rustup path
+# explicitly before deciding the extension is unavailable.
+CARGO_BIN="$(command -v cargo 2>/dev/null || true)"
+if [ -z "$CARGO_BIN" ] && [ -x "$HOME/.cargo/bin/cargo" ]; then
+  CARGO_BIN="$HOME/.cargo/bin/cargo"
+fi
+if [ -n "$CARGO_BIN" ]; then
   echo "building the native extension"
-  cargo build --release --manifest-path "$ROOT/native/solana_fastpath/Cargo.toml"
+  "$CARGO_BIN" build --release --manifest-path "$ROOT/native/solana_fastpath/Cargo.toml"
   cp "$ROOT/native/solana_fastpath/target/release/libsolana_fastpath.so" \
      "$ROOT/.venv/lib/python3."*"/site-packages/solana_fastpath.so"
 else
