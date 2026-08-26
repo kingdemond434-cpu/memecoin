@@ -28,6 +28,7 @@ sources:
     kind: code_repo
     tier: 2
     region: global
+    options: {repo: pump-fun/pump-public-docs}
 
   # ---- Telegram: crypto-native, where a CA usually appears first -----------
   - id: telegram:calls-en-1
@@ -78,6 +79,7 @@ sources:
     kind: nostr
     tier: 2
     region: global
+    options: {relay: "wss://relay.damus.io"}
   - id: farcaster:casts
     kind: farcaster
     tier: 2
@@ -87,6 +89,7 @@ sources:
     kind: mastodon
     tier: 3
     region: global
+    options: {instance: "https://mastodon.social"}
 
   # ---- live video and audio: spoken before written ------------------------
   - id: youtube:websub-watchlist

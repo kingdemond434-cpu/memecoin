@@ -132,6 +132,42 @@ curl http://127.0.0.1:18080/status
 journalctl -u memecoin-shadow -f
 ```
 
+## Source mesh: verifying endpoints on the node
+
+`config/sources.yaml` is a SEED. Every declaration in it names a lawful public
+interface, but a declaration that names an endpoint nobody has checked is worse
+than no declaration -- the mesh reports it DEAD, an operator assumes it needs a
+key, and the coverage number stays wrong in the flattering direction.
+
+So endpoints are verified on the node the desk runs on, not in a repository:
+
+```bash
+.venv/bin/python tools/verify_sources.py                          # what answers here
+.venv/bin/python tools/verify_sources.py --out config/sources.verified.yaml
+```
+
+The loader reads `config/sources.yaml,config/sources.verified.yaml` and the
+overlay WINS on any id it names, so the seed stays under version control and
+the verified endpoints stay specific to the host. A sandbox with an egress
+allowlist reports almost everything unreachable, and that verdict is about the
+sandbox rather than the endpoints -- which is exactly why this file is not
+committed from wherever the code happened to be written.
+
+`GET /status` reports the transport layer under `source_mesh.transports`, with
+the three reasons a declaration has no transport kept apart, because they have
+three different owners:
+
+- `pending_endpoint` -- declared coverage, no endpoint chosen yet (research)
+- `unconfigured` -- the credential named in `requires_env` is absent (operator)
+- `unsupported` -- no transport exists for that kind (ours)
+
+Transports that need no credential and work out of the box: RSS/Atom (the whole
+regional long tail), YouTube per-channel feeds, Mastodon public timelines,
+Bluesky Jetstream, Nostr relays, public GitHub repository activity, and official
+page change detection. Telegram uses the operator's own registered API
+credentials against public channels. Twitch, Discord and token metadata are
+push-fed queues: something else in the process produces the records.
+
 ## Data credentials and honest blockers
 
 - `YELLOWSTONE_GRPC_URL` and token: lowest-latency program stream. Without it,

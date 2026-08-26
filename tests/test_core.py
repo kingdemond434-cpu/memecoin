@@ -66,6 +66,12 @@ from src.collectors.adapters import (
 from src.collectors.event_source import (
     Event, EventSource, SourceClass, SourceMesh, SourceState,
 )
+from src.collectors.transports import (
+    BlueskyJetstreamTransport, GithubRepoTransport, JsonPollTransport,
+    MastodonTimelineTransport, NostrRelayTransport, OfficialSiteTransport,
+    QueueTransport, RssTransport, TelegramChannelTransport, TransportError,
+    build_transport, build_transports, parse_timestamp, transport_report,
+)
 from src.strategies.decision_snapshot import (
     DecisionSnapshot, DecisionStatus, StateSequencer, guard as decision_guard,
     state_hash,
@@ -10018,6 +10024,258 @@ class TestDeskMaintainsPoolState(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(live["status"], "OK")
         self.assertEqual(live["pools_executable"], 1)
         self.assertEqual(live["executable_share"], 1.0)
+
+
+class FakeHttpClient:
+    """Canned responses in the shape HttpClient.get returns."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.requests = []
+
+    async def get(self, url, headers=None):
+        self.requests.append((url, dict(headers or {})))
+        if not self.responses:
+            raise TransportError("no more canned responses")
+        item = self.responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+class TestSourceTransports(unittest.IsolatedAsyncioTestCase):
+    """The mesh was an adapter library, not a source of signal.
+
+    source_fetchers was empty, so build_sources ran from nothing and every
+    declaration reported NO_FETCHER -- which reads as an operator task and was
+    actually a missing layer.
+    """
+
+    RSS = """<?xml version="1.0"?><rss version="2.0"><channel>
+      <item><title>First &amp; only</title><description>&lt;b&gt;body&lt;/b&gt;</description>
+        <link>https://example.test/a</link><guid>a</guid>
+        <pubDate>Tue, 10 Jun 2025 09:00:00 GMT</pubDate></item>
+      <item><title>Second</title><description>more</description>
+        <link>https://example.test/b</link><guid>b</guid></item>
+    </channel></rss>"""
+
+    ATOM = """<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">
+      <entry><id>urn:1</id><title>Atom title</title><summary>Atom summary</summary>
+        <link href="https://example.test/atom"/>
+        <published>2025-06-10T09:00:00Z</published></entry>
+    </feed>"""
+
+    def test_rss_parses_both_formats_and_decodes_entities(self):
+        client = FakeHttpClient([(200, self.RSS, {}), (200, self.ATOM, {})])
+        rss = RssTransport("rss:test", "https://example.test/feed", client, language="en")
+        records = asyncio.run(rss.fetch())
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["title"], "First & only")
+        # Tags stripped, not left as markup for the mint extractor to trip on.
+        self.assertEqual(records[0]["summary"], "body")
+        self.assertEqual(records[0]["language"], "en")
+        self.assertAlmostEqual(records[0]["published_epoch"], 1749546000.0, places=0)
+
+        atom = RssTransport("rss:atom", "https://example.test/atom", client)
+        entries = asyncio.run(atom.fetch())
+        self.assertEqual(entries[0]["title"], "Atom title")
+        self.assertEqual(entries[0]["link"], "https://example.test/atom")
+
+    def test_a_feed_that_reserves_the_same_items_emits_them_once(self):
+        """Without this, every poll re-emits the page and one story is fifty."""
+        client = FakeHttpClient([(200, self.RSS, {}), (200, self.RSS, {})])
+        rss = RssTransport("rss:test", "https://example.test/feed", client)
+        self.assertEqual(len(asyncio.run(rss.fetch())), 2)
+        self.assertEqual(len(asyncio.run(rss.fetch())), 0)
+
+    def test_conditional_get_is_sent_and_a_304_is_not_a_failure(self):
+        client = FakeHttpClient([
+            (200, self.RSS, {"ETag": "abc", "Last-Modified": "Tue, 10 Jun 2025 09:00:00 GMT"}),
+            (304, "", {})])
+        rss = RssTransport("rss:test", "https://example.test/feed", client)
+        asyncio.run(rss.fetch())
+        self.assertEqual(asyncio.run(rss.fetch()), [])
+        self.assertEqual(client.requests[1][1]["If-None-Match"], "abc")
+        self.assertIn("If-Modified-Since", client.requests[1][1])
+
+    def test_an_error_status_raises_rather_than_returning_empty(self):
+        """A silent empty batch turns a dead feed into a quiet one."""
+        rss = RssTransport("rss:test", "https://example.test/feed",
+                           FakeHttpClient([(503, "", {})]))
+        with self.assertRaises(TransportError):
+            asyncio.run(rss())
+        self.assertEqual(rss.failures, 1)
+
+    def test_rate_limiting_is_named_as_such(self):
+        rss = RssTransport("rss:test", "https://example.test/feed",
+                           FakeHttpClient([(429, "", {})]))
+        with self.assertRaises(TransportError) as raised:
+            asyncio.run(rss.fetch())
+        self.assertIn("rate limited", str(raised.exception))
+
+    def test_a_missing_publication_time_is_not_backfilled_with_now(self):
+        """A stale item stamped 'now' manufactures lead time we did not have."""
+        client = FakeHttpClient([(200, self.RSS, {})])
+        records = asyncio.run(
+            RssTransport("rss:test", "https://example.test/feed", client).fetch())
+        self.assertIsNone(records[1]["published_epoch"])
+
+    def test_timestamps_parse_from_every_shape_feeds_actually_use(self):
+        self.assertAlmostEqual(parse_timestamp(1749546000), 1749546000.0)
+        self.assertAlmostEqual(parse_timestamp(1749546000000), 1749546000.0)
+        self.assertAlmostEqual(parse_timestamp(1749546000000000), 1749546000.0)
+        self.assertAlmostEqual(parse_timestamp("2025-06-10T09:00:00Z"), 1749546000.0, places=0)
+        self.assertAlmostEqual(
+            parse_timestamp("Tue, 10 Jun 2025 09:00:00 GMT"), 1749546000.0, places=0)
+        self.assertIsNone(parse_timestamp("not a date"))
+        self.assertIsNone(parse_timestamp(None))
+
+    def test_the_mastodon_timeline_advances_its_cursor(self):
+        page = json.dumps([
+            {"id": "12", "content": "<p>hello</p>", "created_at": "2025-06-10T09:00:00Z",
+             "account": {"acct": "someone"}, "language": "en"}])
+        client = FakeHttpClient([(200, page, {}), (200, "[]", {})])
+        transport = MastodonTimelineTransport("m", "https://example.test", client)
+        records = asyncio.run(transport.fetch())
+        self.assertEqual(records[0]["content"], "hello")
+        self.assertEqual(records[0]["account"]["acct"], "someone")
+        asyncio.run(transport.fetch())
+        self.assertIn("since_id=12", client.requests[1][0])
+
+    def test_official_site_emits_only_on_change_and_never_on_first_read(self):
+        client = FakeHttpClient([(200, "<p>one</p>", {}), (200, "<p>one</p>", {}),
+                                 (200, "<p>two</p>", {})])
+        site = OfficialSiteTransport("o", "https://example.test/page", client)
+        self.assertEqual(asyncio.run(site.fetch()), [])
+        self.assertEqual(asyncio.run(site.fetch()), [])
+        changed = asyncio.run(site.fetch())
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(changed[0]["changed_text"], "two")
+
+    def test_github_commits_become_code_records(self):
+        payload = json.dumps([
+            {"sha": "deadbeef",
+             "commit": {"message": "add mint", "author": {"name": "dev", "date": "2025-06-10T09:00:00Z"}}}])
+        client = FakeHttpClient([(200, payload, {}), (200, payload, {})])
+        transport = GithubRepoTransport("c", "owner/repo", client)
+        records = asyncio.run(transport.fetch())
+        self.assertEqual(records[0]["sha"], "deadbeef")
+        self.assertEqual(records[0]["repo"], "owner/repo")
+        # And the same commit is not reported twice.
+        self.assertEqual(asyncio.run(transport.fetch()), [])
+
+    def test_a_non_json_body_is_a_transport_error_not_a_crash(self):
+        transport = JsonPollTransport("j", "https://example.test/api",
+                                      FakeHttpClient([(200, "<html>", {})]))
+        with self.assertRaises(TransportError):
+            asyncio.run(transport.fetch())
+
+    def test_the_queue_transport_drops_the_oldest_under_pressure(self):
+        queue = QueueTransport("q", capacity=3)
+        for index in range(5):
+            queue.push({"n": index})
+        drained = asyncio.run(queue.fetch())
+        self.assertEqual([record["n"] for record in drained], [2, 3, 4])
+        self.assertEqual(queue.report()["dropped"], 2)
+
+    def test_the_jetstream_transport_ignores_frames_with_no_text(self):
+        transport = BlueskyJetstreamTransport("b")
+        self.assertIsNone(transport.on_message({"commit": {"operation": "delete"}}))
+        self.assertIsNone(transport.on_message({"commit": {"record": {}}}))
+        kept = transport.on_message(
+            {"did": "did:plc:x", "commit": {"operation": "create",
+                                            "record": {"text": "gm"}}})
+        self.assertIsNotNone(kept)
+
+    def test_the_nostr_subscription_names_its_authors_when_it_has_them(self):
+        transport = NostrRelayTransport("n", "wss://relay.test", authors=("abc",))
+        frame = json.loads(transport.on_open()[0])
+        self.assertEqual(frame[0], "REQ")
+        self.assertEqual(frame[2]["authors"], ["abc"])
+        self.assertEqual(frame[2]["kinds"], [1])
+        # Relay frames are arrays; anything else is not an event.
+        self.assertIsNone(transport.on_message({"content": "x"}))
+        self.assertEqual(
+            transport.on_message(["EVENT", "sub", {"content": "gm"}])["content"], "gm")
+
+    def test_telegram_names_the_variables_it_needs_and_never_reads_a_value(self):
+        transport = TelegramChannelTransport("t", "somechannel",
+                                             api_id_env="NOT_SET_API_ID",
+                                             api_hash_env="NOT_SET_API_HASH")
+        with self.assertRaises(TransportError) as raised:
+            asyncio.run(transport.start())
+        message = str(raised.exception)
+        self.assertIn("NOT_SET_API_ID", message)
+        self.assertIn("NOT_SET_API_HASH", message)
+
+
+class TestTransportsAreBuiltFromDeclarations(unittest.TestCase):
+    """A declaration with no transport is a coverage hole with a name."""
+
+    def _declaration(self, **overrides):
+        args = dict(source_id="s", kind="rss", options={"url": "https://example.test/f"})
+        args.update(overrides)
+        return SourceDeclaration(**args)
+
+    def test_every_supported_kind_builds(self):
+        client = FakeHttpClient([])
+        kinds = {
+            "rss": {"url": "https://example.test/f"},
+            "official_site": {"url": "https://example.test/p"},
+            "mastodon": {"instance": "https://example.test"},
+            "code_repo": {"repo": "o/r"},
+            "youtube": {"channel_id": "UC123"},
+            "bluesky": {},
+            "nostr": {"relay": "wss://relay.test"},
+            "farcaster": {"hub_url": "https://hub.test/v1/casts"},
+            "telegram": {"channel": "chan"},
+            "metadata": {}, "twitch": {}, "discord": {},
+        }
+        for kind, options in kinds.items():
+            transport = build_transport(
+                self._declaration(source_id=kind, kind=kind, options=options), client)
+            self.assertIsNotNone(transport, kind)
+
+    def test_a_missing_option_is_reported_by_name_not_raised_as_a_type_error(self):
+        with self.assertRaises(TransportError) as raised:
+            build_transport(self._declaration(options={}), FakeHttpClient([]))
+        self.assertIn("url", str(raised.exception))
+
+    def test_the_three_reasons_a_source_has_no_transport_are_kept_apart(self):
+        """Three different problems with three different owners."""
+        declarations = [
+            self._declaration(source_id="ready"),
+            self._declaration(source_id="pending", options={}),
+            self._declaration(source_id="keyless", requires_env=("NOT_SET_ANYWHERE",)),
+            self._declaration(source_id="odd", kind="carrier_pigeon", options={}),
+        ]
+        transports, report, _client = build_transports(declarations, FakeHttpClient([]))
+        self.assertEqual(sorted(transports), ["ready"])
+        self.assertEqual([source for source, _ in report.pending_endpoint], ["pending"])
+        self.assertEqual([source for source, _ in report.unconfigured], ["keyless"])
+        self.assertEqual([source for source, _ in report.unsupported], ["odd"])
+        self.assertEqual(len(report.unbuilt), 3)
+
+    def test_the_shipped_registry_builds_the_transports_it_declares(self):
+        """The seed is a seed, and the report says exactly which part is which."""
+        declarations = load_declarations("config/sources.yaml")
+        self.assertGreater(len(declarations), 20)
+        transports, report, _client = build_transports(declarations, FakeHttpClient([]))
+        self.assertGreater(report.built, 0)
+        self.assertEqual(report.declared, len(declarations))
+        # Nothing declared is unsupported: every kind in the registry has a
+        # transport, and what is left is endpoints and credentials.
+        self.assertEqual(report.unsupported, [])
+        self.assertEqual(report.built + len(report.unbuilt), report.declared)
+
+    def test_the_report_names_a_wired_source_that_has_never_answered(self):
+        transport = QueueTransport("q")
+        report = transport_report({"q": transport})
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertEqual(report["transports"], 1)
+        transport.push({"any": "thing"})
+        asyncio.run(transport())
+        self.assertEqual(transport_report({"q": transport})["status"], "OK")
 
 class TestPumpSwapConstruction(unittest.TestCase):
     """The last DATA_BLOCKED that was never about missing information.

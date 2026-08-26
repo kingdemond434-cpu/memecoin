@@ -30,6 +30,7 @@ import argparse
 import json
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Tuple
 
@@ -112,12 +113,38 @@ def probe(url: str) -> Tuple[bool, str]:
         return False, f"{type(exc).__name__}: {exc}"
 
 
+def declaration_options(kind: str, url: str) -> str:
+    """The options THIS kind's transport actually requires.
+
+    Emitting `url` for every kind produced declarations the transport builder
+    rejects by name -- a mastodon source needs an instance, a code repo needs
+    a repo. A verified endpoint that then fails to build is the same coverage
+    hole as an unverified one, arrived at more slowly.
+    """
+    if kind == "mastodon":
+        parsed = urllib.parse.urlparse(url)
+        return f'{{instance: "{parsed.scheme}://{parsed.netloc}"}}'
+    if kind == "nostr":
+        return f'{{relay: "{url}"}}'
+    if kind == "farcaster":
+        return f'{{hub_url: "{url}"}}'
+    if kind == "bluesky":
+        return f'{{url: "{url}"}}'
+    return f'{{url: "{url}"}}'
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--emit", action="store_true",
                         help="print sources.yaml declarations for verified endpoints")
+    parser.add_argument("--out", default="",
+                        help="write the emitted declarations to this file "
+                             "(use config/sources.verified.yaml, which the loader "
+                             "merges over the seed registry)")
     args = parser.parse_args()
+    if args.out:
+        args.emit = True
     results: List[Dict[str, Any]] = []
     for source_id, kind, language, region, url in CANDIDATES:
         ok, detail = probe(url)
@@ -130,19 +157,29 @@ def main() -> int:
     if args.json:
         print(json.dumps(results, indent=2))
     elif args.emit:
-        # Emitted rather than written: appending to the registry is the
-        # operator's decision, made after reading what actually answered on
-        # their node.
-        print("# Verified on this host at "
-              f"{__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()}")
-        print("sources:")
+        # Emitted rather than merged into the seed: what belongs in the
+        # registry is the operator's decision, made after reading what
+        # actually answered on their node.
+        import datetime
+
+        lines = ["# Verified on this host at "
+                 f"{datetime.datetime.now(datetime.timezone.utc).isoformat()}",
+                 "# Only endpoints that answered here. Re-run to refresh.",
+                 "schema_version: v1", "sources:"]
         for item in verified:
-            print(f"  - id: {item['id']}")
-            print(f"    kind: {item['kind']}")
-            print(f"    language: {item['language']}")
-            print(f"    region: {item['region']}")
-            print("    tier: 2")
-            print(f"    options: {{url: \"{item['url']}\"}}")
+            lines.append(f"  - id: {item['id']}")
+            lines.append(f"    kind: {item['kind']}")
+            lines.append(f"    language: {item['language']}")
+            lines.append(f"    region: {item['region']}")
+            lines.append("    tier: 2")
+            lines.append(f"    options: {declaration_options(item['kind'], item['url'])}")
+        rendered = "\n".join(lines) + "\n"
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as handle:
+                handle.write(rendered)
+            print(f"wrote {len(verified)} verified declarations to {args.out}")
+        else:
+            print(rendered, end="")
     else:
         print(f"\n{len(verified)}/{len(results)} endpoints answered")
         if len(verified) < len(results):

@@ -55,6 +55,9 @@ from src.strategies.action_value import (
 )
 from src.collectors.event_source import Event, SourceMesh
 from src.collectors.registry import build_sources, load_declarations
+from src.collectors.transports import (
+    HttpClient, build_transports, start_transports, stop_transports, transport_report,
+)
 from src.strategies.decision_snapshot import (
     DecisionSnapshot, StateSequencer, guard as decision_guard, state_hash,
 )
@@ -509,17 +512,30 @@ class MemecoinQuantDesk:
             min_hazard_improvement=float(
                 self.global_config.get("reentry_min_hazard_improvement", 0.25)),
         ), action_policy=self.action_policy)
-        # Production transport per source. Empty until an operator supplies
-        # connections; the registry then reports every declaration NO_FETCHER,
-        # which is the honest reading -- a declared source with no transport
-        # is a coverage hole, not a working source.
-        self.source_fetchers: Dict[str, Any] = getattr(self, "source_fetchers", {})
         # The mesh is constructed from the declared universe. Sources without
         # a production fetcher are reported NO_FETCHER by the registry rather
         # than silently absent -- "we have adapters" is not "those signals
         # reach T0 decisions", and the registry report is what says which.
         declarations = load_declarations(
-            self.global_config.get("source_registry", "config/sources.yaml"))
+            # Seed first, then the operator's verified overlay -- which
+            # tools/verify_sources.py writes and which wins on any id it
+            # names. Endpoints that answered on the trading node beat
+            # endpoints that looked plausible in a repository.
+            self.global_config.get(
+                "source_registry",
+                "config/sources.yaml,config/sources.verified.yaml"))
+        # Real transports, built from the declarations themselves. This map was
+        # empty, so build_sources ran from nothing and reported every source
+        # NO_FETCHER -- an adapter library rather than a source of signal.
+        # Anything an operator injected before construction is kept and wins,
+        # so a bespoke connection is still theirs to supply.
+        self.http_client = HttpClient(
+            timeout_s=float(self.global_config.get("source_http_timeout", 10.0)))
+        built, self.transport_report, self.http_client = build_transports(
+            declarations, self.http_client)
+        injected = dict(getattr(self, "source_fetchers", {}) or {})
+        self.transports: Dict[str, Any] = {**built, **injected}
+        self.source_fetchers: Dict[str, Any] = dict(self.transports)
         sources, self.source_registry_report = build_sources(
             declarations, self.source_fetchers)
         self.source_mesh = SourceMesh(
@@ -693,6 +709,10 @@ class MemecoinQuantDesk:
             await self.source_mesh.stop()
         except Exception as exc:  # pragma: no cover - shutdown only
             logger.warning("source mesh shutdown: %s", exc)
+        try:
+            await stop_transports(self.transports, self.http_client)
+        except Exception as exc:  # pragma: no cover - shutdown only
+            logger.warning("transport shutdown: %s", exc)
         for task in list(self._background_tasks):
             task.cancel()
         if self._background_tasks:
@@ -2270,8 +2290,18 @@ class MemecoinQuantDesk:
         without waiting for the slowest feed in the forest to finish its
         request.
         """
+        # Connections first. A relay or a Telegram client that has not
+        # connected answers its first poll with a failure, and the mesh would
+        # count that against the source rather than against the connection.
+        failures = await start_transports(self.transports)
+        if failures:
+            logger.warning("TRANSPORTS %d of %d failed to start: %s",
+                           len(failures), len(self.transports),
+                           ", ".join(sorted(failures)))
+        self.transport_start_failures = failures
         started = await self.source_mesh.start()
-        logger.info("SOURCE_MESH started %d producers", started)
+        logger.info("SOURCE_MESH started %d producers (%d transports, %d connected)",
+                    started, len(self.transports), len(self.transports) - len(failures))
         while self._running:
             try:
                 event = await self.source_mesh.next_event()
@@ -3206,7 +3236,16 @@ class MemecoinQuantDesk:
             "action_policy": {"trained": self.action_policy.is_trained,
                               "min_edge": self.action_policy.min_edge},
             "source_mesh": {**self.source_mesh.health(),
-                            "registry": self.source_registry_report.to_dict()},
+                            "registry": self.source_registry_report.to_dict(),
+                            # What is wired, what answered, and what could not
+                            # be built and why. A declaration with no transport
+                            # is a coverage hole; one with a transport that has
+                            # never returned a record is a different hole, and
+                            # the two need telling apart.
+                            "transports": {**self.transport_report.to_dict(),
+                                           **transport_report(self.transports)},
+                            "transport_start_failures": dict(
+                                getattr(self, "transport_start_failures", {}))},
             "actor_graph": {"independence_status": self.independence_report.status,
                             "measured_pairs": self.independence_report.observed_pairs,
                             "scored_wallets": len(self.independence_report.scores)},

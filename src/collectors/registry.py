@@ -125,9 +125,28 @@ class RegistryReport:
 def load_declarations(path: str) -> List[SourceDeclaration]:
     """Parse the source universe from YAML.
 
+    ``path`` may name several files, comma separated. Later files OVERRIDE
+    earlier ones by source_id, which is what lets an operator keep the seed
+    registry under version control and layer a machine-verified overlay --
+    `tools/verify_sources.py --out config/sources.verified.yaml` -- on top of
+    it without editing the seed. A file that does not exist is skipped
+    silently only when it is one of several: a single missing registry is an
+    error worth reporting.
+
     A malformed entry is skipped with its id reported rather than raising:
     one bad line in a 400-source file must not take the whole mesh offline.
     """
+    paths = [item.strip() for item in str(path).split(",") if item.strip()]
+    if len(paths) > 1:
+        merged: Dict[str, SourceDeclaration] = {}
+        for one in paths:
+            if not os.path.exists(one):
+                logger.info("source registry overlay %s absent; skipping", one)
+                continue
+            for declaration in load_declarations(one):
+                merged[declaration.source_id] = declaration
+        return list(merged.values())
+
     try:
         with open(path, encoding="utf-8") as handle:
             raw = yaml.safe_load(handle) or {}
