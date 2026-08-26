@@ -1,0 +1,42 @@
+[
+  {
+    "slug": "speedway-shakedown",
+    "name": "Speedway Shakedown",
+    "giver": "raul-bautista",
+    "region": "Port Gellhorn",
+    "location": "port-gellhorn-speedway",
+    "vehicles": [
+      "declasse-impaler-sz"
+    ],
+    "rewards": "Cash + Impaler SZ unlock (speculated)",
+    "status": "speculated",
+    "source": "Fan speculation",
+    "summary": "Speculative early-game job: win a demolition night at the Port Gellhorn oval to prove yourself to Raul's crew."
+  },
+  {
+    "slug": "keys-run",
+    "name": "Keys Run",
+    "giver": "brian-heder",
+    "region": "Leonida Keys",
+    "location": "keys-marina",
+    "vehicles": [
+      "shitzu-longfin"
+    ],
+    "rewards": "Cash + Longfin access (speculated)",
+    "status": "speculated",
+    "source": "Fan speculation",
+    "summary": "Speculative smuggling mission: move Brian Heder's product up the causeway before the Coast Guard closes the gap."
+  },
+  {
+    "slug": "grand-opening",
+    "name": "Grand Opening",
+    "giver": "boobie-ike",
+    "region": "Vice City",
+    "location": "ocean-drive-strip",
+    "vehicles": [],
+    "rewards": "Reputation (speculated)",
+    "status": "speculated",
+    "source": "Fan speculation",
+    "summary": "Speculative intro to Boobie Ike's empire: security detail for a chaotic club launch on the strip."
+  }
+]

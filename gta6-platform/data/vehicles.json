@@ -1,0 +1,198 @@
+[
+  {
+    "slug": "bravado-banshee-gts",
+    "name": "Bravado Banshee GTS",
+    "manufacturer": "Bravado",
+    "class": "Sports",
+    "seats": 2,
+    "stats": {
+      "top_speed_mph": 128,
+      "acceleration": 8.6,
+      "handling": 8.2,
+      "braking": 7.4
+    },
+    "price_estimate_usd": 126000,
+    "acquisition": "Purchase (dealership, expected)",
+    "status": "confirmed",
+    "source": "Trailer 1 analysis",
+    "location": "ocean-drive-strip",
+    "missions": [],
+    "discovered_at": "2023-12-05",
+    "summary": "The returning Banshee, seen open-top on Ocean Drive in the first trailer. Classic front-engine roadster lines with a modern widebody stance.",
+    "overall": 8.32,
+    "rank_overall": 2,
+    "rank_in_class": 1
+  },
+  {
+    "slug": "declasse-impaler-sz",
+    "name": "Declasse Impaler SZ",
+    "manufacturer": "Declasse",
+    "class": "Muscle",
+    "seats": 2,
+    "stats": {
+      "top_speed_mph": 122,
+      "acceleration": 8.9,
+      "handling": 6.4,
+      "braking": 6.0
+    },
+    "price_estimate_usd": 74000,
+    "acquisition": "Street find / purchase (expected)",
+    "status": "confirmed",
+    "source": "Trailer 2 analysis",
+    "location": "port-gellhorn-speedway",
+    "missions": [
+      "speedway-shakedown"
+    ],
+    "discovered_at": "2025-05-06",
+    "summary": "A boxy late-90s muscle coupe spotted sliding the Port Gellhorn dirt oval. Big torque, loose rear end.",
+    "overall": 7.7,
+    "rank_overall": 3,
+    "rank_in_class": 1
+  },
+  {
+    "slug": "vapid-sandking-swb",
+    "name": "Vapid Sandking SWB",
+    "manufacturer": "Vapid",
+    "class": "Off-road",
+    "seats": 4,
+    "stats": {
+      "top_speed_mph": 104,
+      "acceleration": 6.8,
+      "handling": 6.9,
+      "braking": 6.2
+    },
+    "price_estimate_usd": 58000,
+    "acquisition": "Street find (rural Leonida, expected)",
+    "status": "confirmed",
+    "source": "Trailer 2 analysis",
+    "location": "kelly-county-airstrip",
+    "missions": [],
+    "discovered_at": "2025-05-06",
+    "summary": "Lifted short-wheelbase pickup built for mudding through Ambrosia's sugarcane tracks.",
+    "overall": 6.78,
+    "rank_overall": 6,
+    "rank_in_class": 1
+  },
+  {
+    "slug": "shitzu-longfin",
+    "name": "Shitzu Longfin",
+    "manufacturer": "Shitzu",
+    "class": "Boats",
+    "seats": 4,
+    "stats": {
+      "top_speed_mph": 86,
+      "acceleration": 7.8,
+      "handling": 7.0,
+      "braking": 4.5
+    },
+    "price_estimate_usd": 235000,
+    "acquisition": "Marina purchase (expected)",
+    "status": "confirmed",
+    "source": "Trailer 2 analysis",
+    "location": "keys-marina",
+    "missions": [
+      "keys-run"
+    ],
+    "discovered_at": "2025-05-06",
+    "summary": "Cigarette boat in the classic smuggler mold, seen carving through the Keys at full send.",
+    "overall": 6.42,
+    "rank_overall": 7,
+    "rank_in_class": 1
+  },
+  {
+    "slug": "airboat-swampmaster",
+    "name": "Swampmaster Airboat",
+    "manufacturer": "Nagasaki",
+    "class": "Boats",
+    "seats": 4,
+    "stats": {
+      "top_speed_mph": 62,
+      "acceleration": 6.0,
+      "handling": 5.5,
+      "braking": 3.8
+    },
+    "price_estimate_usd": 41000,
+    "acquisition": "Spawn at Grassrivers docks (expected)",
+    "status": "confirmed",
+    "source": "Trailer 2 analysis",
+    "location": "grassrivers-airboat-dock",
+    "missions": [],
+    "discovered_at": "2025-05-06",
+    "summary": "Flat-bottom airboat for the Grassrivers wetlands — the only sane way across the sawgrass.",
+    "overall": 4.92,
+    "rank_overall": 8,
+    "rank_in_class": 2
+  },
+  {
+    "slug": "grotti-turismo-classic",
+    "name": "Grotti Turismo Classic",
+    "manufacturer": "Grotti",
+    "class": "Sports Classics",
+    "seats": 2,
+    "stats": {
+      "top_speed_mph": 118,
+      "acceleration": 7.9,
+      "handling": 7.6,
+      "braking": 6.8
+    },
+    "price_estimate_usd": 480000,
+    "acquisition": "Collector purchase (speculated)",
+    "status": "speculated",
+    "source": "Fan speculation",
+    "location": "little-cuba",
+    "missions": [],
+    "discovered_at": "2026-01-15",
+    "summary": "An 80s wedge supercar that would be right at home outside a Little Cuba cafecito window. Speculative entry pending confirmation.",
+    "overall": 7.66,
+    "rank_overall": 4,
+    "rank_in_class": 1
+  },
+  {
+    "slug": "western-daemon-vi",
+    "name": "Western Daemon",
+    "manufacturer": "Western",
+    "class": "Motorcycles",
+    "seats": 2,
+    "stats": {
+      "top_speed_mph": 110,
+      "acceleration": 8.4,
+      "handling": 6.6,
+      "braking": 5.9
+    },
+    "price_estimate_usd": 32000,
+    "acquisition": "Street find (expected)",
+    "status": "rumored",
+    "source": "Leak compilation, unverified",
+    "location": "ocean-drive-strip",
+    "missions": [],
+    "discovered_at": "2025-09-20",
+    "summary": "Classic chopper silhouette reported in background footage. Rumored until a clean frame confirms it.",
+    "overall": 7.29,
+    "rank_overall": 5,
+    "rank_in_class": 1
+  },
+  {
+    "slug": "ocelot-jastic",
+    "name": "Ocelot Jastic",
+    "manufacturer": "Ocelot",
+    "class": "Super",
+    "seats": 2,
+    "stats": {
+      "top_speed_mph": 136,
+      "acceleration": 9.2,
+      "handling": 8.8,
+      "braking": 8.1
+    },
+    "price_estimate_usd": 1450000,
+    "acquisition": "Luxury dealership (expected)",
+    "status": "rumored",
+    "source": "Frame analysis, promo still batch #7",
+    "location": "vice-city-valet-plaza",
+    "missions": [],
+    "discovered_at": "2026-08-26",
+    "summary": "A sleek mid-engine flagship glimpsed outside a Vice City valet stand. Sharpest acceleration figures of anything spotted so far.",
+    "overall": 8.91,
+    "rank_overall": 1,
+    "rank_in_class": 1
+  }
+]

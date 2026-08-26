@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Map — VI Central</title>
+<meta name="description" content="Database, interactive map, tracker, news and alerts for Grand Theft Auto VI — every page generated and cross-linked automatically by the pipeline.">
+<link rel="stylesheet" href="assets/style.css">
+<link rel="alternate" type="application/rss+xml" title="VI Central feed" href="feed.xml">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">VI Central<span class="brand-vi">VI</span></a>
+  <nav><a href="index.html">Home</a><a href="vehicles.html">Vehicles</a><a href="map.html" class="active">Map</a><a href="missions.html">Missions</a><a href="weapons.html">Weapons</a><a href="characters.html">Characters</a><a href="tracker.html">Tracker</a><a href="search.html">Search</a><a href="subscribe.html">Subscribe</a></nav>
+</header>
+<main>
+
+<h1>Interactive map of Leonida</h1>
+<p class="muted">Drag to pan, scroll to zoom, click a pin for details. Check off collected pins — progress is saved in your browser and counts toward your <a href="tracker.html">tracker</a>. Stylized fan map, not game cartography.</p>
+<div class="legend"><label class="legend-item"><input type="checkbox" data-category="poi" checked><span class="legend-dot" style="background:#f5a623"></span>poi</label><label class="legend-item"><input type="checkbox" data-category="vehicle_spawn" checked><span class="legend-dot" style="background:#38d39f"></span>vehicle spawn</label><label class="legend-item"><input type="checkbox" data-category="collectible" checked><span class="legend-dot" style="background:#c77dff"></span>collectible</label><label class="legend-item"><input type="checkbox" data-category="activity" checked><span class="legend-dot" style="background:#4cc9f0"></span>activity</label><label class="legend-item"><input type="checkbox" data-category="mission" checked><span class="legend-dot" style="background:#ff5d8f"></span>mission</label><label class="legend-item"><input type="checkbox" data-category="shop" checked><span class="legend-dot" style="background:#ffd166"></span>shop</label></div>
+<div class="map-frame" id="map-frame">
+<svg id="leonida-map" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1000" preserveAspectRatio="xMidYMid meet">
+  <defs>
+    <radialGradient id="sea" cx="50%" cy="45%" r="75%">
+      <stop offset="0%" stop-color="#0b3550"/>
+      <stop offset="100%" stop-color="#061e30"/>
+    </radialGradient>
+    <linearGradient id="land" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1d4d3b"/>
+      <stop offset="55%" stop-color="#28584a"/>
+      <stop offset="100%" stop-color="#2e5f4d"/>
+    </linearGradient>
+  </defs>
+  <rect width="1000" height="1000" fill="url(#sea)"/>
+  <!-- mainland peninsula -->
+  <path fill="url(#land)" stroke="#0e2c22" stroke-width="4" d="
+    M 180 40 L 560 30 L 600 90 L 640 200 L 700 320 L 730 420
+    L 720 520 L 680 600 L 620 660 L 560 720 L 500 760
+    L 440 740 L 380 680 L 340 600 L 300 500 L 260 380
+    L 220 260 L 180 150 Z"/>
+  <!-- keys island chain -->
+  <g fill="#2e5f4d" stroke="#0e2c22" stroke-width="3">
+    <ellipse cx="500" cy="800" rx="34" ry="13" transform="rotate(18 500 800)"/>
+    <ellipse cx="555" cy="838" rx="30" ry="11" transform="rotate(22 555 838)"/>
+    <ellipse cx="608" cy="872" rx="26" ry="10" transform="rotate(24 608 872)"/>
+    <ellipse cx="655" cy="905" rx="22" ry="9" transform="rotate(26 655 905)"/>
+  </g>
+  <!-- causeway -->
+  <path fill="none" stroke="#d8c690" stroke-width="4" stroke-dasharray="10 6"
+        d="M 495 762 L 505 798 L 558 836 L 610 870 L 656 903"/>
+  <!-- wetlands -->
+  <path fill="#245245" opacity="0.85" d="
+    M 420 600 Q 470 570 530 610 Q 560 660 520 700 Q 470 730 430 700 Q 400 650 420 600 Z"/>
+  <!-- barrier island / vice beach -->
+  <path fill="#3a6b57" stroke="#0e2c22" stroke-width="3" d="
+    M 690 380 L 706 430 L 704 520 L 688 590 L 672 560 L 678 460 L 676 400 Z"/>
+  <!-- highways -->
+  <g fill="none" stroke="#c9b46a" stroke-width="3" opacity="0.9">
+    <path d="M 250 120 L 300 260 L 360 420 L 430 560 L 500 700 L 500 758"/>
+    <path d="M 300 260 L 420 300 L 560 340 L 640 430 L 650 540"/>
+    <path d="M 640 430 L 620 520 L 590 610"/>
+  </g>
+  <!-- lakes -->
+  <ellipse cx="380" cy="450" rx="36" ry="24" fill="#0b3550"/>
+  <ellipse cx="470" cy="240" rx="22" ry="15" fill="#0b3550"/>
+  <g font-family="'Arial Black', Arial, sans-serif" font-size="22" fill="#e8ddb5"
+     opacity="0.85" text-anchor="middle" letter-spacing="3">
+    <text class="region-label" x="640" y="520">VICE CITY</text>
+    <text class="region-label" x="560" y="890">LEONIDA KEYS</text>
+    <text class="region-label" x="470" y="700">GRASSRIVERS</text>
+    <text class="region-label" x="300" y="220">PORT GELLHORN</text>
+    <text class="region-label" x="400" y="330">AMBROSIA</text>
+    <text class="region-label" x="430" y="120">MT. KALAGA</text>
+  </g>
+  <g id="pins"></g>
+</svg>
+</div>
+<aside id="pin-panel" class="pin-panel" hidden></aside>
+
+</main>
+<footer>
+  <p>VI Central is an unofficial fan project. Not affiliated with or endorsed by Rockstar Games or Take-Two Interactive. All entries marked 'speculated' are fan speculation, not confirmed game content.</p>
+  <p>Generated automatically by the VI Central pipeline · <a href="about.html">How it works</a> · <a href="feed.xml">RSS</a></p>
+</footer>
+<script type="application/json" id="map-data">{"pins": [{"slug": "ocean-drive-strip", "name": "Ocean Drive Strip", "category": "poi", "region": "Vice City", "x": 640, "y": 470, "status": "confirmed", "summary": "The neon heart of Vice City. Art-deco hotels, nightlife, and the busiest cruising strip in Leonida.", "vehicles": [{"slug": "bravado-banshee-gts", "name": "Bravado Banshee GTS"}, {"slug": "western-daemon-vi", "name": "Western Daemon"}], "missions": [{"slug": "grand-opening", "name": "Grand Opening"}]}, {"slug": "vice-beach", "name": "Vice Beach", "category": "poi", "region": "Vice City", "x": 675, "y": 455, "status": "confirmed", "summary": "Packed sands, muscle beach equipment, and airliners on final approach overhead.", "vehicles": [], "missions": []}, {"slug": "port-gellhorn-speedway", "name": "Port Gellhorn Speedway", "category": "activity", "region": "Port Gellhorn", "x": 305, "y": 245, "status": "confirmed", "summary": "A run-down oval speedway on the gulf side — dirt-track racing and demolition events.", "vehicles": [{"slug": "declasse-impaler-sz", "name": "Declasse Impaler SZ"}], "missions": [{"slug": "speedway-shakedown", "name": "Speedway Shakedown"}]}, {"slug": "kelly-county-airstrip", "name": "Kelly County Airstrip", "category": "vehicle_spawn", "region": "Ambrosia", "x": 390, "y": 300, "status": "rumored", "summary": "A cracked crop-duster strip in sugarcane country. Rumored spawn for utility aircraft and smuggling runs.", "vehicles": [{"slug": "vapid-sandking-swb", "name": "Vapid Sandking SWB"}], "missions": []}, {"slug": "mount-kalaga-overlook", "name": "Mount Kalaga Overlook", "category": "collectible", "region": "Mount Kalaga National Park", "x": 430, "y": 150, "status": "speculated", "summary": "A scenic overlook deep in the national park. Prime candidate for a photo-spot collectible chain.", "vehicles": [], "missions": []}, {"slug": "keys-marina", "name": "Leonida Keys Marina", "category": "vehicle_spawn", "region": "Leonida Keys", "x": 555, "y": 840, "status": "confirmed", "summary": "Sport-fishing charters and cigarette boats moored along the old highway causeway.", "vehicles": [{"slug": "shitzu-longfin", "name": "Shitzu Longfin"}], "missions": [{"slug": "keys-run", "name": "Keys Run"}]}, {"slug": "little-cuba", "name": "Little Cuba", "category": "poi", "region": "Vice City", "x": 585, "y": 505, "status": "rumored", "summary": "Cafecito windows, domino tables, and low-slung classics on gold wire wheels.", "vehicles": [{"slug": "grotti-turismo-classic", "name": "Grotti Turismo Classic"}], "missions": []}, {"slug": "grassrivers-airboat-dock", "name": "Grassrivers Airboat Dock", "category": "vehicle_spawn", "region": "Grassrivers", "x": 480, "y": 660, "status": "confirmed", "summary": "Swamp-tour airboats and half-sunk hulls at the edge of the wetlands.", "vehicles": [{"slug": "airboat-swampmaster", "name": "Swampmaster Airboat"}], "missions": []}, {"slug": "hidden-mural-port-gellhorn-pier", "name": "Hidden Mural — Port Gellhorn Pier", "category": "collectible", "region": "Port Gellhorn", "x": 285, "y": 210, "status": "speculated", "summary": "A weathered mural on the old pier warehouse — a likely anchor for a photo-collectible chain along the gulf coast.", "vehicles": [], "missions": []}, {"slug": "vice-city-valet-plaza", "name": "Vice City Valet Plaza", "category": "vehicle_spawn", "region": "Vice City", "x": 620, "y": 440, "status": "rumored", "summary": "Valet stand outside the downtown hotel cluster where the Jastic was first spotted.", "vehicles": [{"slug": "ocelot-jastic", "name": "Ocelot Jastic"}], "missions": []}], "categories": {"poi": "#f5a623", "vehicle_spawn": "#38d39f", "collectible": "#c77dff", "activity": "#4cc9f0", "mission": "#ff5d8f", "shop": "#ffd166"}}</script>
+<script src="assets/map.js"></script>
+</body>
+</html>

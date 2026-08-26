@@ -1,0 +1,55 @@
+name: GTA VI platform pipeline
+
+# Fully automated operation: any discovery pushed to the inbox (or any data
+# edit) rebuilds the database, map, news, social scripts, alerts and site —
+# and commits the result back. Also runs daily as a heartbeat.
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "gta6-platform/data/**"
+      - "gta6-platform/pipeline/**"
+      - "gta6-platform/assets/**"
+      - "gta6-platform/config/**"
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gta6-pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run tests
+        working-directory: gta6-platform
+        run: python -m unittest discover -s tests -v
+
+      - name: Run pipeline
+        working-directory: gta6-platform
+        run: python run_pipeline.py
+
+      - name: Commit regenerated site
+        run: |
+          git config user.name "vi-central-pipeline"
+          git config user.email "actions@users.noreply.github.com"
+          git add gta6-platform
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore(gta6): automated pipeline run"
+            git push
+          fi

@@ -1,0 +1,12 @@
+[
+  {
+    "email": "demo@example.com",
+    "confirmed": true,
+    "topics": [
+      "news",
+      "vehicles",
+      "map"
+    ],
+    "subscribed_at": "2026-08-01T00:00:00Z"
+  }
+]

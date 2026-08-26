@@ -1,0 +1,5 @@
+# VI Central runs on the Python 3.10+ standard library — nothing required.
+#
+# Optional: AI copy-polish for news posts and video scripts
+# (set ai.enabled=true in config/platform.json and provide ANTHROPIC_API_KEY)
+# anthropic>=1.0

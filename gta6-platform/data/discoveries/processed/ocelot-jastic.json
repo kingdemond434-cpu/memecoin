@@ -1,0 +1,25 @@
+{
+  "type": "vehicle",
+  "name": "Ocelot Jastic",
+  "discovered_at": "2026-08-26",
+  "confidence": "rumored",
+  "source": "Frame analysis, promo still batch #7",
+  "data": {
+    "manufacturer": "Ocelot",
+    "class": "Super",
+    "seats": 2,
+    "stats": { "top_speed_mph": 136, "acceleration": 9.2, "handling": 8.8, "braking": 8.1 },
+    "price_estimate_usd": 1450000,
+    "acquisition": "Luxury dealership (expected)",
+    "summary": "A sleek mid-engine flagship glimpsed outside a Vice City valet stand. Sharpest acceleration figures of anything spotted so far."
+  },
+  "location": {
+    "name": "Vice City Valet Plaza",
+    "region": "Vice City",
+    "x": 620,
+    "y": 440,
+    "category": "vehicle_spawn",
+    "summary": "Valet stand outside the downtown hotel cluster where the Jastic was first spotted."
+  },
+  "missions": []
+}

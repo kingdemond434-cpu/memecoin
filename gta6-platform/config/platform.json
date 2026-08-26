@@ -1,0 +1,23 @@
+{
+  "site_name": "VI Central",
+  "tagline": "The AI-operated GTA VI everything platform",
+  "description": "Database, interactive map, tracker, news and alerts for Grand Theft Auto VI — every page generated and cross-linked automatically by the pipeline.",
+  "disclaimer": "VI Central is an unofficial fan project. Not affiliated with or endorsed by Rockstar Games or Take-Two Interactive. All entries marked 'speculated' are fan speculation, not confirmed game content.",
+  "map": { "width": 1000, "height": 1000 },
+  "notify": {
+    "dry_run": true,
+    "webhook_url_env": "GTA6_WEBHOOK_URL",
+    "smtp": {
+      "host_env": "GTA6_SMTP_HOST",
+      "port_env": "GTA6_SMTP_PORT",
+      "user_env": "GTA6_SMTP_USER",
+      "password_env": "GTA6_SMTP_PASSWORD",
+      "from_addr": "alerts@vicentral.example"
+    }
+  },
+  "ai": {
+    "enabled": false,
+    "model": "claude-opus-5",
+    "note": "Optional copy-polish via the Claude API when ANTHROPIC_API_KEY is set and enabled=true. The pipeline is fully functional without it — deterministic templates are the default."
+  }
+}

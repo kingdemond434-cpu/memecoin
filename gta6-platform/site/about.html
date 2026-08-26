@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>About — VI Central</title>
+<meta name="description" content="Database, interactive map, tracker, news and alerts for Grand Theft Auto VI — every page generated and cross-linked automatically by the pipeline.">
+<link rel="stylesheet" href="assets/style.css">
+<link rel="alternate" type="application/rss+xml" title="VI Central feed" href="feed.xml">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">VI Central<span class="brand-vi">VI</span></a>
+  <nav><a href="index.html">Home</a><a href="vehicles.html">Vehicles</a><a href="map.html">Map</a><a href="missions.html">Missions</a><a href="weapons.html">Weapons</a><a href="characters.html">Characters</a><a href="tracker.html">Tracker</a><a href="search.html">Search</a><a href="subscribe.html">Subscribe</a></nav>
+</header>
+<main>
+
+<h1>How this site runs itself</h1>
+<p>VI Central is generated end-to-end by a Python pipeline. There is no CMS and no manual publishing step.</p>
+<ol class="pipeline-list">
+  <li><strong>Ingest</strong> — a discovery JSON lands in <code>data/discoveries/inbox/</code> (from a scraper, a tip form, or a human) and becomes database entities.</li>
+  <li><strong>Enrich</strong> — overall scores and class rankings are recomputed for every vehicle and weapon.</li>
+  <li><strong>Link</strong> — vehicles, missions, locations and characters are cross-referenced both ways.</li>
+  <li><strong>Map</strong> — every location becomes a pin on the stylized Leonida map.</li>
+  <li><strong>News</strong> — a post is written for each discovery and pushed to the feed and RSS.</li>
+  <li><strong>Social</strong> — a 30–45s vertical-video script is drafted per discovery.</li>
+  <li><strong>Search &amp; tracker</strong> — the index and personal checklists are rebuilt.</li>
+  <li><strong>Notify</strong> — subscribers are alerted by email/webhook in the same run.</li>
+</ol>
+<p>An optional AI stage can polish the generated copy via the Claude API, but the platform is fully operational without it.</p>
+<h2>Status labels</h2>
+<p><span class="badge badge-ok">confirmed</span> shown in official material · <span class="badge badge-warn">rumored</span> reported but unverified · <span class="badge badge-spec">speculated</span> fan speculation.</p>
+<p class="muted">VI Central is an unofficial fan project. Not affiliated with or endorsed by Rockstar Games or Take-Two Interactive. All entries marked 'speculated' are fan speculation, not confirmed game content.</p>
+
+</main>
+<footer>
+  <p>VI Central is an unofficial fan project. Not affiliated with or endorsed by Rockstar Games or Take-Two Interactive. All entries marked 'speculated' are fan speculation, not confirmed game content.</p>
+  <p>Generated automatically by the VI Central pipeline · <a href="about.html">How it works</a> · <a href="feed.xml">RSS</a></p>
+</footer>
+
+</body>
+</html>

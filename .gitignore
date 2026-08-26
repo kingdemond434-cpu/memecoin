@@ -42,6 +42,11 @@ logs/
 models/
 *.gz
 
+# GTA VI platform database is version-controlled (the pipeline commits to it)
+!gta6-platform/data/
+# ...except per-user account state written by serve.py
+gta6-platform/data/accounts.json
+
 # OS
 .DS_Store
 Thumbs.db

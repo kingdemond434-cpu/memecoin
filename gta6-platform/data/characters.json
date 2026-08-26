@@ -1,0 +1,50 @@
+[
+  {
+    "slug": "lucia-caminos",
+    "name": "Lucia Caminos",
+    "role": "Protagonist",
+    "status": "confirmed",
+    "source": "Official reveal (rockstargames.com/VI)",
+    "summary": "One of the two playable protagonists. Fresh out of prison and determined to change the odds in her favor, Lucia's story runs through the whole of Leonida."
+  },
+  {
+    "slug": "jason-duval",
+    "name": "Jason Duval",
+    "role": "Protagonist",
+    "status": "confirmed",
+    "source": "Official reveal (rockstargames.com/VI)",
+    "summary": "The second playable protagonist. Jason wants an easy life, but things have a way of getting complicated — especially after he meets Lucia."
+  },
+  {
+    "slug": "cal-hampton",
+    "name": "Cal Hampton",
+    "role": "Supporting",
+    "status": "confirmed",
+    "source": "Official reveal (rockstargames.com/VI)",
+    "summary": "Jason's friend and a conspiracy-minded shut-in who feels safest behind a screen, monitoring Coast Guard chatter with a beer in hand."
+  },
+  {
+    "slug": "boobie-ike",
+    "name": "Boobie Ike",
+    "role": "Supporting",
+    "status": "confirmed",
+    "source": "Official reveal (rockstargames.com/VI)",
+    "summary": "A Vice City legend who turned his rap-game success into a business empire spanning a strip club, a recording studio, and more."
+  },
+  {
+    "slug": "raul-bautista",
+    "name": "Raul Bautista",
+    "role": "Supporting",
+    "status": "confirmed",
+    "source": "Official reveal (rockstargames.com/VI)",
+    "summary": "A seasoned bank robber always on the lookout for talent willing to take on high-stakes, high-reward jobs."
+  },
+  {
+    "slug": "brian-heder",
+    "name": "Brian Heder",
+    "role": "Supporting",
+    "status": "confirmed",
+    "source": "Official reveal (rockstargames.com/VI)",
+    "summary": "A classic Keys drug runner from the cigarette-boat era, still moving product through the Leonida Keys with his third wife Lori."
+  }
+]

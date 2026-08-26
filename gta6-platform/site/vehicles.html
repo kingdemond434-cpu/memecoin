@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vehicles — VI Central</title>
+<meta name="description" content="Database, interactive map, tracker, news and alerts for Grand Theft Auto VI — every page generated and cross-linked automatically by the pipeline.">
+<link rel="stylesheet" href="assets/style.css">
+<link rel="alternate" type="application/rss+xml" title="VI Central feed" href="feed.xml">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">VI Central<span class="brand-vi">VI</span></a>
+  <nav><a href="index.html">Home</a><a href="vehicles.html" class="active">Vehicles</a><a href="map.html">Map</a><a href="missions.html">Missions</a><a href="weapons.html">Weapons</a><a href="characters.html">Characters</a><a href="tracker.html">Tracker</a><a href="search.html">Search</a><a href="subscribe.html">Subscribe</a></nav>
+</header>
+<main>
+
+<h1>Vehicle database</h1>
+<p class="muted">8 vehicles tracked. Filter, sort, and click through for stats, comparisons and map locations.</p>
+<div class="controls">
+  <input id="veh-search" type="search" placeholder="Search name or manufacturer…">
+  <select id="veh-class"><option value="">All classes</option><option>Boats</option><option>Motorcycles</option><option>Muscle</option><option>Off-road</option><option>Sports</option><option>Sports Classics</option><option>Super</option></select>
+  <select id="veh-status"><option value="">Any status</option><option>confirmed</option><option>rumored</option><option>speculated</option></select>
+  <select id="veh-sort">
+    <option value="overall">Sort: overall</option>
+    <option value="top_speed">Sort: top speed</option>
+    <option value="price">Sort: price</option>
+    <option value="name">Sort: name</option>
+  </select>
+</div>
+<div class="table-wrap"><table id="veh-table">
+  <thead><tr><th>Vehicle</th><th>Manufacturer</th><th>Class</th><th>Top speed</th><th>Overall</th><th>Seats</th><th>Est. price</th><th>Status</th></tr></thead>
+  <tbody></tbody>
+</table></div>
+
+</main>
+<footer>
+  <p>VI Central is an unofficial fan project. Not affiliated with or endorsed by Rockstar Games or Take-Two Interactive. All entries marked 'speculated' are fan speculation, not confirmed game content.</p>
+  <p>Generated automatically by the VI Central pipeline · <a href="about.html">How it works</a> · <a href="feed.xml">RSS</a></p>
+</footer>
+<script type="application/json" id="vehicles-data">[{"slug": "bravado-banshee-gts", "name": "Bravado Banshee GTS", "manufacturer": "Bravado", "class": "Sports", "top_speed": 128, "overall": 8.32, "seats": 2, "price": 126000, "status": "confirmed", "acquisition": "Purchase (dealership, expected)"}, {"slug": "declasse-impaler-sz", "name": "Declasse Impaler SZ", "manufacturer": "Declasse", "class": "Muscle", "top_speed": 122, "overall": 7.7, "seats": 2, "price": 74000, "status": "confirmed", "acquisition": "Street find / purchase (expected)"}, {"slug": "vapid-sandking-swb", "name": "Vapid Sandking SWB", "manufacturer": "Vapid", "class": "Off-road", "top_speed": 104, "overall": 6.78, "seats": 4, "price": 58000, "status": "confirmed", "acquisition": "Street find (rural Leonida, expected)"}, {"slug": "shitzu-longfin", "name": "Shitzu Longfin", "manufacturer": "Shitzu", "class": "Boats", "top_speed": 86, "overall": 6.42, "seats": 4, "price": 235000, "status": "confirmed", "acquisition": "Marina purchase (expected)"}, {"slug": "airboat-swampmaster", "name": "Swampmaster Airboat", "manufacturer": "Nagasaki", "class": "Boats", "top_speed": 62, "overall": 4.92, "seats": 4, "price": 41000, "status": "confirmed", "acquisition": "Spawn at Grassrivers docks (expected)"}, {"slug": "grotti-turismo-classic", "name": "Grotti Turismo Classic", "manufacturer": "Grotti", "class": "Sports Classics", "top_speed": 118, "overall": 7.66, "seats": 2, "price": 480000, "status": "speculated", "acquisition": "Collector purchase (speculated)"}, {"slug": "western-daemon-vi", "name": "Western Daemon", "manufacturer": "Western", "class": "Motorcycles", "top_speed": 110, "overall": 7.29, "seats": 2, "price": 32000, "status": "rumored", "acquisition": "Street find (expected)"}, {"slug": "ocelot-jastic", "name": "Ocelot Jastic", "manufacturer": "Ocelot", "class": "Super", "top_speed": 136, "overall": 8.91, "seats": 2, "price": 1450000, "status": "rumored", "acquisition": "Luxury dealership (expected)"}]</script>
+<script src="assets/db.js"></script>
+</body>
+</html>

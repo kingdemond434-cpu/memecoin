@@ -1,0 +1,14 @@
+{
+  "type": "location",
+  "name": "Hidden Mural — Port Gellhorn Pier",
+  "discovered_at": "2026-08-26",
+  "confidence": "speculated",
+  "source": "Fan speculation from trailer background art",
+  "data": {
+    "region": "Port Gellhorn",
+    "x": 285,
+    "y": 210,
+    "category": "collectible",
+    "summary": "A weathered mural on the old pier warehouse — a likely anchor for a photo-collectible chain along the gulf coast."
+  }
+}

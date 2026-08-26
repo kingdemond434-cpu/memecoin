@@ -1,0 +1,74 @@
+[
+  {
+    "slug": "combat-pistol",
+    "name": "Combat Pistol",
+    "class": "Handguns",
+    "stats": {
+      "damage": 4.2,
+      "fire_rate": 6.0,
+      "range": 4.0
+    },
+    "price_estimate_usd": 600,
+    "acquisition": "Gun store (expected)",
+    "status": "confirmed",
+    "source": "Trailer 2 analysis",
+    "summary": "Standard sidearm seen holstered in trailer footage.",
+    "overall": 4.69,
+    "rank_overall": 3,
+    "rank_in_class": 1
+  },
+  {
+    "slug": "service-carbine",
+    "name": "Service Carbine",
+    "class": "Rifles",
+    "stats": {
+      "damage": 6.8,
+      "fire_rate": 7.8,
+      "range": 7.5
+    },
+    "price_estimate_usd": 2900,
+    "acquisition": "Gun store / mission (expected)",
+    "status": "rumored",
+    "source": "Leak compilation, unverified",
+    "summary": "AR-pattern rifle reported across multiple leak frames.",
+    "overall": 7.28,
+    "rank_overall": 1,
+    "rank_in_class": 1
+  },
+  {
+    "slug": "pump-shotgun",
+    "name": "Pump Shotgun",
+    "class": "Shotguns",
+    "stats": {
+      "damage": 8.5,
+      "fire_rate": 2.4,
+      "range": 2.8
+    },
+    "price_estimate_usd": 1400,
+    "acquisition": "Gun store (expected)",
+    "status": "confirmed",
+    "source": "Trailer 2 analysis",
+    "summary": "Close-quarters staple, seen in the pawn-shop robbery sequence.",
+    "overall": 5.25,
+    "rank_overall": 2,
+    "rank_in_class": 1
+  },
+  {
+    "slug": "machete",
+    "name": "Machete",
+    "class": "Melee",
+    "stats": {
+      "damage": 3.5,
+      "fire_rate": 3.0,
+      "range": 0.5
+    },
+    "price_estimate_usd": 90,
+    "acquisition": "Hardware store (expected)",
+    "status": "speculated",
+    "source": "Fan speculation",
+    "summary": "A Leonida-appropriate melee option. Speculative entry.",
+    "overall": 2.6,
+    "rank_overall": 4,
+    "rank_in_class": 1
+  }
+]

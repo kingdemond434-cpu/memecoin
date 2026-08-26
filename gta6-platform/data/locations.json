@@ -1,0 +1,112 @@
+[
+  {
+    "slug": "ocean-drive-strip",
+    "name": "Ocean Drive Strip",
+    "category": "poi",
+    "region": "Vice City",
+    "x": 640,
+    "y": 470,
+    "status": "confirmed",
+    "source": "Trailer 1 analysis",
+    "summary": "The neon heart of Vice City. Art-deco hotels, nightlife, and the busiest cruising strip in Leonida."
+  },
+  {
+    "slug": "vice-beach",
+    "name": "Vice Beach",
+    "category": "poi",
+    "region": "Vice City",
+    "x": 675,
+    "y": 455,
+    "status": "confirmed",
+    "source": "Trailer 1 analysis",
+    "summary": "Packed sands, muscle beach equipment, and airliners on final approach overhead."
+  },
+  {
+    "slug": "port-gellhorn-speedway",
+    "name": "Port Gellhorn Speedway",
+    "category": "activity",
+    "region": "Port Gellhorn",
+    "x": 305,
+    "y": 245,
+    "status": "confirmed",
+    "source": "Trailer 2 analysis",
+    "summary": "A run-down oval speedway on the gulf side — dirt-track racing and demolition events."
+  },
+  {
+    "slug": "kelly-county-airstrip",
+    "name": "Kelly County Airstrip",
+    "category": "vehicle_spawn",
+    "region": "Ambrosia",
+    "x": 390,
+    "y": 300,
+    "status": "rumored",
+    "summary": "A cracked crop-duster strip in sugarcane country. Rumored spawn for utility aircraft and smuggling runs.",
+    "source": "Leak compilation, unverified"
+  },
+  {
+    "slug": "mount-kalaga-overlook",
+    "name": "Mount Kalaga Overlook",
+    "category": "collectible",
+    "region": "Mount Kalaga National Park",
+    "x": 430,
+    "y": 150,
+    "status": "speculated",
+    "summary": "A scenic overlook deep in the national park. Prime candidate for a photo-spot collectible chain.",
+    "source": "Fan speculation"
+  },
+  {
+    "slug": "keys-marina",
+    "name": "Leonida Keys Marina",
+    "category": "vehicle_spawn",
+    "region": "Leonida Keys",
+    "x": 555,
+    "y": 840,
+    "status": "confirmed",
+    "source": "Trailer 2 analysis",
+    "summary": "Sport-fishing charters and cigarette boats moored along the old highway causeway."
+  },
+  {
+    "slug": "little-cuba",
+    "name": "Little Cuba",
+    "category": "poi",
+    "region": "Vice City",
+    "x": 585,
+    "y": 505,
+    "status": "rumored",
+    "summary": "Cafecito windows, domino tables, and low-slung classics on gold wire wheels.",
+    "source": "Leak compilation, unverified"
+  },
+  {
+    "slug": "grassrivers-airboat-dock",
+    "name": "Grassrivers Airboat Dock",
+    "category": "vehicle_spawn",
+    "region": "Grassrivers",
+    "x": 480,
+    "y": 660,
+    "status": "confirmed",
+    "source": "Trailer 2 analysis",
+    "summary": "Swamp-tour airboats and half-sunk hulls at the edge of the wetlands."
+  },
+  {
+    "slug": "hidden-mural-port-gellhorn-pier",
+    "name": "Hidden Mural — Port Gellhorn Pier",
+    "category": "collectible",
+    "region": "Port Gellhorn",
+    "x": 285,
+    "y": 210,
+    "status": "speculated",
+    "source": "Fan speculation from trailer background art",
+    "summary": "A weathered mural on the old pier warehouse — a likely anchor for a photo-collectible chain along the gulf coast."
+  },
+  {
+    "slug": "vice-city-valet-plaza",
+    "name": "Vice City Valet Plaza",
+    "category": "vehicle_spawn",
+    "region": "Vice City",
+    "x": 620,
+    "y": 440,
+    "status": "rumored",
+    "source": "Frame analysis, promo still batch #7",
+    "summary": "Valet stand outside the downtown hotel cluster where the Jastic was first spotted."
+  }
+]
