@@ -74,7 +74,9 @@ def render() -> str:
         parts.append(
             f"pub const {prefix}_NAMES: [&str; {len(names)}] = [\n"
             + "".join(f'    "{name}",\n' for name in names) + "];\n\n")
-    return "".join(parts)
+    # rustfmt removes trailing blank lines. Emit its canonical EOF so running
+    # the formatter cannot make a generated file immediately fail --check.
+    return "".join(parts).rstrip() + "\n"
 
 
 def main() -> int:
