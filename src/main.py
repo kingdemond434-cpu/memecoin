@@ -77,7 +77,7 @@ from src.strategies.information_graph import (
 from src.strategies.age_banded import AgeBandedPredictor
 from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPredictor, PredictionFeatures
 from src.chains.pump_curve import (
-    BondingCurveState, parse_bonding_curve, quote_buy, quote_sell,
+    LAMPORTS_PER_SOL, BondingCurveState, parse_bonding_curve, quote_buy, quote_sell,
 )
 from src.chains.idl import report as idl_report
 from src.chains.pump_route import (
@@ -114,6 +114,7 @@ from src.strategies.public_coordination import PublicCoordinationMiner
 from src.strategies.rug_hazard import ContinuousRugHazardModel
 from src.strategies.social_intelligence import SocialIntelligenceEngine
 from src.strategies.wallet_intelligence import WalletIntelligenceEngine
+from src.strategies.wallet_value import FollowOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +262,14 @@ class MemecoinQuantDesk:
         self._latest_pool_state: Dict[str, PumpSwapPoolState] = {}
         self._pool_accounts: Dict[str, PoolState] = {}
         self._pool_account_pending: Set[str] = set()
+        # Followed-wallet trades awaiting their forward result. token ->
+        # candidates. This is what turns "we watch smart wallets" into a
+        # number: without it the wallet-value model has no evidence and ranks
+        # nothing, which is the state the composite score was invented to
+        # paper over.
+        self._follow_candidates: Dict[str, List[Dict[str, Any]]] = {}
+        self._follow_resolved = 0
+        self._follow_unresolved = 0
         # Partial-exit PnL accumulated per token, banked into the final
         # outcome row when the position actually closes.
         self._closed_pnl: Dict[str, float] = {}
@@ -1820,6 +1829,131 @@ class MemecoinQuantDesk:
                 for state in self._latest_pool_state.values())),
         }
 
+    def _follow_quote(self, token: str, lamports: int):
+        """What a buy of ``lamports`` would get us right now, on either venue.
+
+        The same local quoting the execution path uses, so what is measured is
+        what could have been executed -- fees and price impact included, at
+        the size the desk would actually have taken.
+        """
+        curve = self._latest_curve_state.get(token)
+        if curve is not None:
+            quote = quote_buy(curve, lamports)
+            return quote if quote.data_status == "OK" else None
+        pool = self._latest_pool_state.get(token)
+        if pool is not None and pool.blocked_reason() is None:
+            quote = pool_quote_buy(pool, lamports)
+            return quote if quote.data_status == "OK" else None
+        return None
+
+    def _follow_exit_quote(self, token: str, size_tokens: int):
+        """Proceeds of selling the whole followed position now.
+
+        Selling the position through the curve prices its own impact, so
+        there is no separate capacity fudge: this IS what we would receive.
+        """
+        curve = self._latest_curve_state.get(token)
+        if curve is not None:
+            quote = quote_sell(curve, size_tokens)
+            return quote if quote.data_status == "OK" else None
+        pool = self._latest_pool_state.get(token)
+        if pool is not None and pool.blocked_reason() is None:
+            quote = pool_quote_sell(pool, size_tokens)
+            return quote if quote.data_status == "OK" else None
+        return None
+
+    def _open_follow_candidate(self, token: str, event: Dict[str, Any]) -> bool:
+        """Record what following this wallet's buy would have bought us.
+
+        Priced AFTER their trade, which is the point: a wallet whose edge is
+        gone by the time its transaction reaches us has no edge we can take,
+        and measuring from their fill instead of ours is what makes such a
+        wallet look profitable to follow.
+        """
+        wallet = str(event.get("wallet", "") or "")
+        if not wallet or event.get("side") != "buy":
+            return False
+        if not self.wallet_intel.is_watched(wallet):
+            return False
+        pending = self._follow_candidates.setdefault(token, [])
+        if any(item["wallet"] == wallet for item in pending):
+            # One open follow per wallet per token. A wallet adding to a
+            # position is one decision to follow, not three.
+            return False
+        reference = int(float(self.global_config.get("follow_reference_sol", 0.5))
+                        * LAMPORTS_PER_SOL)
+        quote = self._follow_quote(token, reference)
+        if quote is None or quote.output_amount <= 0:
+            return False
+        pending.append({
+            "wallet": wallet, "token": token,
+            "observed_at": float(event.get("timestamp", time.time())),
+            "opened_at": time.time(),
+            "cost_lamports": reference, "size_tokens": int(quote.output_amount),
+            "regime": str(event.get("regime", "") or ""),
+        })
+        # Bounded: a token nobody resolves must not accumulate follows for
+        # ever, and the oldest are the ones the horizon will retire first.
+        if len(pending) > 64:
+            del pending[:-64]
+        return True
+
+    def _resolve_follow_candidates(self, now: Optional[float] = None) -> int:
+        """Close out follows that have reached their horizon.
+
+        The result is the executable multiple: proceeds of selling the whole
+        followed position, over what it cost, both quoted locally. A token
+        whose state has gone away entirely resolves as a total loss -- because
+        for a position we could not have quoted an exit for, that is what it
+        was.
+        """
+        now = time.time() if now is None else now
+        horizon = float(self.global_config.get("follow_horizon_seconds", 300.0))
+        resolved = 0
+        for token, pending in list(self._follow_candidates.items()):
+            keep: List[Dict[str, Any]] = []
+            for candidate in pending:
+                if now - candidate["opened_at"] < horizon:
+                    keep.append(candidate)
+                    continue
+                exit_quote = self._follow_exit_quote(token, candidate["size_tokens"])
+                hazard = self.rug_hazard.get_hazard(token)
+                rugged = exit_quote is None
+                proceeds = float(exit_quote.output_amount) if exit_quote else 0.0
+                multiple = proceeds / max(1.0, float(candidate["cost_lamports"]))
+                accepted = self.wallet_intel.record_follow_outcome(FollowOutcome(
+                    wallet=candidate["wallet"], token=token,
+                    observed_at=candidate["observed_at"],
+                    executable_multiple=multiple, regime=candidate["regime"],
+                    rugged=bool(rugged),
+                    follow_latency_s=max(0.0, candidate["opened_at"]
+                                         - candidate["observed_at"]),
+                    data_status="OK"))
+                resolved += int(accepted)
+                self._follow_resolved += int(accepted)
+                self._follow_unresolved += int(not accepted)
+                if hazard is not None:
+                    # Recorded on the observation, not folded into the score:
+                    # the multiple already contains what the rug did.
+                    candidate["hazard_at_exit"] = hazard.data_status
+            if keep:
+                self._follow_candidates[token] = keep
+            else:
+                self._follow_candidates.pop(token, None)
+        return resolved
+
+    def follow_report(self) -> Dict[str, Any]:
+        """Whether wallet value is being measured or merely modelled."""
+        return {
+            "open_follows": sum(len(items) for items in self._follow_candidates.values()),
+            "tokens_with_follows": len(self._follow_candidates),
+            "resolved": self._follow_resolved,
+            "rejected": self._follow_unresolved,
+            "horizon_seconds": float(self.global_config.get("follow_horizon_seconds", 300.0)),
+            "reference_sol": float(self.global_config.get("follow_reference_sol", 0.5)),
+            "model": self.wallet_intel.wallet_value.report(),
+        }
+
     def _prune_curve_static(self) -> int:
         """Drop static facts for tokens the hot state no longer tracks."""
         stale = [key for key in self._curve_static
@@ -2988,6 +3122,7 @@ class MemecoinQuantDesk:
         await self._refresh_portfolio_state()
         await self.genealogy.build_clusters()
         self._prune_curve_static()
+        self._resolve_follow_candidates()
         self._refresh_independence()
         self._publish_attribution()
         if self.dry_run:
@@ -3111,6 +3246,7 @@ class MemecoinQuantDesk:
             self.dataset_builder.record_market_observation(token, observation)
             if hasattr(self.wallet_intel, "record_live_trade"):
                 self.wallet_intel.record_live_trade(token, observation)
+            self._open_follow_candidate(token, event)
             score = self.wallet_intel.get_wallet_score(event.get("wallet", ""))
             if score and score.overall_score >= 0.7:
                 event_type = LeadEventType.ELITE_WALLET_BUY if event.get("side") == "buy" else LeadEventType.SMART_WALLET_EXIT
@@ -3242,6 +3378,10 @@ class MemecoinQuantDesk:
             # cannot tell", and a status page that stays silent about it lets
             # an operator read silence as safety.
             "entity_registry": self.entity_registry.report(),
+            # What following the wallets we watch has actually returned, at
+            # fills we could have got. A watch list nobody has scored is a
+            # list of wallets, not intelligence.
+            "wallet_follow": self.follow_report(),
             "source_mesh": {**self.source_mesh.health(),
                             "registry": self.source_registry_report.to_dict(),
                             # What is wired, what answered, and what could not

@@ -139,6 +139,9 @@ from src.chains.pump_fee_config import (
     FEE_CONFIG_DISCRIMINATOR, bonding_curve_market_cap, calculate_fee_tier,
     fee_config_address, parse_fee_config, pool_market_cap,
 )
+from src.strategies.wallet_value import (
+    FollowOutcome, WalletValue, WalletValueModel, executable_multiple,
+)
 from src.chains.blockhash import BlockhashCache, BlockhashState
 from src.chains.pumpswap_curve import (
     PumpSwapPoolState, sell_capacity_base,
@@ -10611,6 +10614,265 @@ class TestBlockhashIsNotFetchedOnTheHotPath(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.35)
         await cache.stop()
         self.assertGreater(cache.refreshes, 1)
+
+
+class TestWalletValueIsMeasuredNotWeighted(unittest.TestCase):
+    """The ranking was five chosen weights and two invented multipliers.
+
+    Nothing in the system could say whether following the resulting list made
+    or lost money. This asks the only question with an answer: what did
+    following this wallet do to our capital, at fills we could have got.
+    """
+
+    def _follow(self, wallet, multiple, **overrides):
+        args = dict(wallet=wallet, token="mint", observed_at=time.time(),
+                    executable_multiple=multiple)
+        args.update(overrides)
+        return FollowOutcome(**args)
+
+    def _fill(self, model, wallet, multiples):
+        for multiple in multiples:
+            model.record(self._follow(wallet, multiple))
+        return model
+
+    def test_a_wallet_below_the_sample_floor_has_no_value_not_a_low_one(self):
+        model = WalletValueModel(min_samples=12)
+        self._fill(model, "w", [2.0] * 5)
+        value = model.value("w")
+        self.assertEqual(value.status, "DATA_BLOCKED")
+        self.assertIn("5 followed outcomes", value.detail)
+        self.assertFalse(value.followable)
+
+    def test_the_value_is_expected_log_growth_not_a_composite(self):
+        model = WalletValueModel(min_samples=4, shrinkage_strength=0.0)
+        self._fill(model, "w", [2.0] * 20)
+        value = model.value("w")
+        self.assertAlmostEqual(value.mean_log_return, math.log(2.0), places=6)
+
+    def test_a_rug_is_a_loss_in_the_number_not_a_separate_penalty(self):
+        model = WalletValueModel(min_samples=4, shrinkage_strength=0.0)
+        for _ in range(10):
+            model.record(self._follow("w", 2.0))
+        for _ in range(10):
+            model.record(self._follow("w", 0.0001, rugged=True))
+        value = model.value("w")
+        self.assertLess(value.mean_log_return, 0.0)
+        self.assertAlmostEqual(value.rug_rate, 0.5)
+        self.assertFalse(value.followable)
+
+    def test_six_lucky_trades_do_not_outrank_three_hundred_steady_ones(self):
+        """Ranking on the mean is how a system ends up following noise."""
+        model = WalletValueModel(min_samples=6, shrinkage_strength=10.0)
+        self._fill(model, "lucky", [50.0, 40.0, 0.01, 0.01, 0.01, 0.01])
+        self._fill(model, "steady", [1.6] * 300)
+        ranked = [value.wallet for value in model.rank(limit=5)]
+        self.assertEqual(ranked[0], "steady")
+        self.assertGreater(model.value("steady").lower_bound,
+                           model.value("lucky").lower_bound)
+
+    def test_the_bound_is_below_the_mean_and_tightens_with_evidence(self):
+        model = WalletValueModel(min_samples=6, shrinkage_strength=0.0)
+        self._fill(model, "few", [3.0, 0.5, 4.0, 0.4, 2.0, 0.6])
+        self._fill(model, "many", [3.0, 0.5, 4.0, 0.4, 2.0, 0.6] * 40)
+        few, many = model.value("few"), model.value("many")
+        self.assertLess(few.lower_bound, few.mean_log_return)
+        # Same distribution, more evidence: the bound moves up toward the mean.
+        self.assertGreater(many.lower_bound, few.lower_bound)
+
+    def test_only_positive_growth_wallets_are_followable(self):
+        model = WalletValueModel(min_samples=4, shrinkage_strength=0.0)
+        self._fill(model, "good", [2.0] * 30)
+        self._fill(model, "bad", [0.5] * 30)
+        self.assertTrue(model.value("good").followable)
+        self.assertFalse(model.value("bad").followable)
+        self.assertEqual([value.wallet for value in model.rank()], ["good"])
+
+    def test_an_unmeasurable_outcome_is_refused_not_recorded_as_break_even(self):
+        """Averaging it in as 1.0 pulls every wallet toward break-even."""
+        model = WalletValueModel(min_samples=2)
+        self.assertFalse(model.record(self._follow(
+            "w", 1.0, data_status="DATA_BLOCKED: no exit quote")))
+        self.assertEqual(model.value("w").samples, 0)
+        self.assertEqual(model.report()["rejected_outcomes"], 1)
+
+    def test_a_total_loss_is_floored_rather_than_infinite(self):
+        """One rug must not dominate any amount of evidence."""
+        model = WalletValueModel(min_samples=2, shrinkage_strength=0.0)
+        model.record(self._follow("w", 0.0, rugged=True))
+        model.record(self._follow("w", 3.0))
+        value = model.value("w")
+        self.assertTrue(math.isfinite(value.mean_log_return))
+
+    def test_regimes_are_scored_separately_when_asked(self):
+        model = WalletValueModel(min_samples=4, shrinkage_strength=0.0)
+        for _ in range(10):
+            model.record(self._follow("w", 3.0, regime="ultra_early"))
+            model.record(self._follow("w", 0.4, regime="post_migration"))
+        early = model.value("w", "ultra_early")
+        late = model.value("w", "post_migration")
+        self.assertTrue(early.followable)
+        self.assertFalse(late.followable)
+        # And unfiltered, the two average out to something in between.
+        self.assertLess(model.value("w").mean_log_return, early.mean_log_return)
+
+    def test_history_is_bounded_so_a_wallet_is_judged_on_recent_trades(self):
+        model = WalletValueModel(min_samples=4, history=50, shrinkage_strength=0.0)
+        self._fill(model, "w", [10.0] * 50)
+        self._fill(model, "w", [0.5] * 50)
+        self.assertEqual(model.value("w").samples, 50)
+        self.assertLess(model.value("w").mean_log_return, 0.0)
+
+    def test_the_report_says_nothing_is_ranked_rather_than_showing_an_empty_top(self):
+        model = WalletValueModel(min_samples=12)
+        self._fill(model, "w", [2.0] * 3)
+        report = model.report()
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertIn("none with 12", report["detail"])
+        self.assertEqual(report["wallets_estimable"], 0)
+        self.assertEqual(report["observations"], 3)
+
+
+class TestExecutableMultipleIsOurFillNotTheirs(unittest.TestCase):
+    def test_the_entry_that_counts_is_ours(self):
+        # They got in at 1.0, we could only get in at 3.0, and it ended at 6.0.
+        multiple, status = executable_multiple(1.0, 3.0, 6.0)
+        self.assertEqual(status, "OK")
+        self.assertAlmostEqual(multiple, 2.0)
+
+    def test_fees_come_out_of_the_number(self):
+        plain, _ = executable_multiple(1.0, 1.0, 2.0)
+        with_fee, _ = executable_multiple(1.0, 1.0, 2.0, fee_bps=100)
+        self.assertLess(with_fee, plain)
+
+    def test_a_partial_exit_with_no_mark_for_the_rest_is_blocked(self):
+        """A 10x on a tenth of the position is not a 10x."""
+        multiple, status = executable_multiple(1.0, 1.0, 10.0, capacity_ratio=0.1)
+        self.assertTrue(status.startswith("DATA_BLOCKED"))
+        self.assertEqual(multiple, 0.0)
+
+    def test_a_partial_exit_with_a_mark_blends_the_two(self):
+        multiple, status = executable_multiple(
+            1.0, 1.0, 10.0, capacity_ratio=0.1, remainder_multiple=1.0)
+        self.assertEqual(status, "OK")
+        self.assertAlmostEqual(multiple, 0.1 * 10.0 + 0.9 * 1.0)
+
+    def test_unmeasured_prices_are_blocked_not_treated_as_one(self):
+        for args in ((0.0, 1.0, 2.0), (1.0, 0.0, 2.0), (1.0, 1.0, -1.0)):
+            _multiple, status = executable_multiple(*args)
+            self.assertTrue(status.startswith("DATA_BLOCKED"), args)
+
+
+class TestTheDeskMeasuresWhatFollowingReturns(unittest.IsolatedAsyncioTestCase):
+    """A watch list nobody has scored is a list of wallets, not intelligence."""
+
+    TOKEN = "So11111111111111111111111111111111111111112"
+
+    def _curve(self, sol=30_000_000_000, tokens=1_000_000_000_000):
+        return BondingCurveState(
+            virtual_token_reserves=tokens, virtual_sol_reserves=sol,
+            real_token_reserves=tokens, real_sol_reserves=sol,
+            token_total_supply=tokens, complete=False, creator="c")
+
+    def _desk(self, watched=("w",)):
+        model = WalletValueModel(min_samples=2, shrinkage_strength=0.0)
+        intel = SimpleNamespace(
+            wallet_value=model,
+            is_watched=lambda wallet: wallet in set(watched),
+            record_follow_outcome=model.record)
+        desk = SimpleNamespace(
+            _latest_curve_state={self.TOKEN: self._curve()},
+            _latest_pool_state={}, _follow_candidates={},
+            _follow_resolved=0, _follow_unresolved=0,
+            global_config={"follow_reference_sol": 0.5, "follow_horizon_seconds": 300.0},
+            wallet_intel=intel,
+            rug_hazard=SimpleNamespace(get_hazard=lambda token: None))
+        desk._follow_quote = (
+            lambda token, lamports: MemecoinQuantDesk._follow_quote(desk, token, lamports))
+        desk._follow_exit_quote = (
+            lambda token, size: MemecoinQuantDesk._follow_exit_quote(desk, token, size))
+        return desk
+
+    def _event(self, wallet="w", side="buy"):
+        return {"wallet": wallet, "side": side, "timestamp": time.time()}
+
+    def test_a_watched_wallet_buy_opens_a_follow_priced_after_their_trade(self):
+        desk = self._desk()
+        self.assertTrue(
+            MemecoinQuantDesk._open_follow_candidate(desk, self.TOKEN, self._event()))
+        candidate = desk._follow_candidates[self.TOKEN][0]
+        self.assertEqual(candidate["wallet"], "w")
+        self.assertGreater(candidate["size_tokens"], 0)
+        self.assertEqual(candidate["cost_lamports"], 500_000_000)
+
+    def test_an_unwatched_wallet_is_not_followed(self):
+        """Measuring every wallet would rank the market, not our watch list."""
+        desk = self._desk(watched=())
+        self.assertFalse(
+            MemecoinQuantDesk._open_follow_candidate(desk, self.TOKEN, self._event()))
+        self.assertEqual(desk._follow_candidates, {})
+
+    def test_a_sell_is_not_a_follow(self):
+        desk = self._desk()
+        self.assertFalse(MemecoinQuantDesk._open_follow_candidate(
+            desk, self.TOKEN, self._event(side="sell")))
+
+    def test_adding_to_a_position_is_one_decision_to_follow_not_three(self):
+        desk = self._desk()
+        MemecoinQuantDesk._open_follow_candidate(desk, self.TOKEN, self._event())
+        MemecoinQuantDesk._open_follow_candidate(desk, self.TOKEN, self._event())
+        self.assertEqual(len(desk._follow_candidates[self.TOKEN]), 1)
+
+    def test_a_token_we_cannot_quote_opens_no_follow(self):
+        desk = self._desk()
+        desk._latest_curve_state = {}
+        self.assertFalse(
+            MemecoinQuantDesk._open_follow_candidate(desk, self.TOKEN, self._event()))
+
+    def test_nothing_resolves_before_the_horizon(self):
+        desk = self._desk()
+        MemecoinQuantDesk._open_follow_candidate(desk, self.TOKEN, self._event())
+        self.assertEqual(MemecoinQuantDesk._resolve_follow_candidates(desk), 0)
+        self.assertEqual(len(desk._follow_candidates[self.TOKEN]), 1)
+
+    def test_a_price_that_ran_resolves_as_a_gain_net_of_impact(self):
+        desk = self._desk()
+        MemecoinQuantDesk._open_follow_candidate(desk, self.TOKEN, self._event())
+        # The curve moved decisively in our favour.
+        desk._latest_curve_state[self.TOKEN] = self._curve(
+            sol=300_000_000_000, tokens=1_000_000_000_000)
+        resolved = MemecoinQuantDesk._resolve_follow_candidates(
+            desk, now=time.time() + 400)
+        self.assertEqual(resolved, 1)
+        outcome = list(desk.wallet_intel.wallet_value._outcomes["w"])[0]
+        self.assertGreater(outcome.executable_multiple, 1.0)
+        self.assertFalse(outcome.rugged)
+        self.assertEqual(desk._follow_candidates, {})
+
+    def test_a_token_whose_state_vanished_resolves_as_a_total_loss(self):
+        """For a position we could not have quoted an exit for, that is what it was."""
+        desk = self._desk()
+        MemecoinQuantDesk._open_follow_candidate(desk, self.TOKEN, self._event())
+        desk._latest_curve_state = {}
+        MemecoinQuantDesk._resolve_follow_candidates(desk, now=time.time() + 400)
+        outcome = list(desk.wallet_intel.wallet_value._outcomes["w"])[0]
+        self.assertTrue(outcome.rugged)
+        self.assertEqual(outcome.executable_multiple, 0.0)
+
+    def test_a_round_trip_at_a_flat_price_loses_the_spread(self):
+        """Buying and selling the same curve is not break-even, and should not read as one."""
+        desk = self._desk()
+        MemecoinQuantDesk._open_follow_candidate(desk, self.TOKEN, self._event())
+        MemecoinQuantDesk._resolve_follow_candidates(desk, now=time.time() + 400)
+        outcome = list(desk.wallet_intel.wallet_value._outcomes["w"])[0]
+        self.assertLess(outcome.executable_multiple, 1.0)
+
+    def test_the_report_distinguishes_open_follows_from_measured_value(self):
+        desk = self._desk()
+        MemecoinQuantDesk._open_follow_candidate(desk, self.TOKEN, self._event())
+        report = MemecoinQuantDesk.follow_report(desk)
+        self.assertEqual(report["open_follows"], 1)
+        self.assertEqual(report["resolved"], 0)
+        self.assertEqual(report["model"]["status"], "DATA_BLOCKED")
 
 class TestPumpSwapConstruction(unittest.TestCase):
     """The last DATA_BLOCKED that was never about missing information.

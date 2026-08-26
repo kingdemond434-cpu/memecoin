@@ -13,6 +13,9 @@ import aiohttp
 
 from src.chains.rpc_manager import ChainConfig, RPCManager
 from src.strategies.genealogy_graph import GenealogyGraph, WalletProfile, EntityType
+from src.strategies.wallet_value import (
+    FollowOutcome, WalletValue, WalletValueModel, executable_multiple,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +91,12 @@ class WalletIntelligenceEngine:
         
         self.regime_performances: Dict[str, Dict[WalletRegime, WalletRegimePerformance]] = defaultdict(dict)
         self.wallet_scores: Dict[str, WalletScore] = {}
+        # What following a wallet is actually worth, in the same E[log W]
+        # units as every other action the desk values. The composite score
+        # above is kept for the callers that still read it and is no longer
+        # what decides the watch list: its weights were chosen, and nothing
+        # could tell you whether the list they produced made money.
+        self.wallet_value = WalletValueModel()
         self.regime_classifier: Optional[Callable] = None
         
         self._session: Optional[aiohttp.ClientSession] = None
@@ -848,10 +857,23 @@ class WalletIntelligenceEngine:
         return min(1.0, follower_count / 100)
 
     async def _update_live_watch_list(self):
-        top_wallets = [
+        # Measured value first. A wallet with a positive lower bound has been
+        # shown to grow capital when followed at fills we could actually get;
+        # the composite score has been shown to be above 0.5, which is a fact
+        # about the formula rather than about the wallet.
+        measured = [value.wallet for value in
+                    self.wallet_value.rank(limit=200, followable_only=True)]
+        remaining = 200 - len(measured)
+        fallback = [
             s.wallet for s in sorted(self.wallet_scores.values(), key=lambda x: x.overall_score, reverse=True)
             if s.overall_score > 0.5 and s.sample_size >= self.min_trades
-        ][:200]
+            and s.wallet not in set(measured)
+        ][:max(0, remaining)]
+        # Watching a wallet costs a subscription, not capital, so the unproven
+        # ones still fill the list -- that is how they accumulate the outcomes
+        # that would prove them. What they do NOT get is to outrank a wallet
+        # whose value has been measured.
+        top_wallets = measured + fallback
         
         self._live_watch_wallets = set(top_wallets)
         
@@ -867,6 +889,33 @@ class WalletIntelligenceEngine:
 
     def get_wallet_score(self, wallet: str) -> Optional[WalletScore]:
         return self.wallet_scores.get(wallet)
+
+    def is_watched(self, wallet: str) -> bool:
+        """Whether this wallet is on the live watch list.
+
+        The gate on opening a follow: measuring what following EVERY wallet
+        would have returned is measuring the market, and the model would then
+        rank the market rather than the wallets we chose to watch.
+        """
+        return bool(wallet) and wallet in self._live_watch_wallets
+
+    def get_wallet_value(self, wallet: str, regime: Optional[WalletRegime] = None) -> WalletValue:
+        """Forward E[log W] of following this wallet, or why there is none.
+
+        DATA_BLOCKED below the sample floor, never a default. A wallet we have
+        not followed enough times has no value estimate, and reporting a low
+        one instead invites treating "unmeasured" as "measured and poor".
+        """
+        return self.wallet_value.value(wallet, regime.value if regime else "")
+
+    def record_follow_outcome(self, outcome: FollowOutcome) -> bool:
+        """One measured result of following a wallet."""
+        return self.wallet_value.record(outcome)
+
+    def get_top_wallets_by_value(self, limit: int = 20,
+                                 regime: Optional[WalletRegime] = None) -> List[WalletValue]:
+        """Ranked by lower confidence bound, so six lucky trades cannot lead."""
+        return self.wallet_value.rank(limit=limit, regime=regime.value if regime else "")
 
     def get_regime_performance(self, wallet: str, regime: WalletRegime) -> Optional[WalletRegimePerformance]:
         return self.regime_performances.get(wallet, {}).get(regime)
@@ -943,6 +992,9 @@ class WalletIntelligenceEngine:
             "recent_buys": len(self._recent_buys),
             "recent_sells": len(self._recent_sells),
             "top_10": [{"wallet": s.wallet[:8], "score": round(s.overall_score, 3)} for s in self.get_top_wallets(limit=10)],
+            # The measured ranking, alongside the composite one. Where they
+            # disagree, the measured one is the one with evidence behind it.
+            "wallet_value": self.wallet_value.report(),
             "data_blocked_wallets": sum(1 for status in self.data_status.values() if status.startswith("DATA_BLOCKED")),
             "data_status": dict(self.data_status),
         }
