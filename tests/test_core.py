@@ -5,6 +5,7 @@ import base64
 import gzip
 import hashlib
 import json
+import functools
 import math
 import os
 import random
@@ -141,6 +142,14 @@ from src.chains.pump_fee_config import (
     fee_config_address, parse_fee_config, pool_market_cap,
 )
 from src.research.band_split import evaluate_cuts, split_warrant
+from src.strategies.t0_kernel import KernelMode, SurvivalInputs, T0Kernel
+
+try:  # The native kernel is optional; the Python path is the reference.
+    import solana_fastpath as _solana_fastpath  # noqa: F401
+
+    _NATIVE_KERNEL = True
+except ImportError:  # pragma: no cover - depends on the build
+    _NATIVE_KERNEL = False
 from src.strategies import multihead_predictor as multihead_predictor_module
 from src.strategies.wallet_value import (
     FollowOutcome, WalletValue, WalletValueModel, executable_multiple,
@@ -895,6 +904,9 @@ class TestPartialExitAccounting(unittest.IsolatedAsyncioTestCase):
             lambda stream, payload: desk.ops_events.append((stream, payload)))
         desk._closed_pnl = {}
         desk._mechanism_growth = {}
+        desk._exit_edge_usd = (
+            lambda position, exit_pct, reason, supplied=None:
+            MemecoinQuantDesk._exit_edge_usd(desk, position, exit_pct, reason, supplied))
         return desk
 
     @staticmethod
@@ -11059,6 +11071,430 @@ class TestTheRunbookMatchesTheSystem(unittest.TestCase):
         head = unit[:unit.index("\n[Service]\n")]
         self.assertIn("StartLimitIntervalSec", head)
         self.assertIn("StartLimitBurst", head)
+
+
+class TestTheRustKernelIsOnTheCanonicalPath(unittest.TestCase):
+    """A kernel that exists and is never called is a kernel never written.
+
+    Connecting it by swapping the call would be worse: the Rust path has
+    never decided anything in production, and promoting an unproven
+    implementation onto the money path because its unit tests pass is the
+    move this codebase refuses everywhere else. So it is promoted the way a
+    model is -- on evidence, with an automatic and loud demotion.
+    """
+
+    LEVELS = (0.5, 0.3, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005)
+
+    def _survival(self, **overrides):
+        args = dict(levels=self.LEVELS, p_rug_30s=0.1, p_rug_5m=0.2,
+                    expected_feasible_multiple=3.0)
+        args.update(overrides)
+        return SurvivalInputs(**args)
+
+    def _bins(self, survival):
+        prediction = MultiHeadPrediction(token="t", chain="solana", timestamp=0.0)
+        for (target, _multiple), value in zip(SURVIVAL_LEVELS, survival.levels):
+            setattr(prediction, target.value, float(value))
+        prediction.p_rug_30s = survival.p_rug_30s
+        prediction.p_rug_5m = survival.p_rug_5m
+        prediction.expected_feasible_multiple = survival.expected_feasible_multiple
+        return [(probability, gross) for _, probability, gross
+                in ElogwEngine.probability_bins(prediction)]
+
+    def _state(self, survival, **overrides):
+        args = dict(held_fraction=0.02, current_multiple=1.4,
+                    forward_bins=tuple(self._bins(survival)),
+                    exit_cost=0.02, entry_cost=0.02,
+                    exit_capacity_ratio=0.8, escape_probability=0.7)
+        args.update(overrides)
+        return PositionState(**args)
+
+    def _kernel(self, **overrides):
+        args = dict(mode="shadow", promote_after=3)
+        args.update(overrides)
+        return T0Kernel(ActionValuePolicy(min_edge=1e-4, max_add_fraction=0.5), **args)
+
+    def test_the_kernel_is_wired_even_when_the_extension_is_absent(self):
+        """A missing toolchain must not stop the desk from deciding."""
+        kernel = self._kernel()
+        survival = self._survival()
+        decision = kernel.score(self._state(survival), survival=survival)
+        self.assertEqual(decision.status, "OK")
+        self.assertIsNotNone(decision.kernel)
+        if not kernel.rust_available:
+            self.assertEqual(decision.kernel["source"], "python")
+            self.assertIn("unavailable", kernel.report()["native"])
+
+    def test_a_state_the_kernel_cannot_express_goes_to_python_and_is_counted(self):
+        """'Rust was not asked' and 'Rust agreed' are different facts."""
+        kernel = self._kernel()
+        survival = self._survival()
+        state = self._state(survival, held_fraction=0.0,
+                            reentry_bins=tuple(self._bins(survival)))
+        decision = kernel.score(state, survival=survival)
+        self.assertEqual(decision.kernel["source"], "python")
+        report = kernel.report()
+        self.assertEqual(report["not_expressible_in_kernel"], 1)
+        self.assertEqual(report["agreements"], 0)
+
+    def test_a_caller_with_no_survival_inputs_is_counted_separately(self):
+        kernel = self._kernel()
+        decision = kernel.score(self._state(self._survival()))
+        self.assertEqual(decision.kernel["source"], "python")
+        self.assertEqual(kernel.report()["without_survival_inputs"], 1)
+
+    def test_off_never_consults_rust(self):
+        kernel = self._kernel(mode="off")
+        survival = self._survival()
+        kernel.score(self._state(survival), survival=survival)
+        self.assertEqual(kernel.report()["compared"], 0)
+        self.assertFalse(kernel.rust_authoritative)
+
+    def test_an_unknown_mode_falls_back_to_shadow_rather_than_to_rust(self):
+        kernel = T0Kernel(ActionValuePolicy(), mode="turbo")
+        self.assertIs(kernel.mode, KernelMode.SHADOW)
+        self.assertFalse(kernel.rust_authoritative)
+
+
+@unittest.skipUnless(_NATIVE_KERNEL, "solana_fastpath is not importable")
+class TestKernelParityWithTheNativeExtension(unittest.TestCase):
+    """The comparison is POLICY to POLICY.
+
+    Rust is called with permissive limits so its safety layer cannot bind,
+    because the desk's own safety layer is unchanged and still authoritative.
+    Comparing policy against policy-plus-safety would report a divergence
+    every time safety correctly refused.
+    """
+
+    LEVELS = (0.5, 0.3, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005)
+
+    def _survival(self, **overrides):
+        args = dict(levels=self.LEVELS, p_rug_30s=0.1, p_rug_5m=0.2,
+                    expected_feasible_multiple=3.0)
+        args.update(overrides)
+        return SurvivalInputs(**args)
+
+    def _bins(self, survival):
+        prediction = MultiHeadPrediction(token="t", chain="solana", timestamp=0.0)
+        for (target, _multiple), value in zip(SURVIVAL_LEVELS, survival.levels):
+            setattr(prediction, target.value, float(value))
+        prediction.p_rug_30s = survival.p_rug_30s
+        prediction.p_rug_5m = survival.p_rug_5m
+        prediction.expected_feasible_multiple = survival.expected_feasible_multiple
+        return [(probability, gross) for _, probability, gross
+                in ElogwEngine.probability_bins(prediction)]
+
+    def _state(self, survival, **overrides):
+        args = dict(held_fraction=0.02, current_multiple=1.4,
+                    forward_bins=tuple(self._bins(survival)),
+                    exit_cost=0.02, entry_cost=0.02,
+                    exit_capacity_ratio=0.8, escape_probability=0.7)
+        args.update(overrides)
+        return PositionState(**args)
+
+    def _kernel(self, **overrides):
+        args = dict(mode="shadow", promote_after=3)
+        args.update(overrides)
+        return T0Kernel(ActionValuePolicy(min_edge=1e-4, max_add_fraction=0.5), **args)
+
+    RESERVES = {"virtual_sol": 30_000_000_000, "virtual_token": 1_000_000_000_000}
+
+    def test_the_two_implementations_build_the_same_bins(self):
+        """The parity has to start here, or nothing above it means anything."""
+        import solana_fastpath
+
+        survival = self._survival()
+        python_bins = [(round(p, 12), round(g, 12)) for p, g in self._bins(survival)]
+        rust_bins = [(round(p, 12), round(g, 12)) for p, g in solana_fastpath.survival_bins(
+            list(survival.levels), survival.p_rug_30s, survival.p_rug_5m,
+            survival.expected_feasible_multiple)]
+        self.assertEqual(python_bins, rust_bins)
+
+    def test_they_agree_across_a_range_of_positions(self):
+        kernel = self._kernel(promote_after=10_000)
+        survival = self._survival()
+        for held in (0.0, 0.01, 0.05, 0.2):
+            for multiple in (0.5, 1.0, 2.5, 12.0):
+                for capacity in (0.1, 0.5, 1.0):
+                    state = self._state(survival, held_fraction=held,
+                                        current_multiple=multiple,
+                                        exit_capacity_ratio=capacity,
+                                        add_fraction=0.01 if held else None,
+                                        probe_fraction=None if held else 0.01)
+                    decision = kernel.score(state, survival=survival, **self.RESERVES)
+                    self.assertEqual(decision.status, "OK")
+        report = kernel.report()
+        self.assertGreater(report["compared"], 40)
+        self.assertEqual(report["divergences"], 0, report["divergence_examples"])
+        self.assertEqual(report["rust_errors"], 0)
+
+    def test_shadow_never_lets_rust_move_capital(self):
+        kernel = self._kernel(mode="shadow", promote_after=1)
+        survival = self._survival()
+        for _ in range(10):
+            decision = kernel.score(self._state(survival), survival=survival, **self.RESERVES)
+            self.assertEqual(decision.kernel["source"], "python")
+        self.assertFalse(kernel.rust_authoritative)
+        self.assertGreater(kernel.report()["agreements"], 0)
+
+    def test_auto_promotes_only_after_a_run_of_measured_agreement(self):
+        kernel = self._kernel(mode="auto", promote_after=5)
+        survival = self._survival()
+        sources = [kernel.score(self._state(survival), survival=survival, **self.RESERVES).kernel["source"]
+                   for _ in range(8)]
+        # Python decides until the run is established, then Rust does.
+        self.assertEqual(sources[:5], ["python"] * 5)
+        self.assertEqual(sources[5:], ["rust"] * 3)
+        self.assertTrue(kernel.rust_authoritative)
+        self.assertEqual(kernel.report()["decisions_by_rust"], 3)
+
+    def test_one_disagreement_demotes_it_for_the_session(self):
+        """Demotion is automatic and permanent; re-promotion needs a human."""
+        kernel = self._kernel(mode="auto", promote_after=2)
+        survival = self._survival()
+        for _ in range(4):
+            kernel.score(self._state(survival), survival=survival, **self.RESERVES)
+        self.assertTrue(kernel.rust_authoritative)
+
+        # Force a disagreement by making the Python policy answer differently.
+        class Contrarian:
+            min_edge = 1e-4
+            max_add_fraction = 0.5
+
+            def score(self, state):
+                return Decision(status="OK", action=ActionValue.EXIT, q=99.0)
+
+        kernel.policy = Contrarian()
+        kernel.score(self._state(survival), survival=survival, **self.RESERVES)
+        self.assertTrue(kernel.demoted_reason)
+        self.assertFalse(kernel.rust_authoritative)
+        # And it stays demoted however many agreements follow.
+        kernel.policy = ActionValuePolicy(min_edge=1e-4, max_add_fraction=0.5)
+        for _ in range(20):
+            decision = kernel.score(self._state(survival), survival=survival, **self.RESERVES)
+            self.assertEqual(decision.kernel["source"], "python")
+        self.assertFalse(kernel.rust_authoritative)
+
+    def test_a_kernel_that_raises_does_not_take_the_desk_with_it(self):
+        kernel = self._kernel(mode="auto", promote_after=1)
+        survival = self._survival()
+
+        class Exploding:
+            def t0_decide(self, *args, **kwargs):
+                raise RuntimeError("boom")
+
+        kernel.native = Exploding()
+        decision = kernel.score(self._state(survival), survival=survival, **self.RESERVES)
+        self.assertEqual(decision.status, "OK")
+        self.assertEqual(decision.kernel["source"], "python")
+        self.assertEqual(kernel.report()["rust_errors"], 1)
+        self.assertFalse(kernel.rust_authoritative)
+
+    def test_the_report_says_whether_the_money_path_is_on_rust(self):
+        kernel = self._kernel(mode="auto", promote_after=2)
+        survival = self._survival()
+        for _ in range(6):
+            kernel.score(self._state(survival), survival=survival, **self.RESERVES)
+        report = kernel.report()
+        self.assertTrue(report["rust_authoritative"])
+        self.assertGreater(report["rust_share"], 0.0)
+        self.assertEqual(report["status"], "OK")
+
+
+class TestLiveMarkingIsLocal(unittest.IsolatedAsyncioTestCase):
+    """The desk paid for its latency and handed it back at the moment of deciding.
+
+    `_mark_position` used the streamed mark only under `if self.dry_run`, so
+    every LIVE redecision waited on a router quote after an event that had
+    already arrived instantly.
+    """
+
+    TOKEN = "So11111111111111111111111111111111111111112"
+
+    def _curve(self, sol=30_000_000_000, tokens=1_000_000_000_000):
+        return BondingCurveState(
+            virtual_token_reserves=tokens, virtual_sol_reserves=sol,
+            real_token_reserves=tokens, real_sol_reserves=sol,
+            token_total_supply=tokens, complete=False, creator="c")
+
+    def _desk(self, *, dry_run=False, curve=True, stream=None, quote=None):
+        calls = []
+
+        async def get_quote(*args, **kwargs):
+            calls.append(args)
+            return quote
+
+        desk = SimpleNamespace(
+            dry_run=dry_run, offline=False, sol_price_usd=150.0,
+            _latest_curve_state={self.TOKEN: self._curve()} if curve else {},
+            _latest_pool_state={},
+            _latest_stream_mark={self.TOKEN: stream} if stream else {},
+            _marks_local=0, _marks_router=0, _mark_checked_at={},
+            _mark_checks=0, _mark_checks_blocked=0, _mark_checks_diverged=0,
+            _mark_drift_total=0.0, _mark_divergences=[],
+            global_config={},
+            jupiter=SimpleNamespace(get_quote=get_quote),
+            rug_hazard=SimpleNamespace(record_observation=lambda *a: None),
+            dataset_builder=SimpleNamespace(record_market_observation=lambda *a: None),
+            counterfactual_lab=SimpleNamespace(record_market_observation=lambda *a: None),
+        )
+        desk.quote_calls = calls
+        desk.backgrounded = []
+
+        def spawn(coroutine):
+            desk.backgrounded.append(coroutine)
+            coroutine.close()
+
+        desk._spawn_background = spawn
+        for name in ("_local_mark", "_follow_exit_quote", "_maybe_cross_check_mark",
+                     "_cross_check_mark"):
+            setattr(desk, name, functools.partial(getattr(MemecoinQuantDesk, name), desk))
+        return desk
+
+    def _position(self, size=1_000_000):
+        return {"size_tokens": size, "remaining_cost_usd": 100.0}
+
+    async def test_a_live_desk_marks_without_asking_the_router(self):
+        desk = self._desk(dry_run=False)
+        marked = await MemecoinQuantDesk._mark_position(desk, self.TOKEN, self._position())
+        self.assertIsNotNone(marked)
+        self.assertEqual(desk.quote_calls, [])
+        self.assertEqual(desk._marks_local, 1)
+        self.assertEqual(desk._marks_router, 0)
+
+    async def test_the_local_mark_carries_its_own_price_impact(self):
+        """What the position is worth and what it would fetch are different."""
+        desk = self._desk()
+        small = MemecoinQuantDesk._local_mark(desk, self.TOKEN, self._position(1_000))
+        large = MemecoinQuantDesk._local_mark(desk, self.TOKEN,
+                                              self._position(100_000_000_000))
+        self.assertIsNotNone(small)
+        self.assertIsNotNone(large)
+        # Per token, the big exit fetches strictly less.
+        self.assertLess(large[1] / 100_000_000_000, small[1] / 1_000)
+
+    async def test_a_recent_stream_ratio_is_used_when_no_local_quote_can_be_made(self):
+        desk = self._desk(curve=False,
+                          stream={"multiple": 2.5, "timestamp": time.time()})
+        marked = await MemecoinQuantDesk._mark_position(desk, self.TOKEN, self._position())
+        self.assertEqual(marked[0], 2.5)
+        self.assertEqual(desk.quote_calls, [])
+
+    async def test_a_stale_stream_ratio_is_not_used(self):
+        """A price from a minute ago is not a mark."""
+        desk = self._desk(curve=False,
+                          stream={"multiple": 2.5, "timestamp": time.time() - 60},
+                          quote=SimpleNamespace(output_amount=250_000_000,
+                                                price_impact_pct=0.01))
+        marked = await MemecoinQuantDesk._mark_position(desk, self.TOKEN, self._position())
+        self.assertIsNotNone(marked)
+        self.assertEqual(len(desk.quote_calls), 1)
+        self.assertEqual(desk._marks_router, 1)
+
+    async def test_with_nothing_local_the_round_trip_is_paid_rather_than_skipped(self):
+        """A decision priced on no mark at all is worse than a slow one."""
+        desk = self._desk(curve=False, quote=None)
+        self.assertIsNone(
+            await MemecoinQuantDesk._mark_position(desk, self.TOKEN, self._position()))
+        self.assertEqual(len(desk.quote_calls), 1)
+
+    async def test_the_router_is_still_asked_afterwards_as_a_cross_check(self):
+        desk = self._desk()
+        await MemecoinQuantDesk._mark_position(desk, self.TOKEN, self._position())
+        # Off the decision path: scheduled, not awaited.
+        self.assertEqual(len(desk.backgrounded), 1)
+        self.assertEqual(desk.quote_calls, [])
+
+    async def test_the_cross_check_is_sampled_not_run_on_every_mark(self):
+        """Running it every time reintroduces the quote storm one step later."""
+        desk = self._desk()
+        for _ in range(5):
+            await MemecoinQuantDesk._mark_position(desk, self.TOKEN, self._position())
+        self.assertEqual(len(desk.backgrounded), 1)
+        self.assertEqual(desk._marks_local, 5)
+
+    async def test_a_cross_check_that_disagrees_is_recorded_and_moves_no_capital(self):
+        desk = self._desk(quote=SimpleNamespace(output_amount=500_000_000,
+                                                price_impact_pct=0.01))
+        await MemecoinQuantDesk._cross_check_mark(desk, self.TOKEN, 1_000_000, 1.0, 100.0)
+        self.assertEqual(desk._mark_checks, 1)
+        self.assertEqual(desk._mark_checks_diverged, 1)
+        self.assertEqual(len(desk._mark_divergences), 1)
+
+    async def test_a_cross_check_that_agrees_is_not_a_divergence(self):
+        desk = self._desk(quote=SimpleNamespace(output_amount=100_000_000,
+                                                price_impact_pct=0.01))
+        await MemecoinQuantDesk._cross_check_mark(desk, self.TOKEN, 1_000_000, 1.0, 100.0)
+        self.assertEqual(desk._mark_checks, 1)
+        self.assertEqual(desk._mark_checks_diverged, 0)
+
+    async def test_a_router_that_cannot_answer_is_not_counted_as_agreement(self):
+        desk = self._desk(quote=None)
+        await MemecoinQuantDesk._cross_check_mark(desk, self.TOKEN, 1_000_000, 1.0, 100.0)
+        self.assertEqual(desk._mark_checks, 0)
+        self.assertEqual(desk._mark_checks_blocked, 1)
+
+    async def test_the_report_separates_being_fast_from_being_right(self):
+        """Marking 100% locally and drifting 40% is fast and wrong."""
+        desk = self._desk()
+        await MemecoinQuantDesk._mark_position(desk, self.TOKEN, self._position())
+        report = MemecoinQuantDesk.mark_report(desk)
+        self.assertEqual(report["local_share"], 1.0)
+        self.assertEqual(report["status"], "OK")
+        self.assertIsNone(report["mean_drift"])
+
+
+class TestEveryRaceBidsOnItsOwnEconomics(unittest.TestCase):
+    """A $500 position is not $500 of expected value -- and nor is a $500 exit."""
+
+    def _desk(self, equity=10_000.0):
+        desk = SimpleNamespace(wallet_equity_usd=equity)
+        desk._exit_edge_usd = functools.partial(MemecoinQuantDesk._exit_edge_usd, desk)
+        return desk
+
+    def _position(self, **overrides):
+        position = {"remaining_cost_usd": 200.0, "current_multiple": 3.0,
+                    "action_value": {"q": 0.002}}
+        position.update(overrides)
+        return position
+
+    def test_an_ordinary_bank_bids_the_edge_the_decision_priced(self):
+        desk = self._desk()
+        edge = desk._exit_edge_usd(self._position(), 0.25, "action_bank_25")
+        self.assertAlmostEqual(edge, 0.002 * 10_000)
+
+    def test_an_escape_bids_the_slice_because_missing_it_loses_the_slice(self):
+        desk = self._desk()
+        edge = desk._exit_edge_usd(self._position(), 1.0, "rug_hazard_critical")
+        # 200 cost at 3x, all of it.
+        self.assertAlmostEqual(edge, 600.0)
+        # And that is far more than the routine bank would have bid.
+        self.assertGreater(edge, desk._exit_edge_usd(self._position(), 1.0, "action_exit"))
+
+    def test_a_partial_escape_bids_only_the_part_being_escaped(self):
+        desk = self._desk()
+        self.assertAlmostEqual(
+            desk._exit_edge_usd(self._position(), 0.5, "escape_urgent"), 300.0)
+
+    def test_an_explicitly_supplied_edge_wins(self):
+        desk = self._desk()
+        self.assertAlmostEqual(
+            desk._exit_edge_usd(self._position(), 1.0, "rug_hazard_high", 12.5), 12.5)
+
+    def test_an_unpriced_ordinary_exit_bids_nothing_rather_than_the_notional(self):
+        """Bidding the notional overpays for a marginal trade, every time."""
+        desk = self._desk()
+        self.assertEqual(
+            desk._exit_edge_usd(self._position(action_value={}), 1.0, "action_exit"), 0.0)
+
+    def test_the_scale_in_passes_its_marginal_elogw_to_the_bid(self):
+        """An ADD fell back to the fixed ladder while the entry beside it bid."""
+        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        block = source[source.index("attempt = {**_jsonable(result), \"scale_in\": True")
+                       - 2_000:source.index("attempt = {**_jsonable(result), \"scale_in\": True")]
+        self.assertIn("expected_edge_usd=max(0.0, gain * max(self.wallet_equity_usd, 0.0))",
+                      block)
+        self.assertIn("sol_price_usd=self.sol_price_usd", block)
 
 class TestPumpSwapConstruction(unittest.TestCase):
     """The last DATA_BLOCKED that was never about missing information.

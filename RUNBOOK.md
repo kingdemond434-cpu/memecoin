@@ -118,7 +118,60 @@ failing, it is one nothing is reporting, and the two need different fixes.
 The gate does not enable capital and cannot. It answers whether the evidence
 would justify the next stage; enabling it is a separate, deliberate act.
 
-## 5. Weekly
+## 5. Watch the Rust kernel promote itself
+
+The Rust T0 core shadows the Python policy on every ordinary decision. It
+takes over only after `t0_kernel_promote_after` consecutive agreements (500 by
+default -- roughly an hour of an active desk), and a SINGLE disagreement while
+it is deciding demotes it for the rest of the session.
+
+```bash
+curl -s localhost:18080/status | python3 -c "
+import json,sys
+d = json.load(sys.stdin)['t0_kernel']
+print('mode              :', d['mode'], '| native:', d['native'])
+print('authoritative     :', d['rust_authoritative'])
+print('agreement run     :', d['consecutive_agreements'], '/', d['promote_after'])
+print('compared/diverged :', d['compared'], '/', d['divergences'])
+print('decided by rust   :', d['decisions_by_rust'], f\"({d['rust_share']})\")
+if d['demoted_reason']:
+    print('DEMOTED:', d['demoted_reason'])
+for row in d['divergence_examples'][:3]:
+    print('  ', row['reason'])
+"
+```
+
+A non-empty `demoted_reason` needs looking at before anything else: the two
+implementations disagreed about a decision that was moving capital. It does
+not re-promote on its own, and it should not be re-promoted by restarting.
+
+`not_expressible_in_kernel` counting up is normal, not a fault -- re-entry and
+replacement decisions have no kernel representation and go to Python by
+design. `without_survival_inputs` climbing means callers are not passing the
+raw distribution, which is worth fixing; a high `rust_errors` means the
+extension is built wrong and the desk is quietly running on Python.
+
+## 6. Confirm marking is local
+
+```bash
+curl -s localhost:18080/status | python3 -c "
+import json,sys
+d = json.load(sys.stdin)['marking']
+print('local share  :', d['local_share'])
+print('via router   :', d['marks_via_router'])
+print('cross-checks :', d['cross_checks'], 'diverged', d['cross_checks_diverged'])
+print('mean drift   :', d['mean_drift'], '(tolerance', d['divergence_tolerance'], ')')
+"
+```
+
+Two different questions here. `local_share` near 1.0 means position
+redecisions are not waiting on a router. `mean_drift` says whether the local
+mark is RIGHT -- a desk marking entirely locally and drifting 40% from the
+router is fast and wrong, which is worse than slow. Persistent divergence on
+one token usually means its curve state has gone stale or it has moved to a
+venue the desk is not reading.
+
+## 7. Weekly
 
 The audit pack runs Mondays at 18:00 Irish time and needs no approval. Read
 it rather than the live status page: a weekly artefact is comparable
@@ -133,7 +186,7 @@ which says whether the data would support cutting any age band further. It
 reports and never acts: adding a band is an edit to `AGE_BANDS` with that
 report recorded next to it.
 
-## 6. A tiny canary, when and only when the gate says so
+## 8. A tiny canary, when and only when the gate says so
 
 The canary is small enough that being wrong about everything costs an amount
 you would not think about twice. Its purpose is not profit -- it is to find

@@ -75,7 +75,7 @@ from src.strategies.information_graph import (
     LeadEventType,
 )
 from src.strategies.age_banded import AgeBandedPredictor
-from src.strategies.multihead_predictor import ElogwEngine, MultiHeadPredictor, PredictionFeatures
+from src.strategies.multihead_predictor import SURVIVAL_LEVELS, ElogwEngine, MultiHeadPredictor, PredictionFeatures
 from src.chains.pump_curve import (
     LAMPORTS_PER_SOL, BondingCurveState, parse_bonding_curve, quote_buy, quote_sell,
 )
@@ -115,6 +115,7 @@ from src.strategies.rug_hazard import ContinuousRugHazardModel
 from src.strategies.social_intelligence import SocialIntelligenceEngine
 from src.strategies.wallet_intelligence import WalletIntelligenceEngine
 from src.strategies.wallet_value import FollowOutcome
+from src.strategies.t0_kernel import SurvivalInputs, T0Kernel
 
 logger = logging.getLogger(__name__)
 
@@ -270,6 +271,17 @@ class MemecoinQuantDesk:
         self._follow_candidates: Dict[str, List[Dict[str, Any]]] = {}
         self._follow_resolved = 0
         self._follow_unresolved = 0
+        # Marking provenance. A desk that believes it marks locally and in
+        # fact pays a round trip on every decision looks identical from the
+        # outside; these are what tell the two apart.
+        self._marks_local = 0
+        self._marks_router = 0
+        self._mark_checked_at: Dict[str, float] = {}
+        self._mark_checks = 0
+        self._mark_checks_blocked = 0
+        self._mark_checks_diverged = 0
+        self._mark_drift_total = 0.0
+        self._mark_divergences: List[Dict[str, Any]] = []
         # Partial-exit PnL accumulated per token, banked into the final
         # outcome row when the position actually closes.
         self._closed_pnl: Dict[str, float] = {}
@@ -489,6 +501,18 @@ class MemecoinQuantDesk:
             min_edge=float(self.global_config.get("action_min_edge", 1e-4)),
             max_add_fraction=float(setting("max_position_pct", 0.05)),
         )
+        # The Rust T0 core, wired into the canonical path rather than sitting
+        # beside it. It shadows the Python policy on every ordinary decision
+        # and takes over only after a run of measured agreement -- and a
+        # single disagreement while it is deciding demotes it for the rest of
+        # the session. Promotion by evidence, demotion by default, exactly as
+        # a model is promoted here.
+        self.t0_kernel = T0Kernel(
+            self.action_policy,
+            mode=str(self.global_config.get("t0_kernel_mode", "auto")),
+            promote_after=int(self.global_config.get("t0_kernel_promote_after", 500)))
+        logger.info("T0 kernel: mode=%s native=%s",
+                    self.t0_kernel.mode.value, self.t0_kernel.native_status)
         self.state_sequencer = StateSequencer()
         # Re-entry is a post-exit candidate, not an action an open
         # position can take: `Action.REENTER` is only scorable at zero held
@@ -2141,7 +2165,31 @@ class MemecoinQuantDesk:
                                 if escape.status == "OK" else None),
             probe_fraction=min(1.0, size_usd / equity),
         )
-        return self.action_policy.score(entry_state)
+        return self.t0_kernel.score(
+            entry_state, survival=self._survival_inputs(prediction),
+            age_seconds=float(trade_info.get("time_since_launch", 0.0) or 0.0),
+            virtual_sol=int(getattr(state, "virtual_sol_reserves", 0) or 0),
+            virtual_token=int(getattr(state, "virtual_token_reserves", 0) or 0))
+
+    @staticmethod
+    def _survival_inputs(prediction: Any) -> Optional[SurvivalInputs]:
+        """The raw distribution the Rust kernel derives its own bins from.
+
+        Raw levels, not the Python bins: handing the kernel the bins Python
+        already built would compare Python's arithmetic against itself and
+        report a parity it had not established.
+        """
+        try:
+            levels = [float(getattr(prediction, target.value))
+                      for target, _multiple in SURVIVAL_LEVELS]
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return SurvivalInputs(
+            levels=levels,
+            p_rug_30s=float(getattr(prediction, "p_rug_30s", 0.0) or 0.0),
+            p_rug_5m=float(getattr(prediction, "p_rug_5m", 0.0) or 0.0),
+            expected_feasible_multiple=float(
+                getattr(prediction, "expected_feasible_multiple", 0.0) or 0.0))
 
     def _price_reentry(self, token: str, prediction: Any, liquidity: float,
                        trade_info: Dict[str, Any]):
@@ -2275,7 +2323,12 @@ class MemecoinQuantDesk:
             add_capacity_fraction=(self.elogw_engine.exposure_cap(liquidity) - held_fraction
                                    if liquidity > 0 else None),
         )
-        decision = self.action_policy.score(state)
+        curve = self._latest_curve_state.get(token)
+        decision = self.t0_kernel.score(
+            state, survival=self._survival_inputs(prediction),
+            age_seconds=max(0.0, time.time() - float(position.get("entry_time", time.time()))),
+            virtual_sol=int(getattr(curve, "virtual_sol_reserves", 0) or 0),
+            virtual_token=int(getattr(curve, "virtual_token_reserves", 0) or 0))
         # Cheap: a handful of pure evaluations over bins already built. Run on
         # every decision rather than on a sample, because the decisions worth
         # attributing are the rare ones and a sample misses exactly those.
@@ -2837,6 +2890,14 @@ class MemecoinQuantDesk:
             priority_fee=self.fee_optimizer.get_optimal_fee(add_usd, 0.5),
             jito_tip=self.fee_optimizer.get_jito_tip(add_usd, "MEDIUM"),
             use_jito=True, decision_id=position.get("decision_id"),
+            # The same economics the entry bid uses, on the same axis. `gain`
+            # is the MARGINAL E[log W] this add buys, so the dollar value of
+            # winning this particular race is that gain against the book --
+            # not the notional being added, which says nothing about whether
+            # the add was worth making. Without this an ADD fell back to the
+            # fixed ladder while the entry beside it bid on economics.
+            expected_edge_usd=max(0.0, gain * max(self.wallet_equity_usd, 0.0)),
+            sol_price_usd=self.sol_price_usd,
         )
         attempt = {**_jsonable(result), "scale_in": True, "marginal_elogw": gain,
                    "added_fraction": fraction, "at_multiple": multiple}
@@ -2861,18 +2922,143 @@ class MemecoinQuantDesk:
         logger.info("%s SCALE-IN %s +$%.2f at %.2fx marginal_elogw=%.6f",
                     "PAPER" if self.dry_run else "LIVE", token, added_cost, multiple, gain)
 
-    async def _mark_position(self, token: str, position: Dict[str, Any]):
+    def _maybe_cross_check_mark(self, token: str, position: Dict[str, Any],
+                                local_multiple: float) -> bool:
+        """Ask the router what it thinks, off the decision path.
+
+        Sampled rather than run on every mark: the point is to catch our own
+        pricing drifting away from the market, and that is a property of the
+        model rather than of any single position. Running it on every
+        redecision would reintroduce the quote storm this change removed,
+        just one step later.
+        """
+        interval = float(self.global_config.get("mark_cross_check_seconds", 30.0))
+        if interval <= 0 or not self.jupiter or self.offline:
+            return False
+        now = time.time()
+        if now - self._mark_checked_at.get(token, 0.0) < interval:
+            return False
+        self._mark_checked_at[token] = now
+        self._spawn_background(
+            self._cross_check_mark(token, int(position.get("size_tokens", 0) or 0),
+                                   float(local_multiple),
+                                   float(position.get("remaining_cost_usd", 0.0) or 0.0)))
+        return True
+
+    async def _cross_check_mark(self, token: str, size_tokens: int,
+                               local_multiple: float, remaining_cost_usd: float) -> None:
+        """Compare our local mark against the router's. Records, never decides.
+
+        A divergence does not move capital and must not: the router is a
+        second opinion about price, not an authority over it. What it is good
+        for is telling us that our own curve state has gone stale or that the
+        token has moved to a venue we are not reading -- both of which show up
+        here long before they show up in a fill.
+        """
+        if size_tokens <= 0 or remaining_cost_usd <= 0:
+            return
+        try:
+            quote = await self.jupiter.get_quote(
+                token, USDC_MINT, size_tokens, slippage_bps=500)
+        except Exception as exc:
+            logger.debug("mark cross-check failed for %s: %s", token, exc)
+            return
+        if not quote or quote.output_amount <= 0:
+            self._mark_checks_blocked += 1
+            return
+        router_multiple = (quote.output_amount / 1_000_000) / max(remaining_cost_usd, 1e-9)
+        self._mark_checks += 1
+        denominator = max(abs(local_multiple), abs(router_multiple), 1e-9)
+        drift = abs(local_multiple - router_multiple) / denominator
+        self._mark_drift_total += drift
+        tolerance = float(self.global_config.get("mark_cross_check_tolerance", 0.10))
+        if drift > tolerance:
+            self._mark_checks_diverged += 1
+            logger.warning(
+                "local mark for %s is %.1f%% from the router (local %.4f, router %.4f); "
+                "curve state may be stale or the token may have moved venue",
+                token, drift * 100, local_multiple, router_multiple)
+            if len(self._mark_divergences) < 20:
+                self._mark_divergences.append({
+                    "token": token, "local": local_multiple,
+                    "router": router_multiple, "drift": drift,
+                    "timestamp": time.time()})
+
+    def mark_report(self) -> Dict[str, Any]:
+        """Whether marking is actually local, and whether it is right.
+
+        Two different questions. A desk marking 100% locally and drifting 40%
+        from the router is fast and wrong, which is worse than slow.
+        """
+        total = self._marks_local + self._marks_router
+        return {
+            "marks_local": self._marks_local,
+            "marks_via_router": self._marks_router,
+            "local_share": (self._marks_local / total) if total else None,
+            "cross_checks": self._mark_checks,
+            "cross_checks_blocked": self._mark_checks_blocked,
+            "cross_checks_diverged": self._mark_checks_diverged,
+            "mean_drift": (self._mark_drift_total / self._mark_checks
+                           if self._mark_checks else None),
+            "divergence_tolerance": float(
+                self.global_config.get("mark_cross_check_tolerance", 0.10)),
+            "recent_divergences": list(self._mark_divergences),
+            "status": "OK" if self._marks_local else "DATA_BLOCKED",
+        }
+
+    def _local_mark(self, token: str, position: Dict[str, Any]):
+        """What this position is worth right now, from streamed state alone.
+
+        Quoted by selling the WHOLE position through the curve or the pool, so
+        the mark carries its own price impact -- which is the difference
+        between what the position is worth and what it would fetch.
+
+        No await, no round trip. This ran only under `if self.dry_run`, so
+        every live HOLD/ADD/BANK/EXIT redecision waited on a Jupiter quote
+        after an event that had already arrived: the desk paid for its
+        latency advantage and then handed it back at the moment of deciding.
+        """
+        size_tokens = int(position.get("size_tokens", 0) or 0)
+        if size_tokens <= 0:
+            return None
+        quote = self._follow_exit_quote(token, size_tokens)
+        if quote is not None and self.sol_price_usd > 0:
+            value_usd = (float(quote.output_amount) / LAMPORTS_PER_SOL) * self.sol_price_usd
+            remaining = max(float(position.get("remaining_cost_usd", 0.0) or 0.0), 1e-9)
+            return (value_usd / remaining, value_usd, "local_executable_quote",
+                    quote.price_impact_pct)
+        # No local quote. A recent streamed price ratio is still a measurement
+        # of this market, just not of this size -- so it is used, and labelled
+        # as the weaker thing it is.
         stream_mark = self._latest_stream_mark.get(token)
-        if self.dry_run and stream_mark and time.time() - stream_mark["timestamp"] <= 3.0:
+        if stream_mark and time.time() - float(stream_mark["timestamp"]) <= 3.0:
             multiple = float(stream_mark["multiple"])
-            current_value = max(0.0, float(position["remaining_cost_usd"]) * multiple)
+            return (multiple,
+                    max(0.0, float(position.get("remaining_cost_usd", 0.0) or 0.0) * multiple),
+                    "decoded_onchain_reserve_event", None)
+        return None
+
+    async def _mark_position(self, token: str, position: Dict[str, Any]):
+        local = self._local_mark(token, position)
+        if local is not None:
+            multiple, current_value, measurement, impact = local
+            self._marks_local += 1
             observation = {"type": "stream_mark", "feasible": True, "value_usd": current_value,
-                           "price_multiple": multiple, "timestamp": stream_mark["timestamp"],
-                           "measurement": "decoded_onchain_reserve_event", "data_status": "OK"}
+                           "price_multiple": multiple, "timestamp": time.time(),
+                           "measurement": measurement, "data_status": "OK"}
+            if impact is not None:
+                observation["price_impact_pct"] = impact
             self.rug_hazard.record_observation(token, observation)
             self.dataset_builder.record_market_observation(token, observation)
             self.counterfactual_lab.record_market_observation(token, multiple, observation["timestamp"])
+            # The router still gets asked -- afterwards, off the decision path,
+            # as an independent check on our own pricing. A local mark nothing
+            # ever contradicts is a local mark nobody has verified.
+            self._maybe_cross_check_mark(token, position, multiple)
             return multiple, current_value
+        # Nothing local could answer. Paying the round trip is right here:
+        # a decision priced on no mark at all is worse than a slow one.
+        self._marks_router += 1
         quote = await self.jupiter.get_quote(token, USDC_MINT, int(position["size_tokens"]), slippage_bps=500)
         if not quote:
             self.rug_hazard.record_observation(token, {"type": "route", "feasible": False, "timestamp": time.time()})
@@ -2979,11 +3165,44 @@ class MemecoinQuantDesk:
         self.rug_hazard.record_observation(token, {**observation, "type": "route"})
         self.counterfactual_lab.record_market_observation(token, multiple, observed_at)
 
-    async def _execute_exit(self, token: str, position: Dict[str, Any], exit_pct: float, reason: str):
+    def _exit_edge_usd(self, position: Dict[str, Any], exit_pct: float, reason: str,
+                       supplied: Optional[float] = None) -> float:
+        """The dollar value of winning the race to get out of this slice.
+
+        An escape is not an economic optimisation. When the reason for leaving
+        is that the thing may be about to stop being sellable, the value of
+        landing is the whole slice, and a bid sized on the marginal E[log W]
+        of a routine bank would under-bid exactly the trade that must not
+        miss.
+        """
+        if supplied is not None:
+            return max(0.0, float(supplied))
+        slice_value = (max(0.0, float(position.get("remaining_cost_usd", 0.0) or 0.0))
+                       * max(0.0, float(position.get("current_multiple", 1.0) or 1.0))
+                       * min(max(float(exit_pct), 0.0), 1.0))
+        urgent = any(token in str(reason) for token in
+                     ("rug_hazard", "escape", "emergency", "sellability", "authority"))
+        if urgent:
+            return slice_value
+        action_value = position.get("action_value") or {}
+        q = float(action_value.get("q", 0.0) or 0.0)
+        return max(0.0, q * max(self.wallet_equity_usd, 0.0))
+
+    async def _execute_exit(self, token: str, position: Dict[str, Any], exit_pct: float,
+                            reason: str, expected_edge_usd: Optional[float] = None):
         current_tokens = int(position["size_tokens"])
         sold_tokens = min(current_tokens, max(1, int(current_tokens * min(max(exit_pct, 0), 1))))
-        result = await self.execution_engine.execute_sell(token, sold_tokens, slippage_bps=500, use_jito=True,
-                                                          decision_id=position.get("decision_id"))
+        result = await self.execution_engine.execute_sell(
+            token, sold_tokens, slippage_bps=500, use_jito=True,
+            decision_id=position.get("decision_id"),
+            # What losing this race costs. For an ordinary bank that is the Q
+            # the decision priced; for an escape it is the slice itself,
+            # because a rug exit that does not land loses the position rather
+            # than an increment of expected growth. Bidding the same fixed
+            # ladder for both is the error in both directions at once.
+            expected_edge_usd=self._exit_edge_usd(position, exit_pct, reason,
+                                                  expected_edge_usd),
+            sol_price_usd=self.sol_price_usd)
         # Only landed, non-simulated sells. A paper fill is not evidence about
         # the network, and a submission that never landed has no latency at
         # all -- counting it as its timeout would make a failing relay look
@@ -3374,6 +3593,10 @@ class MemecoinQuantDesk:
             "idl": idl_report(),
             "action_policy": {"trained": self.action_policy.is_trained,
                               "min_edge": self.action_policy.min_edge},
+            # Whether the canonical decision path is on Rust yet, and the
+            # measured agreement that put it there. A kernel that exists and
+            # is never called is the same defect as one never written.
+            "t0_kernel": self.t0_kernel.report(),
             # An empty registry is not "nothing is a copycat". It is "we
             # cannot tell", and a status page that stays silent about it lets
             # an operator read silence as safety.
@@ -3382,6 +3605,8 @@ class MemecoinQuantDesk:
             # fills we could have got. A watch list nobody has scored is a
             # list of wallets, not intelligence.
             "wallet_follow": self.follow_report(),
+            # Local marking versus the router, and whether the two agree.
+            "marking": self.mark_report(),
             "source_mesh": {**self.source_mesh.health(),
                             "registry": self.source_registry_report.to_dict(),
                             # What is wired, what answered, and what could not

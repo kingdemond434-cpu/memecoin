@@ -164,6 +164,11 @@ class Decision:
     q: float = 0.0
     scores: List[ActionScore] = field(default_factory=list)
     detail: str = ""
+    # Which implementation produced this, and whether the other one agreed.
+    # Declared rather than attached dynamically so a decision can always say
+    # where it came from -- a Rust answer and a Python answer that cannot be
+    # told apart afterwards make a parity ledger unauditable.
+    kernel: Optional[Dict[str, Any]] = None
 
     def score_of(self, action: Action) -> Optional[float]:
         for score in self.scores:
