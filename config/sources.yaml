@@ -25,10 +25,14 @@ sources:
     tier: 1
     region: global
   - id: code:pump-public-docs
-    kind: code_repo
+    kind: rss
     tier: 2
+    language: en
     region: global
-    options: {repo: pump-fun/pump-public-docs}
+    # GitHub's unauthenticated commits API rate-limits the VPS. The
+    # repository's own public Atom feed carries the same commit chronology
+    # without a credential or a token-dependent failure mode.
+    options: {url: "https://github.com/pump-fun/pump-public-docs/commits/main.atom"}
 
   # Telegram sources come from TELEGRAM_CHANNELS at runtime. This keeps the
   # operator's real joined watchlist active without committing private choices
