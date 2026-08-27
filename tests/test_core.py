@@ -91,8 +91,20 @@ from src.research.launch_census import (
     LaunchCensus, LaunchRecord, MONSTER_MULTIPLE, Stage as CensusStage,
 )
 from src.research import rug_mechanism
+from src.research.fallback import (
+    FallbackResolver, FactLadder, Resolution, Rung, Source,
+)
+from src.research.history_warehouse import (
+    ExtractionError, ExtractionPlan, HistoryWarehouse, RpcBackend,
+    WarehouseBackend, Window, windows_between,
+)
+from src.strategies.screen_policy import (
+    ScreenPolicy, ScreenReading, Verdict, graded, veto,
+)
 from src.research.rug_mechanism import RugMechanism
-from src.research.calibration import CalibrationBook, ModelCalibration
+from src.research.calibration import (
+    CalibrationBook, ModelCalibration, Provenance,
+)
 from src.execution import bid_explorer as bid_explorer_module
 from src.execution.bid_explorer import BidExplorer
 from src.execution.signer import (
@@ -15526,3 +15538,356 @@ class TestTheSignerIsAnIndependentAuthority(unittest.TestCase):
         # signed is the failure this whole design exists to prevent.
         source = inspect.getsource(SignerClient.sign_message)
         self.assertIn("raise PermissionError", source)
+
+
+class TestNothingStaysBlockedIfAnyRungCanAnswer(unittest.TestCase):
+    """A desk that refuses to act without a primary measurement stands still
+    through most of the opportunity set."""
+
+    def _ladder(self, **answers):
+        def src(name, rung, **kw):
+            return Source(name=name, rung=rung,
+                          fetch=lambda ctx, n=name: answers.get(n), **kw)
+        return FactLadder("holder_concentration", [
+            src("rpc_largest_accounts", Rung.MEASURED),
+            src("dexscreener", Rung.CORROBORATED),
+            src("deployer_history", Rung.RECONSTRUCTED),
+            src("first25_spread", Rung.PROXY),
+            src("population_base_rate", Rung.PRIOR),
+        ])
+
+    def test_the_best_available_rung_answers(self):
+        res = self._ladder(rpc_largest_accounts=0.42, first25_spread=0.9).resolve()
+        self.assertEqual(res.rung, Rung.MEASURED)
+        self.assertAlmostEqual(res.value, 0.42)
+        self.assertEqual(res.confidence, 1.0)
+        self.assertEqual(res.data_status, "OK")
+
+    def test_it_falls_through_to_a_proxy_rather_than_blocking(self):
+        res = self._ladder(first25_spread=0.71).resolve()
+        self.assertEqual(res.rung, Rung.PROXY)
+        self.assertAlmostEqual(res.value, 0.71)
+        self.assertTrue(res.usable)
+        # Usable, and never mistakable for a reading.
+        self.assertEqual(res.data_status, "DEGRADED:proxy")
+        self.assertLess(res.confidence, 0.5)
+
+    def test_every_declined_rung_is_named_so_a_broken_source_is_visible(self):
+        res = self._ladder(population_base_rate=0.5).resolve()
+        self.assertEqual(res.rung, Rung.PRIOR)
+        tried = [name for name, _why in res.attempted]
+        self.assertIn("rpc_largest_accounts", tried)
+        self.assertIn("dexscreener", tried)
+
+    def test_a_source_that_throws_does_not_take_the_ladder_down(self):
+        def boom(ctx):
+            raise RuntimeError("provider on fire")
+        ladder = FactLadder("x", [
+            Source("primary", Rung.MEASURED, boom),
+            Source("backup", Rung.PROXY, lambda ctx: 7),
+        ])
+        res = ladder.resolve()
+        self.assertEqual(res.value, 7)
+        self.assertIn("provider on fire", dict(res.attempted)["primary"])
+
+    def test_a_stale_value_is_skipped_not_served_as_fresh(self):
+        ladder = FactLadder("x", [
+            Source("cached", Rung.MEASURED, lambda ctx: (5, 100.0), max_age_s=10.0),
+            Source("live_proxy", Rung.PROXY, lambda ctx: 9),
+        ])
+        res = ladder.resolve(now=1000.0)
+        self.assertEqual(res.rung, Rung.PROXY)
+        self.assertIn("stale", dict(res.attempted)["cached"])
+
+    def test_a_ladder_declared_out_of_order_still_prefers_the_measurement(self):
+        ladder = FactLadder("x", [
+            Source("guess", Rung.PRIOR, lambda ctx: 1),
+            Source("read", Rung.MEASURED, lambda ctx: 2),
+        ])
+        self.assertEqual(ladder.resolve().value, 2)
+
+    def test_absent_is_still_possible_and_still_says_so(self):
+        res = self._ladder().resolve()
+        self.assertEqual(res.rung, Rung.ABSENT)
+        self.assertFalse(res.usable)
+        self.assertEqual(res.data_status, "DATA_BLOCKED")
+        self.assertEqual(res.confidence, 0.0)
+
+    def test_three_proxies_do_not_add_up_to_a_measurement(self):
+        proxies = [Resolution("a", 1, Rung.PROXY), Resolution("b", 1, Rung.PROXY),
+                   Resolution("c", 1, Rung.PROXY)]
+        combined = FallbackResolver.combined_confidence(proxies)
+        self.assertLessEqual(combined, Resolution("x", 1, Rung.PROXY).confidence)
+
+    def test_one_dark_fact_caps_a_decision_full_of_clean_ones(self):
+        rows = [Resolution(f"m{i}", 1, Rung.MEASURED) for i in range(6)]
+        rows.append(Resolution("dark", 1, Rung.PRIOR))
+        combined = FallbackResolver.combined_confidence(rows)
+        self.assertLessEqual(combined, Resolution("x", 1, Rung.PRIOR).confidence)
+
+    def test_the_report_names_facts_we_are_usually_guessing(self):
+        resolver = FallbackResolver()
+        resolver.declare("good", [Source("read", Rung.MEASURED, lambda c: 1)])
+        resolver.declare("bad", [Source("guess", Rung.PRIOR, lambda c: 1)])
+        for _ in range(5):
+            resolver.resolve("good"); resolver.resolve("bad")
+        report = resolver.report()
+        self.assertEqual(report["status"], "DEGRADED")
+        self.assertEqual(report["degraded_facts"], ["bad"])
+        self.assertIn("usually being inferred", report["detail"])
+
+
+class TestScreensShrinkPositionsInsteadOfDiscardingLaunches(unittest.TestCase):
+    """The census showed the great majority of monsters were discarded
+    upstream. That is structural, not parametric."""
+
+    def test_a_concern_reduces_size_rather_than_rejecting(self):
+        policy = ScreenPolicy()
+        outcome = policy.evaluate([
+            graded("holder_concentration", 0.55, benign=0.20, severe=0.80)])
+        self.assertEqual(outcome.verdict, Verdict.REDUCED)
+        self.assertFalse(outcome.rejected)
+        self.assertLess(outcome.size_multiplier, 1.0)
+        self.assertGreater(outcome.size_multiplier, 0.0)
+
+    def test_a_cliff_becomes_a_slope(self):
+        policy = ScreenPolicy()
+        just_under = policy.evaluate([
+            graded("c", 0.39, benign=0.2, severe=0.8)]).size_multiplier
+        just_over = policy.evaluate([
+            graded("c", 0.41, benign=0.2, severe=0.8)]).size_multiplier
+        # Two percent of concentration must not cost everything.
+        self.assertLess(abs(just_under - just_over), 0.05)
+
+    def test_several_concerns_compose_into_a_small_position(self):
+        policy = ScreenPolicy()
+        outcome = policy.evaluate([
+            graded("holder_concentration", 0.6, benign=0.2, severe=0.8),
+            graded("no_source_touch", 1.0, benign=0.0, severe=1.0, floor=0.5),
+            graded("first25_not_independent", 0.7, benign=0.2, severe=0.9)])
+        self.assertEqual(outcome.verdict, Verdict.REDUCED)
+        self.assertLess(outcome.size_multiplier, 0.4)
+        self.assertGreater(outcome.size_multiplier, 0.0)
+
+    def test_a_veto_still_rejects_outright(self):
+        policy = ScreenPolicy()
+        outcome = policy.evaluate([
+            graded("holder_concentration", 0.3, benign=0.2, severe=0.8),
+            veto("unsellable", "no route can be built for this mint")])
+        self.assertEqual(outcome.verdict, Verdict.VETOED)
+        self.assertTrue(outcome.rejected)
+        self.assertEqual(outcome.size_multiplier, 0.0)
+        self.assertEqual(outcome.census_reason, "veto_unsellable")
+
+    def test_declining_is_economic_not_rule_based(self):
+        policy = ScreenPolicy(size_floor=0.10)
+        outcome = policy.evaluate([
+            graded("a", 1.0, benign=0.0, severe=1.0, floor=0.2),
+            graded("b", 1.0, benign=0.0, severe=1.0, floor=0.2)])
+        self.assertEqual(outcome.verdict, Verdict.UNECONOMIC)
+        self.assertIn("no size clears its own execution cost", outcome.reason)
+
+    def test_an_unmeasured_input_is_not_treated_as_benign(self):
+        reading = graded("holder_concentration", None, benign=0.2, severe=0.8)
+        # Full multiplier at zero confidence: the screen did not observe a
+        # severity and must not invent one, but nor does it vouch for safety.
+        self.assertEqual(reading.multiplier, 1.0)
+        self.assertEqual(reading.confidence, 0.0)
+        self.assertIn("not treated as benign", reading.reason)
+
+    def test_a_screen_resting_on_a_proxy_cuts_less_than_one_on_a_reading(self):
+        certain = graded("c", 0.8, benign=0.2, severe=0.8, confidence=1.0)
+        inferred = graded("c", 0.8, benign=0.2, severe=0.8, confidence=0.35)
+        self.assertLess(certain.effective(), inferred.effective())
+
+    def test_a_reduced_launch_is_not_recorded_as_screened_out(self):
+        # It reached a decision. Recording it as a screen would corrupt the
+        # missed-monster attribution the census exists to produce.
+        policy = ScreenPolicy()
+        outcome = policy.evaluate([graded("c", 0.5, benign=0.2, severe=0.8)])
+        self.assertEqual(outcome.census_reason, "")
+
+    def test_the_report_prices_screens_by_size_not_by_rejections(self):
+        policy = ScreenPolicy()
+        for _ in range(20):
+            policy.evaluate([
+                graded("halves_everything", 0.5, benign=0.0, severe=1.0, floor=0.5),
+                graded("never_bites", 0.0, benign=0.0, severe=1.0)])
+        report = policy.report()
+        self.assertEqual(report["declined_uneconomic"], 0)
+        self.assertEqual(report["costliest_screens"][0]["screen"],
+                         "halves_everything")
+        self.assertAlmostEqual(report["kept_but_reduced_share"], 1.0)
+
+
+class TestCalibrationEvidenceCarriesItsProvenance(unittest.TestCase):
+
+    def test_a_replayed_model_is_not_proven_on_real_fills(self):
+        book = CalibrationBook(min_samples=10)
+        for _ in range(50):
+            book.record("landing_p", 0.5, True,
+                        provenance=Provenance.RECONSTRUCTED.value)
+        row = book.report()["models"][0]
+        self.assertEqual(row["dominant_provenance"], "reconstructed")
+        self.assertFalse(row["proven_on_real_fills"])
+        self.assertEqual(book.report()["models_proven_on_real_fills"], 0)
+
+    def test_synthetic_observations_weigh_nothing(self):
+        book = ModelCalibration("m")
+        for _ in range(100):
+            book.record(0.5, True, provenance=Provenance.SYNTHETIC.value)
+        self.assertEqual(book.count, 100)
+        self.assertEqual(book.evidence_weight(), 0.0)
+
+    def test_real_fills_outweigh_replay_four_to_one(self):
+        real = ModelCalibration("a")
+        replay = ModelCalibration("b")
+        for _ in range(100):
+            real.record(0.5, True, provenance=Provenance.FORWARD_REAL.value)
+            replay.record(0.5, True, provenance=Provenance.RECONSTRUCTED.value)
+        self.assertAlmostEqual(real.evidence_weight() / replay.evidence_weight(), 4.0)
+
+    def test_provenance_survives_a_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cal.json"
+            book = CalibrationBook(path, min_samples=5)
+            book.record("m", 0.5, True, provenance=Provenance.FORWARD_REAL.value)
+            book.save()
+            revived = CalibrationBook(path, min_samples=5)
+            revived.load()
+            self.assertEqual(revived.models["m"].by_provenance,
+                             {"forward_real": 1})
+
+
+class _FakeWarehouseClient:
+    def __init__(self, schema, rows, estimate=1_000):
+        self._schema = schema
+        self._rows = rows
+        self._estimate = estimate
+        self.queries = 0
+
+    def schema(self, table):
+        if table not in self._schema:
+            raise RuntimeError(f"no such table: {table}")
+        return self._schema[table]
+
+    def estimate(self, query, params):
+        return self._estimate
+
+    def query(self, query, params):
+        self.queries += 1
+        return [row for row in self._rows
+                if params["start_slot"] <= row["block_slot"] <= params["end_slot"]]
+
+
+class TestHistoryIsExtractedNotWaitedFor(unittest.TestCase):
+
+    def _schema(self):
+        return {
+            "bigquery-public-data.crypto_solana_mainnet_us.Transactions":
+                ["block_slot", "block_timestamp", "signature", "signer",
+                 "accounts", "instructions", "status"],
+            "bigquery-public-data.crypto_solana_mainnet_us.Token Transfers":
+                ["block_slot", "block_timestamp", "source", "destination", "value"],
+        }
+
+    def test_a_wrong_table_name_fails_loudly_naming_what_was_expected(self):
+        client = _FakeWarehouseClient({"some.other.table": ["a"]}, [])
+        backend = WarehouseBackend(client)
+        result = backend.verify()
+        self.assertFalse(result["verified"])
+        self.assertTrue(any("unreadable" in p for p in result["problems"]))
+
+    def test_a_renamed_column_is_named_rather_than_returning_nothing(self):
+        schema = self._schema()
+        table = "bigquery-public-data.crypto_solana_mainnet_us.Transactions"
+        schema[table] = [c for c in schema[table] if c != "instructions"]
+        backend = WarehouseBackend(_FakeWarehouseClient(schema, []))
+        result = backend.verify()
+        self.assertFalse(result["verified"])
+        self.assertTrue(any("missing instructions" in p for p in result["problems"]))
+
+    def test_extraction_refuses_before_the_schema_is_verified(self):
+        backend = WarehouseBackend(_FakeWarehouseClient(self._schema(), []))
+        with self.assertRaises(ExtractionError) as caught:
+            backend.launches(Window(0, 100), "prog")
+        self.assertIn("silently empty", str(caught.exception))
+
+    def test_a_query_over_budget_is_refused_before_it_runs(self):
+        client = _FakeWarehouseClient(self._schema(), [], estimate=10**12)
+        backend = WarehouseBackend(client, scan_budget_bytes=10**9)
+        backend.verify()
+        with self.assertRaises(ExtractionError) as caught:
+            backend.launches(Window(0, 100), "prog")
+        self.assertIn("past its", str(caught.exception))
+        self.assertEqual(client.queries, 0, "an over-budget query still ran")
+
+    def test_rows_become_launches_only_when_a_mint_is_identified(self):
+        rows = [
+            {"block_slot": 5, "block_timestamp": 100.0, "mint": "A",
+             "kind": "create", "signer": "dev1"},
+            {"block_slot": 6, "block_timestamp": 101.0, "mint": "A",
+             "kind": "trade", "signature": "s1"},
+            # No mint: must produce nothing rather than a guessed identity.
+            {"block_slot": 7, "block_timestamp": 102.0, "kind": "create",
+             "signer": "dev2"},
+        ]
+        client = _FakeWarehouseClient(self._schema(), rows)
+        backend = WarehouseBackend(client)
+        backend.verify()
+        warehouse = HistoryWarehouse(backend)
+        launches, report = warehouse.run(ExtractionPlan(
+            windows=[Window(0, 100)], backend=None, programs=("prog",)))
+        self.assertEqual(len(launches), 1)
+        self.assertEqual(launches[0].token, "A")
+        self.assertEqual(launches[0].creator, "dev1")
+        self.assertEqual(report.launches_built, 1)
+
+    def test_coverage_is_reported_as_windows_not_as_rows(self):
+        client = _FakeWarehouseClient(self._schema(), [])
+        backend = WarehouseBackend(client)
+        backend.verify()
+        warehouse = HistoryWarehouse(backend)
+        _launches, report = warehouse.run(ExtractionPlan(
+            windows=windows_between(0, 300, slots_per_window=100),
+            backend=None, programs=("prog",)))
+        d = report.to_dict()
+        self.assertEqual(d["windows_planned"], 3)
+        self.assertEqual(d["coverage"], 1.0)
+        # Zero rows and full coverage are different facts and both are stated.
+        self.assertEqual(d["rows"], 0)
+
+    def test_an_interrupted_run_resumes_rather_than_restarting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ck.json"
+            client = _FakeWarehouseClient(self._schema(), [])
+            backend = WarehouseBackend(client)
+            backend.verify()
+            plan = ExtractionPlan(windows=windows_between(0, 300, slots_per_window=100),
+                                  backend=None, programs=("prog",))
+            HistoryWarehouse(backend, checkpoint=path).run(plan)
+            self.assertEqual(client.queries, 3)
+            HistoryWarehouse(backend, checkpoint=path).run(plan)
+            # Already-covered windows are not re-queried.
+            self.assertEqual(client.queries, 3)
+
+    def test_one_failed_window_costs_one_window_not_the_run(self):
+        class Flaky(WarehouseBackend):
+            def launches(self, window, program):
+                if window.start_slot == 100:
+                    raise RuntimeError("timeout")
+                return []
+        backend = Flaky(_FakeWarehouseClient(self._schema(), []))
+        backend.verify()
+        _l, report = HistoryWarehouse(backend).run(ExtractionPlan(
+            windows=windows_between(0, 300, slots_per_window=100),
+            backend=None, programs=("prog",)))
+        self.assertEqual(report.windows_done, 2)
+        self.assertEqual(report.windows_failed, 1)
+        self.assertEqual(report.to_dict()["status"], "PARTIAL")
+
+    def test_windows_tile_the_range_without_gaps_or_overlap(self):
+        windows = windows_between(1000, 3500, slots_per_window=1000)
+        self.assertEqual([(w.start_slot, w.end_slot) for w in windows],
+                         [(1000, 2000), (2000, 3000), (3000, 3500)])
+        self.assertEqual(windows_between(500, 500), [])
