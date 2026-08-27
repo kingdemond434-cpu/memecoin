@@ -120,6 +120,7 @@ from src.strategies.t0_kernel import SurvivalInputs, T0Kernel
 from src.strategies.funder_ancestry import FunderAncestry, compress_independence
 from src.execution.staged_exits import StagedExits
 from src.strategies.disagreement import DisagreementModel, views_from_intelligence
+from src.strategies.ignition import IgnitionModel, touches_from_events
 
 logger = logging.getLogger(__name__)
 
@@ -285,6 +286,12 @@ class MemecoinQuantDesk:
         self.state_sequencer = StateSequencer()
         # Disagreement across the desk's independent views, as a sizing
         # multiplier rather than a veto.
+        # Where a narrative is in its life, which is a different question
+        # from how good the source was: an excellent source can post into a
+        # narrative that never spreads.
+        self.ignition = IgnitionModel(
+            kol_reach=int(self.global_config.get("kol_reach_threshold", 10_000)),
+            horizon_seconds=float(self.global_config.get("ignition_horizon_s", 300.0)))
         self.disagreement = DisagreementModel(
             min_views=int(self.global_config.get("disagreement_min_views", 3)),
             floor=float(self.global_config.get("disagreement_floor", 0.25)),
@@ -3084,6 +3091,53 @@ class MemecoinQuantDesk:
             "status": "OK" if self._marks_local else "DATA_BLOCKED",
         }
 
+    def ignition_census(self) -> Dict[str, Any]:
+        """How many tracked narratives are in each lifecycle state."""
+        counts: Dict[str, int] = {}
+        igniting: List[str] = []
+        for token in list(self._source_events)[:500]:
+            try:
+                reading = self._read_ignition(token)
+            except Exception:
+                continue
+            counts[reading.state.value] = counts.get(reading.state.value, 0) + 1
+            if reading.igniting and len(igniting) < 20:
+                igniting.append(token)
+        return {
+            "status": "OK" if counts else "DATA_BLOCKED",
+            "detail": ("" if counts else
+                       "no token has a source touch yet; every narrative is chain-only"),
+            "states": dict(sorted(counts.items())), "igniting": igniting,
+            "kol_reach_threshold": self.ignition.kol_reach,
+        }
+
+    def _read_ignition(self, token: str):
+        """Where this token's narrative is in its lifecycle.
+
+        Buyer arrivals are the INDEPENDENT ones -- the actor graph's
+        compression has already been applied. Passing raw wallet counts would
+        let a Sybil manufacture the acceleration this exists to detect.
+        """
+        events = self._source_events.get(token) or []
+        dnas = {dna.source_id: dna for dna in (self._source_dnas or {}).values()} \
+            if isinstance(getattr(self, "_source_dnas", None), dict) else {}
+        leads = {item.upstream: item.lead_rate
+                 for item in (self.source_genealogy.lead_lag() or ())} \
+            if hasattr(self.source_genealogy, "lead_lag") else {}
+        touches = touches_from_events(events, dnas=dnas, lead_rates=leads)
+        entries = self._actor_entries.get(token) or []
+        scores = (self.independence_report.scores
+                  if self.independence_report.status == "OK" else {})
+        arrivals: List[float] = []
+        for entry in entries:
+            weight = float(scores.get(entry.wallet, 1.0))
+            # A wallet counted at a third of an arrival is a wallet the graph
+            # has said is a third of an actor. Rounding it up to one is how a
+            # cluster becomes a crowd.
+            if weight >= 0.5:
+                arrivals.append(float(entry.timestamp))
+        return self.ignition.read(touches, arrivals)
+
     def _read_disagreement(self, token: str, candidate: Any, prediction: Any,
                            liquidity: float):
         """Dispersion across the desk's own readings of this launch.
@@ -3113,6 +3167,13 @@ class MemecoinQuantDesk:
             if credibility:
                 intelligence["source"] = {"status": "OK",
                                           "credibility": max(credibility)}
+        reading = self._read_ignition(token)
+        if reading.ok and reading.probability is not None:
+            # The crowd question, not the source question. Whether the next
+            # wave of independent buyers is coming is what decides whether a
+            # position compounds; how good the source was does not.
+            intelligence["ignition"] = {"status": "OK",
+                                        "probability": reading.probability}
         probe = {"size_tokens": 0}
         status, ratio = self._exit_capacity(token, probe)
         intelligence["capacity"] = {
@@ -3841,6 +3902,10 @@ class MemecoinQuantDesk:
             # Whether exits are actually served from the prepared ladder. One
             # built for every position and used for none is pure cost.
             "staged_exits": self.staged_exits.report(),
+            # The narrative lifecycle across tracked tokens. Reported as a
+            # census rather than per token: what an operator needs is whether
+            # anything is igniting, not a row per launch.
+            "ignition": self.ignition_census(),
             "source_mesh": {**self.source_mesh.health(),
                             "registry": self.source_registry_report.to_dict(),
                             # What is wired, what answered, and what could not

@@ -68,6 +68,10 @@ from src.collectors.adapters import (
 from src.collectors.event_source import (
     Event, EventSource, SourceClass, SourceMesh, SourceState,
 )
+from src.strategies.ignition import (
+    IgnitionModel, IgnitionReading, KolRole, NarrativeState, SourceTouch,
+    classify_role, touches_from_events,
+)
 from src.strategies.disagreement import (
     DisagreementModel, DisagreementReading, View, views_from_intelligence,
 )
@@ -109,7 +113,7 @@ from src.strategies.distribution import (
     distribution_features,
 )
 from src.strategies.source_genealogy import (
-    PostOutcome, SourceGenealogy, SourcePost, build_source_dna, rank_sources,
+    PostOutcome, SourceDNA, SourceGenealogy, SourcePost, build_source_dna, rank_sources,
     source_value,
 )
 from src.strategies.mega_event import (
@@ -11995,6 +11999,162 @@ class TestDisagreementShrinksRatherThanVetoes(unittest.TestCase):
             engine.size_candidate(prediction, 150.0, 100_000.0,
                                   disagreement=blocked)["position_size_sol"],
             engine.size_candidate(prediction, 150.0, 100_000.0)["position_size_sol"])
+
+
+class TestNarrativeIgnition(unittest.TestCase):
+    """Ranking sources answers whether a SOURCE is worth following.
+
+    It does not answer what the position turns on, which is about the crowd:
+    an excellent source can post into a narrative that never spreads, and a
+    mediocre one can post the thing that ignites.
+    """
+
+    def _touch(self, source_id, at=0.0, reach=None, independence=1.0):
+        return SourceTouch(source_id=source_id, timestamp=at, reach=reach,
+                           independence=independence)
+
+    def _arrivals(self, recent, previous, now, window=60.0):
+        """`recent` buyers inside the window, `previous` in the one before."""
+        return ([now - window * 0.5] * recent) + ([now - window * 1.5] * previous)
+
+    def test_no_source_has_spoken_so_the_narrative_is_chain_only(self):
+        reading = IgnitionModel().read([], [])
+        self.assertEqual(reading.state, NarrativeState.CHAIN_ONLY)
+        self.assertEqual(reading.status, "DATA_BLOCKED")
+        # Never zero: a zero would read as "we checked and it will not spread".
+        self.assertIsNone(reading.probability)
+
+    def test_one_obscure_source_is_early_not_ignition(self):
+        reading = IgnitionModel().read([self._touch("tiny", reach=50)], [1.0, 2.0])
+        self.assertEqual(reading.state, NarrativeState.EARLY_SOURCE)
+        self.assertLess(reading.probability, 0.3)
+
+    def test_a_source_with_real_reach_is_ignition(self):
+        reading = IgnitionModel().read(
+            [self._touch("big", reach=500_000)], [1.0, 2.0])
+        self.assertEqual(reading.state, NarrativeState.KOL_IGNITION)
+        self.assertTrue(reading.igniting)
+
+    def test_eight_accounts_run_by_one_operator_are_one_source_shouting(self):
+        """Treating them as eight is exactly the manufactured ignition this
+        is supposed to detect."""
+        now = time.time()
+        sybil = [self._touch(f"s{i}", reach=100, independence=0.1) for i in range(8)]
+        genuine = [self._touch(f"g{i}", reach=100, independence=1.0) for i in range(8)]
+        model = IgnitionModel()
+        self.assertEqual(model.read(sybil, self._arrivals(4, 1, now), now).state,
+                         NarrativeState.EARLY_SOURCE)
+        self.assertNotEqual(model.read(genuine, self._arrivals(4, 1, now), now).state,
+                            NarrativeState.EARLY_SOURCE)
+
+    def test_acceleration_and_saturation_are_separated_by_the_second_derivative(self):
+        """In raw volume they are identical and they imply opposite actions."""
+        now = time.time()
+        touches = [self._touch(f"s{i}", reach=100) for i in range(4)]
+        model = IgnitionModel()
+        rising = model.read(touches, self._arrivals(20, 5, now), now)
+        flat = model.read(touches, self._arrivals(5, 20, now), now)
+        self.assertIn(rising.state, (NarrativeState.MULTI_SOURCE_ACCELERATION,
+                                     NarrativeState.MASS_FOMO))
+        self.assertEqual(flat.state, NarrativeState.SATURATION)
+        # Same posting volume, opposite readings.
+        self.assertEqual(rising.independent_sources, flat.independent_sources)
+        self.assertGreater(rising.buyer_acceleration, 0)
+        self.assertLess(flat.buyer_acceleration, 0)
+
+    def test_saturation_says_the_wave_is_not_coming_rather_than_blocking(self):
+        now = time.time()
+        reading = IgnitionModel().read(
+            [self._touch(f"s{i}", reach=100) for i in range(4)],
+            self._arrivals(2, 30, now), now)
+        self.assertEqual(reading.state, NarrativeState.SATURATION)
+        self.assertEqual(reading.probability, 0.0)
+        self.assertFalse(reading.igniting)
+
+    def test_many_independent_sources_with_rising_buyers_is_mass_fomo(self):
+        now = time.time()
+        reading = IgnitionModel(multi_source=3).read(
+            [self._touch(f"s{i}", reach=1_000) for i in range(8)],
+            self._arrivals(40, 5, now), now)
+        self.assertEqual(reading.state, NarrativeState.MASS_FOMO)
+
+    def test_the_state_is_not_a_ratchet(self):
+        """A narrative that reaches ignition and does not spread falls back;
+        pretending otherwise holds a position on a fire that went out."""
+        now = time.time()
+        model = IgnitionModel()
+        hot = model.read([self._touch(f"s{i}", reach=9_000) for i in range(4)],
+                         self._arrivals(30, 4, now), now)
+        cold = model.read([self._touch(f"s{i}", reach=9_000) for i in range(4)],
+                          self._arrivals(1, 30, now), now)
+        self.assertGreater(hot.state.rank, NarrativeState.KOL_IGNITION.rank)
+        self.assertEqual(cold.state, NarrativeState.SATURATION)
+
+    def test_the_probability_never_reads_as_a_confident_forecast(self):
+        """A structural prior is not a trained model and must not look like one."""
+        now = time.time()
+        reading = IgnitionModel().read(
+            [self._touch(f"s{i}", reach=1_000_000) for i in range(30)],
+            self._arrivals(100, 1, now), now)
+        self.assertLessEqual(reading.probability, 0.9)
+
+
+class TestKolRolesDecideTheAction(unittest.TestCase):
+    """A DISTRIBUTOR is not a source to ignore.
+
+    Its posts are excellent at predicting flow and terrible to hold alongside:
+    the right action is in before its followers arrive and out as their flow
+    peaks, which is the opposite of 'he posted, so hold'.
+    """
+
+    def _dna(self, **overrides):
+        args = dict(source_id="s", posts=50, status="MEASURED",
+                    median_observation_lag=10.0, best_horizon_return=0.4,
+                    flow_prediction=1.3, distribution_score=0.1)
+        args.update(overrides)
+        return SourceDNA(**args)
+
+    def test_an_unmeasured_source_has_no_role(self):
+        self.assertEqual(classify_role(None), KolRole.UNKNOWN)
+        self.assertEqual(classify_role(self._dna(status="MEASURING")), KolRole.UNKNOWN)
+
+    def test_accumulating_before_and_selling_after_is_a_distributor(self):
+        self.assertEqual(classify_role(self._dna(distribution_score=0.9)),
+                         KolRole.DISTRIBUTOR)
+
+    def test_being_early_does_not_stop_a_distributor_being_one(self):
+        """Early makes it better at predicting flow and no safer to hold."""
+        role = classify_role(self._dna(distribution_score=0.9,
+                                       median_observation_lag=1.0), lead_rate=0.95)
+        self.assertEqual(role, KolRole.DISTRIBUTOR)
+
+    def test_a_source_that_loses_money_on_its_own_posts_is_an_anti_signal(self):
+        self.assertEqual(classify_role(self._dna(best_horizon_return=-0.3)),
+                         KolRole.ANTI_SIGNAL)
+
+    def test_leading_the_others_makes_it_an_originator(self):
+        self.assertEqual(classify_role(self._dna(), lead_rate=0.8), KolRole.ORIGINATOR)
+
+    def test_a_late_repeater_is_named_as_one(self):
+        self.assertEqual(classify_role(self._dna(median_observation_lag=1_800.0)),
+                         KolRole.LAGGING_REPEATER)
+
+    def test_a_prompt_source_with_no_lead_history_is_an_early_repeater(self):
+        self.assertEqual(classify_role(self._dna()), KolRole.EARLY_REPEATER)
+
+    def test_one_source_posting_six_times_is_one_source_arriving(self):
+        """Counting each post would make a single loud account a crowd."""
+        events = [SimpleNamespace(source_id="loud", source_at=float(i))
+                  for i in range(6)]
+        touches = touches_from_events(events)
+        self.assertEqual(len(touches), 1)
+        # And it arrived when it FIRST spoke, not when it last did.
+        self.assertEqual(touches[0].timestamp, 0.0)
+
+    def test_the_desk_reports_the_lifecycle_census(self):
+        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        self.assertIn('"ignition": self.ignition_census()', source)
+        self.assertIn("self._read_ignition(token)", source)
 
 class TestPumpSwapConstruction(unittest.TestCase):
     """The last DATA_BLOCKED that was never about missing information.
