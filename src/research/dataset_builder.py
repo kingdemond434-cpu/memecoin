@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import numpy as np
 import aiohttp
 
@@ -19,6 +19,7 @@ from src.strategies.social_intelligence import SocialIntelligenceEngine
 from src.strategies.prelaunch_intent import PrelaunchIntentModel
 from src.strategies.information_graph import InformationLeadGraph, CounterfactualExecutionLab
 from src.strategies.rug_hazard import ContinuousRugHazardModel
+from src.strategies.memecoin_state import social_price_disagreement
 from src.strategies.champion_challenger import ChampionChallengerFramework
 
 logger = logging.getLogger(__name__)
@@ -163,7 +164,9 @@ class PointInTimeDatasetBuilder:
         info_graph: InformationLeadGraph,
         rug_hazard: ContinuousRugHazardModel,
         champion_challenger: ChampionChallengerFramework,
-        storage_path: str = "data/launch_episodes"
+        storage_path: str = "data/launch_episodes",
+        actor_provider: Optional[Callable[[str, Optional[float]], Dict[str, Any]]] = None,
+        memecoin_state_provider: Optional[Callable[[str, Optional[float]], Dict[str, Any]]] = None,
     ):
         self.chain_config = chain_config
         self.rpc = rpc
@@ -174,6 +177,8 @@ class PointInTimeDatasetBuilder:
         self.info_graph = info_graph
         self.rug_hazard = rug_hazard
         self.champion_challenger = champion_challenger
+        self.actor_provider = actor_provider
+        self.memecoin_state_provider = memecoin_state_provider
         self.storage_path = storage_path
         
         self.active_episodes: Dict[str, LaunchEpisode] = {}
@@ -492,7 +497,13 @@ class PointInTimeDatasetBuilder:
 
     async def _capture_social_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
         social_signal = self.social_intel.get_token_social_signal(episode.token, as_of=as_of)
-        return social_signal
+        disagreement = social_price_disagreement(
+            [item for item in episode.market_observations if item.get("type") == "social"],
+            [item for item in episode.market_observations
+             if item.get("type") in {"trade", "market"}], as_of=as_of)
+        return {**social_signal,
+                "price_disagreement_status": disagreement.get("status"),
+                "price_disagreement": disagreement.get("evidence_score")}
 
     async def _capture_token_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
         reports = [item for item in episode.market_observations
@@ -502,22 +513,52 @@ class PointInTimeDatasetBuilder:
             return {"status": "DATA_BLOCKED", "reason": "risk_report_not_recorded"}
         concentrations = [float(item.get("top_10_pct", 0) or 0) for item in reports
                           if item.get("top_10_pct") is not None]
+        concentrations20 = [float(item.get("top_20_pct", 0) or 0) for item in reports
+                            if item.get("top_20_pct") is not None]
         concentration_delta = concentrations[-1] - concentrations[0] if len(concentrations) >= 2 else 0.0
+        concentration20_delta = (concentrations20[-1] - concentrations20[0]
+                                 if len(concentrations20) >= 2 else None)
         duration = (float(reports[-1].get("timestamp", 0)) - float(reports[0].get("timestamp", 0))) if len(reports) >= 2 else 0.0
-        return {
+        result = {
             "status": report.get("data_status", "OK"),
             "ownership_renounced": report.get("ownership_renounced"),
             "can_mint": report.get("can_mint"),
             "can_freeze": report.get("can_freeze"),
             "top_10_pct": report.get("top_10_pct"),
+            "top_20_pct": report.get("top_20_pct"),
             "top_10_delta_pct": concentration_delta,
             "top_10_velocity_pct_per_second": concentration_delta / duration if duration > 0 else 0.0,
+            "top_20_delta_pct": concentration20_delta,
+            "top_20_velocity_pct_per_second": (
+                concentration20_delta / duration
+                if concentration20_delta is not None and duration > 0 else None),
+            "dev_pct": report.get("deployer_balance_pct"),
+            "insider_pct": report.get("insider_pct"),
+            "bundler_pct": report.get("bundler_pct"),
+            "fresh_wallet_pct": report.get("fresh_wallet_pct"),
+            "whale_pct": report.get("whale_pct"),
+            "connected_cluster_pct": report.get("connected_cluster_pct"),
             "token_extensions": report.get("token_extensions", []),
             # The chronological model learns the actual outcome correlation;
             # this input is only the normalized native-extension hazard prior.
             "extension_risk": float(report.get("extension_risk", 0) or 0),
             "sell_route_feasible": report.get("sell_route_feasible"),
         }
+        if self.memecoin_state_provider is not None:
+            state = self.memecoin_state_provider(episode.token, as_of)
+            dev = state.get("dev_wallet") or {}
+            rotation = state.get("capital_rotation") or {}
+            result.update({
+                "dev_state_status": dev.get("status", "DATA_BLOCKED"),
+                "dev_balance_pct": dev.get("balance_pct"),
+                "dev_recent_sells": dev.get("recent_dev_sells"),
+                "dev_sell_supply_pct": dev.get("recent_measured_sell_supply_pct"),
+                "dev_hard_veto_count": len(dev.get("hard_vetoes", ())),
+                "capital_rotation_status": rotation.get("status", "DATA_BLOCKED"),
+                "capital_rotation_flow": (rotation.get("token_flow") or {}).get(
+                    episode.token),
+            })
+        return result
 
     async def _capture_market_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
         observed = [
@@ -644,13 +685,32 @@ class PointInTimeDatasetBuilder:
                     if data.get("type") == "funded" and float(data.get("timestamp", 0) or 0) <= as_of
                 }
                 funding_reuse = max(funding_reuse, len(funded_deployers))
-        return {
+        result = {
             "deployer_cluster_risk": cluster_risk,
             "funding_wallet_risk": max(funding_risks) if funding_risks else None,
             "funding_wallet_reuse": min(funding_reuse / 10, 1),
             "creator_genealogy_depth": len(dp.funding_wallets) if dp else None,
             "status": "OK" if dp else "DATA_BLOCKED",
         }
+        if self.actor_provider is not None:
+            actor = self.actor_provider(episode.token, as_of)
+            flow = actor.get("smart_flow") or {}
+            swarm = actor.get("swarm") or {}
+            result.update({
+                "actor_status": actor.get("status", "DATA_BLOCKED"),
+                "actor_adjusted_flow": (flow.get("evidence")
+                                        if flow.get("status") == "OK" else None),
+                "actor_naive_flow": (flow.get("naive_evidence")
+                                     if flow.get("status") == "OK" else None),
+                "sybil_discount": (flow.get("discount")
+                                   if flow.get("status") == "OK" else None),
+                "smart_wallet_sync_evidence": swarm.get("evidence"),
+                "smart_wallet_sync_probability": (
+                    swarm.get("probability") if swarm.get("status") == "OK" else None),
+            })
+            if actor.get("status") == "OK":
+                result["status"] = "OK"
+        return result
 
     async def _finalize_episode(self, token: str):
         if token not in self.active_episodes:

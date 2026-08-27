@@ -116,6 +116,9 @@ class PredictionFeatures:
     deployer_cluster_risk: float = 0
     funding_wallet_risk: float = 0
     funding_wallet_reuse: float = 0
+    wallet_quality_weighted_flow: float = 0
+    sybil_discount: float = 0
+    smart_wallet_sync_evidence: float = 0
     
     initial_buyers: int = 0
     smart_buyers: int = 0
@@ -136,6 +139,7 @@ class PredictionFeatures:
     
     social_velocity: float = 0
     social_acceleration: float = 0
+    social_price_disagreement: float = 0
     social_credibility: float = 0
     chain_before_social: float = 0
     cross_platform: bool = False
@@ -147,7 +151,18 @@ class PredictionFeatures:
     holder_concentration_delta: float = 0
     holder_concentration_velocity: float = 0
     top_10_pct: float = 0
+    top_20_pct: float = 0
+    top_20_delta_pct: float = 0
     deployer_pct: float = 0
+    insider_pct: float = 0
+    bundler_pct: float = 0
+    fresh_wallet_pct: float = 0
+    whale_pct: float = 0
+    connected_cluster_pct: float = 0
+    dev_recent_sells: float = 0
+    dev_sell_supply_pct: float = 0
+    dev_hard_veto_count: float = 0
+    capital_rotation_flow: float = 0
     token_extension_risk: float = 0
     meme_launch_rate_1h: float = 0
     sol_change_24h: float = 0
@@ -162,6 +177,12 @@ class PredictionFeatures:
     data_coverage: float = 0
     wallet_history_available: bool = False
     social_available: bool = False
+    social_price_disagreement_available: bool = False
+    holder_trajectory_available: bool = False
+    holder_owner_enrichment_available: bool = False
+    actor_flow_available: bool = False
+    dev_state_available: bool = False
+    capital_rotation_available: bool = False
     coordination_available: bool = False
     flow_available: bool = False
     
@@ -173,6 +194,9 @@ class PredictionFeatures:
             self.deployer_cluster_risk,
             self.funding_wallet_risk,
             self.funding_wallet_reuse,
+            float(np.clip(np.log1p(max(0.0, self.wallet_quality_weighted_flow)) / 10, 0, 1)),
+            self.sybil_discount,
+            float(np.clip(self.smart_wallet_sync_evidence / 10, 0, 1)),
             min(self.initial_buyers / 50, 1),
             min(self.smart_buyers / 10, 1),
             min(self.insider_buyers / 10, 1),
@@ -190,6 +214,7 @@ class PredictionFeatures:
             float(self.can_freeze),
             min(self.social_velocity / 10, 1),
             min(self.social_acceleration / 5, 1),
+            float(np.clip(self.social_price_disagreement, -5, 5) / 5),
             self.social_credibility,
             self.chain_before_social,
             float(self.cross_platform),
@@ -199,7 +224,19 @@ class PredictionFeatures:
             self.holder_concentration_delta,
             self.holder_concentration_velocity,
             self.top_10_pct / 100,
+            self.top_20_pct / 100,
+            self.top_20_delta_pct / 100,
             self.deployer_pct / 100,
+            self.insider_pct / 100,
+            self.bundler_pct / 100,
+            self.fresh_wallet_pct / 100,
+            self.whale_pct / 100,
+            self.connected_cluster_pct / 100,
+            min(self.dev_recent_sells / 10, 1),
+            self.dev_sell_supply_pct / 100,
+            min(self.dev_hard_veto_count, 1),
+            float(np.clip(np.sign(self.capital_rotation_flow)
+                          * np.log1p(abs(self.capital_rotation_flow)) / 10, -1, 1)),
             self.token_extension_risk,
             min(self.meme_launch_rate_1h / 500, 1),
             np.clip(self.sol_change_24h / 100, -1, 1),
@@ -211,6 +248,12 @@ class PredictionFeatures:
             self.data_coverage,
             float(self.wallet_history_available),
             float(self.social_available),
+            float(self.social_price_disagreement_available),
+            float(self.holder_trajectory_available),
+            float(self.holder_owner_enrichment_available),
+            float(self.actor_flow_available),
+            float(self.dev_state_available),
+            float(self.capital_rotation_available),
             float(self.coordination_available),
             float(self.flow_available),
             # Age was carried on the dataclass and never reached the array, so
@@ -256,7 +299,7 @@ class MultiHeadPrediction:
 
 
 class MultiHeadPredictor:
-    ARTIFACT_VERSION = 4
+    ARTIFACT_VERSION = 5
 
     def __init__(self, model_dir: str = "models"):
         self.model_dir = model_dir
@@ -264,19 +307,30 @@ class MultiHeadPredictor:
         self.calibrators: Dict[PredictionTarget, Any] = {}
         self.feature_names = [
             "deployer_rug_rate", "deployer_success_rate", "deployer_avg_multiple",
-            "deployer_cluster_risk", "funding_wallet_risk", "funding_wallet_reuse", "initial_buyers",
+            "deployer_cluster_risk", "funding_wallet_risk", "funding_wallet_reuse",
+            "wallet_quality_weighted_flow", "sybil_discount",
+            "smart_wallet_sync_evidence", "initial_buyers",
             "smart_buyers", "insider_buyers", "buyer_acceleration", "buy_velocity",
             "sol_volume", "organic_ratio", "bundle_concentration", "liquidity_usd",
             "liquidity_locked", "buy_tax", "sell_tax", "ownership_renounced",
             "can_mint", "can_freeze", "social_velocity", "social_acceleration",
+            "social_price_disagreement",
             "social_credibility", "chain_before_social", "cross_platform",
             "narrative_novelty", "narrative_momentum", "holder_concentration",
             "holder_concentration_delta", "holder_concentration_velocity",
-            "top_10_pct", "deployer_pct", "token_extension_risk", "meme_launch_rate_1h",
+            "top_10_pct", "top_20_pct", "top_20_delta_pct", "deployer_pct",
+            "insider_pct", "bundler_pct", "fresh_wallet_pct", "whale_pct",
+            "connected_cluster_pct", "token_extension_risk", "meme_launch_rate_1h",
+            "dev_recent_sells", "dev_sell_supply_pct", "dev_hard_veto_count",
+            "capital_rotation_flow",
             "sol_change_24h", "btc_change_24h", "sol_btc_beta", "solana_tvl_change",
             "priority_fee_p90", "fee_pressure",
             "data_coverage", "wallet_history_available",
-            "social_available", "coordination_available", "flow_available",
+            "social_available", "social_price_disagreement_available",
+            "holder_trajectory_available", "holder_owner_enrichment_available",
+            "actor_flow_available",
+            "dev_state_available", "capital_rotation_available",
+            "coordination_available", "flow_available",
             "time_since_launch",
             *(f"regime_{name}" for name in REGIME_NAMES),
         ]

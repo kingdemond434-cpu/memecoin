@@ -96,9 +96,18 @@ class TokenRiskReport:
     can_mint: bool = False
     can_freeze: bool = False
     is_proxy: bool = False
-    holder_count: int = 0
+    holder_count: Optional[int] = None
     top_10_pct: float = 0
-    deployer_balance_pct: float = 0
+    top_20_pct: Optional[float] = None
+    # These require token-account owner/entity enrichment.  They stay None
+    # until measured; zero would falsely assert that no developer, insider,
+    # bundler, fresh wallet, whale or connected cluster holds supply.
+    deployer_balance_pct: Optional[float] = None
+    insider_pct: Optional[float] = None
+    bundler_pct: Optional[float] = None
+    fresh_wallet_pct: Optional[float] = None
+    whale_pct: Optional[float] = None
+    connected_cluster_pct: Optional[float] = None
     token_program: str = ""
     token_extensions: List[str] = field(default_factory=list)
     extension_risk: float = 0.0
@@ -210,6 +219,7 @@ class RugDetector:
         if holders.get("status") == "DATA_BLOCKED":
             blocked.append("holders")
         top10 = float(holders.get("top_10_pct", 0))
+        top20 = holders.get("top_20_pct")
         if top10 > 80:
             warnings.append(f"Top token accounts hold {top10:.1f}% of supply")
             score -= 25
@@ -240,8 +250,11 @@ class RugDetector:
             ownership_renounced=not mint_state["mint_authority_present"],
             can_mint=mint_state["mint_authority_present"],
             can_freeze=mint_state["freeze_authority_present"],
-            holder_count=int(holders.get("count", 0)),
+            # getTokenLargestAccounts returns at most twenty accounts. Its
+            # list length is not the token's holder count.
+            holder_count=None,
             top_10_pct=top10,
+            top_20_pct=float(top20) if top20 is not None else None,
             token_program=owner,
             token_extensions=extensions,
             extension_risk=min(1.0, sum(HIGH_RISK_EXTENSIONS.get(name, 0) for name in extensions) / 100.0),
@@ -283,16 +296,23 @@ class RugDetector:
 
     async def _solana_holder_concentration(self, mint: str, supply: int) -> Dict[str, Any]:
         if supply <= 0:
-            return {"status": "OK", "count": 0, "top_10_pct": 100.0}
+            return {"status": "OK", "largest_account_count": 0,
+                    "holder_count_status": "DATA_BLOCKED",
+                    "top_10_pct": 100.0,
+                    "top_20_pct": 100.0}
         try:
             result = await self.rpc.request("getTokenLargestAccounts", [mint, {"commitment": "confirmed"}])
             values = (result or {}).get("value", [])
-            amounts = [int(item.get("amount", 0) or 0) for item in values[:10]]
+            amounts = [int(item.get("amount", 0) or 0) for item in values[:20]]
             return {
                 "status": "OK",
-                "count": len(values),
-                "top_10_pct": 100.0 * sum(amounts) / supply,
-                "note": "account concentration; entity-cluster concentration is computed separately",
+                "largest_account_count": len(values),
+                "holder_count_status": "DATA_BLOCKED",
+                "top_10_pct": 100.0 * sum(amounts[:10]) / supply,
+                "top_20_pct": 100.0 * sum(amounts) / supply,
+                "owner_enrichment_status": "DATA_BLOCKED",
+                "note": ("largest token-account concentration; account owners, "
+                         "developer share and entity-cluster concentration are separate evidence"),
             }
         except Exception as exc:
             return {"status": "DATA_BLOCKED", "error": str(exc), "count": 0}

@@ -19,7 +19,15 @@ or safe operating assumption.
   pool-reserve price multiples, and immediate PIT episodes without per-trade
   HTTP requests. Jupiter marks remain the independent executable-route check.
 - Native SPL and Token-2022 mint-authority, freeze-authority, extension,
-  concentration, and Jupiter sell-route checks.
+  top-10/top-20 account concentration, and Jupiter sell-route checks. Owner-
+  enriched developer/insider/bundler/fresh-wallet/whale/cluster shares remain
+  explicitly blocked until account owners are resolved.
+- A centralized hard safety veto sits outside alpha ranking; active authorities,
+  dangerous Token-2022 controls, an unavailable sell route, catastrophic exit
+  impact, and observed developer emergencies cannot be voted away by a model.
+- Point-in-time holder trajectories, creator-wallet event monitoring,
+  quality/independence/notional-weighted cross-token rotation, and social-price
+  disagreement feed the research schema with missingness indicators.
 - Point-in-time launch episodes, immutable snapshot timestamps, observed price
   paths, route-feasible outcomes, P50X labels, crash-safe active checkpoints,
   and persistent outcome indices.
@@ -43,6 +51,10 @@ or safe operating assumption.
   instruction limits—drive token amounts and cost/PnL accounting.
 - Block/receipt/decode timestamps and measured balance deltas are retained for
   latency, flow, and transaction-economics research.
+- Every candidate, rejection, submission, fill and outcome is mirrored into a
+  hash-chained evidence ledger. Profit isolation is planning-only: it can
+  describe a surplus transfer to a configured public cold address but cannot
+  construct, sign, or submit one.
 
 Missing data is reported as `DATA_BLOCKED`; it is not replaced with a zero or a
 made-up value. Discovery never grants execution authority. A model must first
