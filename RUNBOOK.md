@@ -281,3 +281,52 @@ systemctl --user disable --now memecoin-health.timer memecoin-audit-pack.timer m
 The evidence in `data/state` is the one thing here that cannot be
 regenerated. A reinstall excludes it deliberately; do not clear it to "start
 fresh" unless the model that produced it is gone too.
+
+## The desk's own terminal
+
+The health server serves the operator dashboard from the same loopback
+binding as `/status`:
+
+```
+http://127.0.0.1:18080/
+```
+
+It polls `/status` every ten seconds, so it shows the live desk with nothing
+to paste. From a laptop, tunnel it rather than exposing the port — this page
+renders the desk's whole interior and carries exactly the exposure `/status`
+does:
+
+```
+ssh -N -L 18080:127.0.0.1:18080 quant@<vps>
+```
+
+then open `http://127.0.0.1:18080/` locally.
+
+## Isolated signing
+
+By default the private key is held in the trading process, and the desk says
+so in `/status` under `signer.mode = "local"`. To move it out, run the signer
+as its own unit and point the desk at its socket:
+
+```
+MEMECOIN_SIGNER_SOCKET=/run/memecoin/signer.sock
+```
+
+There is no fallback. If the socket is configured and the signer refuses or is
+unreachable, the transaction fails — it never quietly returns to signing with
+a local key, because that is the state the isolation exists to leave.
+
+`data/state/HALT_SIGNING` stops all signing immediately, for any caller:
+
+```
+touch ~/.local/opt/memecoin-shadow/data/state/HALT_SIGNING
+```
+
+## Memory
+
+The desk reads its own RSS against the cgroup ceiling and sheds context in two
+bands before the kernel intervenes: census detail spills to disk, miner
+concurrency halves, price paths for untraded tokens are dropped. None of it
+touches the decision path. Watch `memory.band` in `/status`; a desk that lives
+in `shed` is on a host too small for it, and trimming harder will not fix
+that.
