@@ -96,6 +96,12 @@ class YellowstoneClient:
         self._reconnect_attempts = 0
         self.status = "NOT_STARTED"
         self.status_detail = ""
+        # Delivery, as distinct from connection. Everything above proves a
+        # socket; only these prove the subscription is worth anything.
+        self.responses = 0
+        self.last_response_at = 0.0
+        self.dispatched: Dict[str, int] = {}
+        self._opened_at = 0.0
 
     @property
     def available(self) -> bool:
@@ -176,12 +182,28 @@ class YellowstoneClient:
 
     async def _stream_loop(self):
         while self._running:
+            self._opened_at = time.time()
             try:
                 metadata = (("x-token", self.x_token),) if self.x_token else ()
                 self._stream = self._stub.Subscribe(self._request_iterator(), metadata=metadata)
-                self.status = "STREAMING"
+                # NOT "STREAMING" yet. Opening the call proves the socket and
+                # nothing else: a rejected token, a filter matching no
+                # account, or a silent server all leave this iterator empty
+                # for ever while the call itself stays open. Reporting
+                # STREAMING here made a desk receiving zero events
+                # indistinguishable from a healthy one, and the launch census
+                # sat empty behind a green status for hours.
+                self.status = "CONNECTED"
+                self.status_detail = "call opened; awaiting the first response"
                 self._reconnect_attempts = 0
                 async for response in self._stream:
+                    self.responses += 1
+                    self.last_response_at = time.time()
+                    if self.status != "STREAMING":
+                        self.status = "STREAMING"
+                        self.status_detail = ""
+                        logger.info("yellowstone delivering; first response after "
+                                    "%.1fs", time.time() - self._opened_at)
                     await self._handle_response(response)
             except asyncio.CancelledError:
                 raise
@@ -219,7 +241,14 @@ class YellowstoneClient:
                 return
 
     async def _dispatch(self, event_type: str, data: Any):
-        for handler in self._handlers.get(event_type, []):
+        self.dispatched[event_type] = self.dispatched.get(event_type, 0) + 1
+        handlers = self._handlers.get(event_type, [])
+        if not handlers:
+            # Responses arriving for a type nobody consumes is its own
+            # failure, and looks identical to no responses from outside.
+            self.dispatched[f"{event_type}:unhandled"] = (
+                self.dispatched.get(f"{event_type}:unhandled", 0) + 1)
+        for handler in handlers:
             try:
                 result = handler(data)
                 if asyncio.iscoroutine(result):
@@ -229,6 +258,34 @@ class YellowstoneClient:
 
     def on(self, event_type: str, handler: Callable):
         self._handlers.setdefault(event_type, []).append(handler)
+
+    def health(self, now: Optional[float] = None,
+               stall_after_s: float = 120.0) -> Dict[str, Any]:
+        """Whether the stream is DELIVERING, as opposed to merely connected.
+
+        A subscription that opened and then went quiet is the failure this
+        client could not previously express. Silence is reported as a stall
+        with its duration, because on a chain producing thousands of events a
+        minute, two minutes of nothing is not a quiet market.
+        """
+        moment = time.time() if now is None else now
+        quiet_for = (moment - self.last_response_at) if self.last_response_at else None
+        stalled = bool(self.responses and quiet_for and quiet_for > stall_after_s)
+        never = self.status in ("CONNECTED",) and not self.responses
+        return {
+            "status": ("DATA_BLOCKED" if never else
+                       "DEGRADED" if stalled else self.status),
+            "detail": (
+                f"the call has been open {moment - self._opened_at:.0f}s and "
+                "delivered nothing; the token may be rejected or the filter "
+                "may match no account" if never else
+                f"no response for {quiet_for:.0f}s" if stalled else
+                self.status_detail),
+            "responses": self.responses,
+            "dispatched": dict(sorted(self.dispatched.items())),
+            "seconds_since_response": (round(quiet_for, 1)
+                                       if quiet_for is not None else None),
+        }
 
     async def close(self):
         self._running = False
@@ -244,8 +301,9 @@ class YellowstoneClient:
             await self._channel.close()
         self.status = "CLOSED"
 
-    def get_status(self) -> Dict[str, str]:
-        return {"status": self.status, "detail": self.status_detail}
+    def get_status(self) -> Dict[str, Any]:
+        """Delivery, not connection. `health` is the honest reading."""
+        return self.health()
 
 
 class SolanaRpcProgramStream:
