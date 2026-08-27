@@ -8,6 +8,7 @@ WorkingDirectory=%h/.local/opt/memecoin-shadow
 EnvironmentFile=-%h/.config/memecoin-shadow/env
 Environment=ALLOW_LIVE_TRADING=
 Environment=SOLANA_PRIVATE_KEY=
+ExecCondition=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.runtime.training_guard --min-available-mib 1400
 ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.research.shadow_trainer --storage data/launch_episodes --model-dir models --min-samples 250
 ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.research.hazard_trainer --storage data/launch_episodes --model-dir models --min-rows 250
 ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.research.exit_policy_trainer

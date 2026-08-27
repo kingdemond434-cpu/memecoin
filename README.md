@@ -296,7 +296,11 @@ isolated user service. `memecoin-shadow-trainer.timer` invokes the strict
 chronological multi-head, rug-hazard calibration, and learned exit-policy
 trainers hourly. Insufficient samples, class coverage, or OOS E[log W] remain
 `DATA_BLOCKED`/`REJECTED`; only passed artifacts are loaded into forward
-dry-run shadow evaluation. The hazard calibration trainer only fits on the
+dry-run shadow evaluation. An hourly cycle is skipped when the VPS has less
+than 1,400 MiB of currently available memory, protecting uninterrupted data
+collection and retrying automatically on the next tick. This schedule does
+not depend on an interactive Codex or Claude session. The hazard calibration
+trainer only fits on the
 leakage-free half of the hazard signal set (trade flow, liquidity, route,
 concentration, social velocity, and explicit event tags) -- wallet-reputation
 signals are excluded from replay because they are live state, never
