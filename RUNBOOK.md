@@ -66,6 +66,59 @@ The entity registry stays empty until entries are verified from the entity's
 own published pages (`tools/verify_entities.py`). Empty is not "nothing is a
 copycat" -- it is "we cannot tell", and the desk sizes accordingly.
 
+## 2a. Confirm the desk sees your keys, and authorise Telegram
+
+Setting a key and the desk seeing it are different facts. An env file loaded
+by the wrong unit, or a variable exported in a shell the service never
+inherited, looks exactly like a missing key from outside.
+
+```bash
+curl -s localhost:18080/status | python3 -c "
+import json,sys
+d = json.load(sys.stdin)['credentials']
+print('present:', ', '.join(d['present']) or '(none)')
+for row in d['absent']:
+    print(f\"  absent  {row['name']:24s} -> {row['unlocks']}\")
+t = d['telegram']
+print(f\"telegram: keys={t['keys_present']} channels={t['channels_listed']} \"
+      f\"session={t['session_authorised']} ready={t['ready']}\")
+if t['authorise_with']:
+    print('  run once, interactively:', t['authorise_with'])
+"
+```
+
+Only presence is reported. No value is ever read, logged or returned.
+
+**Telegram needs one interactive step that the keys alone do not cover.**
+Telethon asks for a phone number and a login code when it finds no session
+file, and a systemd unit has no stdin to ask on -- so the transport refuses to
+start rather than hanging. Authorise once, by hand:
+
+```bash
+cd ~/.local/opt/memecoin-shadow
+.venv/bin/python -m src.research.telegram_authorize
+systemctl --user restart memecoin-shadow.service
+```
+
+That writes `data/telegram/collector.session`, which both the social collector
+and the source mesh read. It survives restarts and reinstalls.
+
+**Channels come from one list.** `TELEGRAM_CHANNELS` in your env file feeds
+both the social collector and the source mesh -- listing them twice is asking
+for two lists that disagree. Each channel is added to the mesh with chat-rate
+polling. A channel whose language matters gets its own entry in
+`config/sources.yaml`; an expanded one deliberately carries no language,
+because assigning one by list position would invent an attribute nobody gave.
+
+```bash
+grep -c . <<< "$(grep TELEGRAM_CHANNELS ~/.config/memecoin-shadow/env)"
+curl -s localhost:18080/status | python3 -c "
+import json,sys
+t = json.load(sys.stdin)['source_mesh']['transports']['by_kind']
+print('telegram transports built:', t.get('telegram', 0))
+"
+```
+
 ## 3. Accumulate the forward ledger
 
 The ledger is the scarce thing. It counts decisions the desk made in real

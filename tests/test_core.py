@@ -19,6 +19,7 @@ import unittest
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import patch
 
 import numpy as np
@@ -57,7 +58,7 @@ from src.strategies.multihead_predictor import (
 )
 from src.collectors.registry import (
     ADAPTER_KINDS, SourceDeclaration, SourceDiscovery, build_sources,
-    load_declarations,
+    expand_env_channels, load_declarations,
 )
 from src.collectors.adapters import (
     bluesky_source, code_repository_source, coverage_report, discord_gateway_source,
@@ -82,7 +83,7 @@ from src.execution.staged_exits import (
     StagedExits, StagedLadder, StagedRung,
 )
 from src.collectors.transports import (
-    HttpClient,
+    HttpClient, TelegramChannelTransport,
     BlueskyJetstreamTransport, GithubRepoTransport, JsonPollTransport,
     MastodonTimelineTransport, NostrRelayTransport, OfficialSiteTransport,
     QueueTransport, RssTransport, TelegramChannelTransport, TransportError,
@@ -12396,6 +12397,165 @@ class TestTheSourceUniverseIsActuallyWired(unittest.TestCase):
             url = str(declaration.options.get("url", ""))
             if url:
                 self.assertTrue(url.startswith("https://"), url)
+
+
+class TestTheOperatorCanSeeWhatTheDeskSees(unittest.TestCase):
+    """An env file loaded by the wrong unit and a missing key look identical
+    from outside. This is what tells them apart -- without ever echoing one."""
+
+    def _desk(self):
+        return MemecoinQuantDesk.__new__(MemecoinQuantDesk)
+
+    def test_presence_is_reported_and_the_value_never_is(self):
+        secret = "this-value-must-never-appear-anywhere"
+        with mock.patch.dict(os.environ, {"HELIUS_API_KEY": secret}, clear=False):
+            report = MemecoinQuantDesk.credential_report(self._desk())
+        self.assertIn("HELIUS_API_KEY", report["present"])
+        self.assertNotIn(secret, json.dumps(report))
+
+    def test_an_absent_credential_says_what_it_would_unlock(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            report = MemecoinQuantDesk.credential_report(self._desk())
+        absent = {row["name"]: row["unlocks"] for row in report["absent"]}
+        self.assertIn("YELLOWSTONE_GRPC_URL", absent)
+        self.assertTrue(absent["YELLOWSTONE_GRPC_URL"])
+        self.assertEqual(report["present"], [])
+
+    def test_telegram_keys_present_is_not_the_same_as_telegram_ready(self):
+        """Telethon asks for a phone number when it finds no session, and
+        under systemd there is no stdin to ask on."""
+        with mock.patch.dict(os.environ, {"TELEGRAM_API_ID": "1",
+                                          "TELEGRAM_API_HASH": "2",
+                                          "TELEGRAM_CHANNELS": "a,b"}, clear=True):
+            with mock.patch.object(Path, "exists", return_value=False):
+                report = MemecoinQuantDesk.credential_report(self._desk())
+        telegram = report["telegram"]
+        self.assertTrue(telegram["keys_present"])
+        self.assertEqual(telegram["channels_listed"], 2)
+        self.assertFalse(telegram["session_authorised"])
+        self.assertFalse(telegram["ready"])
+        self.assertIn("telegram_authorize", telegram["authorise_with"])
+
+    def test_with_a_session_it_reports_ready_and_stops_nagging(self):
+        with mock.patch.dict(os.environ, {"TELEGRAM_API_ID": "1",
+                                          "TELEGRAM_API_HASH": "2"}, clear=True):
+            with mock.patch.object(Path, "exists", return_value=True):
+                telegram = MemecoinQuantDesk.credential_report(self._desk())["telegram"]
+        self.assertTrue(telegram["ready"])
+        self.assertEqual(telegram["authorise_with"], "")
+
+    def test_the_live_lock_is_reported_as_the_boolean_it_is(self):
+        with mock.patch.dict(os.environ, {"ALLOW_LIVE_TRADING": "yes"}, clear=True):
+            self.assertFalse(MemecoinQuantDesk.credential_report(
+                self._desk())["live_trading_acknowledged"])
+        with mock.patch.dict(os.environ,
+                             {"ALLOW_LIVE_TRADING": "yes-i-understand"}, clear=True):
+            self.assertTrue(MemecoinQuantDesk.credential_report(
+                self._desk())["live_trading_acknowledged"])
+
+
+class TestChannelsComeFromOneList(unittest.TestCase):
+    """Asking an operator to list channels twice is asking for two lists that
+    disagree."""
+
+    def _declarations(self):
+        return load_declarations("config/sources.yaml")
+
+    def test_the_env_var_the_social_collector_uses_also_feeds_the_mesh(self):
+        with mock.patch.dict(os.environ,
+                             {"TELEGRAM_CHANNELS": "alpha,@beta"}, clear=False):
+            expanded = expand_env_channels(self._declarations())
+        channels = {item.options.get("channel") for item in expanded
+                    if item.kind == "telegram"}
+        self.assertIn("alpha", channels)
+        # A leading @ is a display convention, not part of the name.
+        self.assertIn("beta", channels)
+
+    def test_an_expanded_channel_inherits_polling_policy_not_content_claims(self):
+        """Assigning a language by list position invents an attribute nobody
+        supplied."""
+        with mock.patch.dict(os.environ,
+                             {"TELEGRAM_CHANNELS": "alpha,beta,gamma"}, clear=False):
+            expanded = expand_env_channels(self._declarations())
+        added = [item for item in expanded
+                 if item.kind == "telegram" and item.options.get("channel")]
+        self.assertEqual(len(added), 3)
+        for declaration in added:
+            self.assertEqual(declaration.language, "")
+            self.assertEqual(declaration.region, "")
+            # Policy IS inherited: a chat channel is worth asking often.
+            self.assertLessEqual(declaration.poll_interval_seconds, 5)
+            self.assertEqual(declaration.tier, 1)
+
+    def test_an_explicitly_declared_channel_is_not_duplicated(self):
+        declared = SourceDeclaration(
+            source_id="telegram:mine", kind="telegram", language="ko",
+            options={"channel": "alpha"})
+        with mock.patch.dict(os.environ, {"TELEGRAM_CHANNELS": "alpha"}, clear=False):
+            expanded = expand_env_channels([declared])
+        self.assertEqual(len(expanded), 1)
+        # And the explicit declaration keeps the language it was given.
+        self.assertEqual(expanded[0].language, "ko")
+
+    def test_no_channels_listed_changes_nothing(self):
+        declarations = self._declarations()
+        with mock.patch.dict(os.environ, {"TELEGRAM_CHANNELS": ""}, clear=False):
+            self.assertEqual(len(expand_env_channels(declarations)),
+                             len(declarations))
+
+    def test_listed_channels_build_a_transport_once_the_keys_are_present(self):
+        with mock.patch.dict(os.environ,
+                             {"TELEGRAM_CHANNELS": "alpha",
+                              "TELEGRAM_API_ID": "1",
+                              "TELEGRAM_API_HASH": "2"}, clear=False):
+            expanded = expand_env_channels(self._declarations())
+            transports, report, _client = build_transports(expanded, HttpClient())
+        self.assertIn("telegram:alpha", transports)
+        self.assertNotIn("telegram:alpha",
+                         {source for source, _ in report.unconfigured})
+
+
+class TestTelegramNeverPromptsUnderSystemd(unittest.TestCase):
+    """A unit that asks for a phone number on stdin is a unit that hangs at
+    start and appears to be starting for ever."""
+
+    def test_it_looks_where_the_authorize_tool_actually_writes(self):
+        """A transport looking elsewhere finds no session, and Telethon's
+        response to no session is to ask for a phone number."""
+        tool = (Path(__file__).resolve().parents[1] / "src" / "research"
+                / "telegram_authorize.py").read_text()
+        self.assertIn('"data/telegram"', tool)
+        self.assertIn('"collector"', tool)
+        self.assertEqual(TelegramChannelTransport.SESSION_PATH,
+                         "data/telegram/collector")
+
+    def test_a_missing_session_is_refused_with_the_command_that_creates_it(self):
+        transport = TelegramChannelTransport(
+            "t", "chan", session_name=os.path.join(tempfile.mkdtemp(), "absent"))
+        with mock.patch.dict(os.environ, {"TELEGRAM_API_ID": "1",
+                                          "TELEGRAM_API_HASH": "2"}, clear=False):
+            with self.assertRaises(TransportError) as raised:
+                asyncio.run(transport.start())
+        message = str(raised.exception)
+        self.assertIn("no authorised Telegram session", message)
+        self.assertIn("telegram_authorize", message)
+
+    def test_missing_keys_are_still_named_rather_than_read(self):
+        transport = TelegramChannelTransport("t", "chan",
+                                             api_id_env="NOT_SET_ID",
+                                             api_hash_env="NOT_SET_HASH")
+        with self.assertRaises(TransportError) as raised:
+            asyncio.run(transport.start())
+        self.assertIn("NOT_SET_ID", str(raised.exception))
+
+    def test_the_source_never_calls_the_prompting_entry_point(self):
+        """Telethon's start() is the one that prompts; connect() is not."""
+        source = (Path(__file__).resolve().parents[1] / "src" / "collectors"
+                  / "transports.py").read_text()
+        block = source[source.index("class TelegramChannelTransport"):]
+        self.assertIn("await self.client.connect()", block)
+        self.assertNotIn("await self.client.start()", block)
+        self.assertIn("is_user_authorized", block)
 
 class TestPumpSwapConstruction(unittest.TestCase):
     """The last DATA_BLOCKED that was never about missing information.

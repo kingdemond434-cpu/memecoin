@@ -55,7 +55,7 @@ from src.strategies.action_value import (
     PositionState as ActionState,
 )
 from src.collectors.event_source import Event, SourceMesh
-from src.collectors.registry import build_sources, load_declarations
+from src.collectors.registry import build_sources, expand_env_channels, load_declarations
 from src.collectors.transports import (
     HttpClient, build_transports, start_transports, stop_transports, transport_report,
 )
@@ -594,6 +594,10 @@ class MemecoinQuantDesk:
             self.global_config.get(
                 "source_registry",
                 "config/sources.yaml,config/sources.verified.yaml"))
+        # The channels the operator already listed for the social collector.
+        # Asking for them twice -- once in an env var, once in YAML -- is
+        # asking for two lists that disagree.
+        declarations = expand_env_channels(declarations)
         # Real transports, built from the declarations themselves. This map was
         # empty, so build_sources ran from nothing and reported every source
         # NO_FETCHER -- an adapter library rather than a source of signal.
@@ -3138,6 +3142,65 @@ class MemecoinQuantDesk:
             return self.slot_value.from_hazard(1e6, expected_edge_usd=expected_edge_usd)
         return self.slot_value.from_hazard(rate, expected_edge_usd=expected_edge_usd)
 
+    #: Every environment variable the desk reads, and what it unblocks.
+    #: Presence is reported, never a value -- a status page that echoes a
+    #: credential is a status page that leaks one to anything that can read it.
+    CREDENTIALS: Tuple[Tuple[str, str], ...] = (
+        ("YELLOWSTONE_GRPC_URL", "lowest-latency program stream"),
+        ("YELLOWSTONE_GRPC_TOKEN", "authenticates the Yellowstone stream"),
+        ("HELIUS_API_KEY", "wallet transaction history for round-trip scoring"),
+        ("TELEGRAM_API_ID", "public Telegram channels"),
+        ("TELEGRAM_API_HASH", "public Telegram channels"),
+        ("TELEGRAM_CHANNELS", "which channels the mesh watches"),
+        ("JUPITER_API_KEY", "router quotes above the anonymous rate limit"),
+        ("YOUTUBE_API_KEY", "YouTube Data API research"),
+        ("NEYNAR_API_KEY", "Farcaster casts"),
+        ("TWITCH_CLIENT_ID", "Twitch EventSub"),
+        ("TWITCH_CLIENT_SECRET", "Twitch EventSub"),
+        ("GITHUB_TOKEN", "higher public-repository quota"),
+        ("X_BEARER_TOKEN", "official recent-search"),
+        ("REDDIT_CLIENT_ID", "approved Reddit application-only OAuth"),
+        ("REDDIT_CLIENT_SECRET", "approved Reddit application-only OAuth"),
+    )
+
+    def credential_report(self) -> Dict[str, Any]:
+        """Which credentials are present, by NAME.
+
+        No value is read, logged or returned. What an operator needs to know
+        is whether the desk can see the key they set -- an env file loaded by
+        the wrong unit, or a variable set in a shell the service never
+        inherited, both look exactly like a missing key from the outside and
+        this is what tells them apart.
+        """
+        present = [name for name, _ in self.CREDENTIALS if os.getenv(name)]
+        absent = [(name, unlocks) for name, unlocks in self.CREDENTIALS
+                  if not os.getenv(name)]
+        session = Path("data/telegram/collector.session")
+        telegram_ready = bool(os.getenv("TELEGRAM_API_ID")
+                              and os.getenv("TELEGRAM_API_HASH")
+                              and session.exists())
+        return {
+            "present": present,
+            "absent": [{"name": name, "unlocks": unlocks} for name, unlocks in absent],
+            "telegram": {
+                "keys_present": bool(os.getenv("TELEGRAM_API_ID")
+                                     and os.getenv("TELEGRAM_API_HASH")),
+                "channels_listed": len([item for item in
+                                        os.getenv("TELEGRAM_CHANNELS", "").split(",")
+                                        if item.strip()]),
+                # Telethon asks for a phone number when it finds no session,
+                # and under systemd there is no stdin to ask on. So the keys
+                # being set is not the same as Telegram being ready.
+                "session_authorised": session.exists(),
+                "ready": telegram_ready,
+                "authorise_with": (
+                    "" if telegram_ready
+                    else ".venv/bin/python -m src.research.telegram_authorize"),
+            },
+            "live_trading_acknowledged": (
+                os.getenv("ALLOW_LIVE_TRADING", "").lower() == "yes-i-understand"),
+        }
+
     def ignition_census(self) -> Dict[str, Any]:
         """How many tracked narratives are in each lifecycle state."""
         counts: Dict[str, int] = {}
@@ -3948,6 +4011,9 @@ class MemecoinQuantDesk:
             # An empty registry is not "nothing is a copycat". It is "we
             # cannot tell", and a status page that stays silent about it lets
             # an operator read silence as safety.
+            # Presence only, never a value. An env file loaded by the wrong
+            # unit and a missing key look identical from outside.
+            "credentials": self.credential_report(),
             "entity_registry": self.entity_registry.report(),
             # What following the wallets we watch has actually returned, at
             # fills we could have got. A watch list nobody has scored is a

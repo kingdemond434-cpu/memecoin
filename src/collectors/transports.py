@@ -719,28 +719,48 @@ class TelegramChannelTransport(Transport):
 
     kind = "telegram"
 
+    #: The session the operator authorised with
+    #: `python -m src.research.telegram_authorize`. Pointed at the same path
+    #: that tool writes: a transport looking somewhere else finds no session,
+    #: and Telethon's response to no session is to ask for a phone number.
+    SESSION_PATH = "data/telegram/collector"
+
     def __init__(self, source_id: str, channel: str, *,
                  api_id_env: str = "TELEGRAM_API_ID",
                  api_hash_env: str = "TELEGRAM_API_HASH",
-                 session_name: str = "memecoin-mesh",
+                 session_name: str = "",
                  capacity: int = STREAM_BUFFER):
         super().__init__(source_id)
         self.channel = channel
         self.api_id_env = api_id_env
         self.api_hash_env = api_hash_env
-        self.session_name = session_name
+        self.session_name = session_name or self.SESSION_PATH
         self.buffer: Deque[Dict[str, Any]] = deque(maxlen=capacity)
         self.client: Any = None
         self.connected = False
 
     async def start(self) -> None:
-        """Connect and register the handler. Raises if the credential is absent."""
+        """Connect to an ALREADY AUTHORISED session. Never prompts.
+
+        Telethon's `start()` falls back to asking for a phone number and a
+        login code on stdin when it finds no session. Under systemd there is
+        no stdin, so that is a unit that hangs at start or dies with an
+        unhelpful EOF -- and on a desk it is a unit that appears to be
+        starting for ever. So the session file is checked first and its
+        absence is refused with the command that creates it.
+        """
         api_id = os.getenv(self.api_id_env, "")
         api_hash = os.getenv(self.api_hash_env, "")
         if not api_id or not api_hash:
             # Names, never values.
             raise TransportError(
                 f"{self.api_id_env} and {self.api_hash_env} must both be set")
+        session_file = f"{self.session_name}.session"
+        if not os.path.exists(session_file):
+            raise TransportError(
+                f"no authorised Telegram session at {session_file}; run "
+                "`.venv/bin/python -m src.research.telegram_authorize` once, "
+                "interactively, before starting the desk")
         try:
             from telethon import TelegramClient, events
         except ImportError as exc:
@@ -755,7 +775,15 @@ class TelegramChannelTransport(Transport):
                 "date": message.date.timestamp() if message.date else time.time(),
                 "sender_id": str(getattr(message, "sender_id", "") or self.channel)})
 
-        await self.client.start()
+        # connect(), not start(): start() is the one that prompts. A session
+        # that exists but is no longer authorised is refused here rather than
+        # silently connecting as nobody.
+        await self.client.connect()
+        if not await self.client.is_user_authorized():
+            await self.client.disconnect()
+            raise TransportError(
+                f"the Telegram session at {session_file} is no longer authorised; "
+                "re-run src.research.telegram_authorize")
         self.connected = True
 
     async def stop(self) -> None:

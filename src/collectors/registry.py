@@ -137,6 +137,55 @@ class RegistryReport:
         }
 
 
+def expand_env_channels(declarations: Sequence[SourceDeclaration],
+                        ) -> List[SourceDeclaration]:
+    """Turn `TELEGRAM_CHANNELS` into mesh declarations.
+
+    The social collector already reads that variable, and asking an operator
+    to list their channels twice -- once in an env var and once in YAML -- is
+    asking for two lists that disagree. One list, two consumers.
+
+    Channels already named by a declaration are left alone, so a channel that
+    needs its own cadence or tier can still be declared explicitly and is not
+    duplicated by this.
+    """
+    raw = os.getenv("TELEGRAM_CHANNELS", "")
+    wanted = [item.strip().lstrip("@") for item in raw.split(",") if item.strip()]
+    if not wanted:
+        return list(declarations)
+
+    existing = list(declarations)
+    already = {str(item.options.get("channel", "")).lstrip("@")
+               for item in existing if item.kind == "telegram"}
+    # The declared telegram entries carry POLLING POLICY -- tier, cadence,
+    # what silence means -- which is the same for any crypto chat channel and
+    # is worth inheriting. What they do NOT lend is language or region: those
+    # are claims about a channel's content, and assigning one by list position
+    # would invent an attribute nobody supplied. A channel whose language
+    # matters gets its own declaration in YAML.
+    template = next((item for item in existing
+                     if item.kind == "telegram" and not item.options.get("channel")),
+                    None)
+    added: List[SourceDeclaration] = []
+    for channel in wanted:
+        if channel in already:
+            continue
+        added.append(SourceDeclaration(
+            source_id=f"telegram:{channel}", kind="telegram",
+            tier=(template.tier if template else 1),
+            requires_env=("TELEGRAM_API_ID", "TELEGRAM_API_HASH"),
+            degraded_after_seconds=(template.degraded_after_seconds
+                                    if template else 60.0) or 60.0,
+            dead_after_seconds=(template.dead_after_seconds
+                                if template else 300.0) or 300.0,
+            poll_interval_seconds=(template.poll_interval_seconds
+                                   if template else 1.0) or 1.0,
+            options={"channel": channel}))
+    logger.info("TELEGRAM_CHANNELS supplied %d channel(s); %d added to the mesh",
+                len(wanted), len(added))
+    return existing + added
+
+
 def _adapter_options(factory: Callable[..., EventSource],
                      options: Dict[str, Any]) -> Dict[str, Any]:
     """The subset of a declaration's options this adapter accepts.
