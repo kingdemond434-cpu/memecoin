@@ -44,6 +44,7 @@ import tempfile
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -64,6 +65,40 @@ DEFAULT_MIN_BIN_SAMPLES = 10
 
 #: ECE at or below which a model is treated as calibrated enough to size on.
 DEFAULT_ECE_THRESHOLD = 0.05
+
+
+class Provenance(Enum):
+    """Where a prediction/outcome pair came from.
+
+    Without this an "OK" model looks equally proven whether it was validated
+    against real money or replayed over reconstructed history -- and those are
+    not remotely the same evidence. A landing model reporting 900 clean
+    observations while the signer has signed zero transactions is not lying;
+    it is answering a question nobody asked precisely enough.
+    """
+
+    #: Real capital, real fills. The only kind that proves execution.
+    FORWARD_REAL = "forward_real"
+    #: Live decisions, paper fills. Proves the model, not the execution.
+    SHADOW = "shadow"
+    #: Replayed over historical point-in-time snapshots. Real market data,
+    #: but our own latency and slippage are assumed rather than measured.
+    RECONSTRUCTED = "reconstructed"
+    #: Generated. Useful for wiring tests, worthless as evidence.
+    SYNTHETIC = "synthetic"
+
+
+#: How much each provenance counts toward a promotion decision. Reconstructed
+#: evidence is real evidence about the market and no evidence at all about our
+#: own execution, so it is admitted at a discount rather than excluded --
+#: excluding it would throw away the fastest available path to a calibrated
+#: model, and counting it in full would let a replay authorise live capital.
+PROVENANCE_WEIGHT: Dict[str, float] = {
+    Provenance.FORWARD_REAL.value: 1.0,
+    Provenance.SHADOW.value: 0.5,
+    Provenance.RECONSTRUCTED.value: 0.25,
+    Provenance.SYNTHETIC.value: 0.0,
+}
 
 
 @dataclass
@@ -120,9 +155,13 @@ class ModelCalibration:
         self.brier_sum = 0.0
         self.first_at = 0.0
         self.last_at = 0.0
+        #: Observations by where they came from. A model whose evidence is
+        #: entirely reconstructed must not read as proven.
+        self.by_provenance: Dict[str, int] = {}
 
     def record(self, probability: float, occurred: bool,
-               at: Optional[float] = None) -> bool:
+               at: Optional[float] = None,
+               provenance: str = Provenance.SHADOW.value) -> bool:
         """One prediction and what actually happened.
 
         A probability outside [0, 1] is refused rather than clipped: a model
@@ -142,6 +181,8 @@ class ModelCalibration:
         bucket.observed_sum += outcome
         self.count += 1
         self.brier_sum += (value - outcome) ** 2
+        key = str(provenance or Provenance.SHADOW.value)
+        self.by_provenance[key] = self.by_provenance.get(key, 0) + 1
         if not self.first_at:
             self.first_at = now
         self.last_at = now
@@ -152,6 +193,21 @@ class ModelCalibration:
     @property
     def brier(self) -> Optional[float]:
         return (self.brier_sum / self.count) if self.count else None
+
+    def evidence_weight(self) -> float:
+        """Provenance-weighted observation count.
+
+        A thousand synthetic observations weigh nothing; a thousand replayed
+        ones weigh two hundred and fifty. This is what a promotion gate should
+        read instead of the raw count.
+        """
+        return sum(count * PROVENANCE_WEIGHT.get(name, 0.0)
+                   for name, count in self.by_provenance.items())
+
+    def dominant_provenance(self) -> str:
+        if not self.by_provenance:
+            return "none"
+        return max(self.by_provenance.items(), key=lambda item: item[1])[0]
 
     def expected_calibration_error(self) -> Optional[float]:
         """Bin-weighted mean absolute gap. None below the sample floor."""
@@ -208,6 +264,14 @@ class ModelCalibration:
             "status": status,
             "detail": detail,
             "observations": self.count,
+            # Beside every number, where the number came from. An OK model
+            # built on replay is a hypothesis; the same model built on real
+            # fills is a result.
+            "provenance": dict(sorted(self.by_provenance.items())),
+            "dominant_provenance": self.dominant_provenance(),
+            "evidence_weight": round(self.evidence_weight(), 1),
+            "proven_on_real_fills": bool(
+                self.by_provenance.get(Provenance.FORWARD_REAL.value, 0)),
             "min_samples": self.min_samples,
             "brier": (round(self.brier, 5) if self.brier is not None else None),
             "expected_calibration_error": (round(ece, 5) if ece is not None else None),
@@ -227,6 +291,7 @@ class ModelCalibration:
         return {
             "name": self.name, "count": self.count, "brier_sum": self.brier_sum,
             "first_at": self.first_at, "last_at": self.last_at,
+            "by_provenance": dict(self.by_provenance),
             "bins": [{"lower": b.lower, "upper": b.upper, "count": b.count,
                       "predicted_sum": b.predicted_sum,
                       "observed_sum": b.observed_sum} for b in self.bins],
@@ -245,7 +310,8 @@ class CalibrationBook:
         self.models: Dict[str, ModelCalibration] = {}
 
     def record(self, model: str, probability: float, occurred: bool,
-               at: Optional[float] = None) -> bool:
+               at: Optional[float] = None,
+               provenance: str = Provenance.SHADOW.value) -> bool:
         if not model:
             return False
         book = self.models.get(model)
@@ -253,7 +319,7 @@ class CalibrationBook:
             book = ModelCalibration(model, min_samples=self.min_samples,
                                     ece_threshold=self.ece_threshold)
             self.models[model] = book
-        return book.record(probability, occurred, at)
+        return book.record(probability, occurred, at, provenance)
 
     def trustworthy(self, model: str) -> Optional[bool]:
         """Can this model's probabilities be sized on?
@@ -288,6 +354,8 @@ class CalibrationBook:
             "models_tracked": len(rows),
             "models_measured": len(measured),
             "models_miscalibrated": len(bad),
+            "models_proven_on_real_fills": len(
+                [row for row in rows if row.get("proven_on_real_fills")]),
             "models": rows,
         }
 
@@ -329,6 +397,7 @@ class CalibrationBook:
             book.brier_sum = float(row.get("brier_sum", 0.0))
             book.first_at = float(row.get("first_at", 0.0))
             book.last_at = float(row.get("last_at", 0.0))
+            book.by_provenance = dict(row.get("by_provenance") or {})
             for bucket, saved in zip(book.bins, row.get("bins") or []):
                 bucket.count = int(saved.get("count", 0))
                 bucket.predicted_sum = float(saved.get("predicted_sum", 0.0))
