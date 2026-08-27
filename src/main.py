@@ -372,6 +372,10 @@ class MemecoinQuantDesk:
         # time, and copying it into each one would be the same fact stored a
         # thousand times and updated in none of them.
         self._market_context: Dict[str, Any] = {}
+        # Every event type the stream has actually delivered. The cheapest
+        # possible answer to "is the denominator empty because nothing is
+        # launching, or because creations are not reaching us".
+        self._stream_events: Dict[str, int] = {}
         # Chain-wide execution conditions, mined rather than assumed. Empty
         # means unmeasured, which the bidder reads as None and the landing
         # model buckets as unknown -- never as calm.
@@ -3408,6 +3412,30 @@ class MemecoinQuantDesk:
                     ordered.append(token)
         return ordered
 
+    def stream_event_report(self) -> Dict[str, Any]:
+        """What the chain stream has delivered, by event type.
+
+        A connected stream that carries trades but no creations produces an
+        empty launch census while every other panel looks healthy, and nothing
+        else in the desk distinguishes that from a quiet market.
+        """
+        counts = dict(sorted(self._stream_events.items()))
+        creations = counts.get("token_created", 0)
+        total = sum(value for key, value in counts.items() if ":" not in key)
+        return {
+            "status": ("OK" if creations else
+                       "DEGRADED" if total else "DATA_BLOCKED"),
+            "detail": (
+                "" if creations else
+                f"{total} events delivered and not one token_created; the "
+                "launch census cannot fill and every rate over it is "
+                "undefined" if total else
+                "no chain event has been delivered at all"),
+            "total": total,
+            "token_created": creations,
+            "by_type": counts,
+        }
+
     def signer_report(self) -> Dict[str, Any]:
         """Where the private key actually lives, and what the signer has done.
 
@@ -4375,8 +4403,17 @@ class MemecoinQuantDesk:
                     logger.info("Activated chronologically validated shadow model %s", candidate.model_version)
 
     async def _on_pump_event(self, event: Dict[str, Any]):
+        # Counted before anything can reject it, including the empty-token
+        # guard below. "The stream is connected" and "the stream is delivering
+        # the event type we need" are different claims, and only the second
+        # one matters -- a desk seeing a million trades and no creations has a
+        # healthy connection and an empty denominator.
+        kind = str(event.get("type", "") or "unknown")
+        self._stream_events[kind] = self._stream_events.get(kind, 0) + 1
         token = event.get("token", "")
         if not token:
+            self._stream_events[f"{kind}:no_token"] = (
+                self._stream_events.get(f"{kind}:no_token", 0) + 1)
             return
         if event.get("type") == "token_created":
             # Counted before anything can filter it. This is the denominator.
@@ -4644,6 +4681,7 @@ class MemecoinQuantDesk:
             # failing, and the two need different fixes.
             "data_miners": self.data_miners.report(),
             "execution_conditions": self.execution_conditions_report(),
+            "stream_events": self.stream_event_report(),
             "launch_census": self.launch_census.report(),
             "screen_policy": self.screen_policy.report(),
             "memory": self.memory.report(),
