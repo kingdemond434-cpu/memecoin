@@ -53,8 +53,18 @@ def resolve_public(platform: str, handle: str) -> Tuple[Optional[str], str]:
         if platform == "github":
             token = os.getenv("GITHUB_TOKEN", "").strip()
             headers = ({"Authorization": f"Bearer {token}"} if token else {})
-            payload = _json(
-                f"https://api.github.com/users/{urllib.parse.quote(handle)}", headers)
+            url = f"https://api.github.com/users/{urllib.parse.quote(handle)}"
+            try:
+                payload = _json(url, headers)
+            except urllib.error.HTTPError as exc:
+                # An expired optional token must not disable GitHub's lawful
+                # unauthenticated public endpoint. Retry only authentication
+                # failures, never rate-limit/server errors that would turn a
+                # controlled backoff into extra load.
+                if token and exc.code == 401:
+                    payload = _json(url)
+                else:
+                    raise
             value = payload.get("id")
         elif platform == "bluesky":
             payload = _json(

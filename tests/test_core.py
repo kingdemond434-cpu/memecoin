@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 from collections import defaultdict, deque
 import unittest
 from dataclasses import asdict
@@ -10667,6 +10668,17 @@ class TestEntityVerifierReadsPublishedPages(unittest.TestCase):
 
 
 class TestEntityStableIdResolver(unittest.IsolatedAsyncioTestCase):
+    def test_expired_github_token_falls_back_to_the_public_endpoint(self):
+        failure = urllib.error.HTTPError("url", 401, "expired", {}, None)
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "expired"}), \
+             patch.object(resolve_entity_ids, "_json",
+                          side_effect=[failure, {"id": 202}]) as fetch:
+            value, status = resolve_entity_ids.resolve_public("github", "example")
+        self.assertEqual((value, status), ("202", "OK"))
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(fetch.call_args_list[-1].args, (
+            "https://api.github.com/users/example",))
+
     async def test_only_platform_resolved_ids_enter_the_authoritative_accounts(self):
         document = {"entities": [{
             "entity_id": "example", "display_name": "Example",
