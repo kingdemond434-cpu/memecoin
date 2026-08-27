@@ -4037,7 +4037,19 @@ class MemecoinQuantDesk:
         count toward the promotion gate's diversity requirement -- a desk that
         never measured the market must not satisfy it with one bucket.
         """
-        stats = (self.global_research.get_stats() if self.global_research else {}) or {}
+        builder = getattr(self, "dataset_builder", None)
+        stats = (builder.current_market_state()
+                 if builder is not None and hasattr(builder, "current_market_state")
+                 else {}) or {}
+        # Compatibility for isolated callers which provide the measurements
+        # directly through a research stub. The production miner is not used:
+        # it discovers mechanisms and does not collect market state.
+        if (stats.get("meme_launch_rate_1h") is None
+                or stats.get("sol_change_24h") is None):
+            research = getattr(self, "global_research", None)
+            fallback = (research.get_stats() if research else {}) or {}
+            if fallback.get("meme_launch_rate_1h") is not None:
+                stats = fallback
         launch_rate = stats.get("meme_launch_rate_1h")
         sol_change = stats.get("sol_change_24h")
         if launch_rate is None or sol_change is None:

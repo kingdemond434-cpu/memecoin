@@ -1031,6 +1031,7 @@ class PointInTimeDatasetBuilder:
         return episode
 
     def get_stats(self) -> Dict:
+        market = self.current_market_state()
         return {
             "active_episodes": len(self.active_episodes),
             "completed_episodes": len(self.completed_episodes),
@@ -1038,4 +1039,40 @@ class PointInTimeDatasetBuilder:
             "storage_path": self.storage_path,
             "market_sources": dict(self._market_cache.get("sources", {})),
             "market_observed_at": self._market_cache.get("observed_at"),
+            "market_state": market,
+        }
+
+    def current_market_state(self, as_of: Optional[float] = None,
+                             max_cache_age_seconds: float = 180.0) -> Dict[str, Any]:
+        """Synchronous measured inputs for live regime attribution.
+
+        The external market collector already owns the CoinGecko/DefiLlama
+        cache. Regime attribution must read that cache rather than the public
+        research miner, which discovers papers and repositories and never
+        measures SOL price or launch rate.
+        """
+        cutoff = time.time() if as_of is None else float(as_of)
+        observed_at = self._market_cache.get("observed_at")
+        try:
+            cache_age = cutoff - float(observed_at)
+        except (TypeError, ValueError):
+            cache_age = float("inf")
+        # Active and completed are joined by token to avoid counting the same
+        # episode twice while it moves between stores.
+        episodes = {**self.completed_episodes, **self.active_episodes}
+        launch_rate = sum(
+            0 <= cutoff - float(episode.created_at) <= 3600
+            for episode in episodes.values())
+        sol_change = (self._market_cache.get("sol_change_24h")
+                      if 0 <= cache_age <= max_cache_age_seconds else None)
+        return {
+            "status": "OK" if sol_change is not None else "DATA_BLOCKED",
+            "meme_launch_rate_1h": launch_rate,
+            "sol_change_24h": sol_change,
+            "priority_fee_median": (self._market_cache.get("priority_fee_median")
+                                    if sol_change is not None else None),
+            "priority_fee_p90": (self._market_cache.get("priority_fee_p90")
+                                 if sol_change is not None else None),
+            "observed_at": observed_at,
+            "cache_age_seconds": cache_age if cache_age != float("inf") else None,
         }

@@ -12654,6 +12654,36 @@ class TestForwardEvidence(unittest.TestCase):
             "meme_launch_rate_1h": 10, "sol_change_24h": -5.0})
         self.assertEqual(MemecoinQuantDesk.current_regime.fget(desk), "bear")
 
+    def test_production_regime_uses_the_market_cache_not_the_research_miner(self):
+        desk = SimpleNamespace(
+            global_config={"regime_hot_launch_rate": 300},
+            dataset_builder=SimpleNamespace(current_market_state=lambda: {
+                "status": "OK", "meme_launch_rate_1h": 500,
+                "sol_change_24h": -2.0,
+            }),
+            global_research=SimpleNamespace(get_stats=lambda: {
+                "meme_launch_rate_1h": 1, "sol_change_24h": 10.0,
+            }),
+        )
+        self.assertEqual(MemecoinQuantDesk.current_regime.fget(desk), "churn")
+
+    def test_market_state_refuses_a_stale_price_cache(self):
+        builder = PointInTimeDatasetBuilder.__new__(PointInTimeDatasetBuilder)
+        builder._market_cache = {
+            "observed_at": 900.0, "sol_change_24h": 3.0,
+            "priority_fee_median": 10.0, "priority_fee_p90": 20.0,
+        }
+        builder.active_episodes = {
+            "recent": SimpleNamespace(created_at=950.0),
+            "old": SimpleNamespace(created_at=1.0),
+        }
+        builder.completed_episodes = {}
+        fresh = builder.current_market_state(as_of=1_000.0)
+        stale = builder.current_market_state(as_of=2_000.0)
+        self.assertEqual(fresh["meme_launch_rate_1h"], 2)
+        self.assertEqual(fresh["status"], "OK")
+        self.assertIsNone(stale["sol_change_24h"])
+
 
 def _fastpath():
     """The compiled extension, or None when it has not been built here.
