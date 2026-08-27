@@ -66,6 +66,44 @@ The entity registry stays empty until entries are verified from the entity's
 own published pages (`tools/verify_entities.py`). Empty is not "nothing is a
 copycat" -- it is "we cannot tell", and the desk sizes accordingly.
 
+Measure the wire before arguing about geography. Run it ON THE NODE, never
+from a laptop or a sandbox -- a proxy in the path makes Tokyo look 5ms away
+and the tool refuses to draw a conclusion when it detects that:
+
+```bash
+.venv/bin/python tools/measure_wire.py --samples 12
+.venv/bin/python tools/measure_wire.py --json data/state/wire.json
+```
+
+It times every Jito block engine the submitter already races, plus the RPC
+set, and quotes each as a fraction of a 400ms slot. Under 15ms to the nearest
+engine is colocated-tier and geography is not your problem; over 90ms and
+moving the box is worth more than every code change combined.
+
+Build the Rust hot path on the node. It is optional -- the desk falls back to
+Python and says so -- but the fallback costs about 40 microseconds per entry
+on build-and-sign, and more importantly the Rust build is what unblocks the
+kernel parity ladder:
+
+```bash
+cd native/solana_fastpath && cargo build --release
+cp target/release/libsolana_fastpath.so ../../.venv/lib/python3.11/site-packages/solana_fastpath.so
+cd ../.. && .venv/bin/python -c "import solana_fastpath; print(solana_fastpath.IMPLEMENTATION)"
+```
+
+Then check `/status.latency`. This is the only page that can tell you whether
+the next hour belongs to code or to money: `dominant_controllable_stage` names
+the slowest stage we own, and if the detail line says the wire dominates, stop
+writing code and move the box.
+
+```bash
+curl -s http://127.0.0.1:18080/status | python3 -c "
+import json,sys; d=json.load(sys.stdin)['latency']
+print(d['status'], '|', d['detail'])
+print('slowest ours:', d['dominant_controllable_stage'])
+print('unmeasured  :', d['unmeasured_stages'])"
+```
+
 The substitution catalogue -- sixty public endpoints across eleven regions,
 each a rung the desk falls back to when the one above it refuses this address
 -- is a claim until it is probed from the node that will use it:
