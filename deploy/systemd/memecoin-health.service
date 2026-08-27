@@ -1,0 +1,29 @@
+[Unit]
+Description=Local health checks for the memecoin trading node
+After=memecoin-shadow.service
+OnFailure=memecoin-health-escalate.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/opt/memecoin-shadow
+EnvironmentFile=-%h/.config/memecoin-shadow/env
+# The monitor never trades, so it is denied the acknowledgement outright
+# rather than merely not using it.
+Environment=ALLOW_LIVE_TRADING=
+Environment=SOLANA_PRIVATE_KEY=
+ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m ops.monitor --root %h/.local/opt/memecoin-shadow --quiet
+# Exit 1 is WARN and exit 2 is CRITICAL. Both are successful RUNS of the
+# monitor, so systemd must not treat them as unit failures and start
+# restarting or rate-limiting the timer -- the escalation path below is what
+# reacts to them.
+SuccessExitStatus=0 1 2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=%h/.local/opt/memecoin-shadow/data
+UMask=0077
+# Deliberately tiny. A monitor that can contend for memory with the desk it
+# monitors is a liability on a 4 GB node.
+MemoryMax=192M
+CPUQuota=25%
+Nice=15

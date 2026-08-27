@@ -1,0 +1,13 @@
+[Unit]
+Description=Run local health checks every five minutes
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=5m
+# Persistent so a reboot does not leave a silent gap: the first run after
+# boot happens immediately rather than five minutes later.
+Persistent=true
+Unit=memecoin-health.service
+
+[Install]
+WantedBy=timers.target

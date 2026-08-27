@@ -131,6 +131,12 @@ class GenealogyGraph:
         
         self._update_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
         self._processing = False
+        self.outcome_provider = None
+        self.data_status: Dict[str, str] = {}
+        # Real detected launch timestamps, keyed by token. This is the only
+        # genuine point-in-time evidence available for launch-relative wallet
+        # regime classification (see WalletIntelligenceEngine._build_wallet_history).
+        self.token_launch_times: Dict[str, float] = {}
 
     async def start(self):
         self._session = aiohttp.ClientSession(
@@ -147,7 +153,26 @@ class GenealogyGraph:
             await self._session.close()
 
     async def _load_historical_data(self):
-        pass
+        self.data_status["historical_genealogy"] = (
+            "DATA_BLOCKED: no versioned historical genealogy artifact; building from observed launches"
+        )
+
+    def set_outcome_provider(self, provider):
+        self.outcome_provider = provider
+
+    def record_token_creation(self, token: str, deployer: str, metadata: Optional[Dict] = None):
+        update = {
+            "type": "token_created",
+            "token": token,
+            "deployer": deployer,
+            "timestamp": (metadata or {}).get("timestamp", time.time()),
+            "funding_wallets": (metadata or {}).get("funding_wallets", []),
+            "initial_buyers": (metadata or {}).get("initial_buyers", []),
+        }
+        try:
+            self._update_queue.put_nowait(update)
+        except asyncio.QueueFull:
+            self.data_status["update_queue"] = "DATA_BLOCKED: genealogy update queue full"
 
     async def _process_updates(self):
         while self._processing:
@@ -176,7 +201,9 @@ class GenealogyGraph:
         funding_wallets = data.get("funding_wallets", [])
         initial_buyers = data.get("initial_buyers", [])
         timestamp = data.get("timestamp", time.time())
-        
+        if token:
+            self.token_launch_times.setdefault(token, timestamp)
+
         if deployer not in self.wallets:
             self.wallets[deployer] = WalletProfile(
                 address=deployer,
@@ -344,7 +371,18 @@ class GenealogyGraph:
         return max(0, min(1, score))
 
     async def _get_launch_outcomes(self, tokens: List[str]) -> List[Dict]:
-        return []
+        if not self.outcome_provider:
+            self.data_status["launch_outcomes"] = "DATA_BLOCKED: PIT outcome provider unavailable"
+            return []
+        outcomes = []
+        for token in tokens:
+            outcome = self.outcome_provider(token)
+            if asyncio.iscoroutine(outcome):
+                outcome = await outcome
+            if outcome and outcome.get("status") != "DATA_BLOCKED":
+                outcomes.append(outcome)
+        self.data_status["launch_outcomes"] = "OK" if outcomes else "DATA_BLOCKED: no finalized outcomes"
+        return outcomes
 
     def get_wallet_profile(self, address: str) -> Optional[WalletProfile]:
         return self.wallets.get(address)
@@ -359,11 +397,20 @@ class GenealogyGraph:
         return None
 
     async def build_clusters(self, min_connections: int = 3):
+        # Rebuild deterministically from current evidence. Wallet profiles may
+        # exist before their first graph edge, and graph nodes may exist before
+        # their wallet profile is hydrated.
+        self.clusters.clear()
+        self._wallet_to_cluster.clear()
+        self._cluster_counter = 0
+        for profile in self.wallets.values():
+            profile.cluster_id = None
         visited = set()
-        for wallet in self.wallets:
+        for wallet in list(self.wallets):
             if wallet in visited:
                 continue
             cluster_wallets = self._find_connected_component(wallet, min_connections)
+            visited.update(cluster_wallets)
             if len(cluster_wallets) >= min_connections:
                 cluster_id = f"cluster_{self._cluster_counter}"
                 self._cluster_counter += 1
@@ -379,6 +426,10 @@ class GenealogyGraph:
                 self.clusters[cluster_id] = cluster
 
     def _find_connected_component(self, start: str, min_connections: int) -> Set[str]:
+        if start not in self.wallets:
+            return set()
+        if not self.graph.has_node(start):
+            return {start}
         component = set()
         queue = deque([start])
         while queue:
@@ -386,9 +437,11 @@ class GenealogyGraph:
             if node in component:
                 continue
             component.add(node)
+            if not self.graph.has_node(node):
+                continue
             neighbors = set(self.graph.predecessors(node)) | set(self.graph.successors(node))
             for n in neighbors:
-                if n not in component:
+                if n in self.wallets and n not in component:
                     edge_data = self.graph.get_edge_data(node, n) or self.graph.get_edge_data(n, node)
                     if edge_data:
                         total_weight = sum(d.get('weight', 1) for d in edge_data.values())
@@ -494,6 +547,7 @@ class GenealogyGraph:
             "rugged_deployers": sum(1 for d in self.deployers.values() if d.wallet_profile.is_rugged_deployer),
             "graph_nodes": self.graph.number_of_nodes(),
             "graph_edges": self.graph.number_of_edges()
+            ,"data_status": dict(self.data_status)
         }
 
     def serialize(self) -> Dict:

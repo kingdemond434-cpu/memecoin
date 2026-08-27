@@ -1,0 +1,19 @@
+[Unit]
+Description=Build the weekly Claude audit evidence pack
+After=memecoin-shadow.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/opt/memecoin-shadow
+EnvironmentFile=-%h/.config/memecoin-shadow/env
+Environment=ALLOW_LIVE_TRADING=
+Environment=SOLANA_PRIVATE_KEY=
+ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m ops.build_audit_pack --root %h/.local/opt/memecoin-shadow --days 7
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+# The pack builder runs the test suite, so it needs more headroom than the
+# monitor -- but it is still capped, and it is Nice'd well below the desk.
+MemoryMax=1024M
+CPUQuota=50%
+Nice=15

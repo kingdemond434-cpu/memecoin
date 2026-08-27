@@ -1,0 +1,112 @@
+name: ci
+
+# Runs on every push and pull request so a red suite is visible on the commit
+# rather than discovered on the node. The branch reported zero checks before
+# this existed, which meant "tests pass" was a claim with nothing behind it.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The audit pack reads the repository's own history, so a shallow
+          # checkout makes it report DATA_BLOCKED and fails a test that is
+          # correct. Full history here is not a workaround: it is the state
+          # the pack is built against on a real node.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build the native extension
+        # Built here so the Rust/Python parity tests actually RUN. They skip
+        # when the extension is absent -- correctly, since the Python path is
+        # the reference implementation and must work without Rust -- but a
+        # parity test that always skips is a parity test that proves nothing.
+        run: |
+          cargo build --release --manifest-path native/solana_fastpath/Cargo.toml
+          mkdir -p native-ext
+          cp native/solana_fastpath/target/release/libsolana_fastpath.so \
+             native-ext/solana_fastpath.so
+          echo "PYTHONPATH=$PWD/native-ext" >> "$GITHUB_ENV"
+
+      - name: Assert the parity tests are not silently skipping
+        run: |
+          python - <<'PY'
+          import solana_fastpath
+          print("native extension importable:", solana_fastpath.IMPLEMENTATION)
+          PY
+      - name: Run the suite
+        # The live-capital acknowledgement is explicitly cleared rather than
+        # merely absent, so a runner that inherited it from somewhere cannot
+        # let a test take a path that only exists when trading is unlocked.
+        env:
+          ALLOW_LIVE_TRADING: ""
+          SOLANA_PRIVATE_KEY: ""
+        run: python -m unittest discover -s tests -q
+
+      - name: Assert the vendored IDL tables are current
+        # The Rust account-flag tables are generated from the IDLs. A hand
+        # edit that drifts from them builds transactions the program rejects,
+        # so drift fails here rather than on chain.
+        run: python tools/gen_account_flags.py --check
+
+      - name: Smoke test the desk
+        env:
+          ALLOW_LIVE_TRADING: ""
+          SOLANA_PRIVATE_KEY: ""
+        run: python -m src.main --dry-run --smoke-test > readiness.json
+
+      - name: Assert the safety state
+        # A green suite with an unlocked live path is not a passing build.
+        run: |
+          python - <<'PY'
+          import json, sys
+          raw = open("readiness.json").read()
+          data = json.loads(raw[raw.index("{"):])
+          problems = []
+          if data.get("mode") != "DRY_RUN":
+              problems.append(f"mode is {data.get('mode')}")
+          if not data.get("live_submission_locked"):
+              problems.append("live submission is not locked")
+          if not (data.get("execution") or {}).get("dry_run"):
+              problems.append("execution is not in dry run")
+          if problems:
+              sys.exit("SAFETY STATE FAILED: " + "; ".join(problems))
+          print("safety state OK: DRY_RUN, live_submission_locked")
+          PY
+
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: native/solana_fastpath
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Test without linking Python
+        # `extension-module` tells pyo3 not to link libpython, which is right
+        # for a wheel and fatal for a test binary. The logic lives behind the
+        # feature gate precisely so it can be tested on its own.
+        run: cargo test --no-default-features
+      - name: Clippy
+        run: cargo clippy --no-default-features -- -D warnings
+      - name: Build the extension
+        run: cargo build --release

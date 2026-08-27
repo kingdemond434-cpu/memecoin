@@ -1,0 +1,24 @@
+[package]
+name = "solana-fastpath"
+version = "0.2.0"
+edition = "2021"
+
+[lib]
+name = "solana_fastpath"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bs58 = "0.5"
+sha2 = "0.10"
+pyo3 = { version = "0.23", features = ["abi3-py310"], optional = true }
+
+[features]
+# On by default so `maturin build` and `pip install .` produce a working
+# extension without extra flags.
+default = ["python"]
+# `extension-module` tells pyo3 NOT to link libpython, which is correct for a
+# wheel and fatal for a test binary -- a test needs those symbols resolved.
+# Gating the bindings behind a feature means `cargo test --no-default-features`
+# exercises all the pricing, decoding and construction logic with no Python in
+# the picture at all, which is where that logic belongs anyway.
+python = ["dep:pyo3", "pyo3/extension-module"]

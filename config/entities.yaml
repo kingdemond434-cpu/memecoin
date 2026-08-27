@@ -1,0 +1,60 @@
+# Watched entities for the authenticity resolver.
+#
+# This file is deliberately EMPTY. An entity declared here asserts that a
+# specific account, domain or wallet canonically IS a named public figure or
+# organisation, and that assertion is the entire basis on which the desk would
+# treat a token as officially theirs rather than as a copycat. A wrong entry
+# does not degrade gracefully: it makes an impersonator look verified, which
+# is the single most expensive error this system can make.
+#
+# So nothing is seeded from memory. Every entry must be filled in from the
+# entity's own published account -- a handle read off their official site, a
+# wallet they have publicly acknowledged, a domain whose certificate resolves
+# to them -- and recorded with where it was verified and when.
+#
+# Until entries exist, `AuthenticityResolver` reports DATA_BLOCKED for every
+# token and the mega-event reserve stays unauthenticated. That is the correct
+# reading of an empty registry: not "nothing is a copycat", but "we cannot
+# tell", and the desk sizes accordingly. `GET /status` reports it under
+# `entity_registry` so silence is never mistaken for safety.
+#
+# `verified_from` and `verified_at` are REQUIRED. An entry without both is
+# refused at load, not loaded with a warning: an identity assertion nobody can
+# trace is precisely the error this file exists to prevent, and a flag on a
+# record that still confers OFFICIAL_DOMAIN proof is not a control.
+#
+# A verification older than 180 days is treated as a claim about the PAST.
+# Accounts get renamed, sold and abandoned, so a stale entity keeps NAME_ONLY
+# -- enough to say "worth watching" -- and loses the levels that authorise a
+# position, until it is re-verified.
+#
+# To fill it, do not type handles from memory. Fetch what the entity itself
+# publishes:
+#
+#   python tools/verify_entities.py --domain example.org --id example-org \
+#       --name "Example Organisation" --out config/entities.verified.yaml
+#
+# The loader reads `config/entities.yaml,config/entities.verified.yaml` and the
+# overlay wins on any entity_id it names. The tool emits account handles as
+# COMMENTS: `accounts` holds stable platform ids, and a display handle there
+# would let a renamed or resold account keep an entity's proof level.
+#
+# Schema:
+#
+# entities:
+#   - entity_id: example-org             # stable, lowercase, never reused
+#     display_name: Example Organisation
+#     accounts:                          # platform -> list of stable account IDs
+#       telegram: ["1234567890"]         # numeric IDs, never @display names:
+#       youtube: ["UCxxxxxxxxxxxxxxxx"]  # display names are free to impersonate
+#     official_domains: ["example.org"]  # registrable domains only, no paths
+#     known_wallets: []                  # base58 mints/wallets they have
+#                                        # publicly acknowledged
+#     aliases: ["Example Org"]           # names that should trigger NAME_ONLY
+#     verified_from: "https://example.org/press"   # REQUIRED: where this was read
+#     verified_at: "2026-01-01"                    # REQUIRED: when
+#     metadata:
+#       verified_pages: ["https://example.org/press"]
+#       page_hashes: {"https://example.org/press": "sha256..."}
+
+entities: []

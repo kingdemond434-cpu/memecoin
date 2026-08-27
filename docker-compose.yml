@@ -1,30 +1,37 @@
-version: '3.8'
+name: memecoin-shadow
 
 services:
-  memecoin-bot:
+  desk:
     build: .
-    container_name: memecoin-quant-desk
+    command: ["python", "-m", "src.main", "--dry-run"]
     restart: unless-stopped
     environment:
-      - SOLANA_PRIVATE_KEY=${SOLANA_PRIVATE_KEY}
-      - HELIUS_API_KEY=${HELIUS_API_KEY}
-      - YELLOWSTONE_GRPC_URL=${YELLOWSTONE_GRPC_URL}
-      - X_BEARER_TOKEN=${X_BEARER_TOKEN}
-      - TELEGRAM_API_KEY=${TELEGRAM_API_KEY}
-      - ALCHEMY_KEY=${ALCHEMY_KEY}
-      - INFURA_KEY=${INFURA_KEY}
-      - ETHERSCAN_KEY=${ETHERSCAN_KEY}
-      - BASESCAN_KEY=${BASESCAN_KEY}
-      - ARBISCAN_KEY=${ARBISCAN_KEY}
-      - BSCSCAN_KEY=${BSCSCAN_KEY}
-      - SOLSCAN_KEY=${SOLSCAN_KEY}
-      - LOG_LEVEL=INFO
-      - PYTHONUNBUFFERED=1
+      HELIUS_API_KEY: ${HELIUS_API_KEY:-}
+      ALCHEMY_KEY: ${ALCHEMY_KEY:-}
+      YELLOWSTONE_GRPC_URL: ${YELLOWSTONE_GRPC_URL:-}
+      YELLOWSTONE_GRPC_TOKEN: ${YELLOWSTONE_GRPC_TOKEN:-}
+      JUPITER_API_KEY: ${JUPITER_API_KEY:-}
+      X_BEARER_TOKEN: ${X_BEARER_TOKEN:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      REDDIT_CLIENT_ID: ${REDDIT_CLIENT_ID:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      LOG_LEVEL: INFO
+      HEALTH_PORT: 8080
+      ALLOW_LIVE_TRADING: ""
+    ports:
+      - "127.0.0.1:${MEMECOIN_SHADOW_PORT:-18080}:8080"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./models:/app/models
       - ./config:/app/config:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     deploy:
       resources:
         limits:
@@ -42,18 +49,3 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
-
-  redis:
-    image: redis:7-alpine
-    container_name: memecoin-redis
-    restart: unless-stopped
-    volumes:
-      - redis_data:/data
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-    command: redis-server --maxmemory 200mb --maxmemory-policy allkeys-lru
-
-volumes:
-  redis_data:

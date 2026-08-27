@@ -1,19 +1,17 @@
 import asyncio
-import json
 import logging
+import os
 import random
 import time
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set
-from urllib.parse import urlparse
+from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import urlsplit
 
 import aiohttp
 import yaml
 from web3 import AsyncWeb3
-from web3.providers import AsyncHTTPProvider, WebSocketProvider
-from web3.types import RPCEndpoint, RPCResponse
+from web3.providers import AsyncHTTPProvider
 
 logger = logging.getLogger(__name__)
 
@@ -113,22 +111,24 @@ class RPCManager:
 
     async def _check_endpoint(self, ep: EndpointHealth):
         start = time.time()
+        method, params = self._health_probe()
         try:
             async with self._session.post(
                 ep.endpoint.url,
-                json={"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1},
+                json={"jsonrpc": "2.0", "method": method, "params": params, "id": 1},
                 headers=ep.endpoint.headers,
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    if "result" in data:
+                    if "result" in data and self._valid_health_result(data["result"]):
                         ep.health = RPCHealth.HEALTHY
                         ep.latency_ms = (time.time() - start) * 1000
                         ep.success_count += 1
                         ep.consecutive_failures = 0
+                        ep.last_check = time.time()
                         return
-        except Exception:
-            pass
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            logger.debug("RPC health probe failed for %s", ep.endpoint.url)
         ep.error_count += 1
         ep.consecutive_failures += 1
         if ep.consecutive_failures >= 3:
@@ -137,16 +137,32 @@ class RPCManager:
             ep.health = RPCHealth.DEGRADED
         ep.last_check = time.time()
 
+    def _health_probe(self) -> tuple[str, List[Any]]:
+        """Return a protocol-correct, inexpensive probe for this chain."""
+        if self.chain_config.chain_type == ChainType.SOLANA:
+            return "getHealth", []
+        return "eth_blockNumber", []
+
+    def _valid_health_result(self, result: Any) -> bool:
+        if self.chain_config.chain_type == ChainType.SOLANA:
+            return result == "ok"
+        return isinstance(result, str) and result.startswith("0x")
+
     def _select_endpoint(self, prefer_ws: bool = False) -> Optional[EndpointHealth]:
-        healthy = [e for e in self.endpoints if e.health != RPCHealth.DOWN]
-        if not healthy:
+        candidates = [e for e in self.endpoints if e.health != RPCHealth.DOWN]
+        if not candidates:
             return None
         if prefer_ws:
-            healthy = [e for e in healthy if e.endpoint.ws_url]
-        if not healthy:
+            candidates = [e for e in candidates if e.endpoint.ws_url]
+        if not candidates:
             return None
-        weights = [e.endpoint.weight * (1 / max(e.latency_ms, 1)) for e in healthy]
-        return random.choices(healthy, weights=weights, k=1)[0]
+        # Never let a credential-rejected/degraded endpoint win merely because
+        # it has no measured latency yet. Degraded providers are a last resort
+        # only when no healthy provider supports the requested transport.
+        healthy = [e for e in candidates if e.health == RPCHealth.HEALTHY]
+        candidates = healthy or candidates
+        weights = [e.endpoint.weight * (1 / max(e.latency_ms, 1)) for e in candidates]
+        return random.choices(candidates, weights=weights, k=1)[0]
 
     async def request(self, method: str, params: List[Any]) -> Any:
         async with self._request_semaphore:
@@ -164,6 +180,8 @@ class RPCManager:
                             data = await resp.json()
                             if "result" in data:
                                 ep.success_count += 1
+                                ep.consecutive_failures = 0
+                                ep.health = RPCHealth.HEALTHY
                                 return data["result"]
                             if "error" in data:
                                 raise RPCError(data["error"])
@@ -192,11 +210,48 @@ class RPCManager:
                     return [r.get("result") for r in data]
                 raise RPCError(await resp.text())
 
+    async def broadcast_request(self, method: str, params: List[Any], timeout: float = 1.5) -> Any:
+        """Race one idempotent signed transaction across every healthy RPC path."""
+        endpoints = [item for item in self.endpoints if item.health == RPCHealth.HEALTHY]
+        if not endpoints:
+            endpoints = [item for item in self.endpoints if item.health != RPCHealth.DOWN]
+        if not endpoints:
+            raise RuntimeError("No usable RPC endpoints")
+
+        async def submit(item: EndpointHealth):
+            async with self._session.post(
+                item.endpoint.url,
+                json={"jsonrpc": "2.0", "method": method, "params": params, "id": 1},
+                headers=item.endpoint.headers,
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                payload = await resp.json()
+                return payload.get("result")
+
+        tasks = [asyncio.create_task(submit(item)) for item in endpoints]
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        # Requests were launched together; cancel only sockets still stalled
+        # after the racing window. The identical signed transaction cannot fill twice.
+        for task in pending:
+            task.cancel()
+        results = [task.result() for task in done if not task.cancelled() and task.exception() is None]
+        return next((value for value in results if value), None)
+
     def get_ws_url(self) -> Optional[str]:
         ep = self._select_endpoint(prefer_ws=True)
         return ep.endpoint.ws_url if ep else None
 
+    def get_ws_urls(self) -> List[str]:
+        """Return transport candidates without exposing them through status output."""
+        usable = [item for item in self.endpoints if item.endpoint.ws_url and item.health != RPCHealth.DOWN]
+        healthy = [item for item in usable if item.health == RPCHealth.HEALTHY]
+        degraded = [item for item in usable if item.health == RPCHealth.DEGRADED]
+        return [item.endpoint.ws_url for item in healthy + degraded if item.endpoint.ws_url]
+
     def get_web3(self) -> AsyncWeb3:
+        if self.chain_config.chain_type != ChainType.EVM:
+            raise TypeError("get_web3() is only valid for EVM chains")
         ep = self._select_endpoint()
         if not ep:
             raise RuntimeError("No healthy RPC endpoints")
@@ -207,7 +262,11 @@ class RPCManager:
             "chain": self.chain_config.name,
             "endpoints": [
                 {
-                    "url": e.endpoint.url,
+                    # Provider keys commonly live in the query string or final
+                    # URL path segment. Health/status output is also journaled,
+                    # so expose only the origin and never credential-bearing
+                    # path/query/fragment data.
+                    "url": self._safe_endpoint_origin(e.endpoint.url),
                     "health": e.health.value,
                     "latency_ms": round(e.latency_ms, 2),
                     "success": e.success_count,
@@ -216,6 +275,16 @@ class RPCManager:
                 for e in self.endpoints
             ],
         }
+
+    @staticmethod
+    def _safe_endpoint_origin(url: str) -> str:
+        parsed = urlsplit(url)
+        if not parsed.scheme or not parsed.hostname:
+            return "REDACTED_ENDPOINT"
+        host = parsed.hostname
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        return f"{parsed.scheme}://{host}"
 
 
 class RPCError(Exception):
@@ -236,14 +305,19 @@ class ChainRegistry:
         globals_cfg = raw.get("global", {})
         for name, cfg in raw.get("chains", {}).items():
             chain_type = ChainType.SOLANA if name == "solana" else ChainType.EVM
-            endpoints = [
-                RPCEndpointConfig(
-                    url=self._interpolate(ep),
-                    ws_url=self._interpolate(cfg.get("ws_urls", [None])[i]) if i < len(cfg.get("ws_urls", [])) else None,
-                    weight=1,
-                )
-                for i, ep in enumerate(cfg["rpc_urls"])
-            ]
+            endpoints = []
+            ws_urls = cfg.get("ws_urls", [])
+            for i, endpoint_url in enumerate(cfg["rpc_urls"]):
+                url = self._interpolate(endpoint_url)
+                ws_url = self._interpolate(ws_urls[i]) if i < len(ws_urls) else None
+                if self._has_unresolved_placeholder(url):
+                    logger.info("Skipping %s RPC endpoint with missing environment value", name)
+                    continue
+                if ws_url and self._has_unresolved_placeholder(ws_url):
+                    ws_url = None
+                endpoints.append(RPCEndpointConfig(url=url, ws_url=ws_url, weight=1))
+            if not endpoints:
+                raise ValueError(f"No usable RPC endpoints configured for {name}")
             self.chains[name] = ChainConfig(
                 name=cfg["name"],
                 chain_id=cfg["chain_id"],
@@ -263,20 +337,28 @@ class ChainRegistry:
                 programs=cfg.get("programs", {}),
             )
 
-    def _interpolate(self, value: str) -> str:
-        import os
-        for key, val in os.environ.items():
-            value = value.replace(f"${{{key}}}", val)
-        return value
+    def _interpolate(self, value: Optional[str]) -> Optional[str]:
+        return os.path.expandvars(value) if value else value
 
-    async def start_all(self):
+    @staticmethod
+    def _has_unresolved_placeholder(value: str) -> bool:
+        return "${" in value
+
+    async def start_all(self, enabled_chains: Optional[Iterable[str]] = None):
+        selected = set(enabled_chains or self.chains.keys())
         for name, chain in self.chains.items():
+            if name not in selected:
+                continue
             self.rpc_managers[name] = RPCManager(chain)
             await self.rpc_managers[name].start()
 
     async def stop_all(self):
         for mgr in self.rpc_managers.values():
             await mgr.stop()
+
+    async def stop(self):
+        """Lifecycle alias used by the desk's uniform component shutdown."""
+        await self.stop_all()
 
     def get_chain(self, name: str) -> Optional[ChainConfig]:
         return self.chains.get(name)
