@@ -87,6 +87,18 @@ from src.research.web_miners import (
     wikipedia_attention_miner, youtube_recent_miner,
 )
 from src.chains import pumpswap_route
+from src.research.launch_census import (
+    LaunchCensus, LaunchRecord, MONSTER_MULTIPLE, Stage as CensusStage,
+)
+from src.research import rug_mechanism
+from src.research.rug_mechanism import RugMechanism
+from src.research.calibration import CalibrationBook, ModelCalibration
+from src.execution import bid_explorer as bid_explorer_module
+from src.execution.bid_explorer import BidExplorer
+from src.execution.signer import (
+    Decision as SignerDecision, SignerClient, SignerPolicy, SignerService,
+    TransactionInspector,
+)
 from src.research import telegram_authorize
 from src.strategies.ignition import (
     IgnitionModel, IgnitionReading, KolRole, NarrativeState, SourceTouch,
@@ -15000,3 +15012,517 @@ class TestTheAuthorizeToolDiagnosesItsOwnFailure(unittest.TestCase):
                 message = telegram_authorize._diagnosis()
         self.assertIn("No environment file was found", message)
         self.assertIn("EnvironmentFile=", message)
+
+
+class TestTheCensusCountsEveryLaunchNotOnlyOurs(unittest.TestCase):
+    """Ratios computed downstream of our own filters cannot see what those
+    filters discarded."""
+
+    def test_a_screened_monster_is_attributed_to_the_screen_that_lost_it(self):
+        census = LaunchCensus()
+        census.see("kept", at=1.0)
+        census.see("thrown", at=1.0)
+        census.decide("kept", "probe")
+        census.enter("kept")
+        census.screen("thrown", "holder_concentration")
+        census.resolve("kept", peak_multiple=12.0)
+        census.resolve("thrown", peak_multiple=40.0)
+        report = census.missed_monster_report()
+        self.assertEqual(report["monsters_resolved"], 2)
+        self.assertEqual(report["monsters_entered"], 1)
+        self.assertEqual(report["monsters_screened_out"], 1)
+        self.assertAlmostEqual(report["monster_capture_rate"], 0.5)
+        costliest = report["costliest_screens"][0]
+        self.assertEqual(costliest["reason"], "holder_concentration")
+        self.assertEqual(costliest["monsters_discarded"], 1)
+        self.assertAlmostEqual(costliest["monster_share_of_rejections"], 1.0)
+
+    def test_the_peak_ratchets_and_never_records_the_way_back_down(self):
+        census = LaunchCensus()
+        census.see("m")
+        for multiple in (2.0, 30.0, 1.5):
+            census.resolve("m", peak_multiple=multiple)
+        self.assertAlmostEqual(census._records["m"].peak_multiple, 30.0)
+        self.assertEqual(census.report()["outcomes"]["monsters"], 1)
+
+    def test_a_monster_is_counted_once_however_often_it_is_resolved(self):
+        census = LaunchCensus()
+        census.see("m")
+        for _ in range(5):
+            census.resolve("m", peak_multiple=50.0)
+        self.assertEqual(census._totals.monsters, 1)
+        self.assertEqual(census._totals.resolved, 1)
+
+    def test_an_unresolved_launch_is_never_counted_as_a_flat_one(self):
+        census = LaunchCensus()
+        census.see("a")
+        census.see("b")
+        census.resolve("a", peak_multiple=1.0)
+        report = census.missed_monster_report()
+        self.assertEqual(report["resolved_launches"], 1)
+        self.assertEqual(report["unresolved_launches"], 1)
+        # No monster resolved: capture rate is null, not perfect.
+        self.assertIsNone(report["monster_capture_rate"])
+
+    def test_seeing_the_same_launch_twice_does_not_inflate_the_denominator(self):
+        census = LaunchCensus()
+        census.see("m")
+        census.see("m")
+        self.assertEqual(census.report()["funnel"]["seen"], 1)
+
+    def test_a_screen_later_overridden_stays_a_partition(self):
+        census = LaunchCensus()
+        census.see("m")
+        census.screen("m", "too_concentrated")
+        census.decide("m", "probe")
+        funnel = census.report()["funnel"]
+        self.assertEqual(funnel["screened_out"], 0)
+        self.assertEqual(funnel["reached_a_decision"], 1)
+        self.assertEqual(funnel["unaccounted"], 0)
+
+    def test_totals_survive_eviction_of_the_detail_they_came_from(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # The cap has a deliberate floor of 100: a census holding fewer
+            # than that in memory cannot answer anything useful.
+            census = LaunchCensus(Path(tmp) / "census.json", max_records=100)
+            for index in range(400):
+                mint = f"m{index}"
+                census.see(mint)
+                census.resolve(mint, peak_multiple=20.0)
+            self.assertLessEqual(len(census._records), 100)
+            # Detail was spilled; the counters did not move.
+            self.assertEqual(census.report()["funnel"]["seen"], 400)
+            self.assertEqual(census.report()["outcomes"]["monsters"], 400)
+            self.assertGreater(census.spilled, 0)
+            self.assertTrue((Path(tmp) / "launch_census.jsonl").exists())
+
+    def test_an_unresolved_backlog_cannot_grow_without_bound(self):
+        census = LaunchCensus(max_records=100, resolve_window_s=0.0)
+        for index in range(500):
+            census.see(f"m{index}", at=1.0)
+        self.assertLessEqual(len(census._records), 100)
+        # Written off as unobserved, and said so, rather than silently lost.
+        self.assertGreater(census.expired_unresolved, 0)
+
+    def test_it_survives_a_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "census.json"
+            census = LaunchCensus(path)
+            census.see("m", creator="dev")
+            census.screen("m", "rug_hazard")
+            census.resolve("m", peak_multiple=25.0)
+            self.assertTrue(census.save())
+            revived = LaunchCensus(path)
+            self.assertTrue(revived.load())
+            self.assertEqual(revived.report()["outcomes"]["monsters"], 1)
+            self.assertEqual(
+                revived.missed_monster_report()["monsters_screened_out"], 1)
+
+    def test_an_empty_census_reports_blocked_not_healthy(self):
+        report = LaunchCensus().report()
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertIn("denominator is empty", report["detail"])
+
+
+class TestRugMechanismsAreNamedOrHonestlyUnnamed(unittest.TestCase):
+
+    def _path(self, multiples, **extra):
+        return [{"type": "trade", "price_multiple": m, "timestamp": float(i),
+                 **extra} for i, m in enumerate(multiples)]
+
+    def test_a_survivor_is_not_a_rug(self):
+        verdict = rug_mechanism.classify(self._path([1.0, 2.0, 1.8]))
+        self.assertIs(verdict.mechanism, RugMechanism.SURVIVED)
+
+    def test_a_growing_supply_is_named_mint_dilution(self):
+        rows = self._path([1.0, 5.0, 0.1]) + [
+            {"type": "authority", "supply": 1_000.0, "timestamp": 0.0},
+            {"type": "authority", "supply": 9_000.0, "timestamp": 5.0}]
+        verdict = rug_mechanism.classify(rows)
+        self.assertIs(verdict.mechanism, RugMechanism.MINT_DILUTION)
+        self.assertNotIn(RugMechanism.MINT_DILUTION.value, verdict.unobserved)
+
+    def test_liquidity_removed_in_one_step_is_an_lp_pull(self):
+        rows = self._path([1.0, 4.0, 0.05]) + [
+            {"type": "lp_supply", "lp_supply": 1_000.0, "timestamp": 0.0},
+            {"type": "lp_supply", "lp_supply": 10.0, "timestamp": 9.0}]
+        verdict = rug_mechanism.classify(rows)
+        self.assertIs(verdict.mechanism, RugMechanism.LP_PULL)
+
+    def test_buys_with_no_sell_ever_is_a_honeypot(self):
+        rows = [{"type": "trade", "side": "buy", "price_multiple": 1.0 + i,
+                 "timestamp": float(i), "wallet": f"w{i}"} for i in range(12)]
+        rows.append({"type": "trade", "side": "buy", "price_multiple": 0.1,
+                     "timestamp": 20.0, "wallet": "w99"})
+        verdict = rug_mechanism.classify(rows)
+        self.assertIs(verdict.mechanism, RugMechanism.HONEYPOT)
+
+    def test_the_first_cohort_leaving_together_is_a_cascade(self):
+        rows = [{"type": "trade", "side": "buy", "wallet": f"w{i}",
+                 "timestamp": float(i), "price_multiple": 1.0 + i,
+                 "amount": 10.0} for i in range(8)]
+        rows += [{"type": "trade", "side": "sell", "wallet": f"w{i}",
+                  "timestamp": 100.0 + i, "price_multiple": 0.2,
+                  "amount": 10.0} for i in range(7)]
+        verdict = rug_mechanism.classify(rows)
+        self.assertIs(verdict.mechanism, RugMechanism.SNIPER_CASCADE)
+
+    def test_an_unexplained_death_is_unclassified_not_slow_bleed(self):
+        # Few priced points and no mechanism evidence. Calling this a slow
+        # bleed would fill the training set with a confident mislabel.
+        verdict = rug_mechanism.classify(self._path([1.0, 5.0, 0.1]))
+        self.assertIs(verdict.mechanism, RugMechanism.UNCLASSIFIED)
+        self.assertEqual(verdict.data_status, "DATA_BLOCKED")
+        self.assertIn("not attributed to slow bleed", verdict.detail)
+
+    def test_a_long_decay_earns_the_slow_bleed_label(self):
+        path = [1.0 + (0.5 * i) for i in range(12)] + [
+            6.5 - (0.5 * i) for i in range(13)]
+        verdict = rug_mechanism.classify(self._path(path))
+        self.assertIs(verdict.mechanism, RugMechanism.SLOW_BLEED)
+
+    def test_unobserved_mechanisms_are_listed_so_a_label_carries_its_gaps(self):
+        verdict = rug_mechanism.classify(self._path([1.0, 5.0, 0.05]),
+                                         migrated=False)
+        self.assertIs(verdict.mechanism, RugMechanism.MIGRATION_STALL)
+        # Neither supply nor LP was ever observed; the label says so.
+        self.assertIn(RugMechanism.MINT_DILUTION.value, verdict.unobserved)
+        self.assertIn(RugMechanism.LP_PULL.value, verdict.unobserved)
+        self.assertFalse(verdict.confident)
+
+    def test_coverage_calls_a_gap_a_gap(self):
+        verdicts = [rug_mechanism.classify(self._path([1.0, 5.0, 0.1]))
+                    for _ in range(10)]
+        report = rug_mechanism.coverage_report(verdicts)
+        self.assertEqual(report["unclassified"], 10)
+        self.assertAlmostEqual(report["unclassified_share"], 1.0)
+        self.assertIn("measurement gap", report["detail"])
+
+
+class TestCalibrationAnswersWhetherTheNumbersAreTrue(unittest.TestCase):
+
+    def test_below_the_sample_floor_nothing_is_reported_as_fine(self):
+        book = ModelCalibration("rug_30s", min_samples=200)
+        for _ in range(50):
+            book.record(0.2, False)
+        report = book.report()
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertIsNone(report["expected_calibration_error"])
+        self.assertIn("must not be read as acceptable", report["detail"])
+
+    def test_a_well_calibrated_model_reads_ok(self):
+        book = ModelCalibration("good", min_samples=100)
+        # 20% stated, 20% observed, across a spread of stated values.
+        for _ in range(100):
+            book.record(0.2, True)
+        for _ in range(400):
+            book.record(0.2, False)
+        report = book.report()
+        self.assertEqual(report["status"], "OK")
+        self.assertLess(report["expected_calibration_error"], 0.05)
+
+    def test_an_overconfident_model_is_caught_and_the_direction_named(self):
+        book = ModelCalibration("understates", min_samples=100)
+        # Says 10%, happens 60% of the time: risk is understated.
+        for _ in range(600):
+            book.record(0.1, True)
+        for _ in range(400):
+            book.record(0.1, False)
+        report = book.report()
+        self.assertEqual(report["status"], "MISCALIBRATED")
+        self.assertGreater(report["understates_risk_by"], 0.4)
+        self.assertAlmostEqual(report["overstates_risk_by"], 0.0)
+
+    def test_accuracy_is_not_calibration(self):
+        # Always says 5%, and is right 95% of the time, but the 5% is a lie:
+        # the event happens 30% of the time in the bucket it was claimed for.
+        book = ModelCalibration("accurate_but_wrong", min_samples=100)
+        for _ in range(300):
+            book.record(0.05, True)
+        for _ in range(700):
+            book.record(0.05, False)
+        self.assertEqual(book.report()["status"], "MISCALIBRATED")
+
+    def test_an_impossible_probability_is_refused_not_clipped(self):
+        book = ModelCalibration("broken")
+        self.assertFalse(book.record(1.4, True))
+        self.assertFalse(book.record(-0.2, False))
+        self.assertFalse(book.record(float("nan"), False))
+        self.assertEqual(book.count, 0)
+
+    def test_a_thin_bin_is_shown_but_flagged(self):
+        book = ModelCalibration("thin", min_samples=1, min_bin_samples=10)
+        book.record(0.95, True)
+        tail = [row for row in book.report()["reliability"]
+                if row["count"] and row["range"][0] >= 0.9][0]
+        self.assertTrue(tail["thin"])
+
+    def test_an_unmeasured_model_is_not_trustworthy_and_not_untrustworthy(self):
+        book = CalibrationBook(min_samples=100)
+        self.assertIsNone(book.trustworthy("never_seen"))
+        book.record("seen", 0.5, True)
+        # Measured but below floor: still None, never True.
+        self.assertIsNone(book.trustworthy("seen"))
+
+    def test_the_book_says_plainly_when_nothing_is_verified(self):
+        report = CalibrationBook().report()
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertIn("currently unverified", report["detail"])
+
+    def test_it_survives_a_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "calibration.json"
+            book = CalibrationBook(path, min_samples=10)
+            for _ in range(20):
+                book.record("m", 0.5, True)
+            self.assertTrue(book.save())
+            revived = CalibrationBook(path, min_samples=10)
+            self.assertTrue(revived.load())
+            self.assertEqual(revived.models["m"].count, 20)
+
+
+class TestBidExplorationFillsTheGridItIsMeasuredOn(unittest.TestCase):
+    """Exploit-only bidding can never discover that it is overpaying."""
+
+    def _explorer(self, **kwargs):
+        kwargs.setdefault("rng", random.Random(7))
+        return BidExplorer(**kwargs)
+
+    def test_exits_are_never_explored_on(self):
+        choice = self._explorer().choose(
+            recommended_lamports=100_000, edge_usd=1.0, congestion=0.1,
+            is_exit=True, measured=True)
+        self.assertFalse(choice.explore)
+        self.assertEqual(choice.bid_lamports, 100_000)
+        self.assertIn("missed exit", choice.reason)
+
+    def test_a_high_edge_trade_is_never_explored_on(self):
+        choice = self._explorer(max_edge_usd=25.0).choose(
+            recommended_lamports=100_000, edge_usd=500.0, congestion=0.1,
+            is_exit=False, measured=True)
+        self.assertFalse(choice.explore)
+        self.assertIn("too expensive to learn on", choice.reason)
+
+    def test_exploring_around_the_fallback_ladder_is_pointless_and_refused(self):
+        choice = self._explorer().choose(
+            recommended_lamports=100_000, edge_usd=1.0, congestion=0.1,
+            is_exit=False, measured=False)
+        self.assertFalse(choice.explore)
+        self.assertIn("no curve to inform", choice.reason)
+
+    def test_it_explores_downward_which_is_how_overpaying_is_discovered(self):
+        explorer = self._explorer()
+        seen = set()
+        for _ in range(40):
+            choice = explorer.choose(
+                recommended_lamports=100_000, edge_usd=1.0, congestion=0.05,
+                is_exit=False, measured=True)
+            if choice.explore:
+                seen.add(choice.multiple)
+                explorer.record(cell=choice.cell, landed=True)
+        self.assertTrue(any(multiple < 1.0 for multiple in seen),
+                        f"never bid below the recommendation: {seen}")
+
+    def test_a_downward_probe_costs_nothing_from_the_budget(self):
+        explorer = self._explorer(hourly_budget_lamports=0)
+        placed = [explorer.choose(recommended_lamports=100_000, edge_usd=1.0,
+                                  congestion=0.05, is_exit=False, measured=True)
+                  for _ in range(30)]
+        explored = [choice for choice in placed if choice.explore]
+        self.assertTrue(explored, "a zero budget blocked even cheaper bids")
+        # With no budget, only bids at or below the recommendation are allowed.
+        self.assertTrue(all(choice.extra_spend_lamports == 0
+                            for choice in explored))
+
+    def test_upward_exploration_stops_when_the_budget_is_spent(self):
+        explorer = self._explorer(bid_multiples=(2.0,),
+                                  hourly_budget_lamports=150_000)
+        first = explorer.choose(recommended_lamports=100_000, edge_usd=1.0,
+                                congestion=0.05, is_exit=False, measured=True)
+        self.assertTrue(first.explore)
+        self.assertEqual(first.extra_spend_lamports, 100_000)
+        second = explorer.choose(recommended_lamports=100_000, edge_usd=1.0,
+                                 congestion=0.05, is_exit=False, measured=True)
+        self.assertFalse(second.explore)
+        self.assertIn("budget spent", second.reason)
+
+    def test_no_bid_ever_exceeds_the_absolute_ceiling(self):
+        explorer = self._explorer(bid_multiples=(50.0,),
+                                  max_bid_lamports=500_000,
+                                  hourly_budget_lamports=10**9)
+        choice = explorer.choose(recommended_lamports=100_000, edge_usd=1.0,
+                                 congestion=0.05, is_exit=False, measured=True)
+        self.assertLessEqual(choice.bid_lamports, 500_000)
+
+    def test_it_targets_the_emptiest_cell_rather_than_at_random(self):
+        explorer = self._explorer(bid_multiples=(0.5, 0.7), coverage_target=3)
+        # Saturate one multiple by hand.
+        for _ in range(3):
+            explorer.record(cell="calm@0.50", landed=True)
+        choice = explorer.choose(recommended_lamports=100_000, edge_usd=1.0,
+                                 congestion=0.05, is_exit=False, measured=True)
+        self.assertTrue(choice.explore)
+        self.assertAlmostEqual(choice.multiple, 0.7)
+
+    def test_a_fully_covered_bucket_stops_being_explored(self):
+        explorer = self._explorer(bid_multiples=(0.5,), coverage_target=2)
+        for _ in range(2):
+            explorer.record(cell="calm@0.50", landed=True)
+        choice = explorer.choose(recommended_lamports=100_000, edge_usd=1.0,
+                                 congestion=0.05, is_exit=False, measured=True)
+        self.assertFalse(choice.explore)
+        self.assertIn("reached coverage", choice.reason)
+
+    def test_it_labels_congestion_exactly_as_the_landing_model_does(self):
+        """A parallel set of labels would mean the cell explored is not the
+        cell the model records against."""
+        from src.execution import landing_model
+        for value in (None, 0.0, 0.1, 0.4, 0.7, 0.9, 1.0):
+            self.assertEqual(bid_explorer_module.congestion_bucket(value),
+                             landing_model.congestion_bucket(value))
+        self.assertEqual(bid_explorer_module.congestion_bucket(None), "unknown")
+        self.assertEqual(
+            set(bid_explorer_module.CONGESTION_BUCKETS) - {"unknown"},
+            {name for name, _upper in landing_model.CONGESTION_BUCKETS})
+
+    def test_the_report_says_the_curve_is_unobserved_before_any_probe(self):
+        report = self._explorer().report()
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertIn("only where it is already exploited", report["detail"])
+
+
+class TestTheSignerIsAnIndependentAuthority(unittest.TestCase):
+    """The signer re-derives what a transaction does. It never takes the
+    caller's word for it."""
+
+    def _service(self, **policy_kwargs):
+        from solders.keypair import Keypair
+        policy_kwargs.setdefault("require_live_ack", False)
+        policy_kwargs.setdefault("kill_file", Path("/nonexistent/HALT"))
+        return SignerService(Keypair(), SignerPolicy(**policy_kwargs))
+
+    def _message(self, service, instructions):
+        from solders.message import MessageV0
+        from solders.hash import Hash
+        return bytes(MessageV0.try_compile(
+            service.keypair.pubkey(), instructions, [], Hash.default()))
+
+    def _transfer(self, frm, to, lamports):
+        from solders.system_program import transfer, TransferParams
+        return transfer(TransferParams(from_pubkey=frm, to_pubkey=to,
+                                       lamports=lamports))
+
+    def test_it_signs_an_ordinary_permitted_transaction(self):
+        from solders.pubkey import Pubkey
+        service = self._service()
+        message = self._message(service, [self._transfer(
+            service.keypair.pubkey(), Pubkey.default(), 1_000)])
+        signature, decision = service.sign(message)
+        self.assertIsNotNone(signature)
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.transfer_lamports, 1_000)
+
+    def test_an_unlisted_program_is_refused(self):
+        from solders.pubkey import Pubkey
+        from solders.instruction import Instruction, AccountMeta
+        service = self._service()
+        stranger = Pubkey.new_unique()
+        message = self._message(service, [Instruction(
+            stranger, b"\x00",
+            [AccountMeta(service.keypair.pubkey(), True, True)])])
+        signature, decision = service.sign(message)
+        self.assertIsNone(signature)
+        self.assertIn("unlisted program", decision.reason)
+
+    def test_a_transfer_above_the_ceiling_is_refused(self):
+        from solders.pubkey import Pubkey
+        service = self._service(max_transfer_lamports=1_000)
+        message = self._message(service, [self._transfer(
+            service.keypair.pubkey(), Pubkey.default(), 5_000)])
+        signature, decision = service.sign(message)
+        self.assertIsNone(signature)
+        self.assertIn("above the", decision.reason)
+
+    def test_the_lamport_total_is_decoded_not_taken_on_trust(self):
+        # Two transfers that individually pass and together do not. A signer
+        # reading a caller-supplied "amount" field would sign this.
+        from solders.pubkey import Pubkey
+        service = self._service(max_transfer_lamports=1_500)
+        message = self._message(service, [
+            self._transfer(service.keypair.pubkey(), Pubkey.default(), 1_000),
+            self._transfer(service.keypair.pubkey(), Pubkey.new_unique(), 1_000)])
+        signature, decision = service.sign(message)
+        self.assertIsNone(signature)
+        self.assertEqual(decision.transfer_lamports, 2_000)
+
+    def test_a_transaction_paying_for_someone_else_is_refused(self):
+        from solders.keypair import Keypair
+        from solders.message import MessageV0
+        from solders.hash import Hash
+        from solders.pubkey import Pubkey
+        service = self._service()
+        stranger = Keypair()
+        message = bytes(MessageV0.try_compile(
+            stranger.pubkey(),
+            [self._transfer(stranger.pubkey(), Pubkey.default(), 10)],
+            [], Hash.default()))
+        signature, decision = service.sign(message)
+        self.assertIsNone(signature)
+        self.assertIn("is not this signer's account", decision.reason)
+
+    def test_undecodable_bytes_are_never_signed(self):
+        service = self._service()
+        signature, decision = service.sign(b"\x01\x02\x03not a message")
+        self.assertIsNone(signature)
+        self.assertIn("did not decode", decision.reason)
+
+    def test_the_kill_file_halts_everything(self):
+        from solders.pubkey import Pubkey
+        with tempfile.TemporaryDirectory() as tmp:
+            halt = Path(tmp) / "HALT_SIGNING"
+            service = self._service(kill_file=halt)
+            message = self._message(service, [self._transfer(
+                service.keypair.pubkey(), Pubkey.default(), 10)])
+            self.assertIsNotNone(service.sign(message)[0])
+            halt.write_text("stop")
+            signature, decision = service.sign(message)
+            self.assertIsNone(signature)
+            self.assertIn("halt file present", decision.reason)
+
+    def test_the_rate_limit_stops_a_runaway_loop(self):
+        from solders.pubkey import Pubkey
+        service = self._service(rate_limit_per_minute=3)
+        message = self._message(service, [self._transfer(
+            service.keypair.pubkey(), Pubkey.default(), 10)])
+        results = [service.sign(message, now=1000.0)[0] for _ in range(5)]
+        self.assertEqual(sum(1 for item in results if item is not None), 3)
+        self.assertIn("at the limit", service.refusals[-1]["reason"])
+
+    def test_live_signing_requires_the_acknowledgement(self):
+        from solders.pubkey import Pubkey
+        service = self._service(require_live_ack=True)
+        message = self._message(service, [self._transfer(
+            service.keypair.pubkey(), Pubkey.default(), 10)])
+        with mock.patch.dict(os.environ, {"ALLOW_LIVE_TRADING": ""}):
+            signature, decision = service.sign(message)
+        self.assertIsNone(signature)
+        self.assertIn("ALLOW_LIVE_TRADING", decision.reason)
+        with mock.patch.dict(os.environ,
+                             {"ALLOW_LIVE_TRADING": "yes-i-understand"}):
+            self.assertIsNotNone(service.sign(message)[0])
+
+    def test_the_report_never_contains_the_key_in_any_form(self):
+        service = self._service()
+        blob = json.dumps(service.report())
+        secret = bytes(service.keypair)
+        self.assertNotIn(base64.b64encode(secret).decode(), blob)
+        self.assertNotIn(secret.hex(), blob)
+        # The PUBLIC key is expected and is not a secret.
+        self.assertIn(service.public_key, blob)
+
+    def test_a_refusal_raises_rather_than_returning_something_falsy(self):
+        # A caller ignoring a return value is far likelier than one ignoring
+        # an exception, and an unsigned transaction flowing onward as if
+        # signed is the failure this whole design exists to prevent.
+        source = inspect.getsource(SignerClient.sign_message)
+        self.assertIn("raise PermissionError", source)
