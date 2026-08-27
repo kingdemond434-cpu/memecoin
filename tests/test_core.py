@@ -75,6 +75,9 @@ from src.strategies.ignition import (
 from src.strategies.disagreement import (
     DisagreementModel, DisagreementReading, View, views_from_intelligence,
 )
+from src.execution.slot_value import (
+    SlotValue, SlotValueModel, urgency_adjusted_edge,
+)
 from src.execution.staged_exits import (
     StagedExits, StagedLadder, StagedRung,
 )
@@ -924,6 +927,10 @@ class TestPartialExitAccounting(unittest.IsolatedAsyncioTestCase):
         desk.state_sequencer = StateSequencer()
         desk._stage_exits = lambda token, position: None
         desk._reprice_staged_exits = lambda token: 0
+        desk.slot_value = SlotValueModel()
+        desk._mark_history = {}
+        desk._exit_slot_value = (
+            lambda token, edge: MemecoinQuantDesk._exit_slot_value(desk, token, edge))
         return desk
 
     @staticmethod
@@ -1653,7 +1660,11 @@ class TestScaleInWiring(unittest.IsolatedAsyncioTestCase):
             sol_price_usd=150.0,
             _build_prediction_features=self._features,
             _refresh_portfolio_state=self._noop,
+            slot_value=SlotValueModel(),
+            _mark_history={},
         )
+        desk._entry_slot_value = (
+            lambda token, edge: MemecoinQuantDesk._entry_slot_value(desk, token, edge))
         return desk
 
     @staticmethod
@@ -7669,6 +7680,10 @@ class TestScaleInExecutesTheDecidedSize(unittest.IsolatedAsyncioTestCase):
             return None
 
         desk._refresh_portfolio_state = refresh
+        desk.slot_value = SlotValueModel()
+        desk._mark_history = {}
+        desk._entry_slot_value = (
+            lambda token, edge: MemecoinQuantDesk._entry_slot_value(desk, token, edge))
         return desk
 
     @staticmethod
@@ -12155,6 +12170,148 @@ class TestKolRolesDecideTheAction(unittest.TestCase):
         source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
         self.assertIn('"ignition": self.ignition_census()', source)
         self.assertIn("self._read_ignition(token)", source)
+
+
+class TestOneSlotOfDelayIsPricedPerOpportunity(unittest.TestCase):
+    """The landing model treated the edge as a constant. It is not.
+
+    The whole value of a trade is that some is available now and less later,
+    and how much less is a property of the specific opportunity.
+    """
+
+    def _marks(self, *, slope_per_s, now, count=6, start=1.0):
+        """A path whose log slope is exactly `slope_per_s`."""
+        return [(now - (count - 1 - index),
+                 start * math.exp(slope_per_s * index))
+                for index in range(count)]
+
+    def test_an_ordinary_launch_drifting_sideways_costs_almost_nothing(self):
+        now = time.time()
+        value = SlotValueModel().from_marks(
+            [(now - index, 1.0) for index in range(6)][::-1],
+            expected_edge_usd=100.0, buying=True, now=now)
+        self.assertTrue(value.ok)
+        self.assertEqual(value.decay_per_slot, 0.0)
+        self.assertEqual(value.slot_cost_usd, 0.0)
+
+    def test_a_curve_moving_every_slot_costs_a_real_share_of_the_edge(self):
+        now = time.time()
+        value = SlotValueModel().from_marks(
+            self._marks(slope_per_s=0.5, now=now), expected_edge_usd=100.0,
+            buying=True, now=now)
+        self.assertTrue(value.ok)
+        self.assertGreater(value.decay_per_slot, 0.15)
+        self.assertGreater(value.slot_cost_usd, 15.0)
+
+    def test_the_fast_mover_bids_against_far_more_than_the_slow_one(self):
+        """One bid for both is the error in both directions at once."""
+        now = time.time()
+        model = SlotValueModel()
+        slow = model.from_marks(self._marks(slope_per_s=0.005, now=now),
+                                expected_edge_usd=100.0, now=now)
+        fast = model.from_marks(self._marks(slope_per_s=1.0, now=now),
+                                expected_edge_usd=100.0, now=now)
+        self.assertGreater(urgency_adjusted_edge(fast, 100.0),
+                           urgency_adjusted_edge(slow, 100.0) * 20)
+
+    def test_a_falling_price_is_not_urgency_to_buy(self):
+        """The same slope that makes a rising token expensive to miss makes a
+        falling one cheaper to wait for."""
+        now = time.time()
+        model = SlotValueModel()
+        falling = model.from_marks(self._marks(slope_per_s=-0.5, now=now),
+                                   expected_edge_usd=100.0, buying=True, now=now)
+        self.assertTrue(falling.ok)
+        self.assertEqual(falling.decay_per_slot, 0.0)
+        self.assertIn("in our favour", falling.detail)
+        # And the same path IS urgent for a seller.
+        selling = model.from_marks(self._marks(slope_per_s=-0.5, now=now),
+                                   expected_edge_usd=100.0, buying=False, now=now)
+        self.assertGreater(selling.decay_per_slot, 0.0)
+
+    def test_the_slope_is_taken_in_log_space(self):
+        """A linear slope would call the same proportional move twice as
+        urgent at twice the price."""
+        now = time.time()
+        model = SlotValueModel()
+        cheap = model.from_marks(self._marks(slope_per_s=0.2, now=now, start=1.0),
+                                 expected_edge_usd=100.0, now=now)
+        dear = model.from_marks(self._marks(slope_per_s=0.2, now=now, start=50.0),
+                                expected_edge_usd=100.0, now=now)
+        self.assertAlmostEqual(cheap.decay_per_slot, dear.decay_per_slot, places=9)
+
+    def test_stale_marks_say_nothing_about_the_current_slope(self):
+        """A token that moved two minutes ago and has been flat is not
+        decaying now."""
+        now = time.time()
+        old = [(now - 300 - index, 1.0 + index) for index in range(6)]
+        value = SlotValueModel().from_marks(old, expected_edge_usd=100.0, now=now)
+        self.assertEqual(value.status, "DATA_BLOCKED")
+        self.assertEqual(value.marks_used, 0)
+
+    def test_two_points_through_noise_is_not_a_slope(self):
+        now = time.time()
+        value = SlotValueModel(min_marks=3).from_marks(
+            [(now - 1, 1.0), (now, 2.0)], expected_edge_usd=100.0, now=now)
+        self.assertEqual(value.status, "DATA_BLOCKED")
+
+    def test_the_decay_is_capped_so_a_measurement_error_cannot_be_a_whole_edge(self):
+        now = time.time()
+        value = SlotValueModel(max_decay=0.35).from_marks(
+            self._marks(slope_per_s=50.0, now=now), expected_edge_usd=100.0, now=now)
+        self.assertLessEqual(value.decay_per_slot, 0.35)
+
+    def test_an_exit_is_priced_from_the_hazard_not_the_drift(self):
+        """Leaving a position about to become unsellable is worth the position,
+        whatever the price is doing this second."""
+        model = SlotValueModel()
+        calm = model.from_hazard(0.001, expected_edge_usd=500.0)
+        dying = model.from_hazard(2.0, expected_edge_usd=500.0)
+        self.assertTrue(calm.ok)
+        self.assertTrue(dying.ok)
+        self.assertGreater(dying.decay_per_slot, calm.decay_per_slot * 50)
+        self.assertEqual(dying.source, "hazard")
+
+    def test_an_unmeasured_hazard_blocks_rather_than_reading_as_calm(self):
+        value = SlotValueModel().from_hazard(None, expected_edge_usd=500.0)
+        self.assertEqual(value.status, "DATA_BLOCKED")
+        self.assertEqual(value.decay_per_slot, 0.0)
+
+    def test_an_unmeasured_slot_value_leaves_the_bid_where_it_was(self):
+        """It can only ever leave the bid where the landing model put it."""
+        blocked = SlotValue(status="DATA_BLOCKED")
+        self.assertEqual(urgency_adjusted_edge(blocked, 250.0), 250.0)
+
+    def test_the_bid_is_sized_on_the_race_not_the_whole_trade(self):
+        """Bidding the whole edge on every slot is indistinguishable from the
+        fixed ladder it replaced."""
+        now = time.time()
+        value = SlotValueModel().from_marks(
+            self._marks(slope_per_s=0.1, now=now), expected_edge_usd=1_000.0, now=now)
+        raced = urgency_adjusted_edge(value, 1_000.0)
+        self.assertLess(raced, 1_000.0)
+        self.assertGreater(raced, 0.0)
+        self.assertAlmostEqual(raced, 1_000.0 * value.decay_per_slot, places=6)
+
+    def test_choose_bid_carries_the_slot_value_it_used(self):
+        engine = ExecutionEngine.__new__(ExecutionEngine)
+        engine.landing_model = LandingModel()
+        now = time.time()
+        value = SlotValueModel().from_marks(
+            self._marks(slope_per_s=0.5, now=now), expected_edge_usd=100.0, now=now)
+        chosen = ExecutionEngine.choose_bid(engine, 100.0, 150.0, 250_000,
+                                            slot_value=value)
+        self.assertIsNotNone(chosen["slot_value"])
+        self.assertLess(chosen["raced_value_usd"], 100.0)
+        # And with no slot value the raced amount is the whole edge, as before.
+        plain = ExecutionEngine.choose_bid(engine, 100.0, 150.0, 250_000)
+        self.assertEqual(plain["raced_value_usd"], 100.0)
+        self.assertIsNone(plain["slot_value"])
+
+    def test_every_race_on_the_desk_prices_its_own_slot(self):
+        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        self.assertEqual(source.count("slot_value=self._entry_slot_value("), 2)
+        self.assertIn("slot_value=self._exit_slot_value(", source)
 
 class TestPumpSwapConstruction(unittest.TestCase):
     """The last DATA_BLOCKED that was never about missing information.

@@ -27,6 +27,7 @@ from solders.transaction import VersionedTransaction
 from src.chains.pump_curve import quote_buy, quote_sell
 from src.execution.landing_model import Attempt, LandingModel
 from src.chains.blockhash import BlockhashCache
+from src.execution.slot_value import urgency_adjusted_edge
 from src.chains.pump_route import NativePumpRoute, PreparedInstruction, WSOL_MINT
 from src.chains.pumpswap_curve import PumpSwapPoolState
 from src.chains.pumpswap_curve import quote_buy as pool_quote_buy
@@ -900,6 +901,7 @@ class ExecutionEngine:
         decision_id: Optional[str] = None,
         expected_edge_usd: float = 0.0,
         sol_price_usd: float = 0.0,
+        slot_value: Optional[Any] = None,
     ) -> ExecutionResult:
         started = time.time()
         if amount <= 0 or slippage_bps <= 0 or slippage_bps > 2_000:
@@ -920,7 +922,12 @@ class ExecutionEngine:
                 # errors that matter, in the two directions that matter.
                 expected_value_usd=float(expected_edge_usd or 0.0),
                 sol_price_usd=float(sol_price_usd or 0.0),
-                fallback_lamports=jito_tip)
+                fallback_lamports=jito_tip,
+                # How fast THIS opportunity decays. A slot costs almost
+                # nothing on a launch drifting sideways and a third of the
+                # edge on a curve moving every slot; one bid for both is the
+                # error in both directions.
+                slot_value=slot_value)
             if chosen.get("measured"):
                 # The observed floor says what cleared; the curve says what is
                 # worth paying. Under the floor is not a bid at all.
@@ -1291,20 +1298,33 @@ class ExecutionEngine:
         return int(after[index]) - int(before[index])
 
     def choose_bid(self, expected_value_usd: float, sol_price_usd: float,
-                   fallback_lamports: int, congestion: Optional[float] = None) -> Dict[str, Any]:
+                   fallback_lamports: int, congestion: Optional[float] = None,
+                   slot_value: Optional[Any] = None) -> Dict[str, Any]:
         """What to bid, from the landing curve where it can answer.
 
         The fallback ladder is used when the curve cannot, and the result says
         which happened -- so a desk running on guesses knows it is, rather
         than reading a number that looks measured.
+
+        ``slot_value`` says how much of the edge one slot of delay destroys on
+        THIS opportunity. Without it the bid is sized on the whole edge, which
+        is what is at stake over the trade rather than over the race -- so an
+        ordinary launch drifting sideways bids as hard as a curve moving every
+        slot, which is indistinguishable from the fixed ladder this replaced.
         """
+        raced = float(expected_value_usd)
+        if slot_value is not None:
+            raced = urgency_adjusted_edge(slot_value, expected_value_usd)
         recommendation = self.landing_model.recommend(
-            expected_value_usd, sol_price_usd, congestion)
+            raced, sol_price_usd, congestion)
+        urgency = ({"slot_value": slot_value.to_dict(), "raced_value_usd": raced}
+                   if slot_value is not None and hasattr(slot_value, "to_dict")
+                   else {"slot_value": None, "raced_value_usd": raced})
         if recommendation.status == "OK":
             return {"lamports": recommendation.bid_lamports, "measured": True,
-                    **recommendation.to_dict()}
+                    **urgency, **recommendation.to_dict()}
         return {"lamports": int(fallback_lamports), "measured": False,
-                **recommendation.to_dict()}
+                **urgency, **recommendation.to_dict()}
 
     def _record(self, result: ExecutionResult, decision_id: Optional[str]):
         result_data = result.__dict__.copy()

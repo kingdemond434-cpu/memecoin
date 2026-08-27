@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import base64
 import collections
+from collections import deque
 import hashlib
 import json
 import logging
@@ -119,6 +120,7 @@ from src.strategies.wallet_value import FollowOutcome
 from src.strategies.t0_kernel import SurvivalInputs, T0Kernel
 from src.strategies.funder_ancestry import FunderAncestry, compress_independence
 from src.execution.staged_exits import StagedExits
+from src.execution.slot_value import SlotValueModel, urgency_adjusted_edge
 from src.strategies.disagreement import DisagreementModel, views_from_intelligence
 from src.strategies.ignition import IgnitionModel, touches_from_events
 
@@ -303,6 +305,11 @@ class MemecoinQuantDesk:
             bound_max_age_s=float(self.global_config.get("staged_bound_max_age_s", 2.0)))
         self._marks_local = 0
         self._marks_router = 0
+        # token -> recent (timestamp, multiple). Bounded and short: a token
+        # that moved two minutes ago and has been flat since is not decaying
+        # now, and a long history would say it was.
+        self._mark_history: Dict[str, Any] = {}
+        self.slot_value = SlotValueModel()
         self._mark_checked_at: Dict[str, float] = {}
         self._mark_checks = 0
         self._mark_checks_blocked = 0
@@ -1177,6 +1184,9 @@ class MemecoinQuantDesk:
             # matter.
             expected_edge_usd=max(0.0, float(trade_info.get("elogw", 0.0) or 0.0)
                                   * max(self.wallet_equity_usd, 0.0)),
+            slot_value=self._entry_slot_value(
+                token, max(0.0, float(trade_info.get("elogw", 0.0) or 0.0)
+                           * max(self.wallet_equity_usd, 0.0))),
             sol_price_usd=float(self.sol_price_usd or 0.0),
         )
         self.dataset_builder.record_execution_attempt(token, _jsonable(result))
@@ -2983,6 +2993,8 @@ class MemecoinQuantDesk:
             # fixed ladder while the entry beside it bid on economics.
             expected_edge_usd=max(0.0, gain * max(self.wallet_equity_usd, 0.0)),
             sol_price_usd=self.sol_price_usd,
+            slot_value=self._entry_slot_value(
+                token, max(0.0, gain * max(self.wallet_equity_usd, 0.0))),
         )
         attempt = {**_jsonable(result), "scale_in": True, "marginal_elogw": gain,
                    "added_fraction": fraction, "at_multiple": multiple}
@@ -3090,6 +3102,41 @@ class MemecoinQuantDesk:
             "recent_divergences": list(self._mark_divergences),
             "status": "OK" if self._marks_local else "DATA_BLOCKED",
         }
+
+    def _entry_slot_value(self, token: str, expected_edge_usd: float):
+        """What one slot of delay costs a BUY of this token.
+
+        Measured from the token's own recent path rather than inferred from a
+        label. A "monster" label is a claim about the outcome; the slope of
+        the curve over the last few seconds is a measurement of the present,
+        and the present is what a slot of delay is spent in.
+        """
+        return self.slot_value.from_marks(
+            list(self._mark_history.get(token) or ()),
+            expected_edge_usd=expected_edge_usd, buying=True)
+
+    def _exit_slot_value(self, token: str, expected_edge_usd: float):
+        """What one slot of delay costs a SELL of this token.
+
+        An exit races the hazard, not the drift: leaving a position that is
+        about to become unsellable is worth the position, whatever the price
+        is doing this second.
+        """
+        hazard = (self.rug_hazard.get_hazard(token)
+                  if getattr(self, "rug_hazard", None) is not None else None)
+        rate = None
+        if hazard is not None and getattr(hazard, "data_status", "") == "OK":
+            horizon = float(getattr(hazard, "hazard_30s", 0.0) or 0.0)
+            if 0.0 < horizon < 1.0:
+                # A 30-second survival probability, converted to the constant
+                # rate that would produce it.
+                rate = -math.log(1.0 - horizon) / 30.0
+            elif horizon >= 1.0:
+                rate = float("inf")
+        if rate == float("inf"):
+            # Certain within the horizon. The slot is worth the whole slice.
+            return self.slot_value.from_hazard(1e6, expected_edge_usd=expected_edge_usd)
+        return self.slot_value.from_hazard(rate, expected_edge_usd=expected_edge_usd)
 
     def ignition_census(self) -> Dict[str, Any]:
         """How many tracked narratives are in each lifecycle state."""
@@ -3480,7 +3527,10 @@ class MemecoinQuantDesk:
             # ladder for both is the error in both directions at once.
             expected_edge_usd=self._exit_edge_usd(position, exit_pct, reason,
                                                   expected_edge_usd),
-            sol_price_usd=self.sol_price_usd)
+            sol_price_usd=self.sol_price_usd,
+            slot_value=self._exit_slot_value(
+                token, self._exit_edge_usd(position, exit_pct, reason,
+                                           expected_edge_usd)))
         # Only landed, non-simulated sells. A paper fill is not evidence about
         # the network, and a submission that never landed has no latency at
         # all -- counting it as its timeout would make a failing relay look
@@ -3725,9 +3775,15 @@ class MemecoinQuantDesk:
             if curve_price > 0:
                 curve_entry = self._curve_entry_price.setdefault(token, curve_price)
                 curve_multiple = curve_price / max(curve_entry, 1e-30)
+                stamp = float(event.get("timestamp", time.time()))
                 self._latest_stream_mark[token] = {
-                    "multiple": curve_multiple, "timestamp": float(event.get("timestamp", time.time()))
+                    "multiple": curve_multiple, "timestamp": stamp
                 }
+                # A short path, not just the latest point. One mark says where
+                # the price is; a few say how fast it is moving, and how fast
+                # it is moving is what a slot of delay costs.
+                self._mark_history.setdefault(token, deque(maxlen=32)).append(
+                    (stamp, curve_multiple))
             observation = {"type": "trade", "side": event.get("side"), "wallet": event.get("wallet"),
                            "amount": event.get("actual_token_amount_ui"),
                            "amount_raw": event.get("actual_token_delta_raw"),
