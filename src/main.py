@@ -50,6 +50,8 @@ from src.research.chain_miners import register_chain_miners
 from src.execution.signer import signer_from_env
 from src.research.calibration import Provenance
 from src.research.fallback import FallbackResolver, Rung, Source
+from src.runtime.latency import LatencyLedger
+from src.runtime.offload import OffloadedPool, install_fast_event_loop
 from src.runtime.memory_governor import Band, MemoryGovernor, Relief
 from src.research.launch_census import LaunchCensus
 from src.research import rug_mechanism
@@ -407,6 +409,12 @@ class MemecoinQuantDesk:
         # Launches that claim a public figure, most recent last. Bounded:
         # this is a display and training surface, not a store of record.
         self._identity_claims: Dict[str, Any] = {}
+        # Where the milliseconds actually go. Built here rather than in
+        # _setup_research because the stream can deliver before research is
+        # up, and an event that arrives with no ledger to open a trace on is
+        # the one measurement that cannot be recovered later.
+        self.latency = LatencyLedger()
+        self.miner_offload: Optional[OffloadedPool] = None
         self.slot_value = SlotValueModel()
         self._mark_checked_at: Dict[str, float] = {}
         self._mark_checks = 0
@@ -937,12 +945,29 @@ class MemecoinQuantDesk:
              for handle in figure.channels), source="figures")
         logger.info("IDENTITY WATCH %d figure(s), %d owned channel(s) seeded",
                     figures, seeded)
+        # Miners run on their OWN loop in their own thread. The expensive
+        # part of a miner is not the socket -- that yields properly -- it is
+        # the synchronous JSON and HTML parsing afterwards, and under the GIL
+        # with no pre-emption that parse does not slow the decision path, it
+        # stops it. Records come back through a bounded queue that a drainer
+        # empties on this loop, so every mutation of desk state still happens
+        # here and only the parsing moved.
+        self.miner_offload = OffloadedPool(
+            self.data_miners, sink=self._ingest_mined_records,
+            queue_depth=int(self.global_config.get("miner_queue_depth", 4096)),
+            name="miners")
         if not self.offline:
             await self.dataset_builder.start()
             await self.global_research.start()
-            started = await self.data_miners.start()
-            logger.info("DATA MINERS %d runnable of %d declared",
-                        started, len(self.miner_registration))
+            if bool(self.global_config.get("offload_miners", True)):
+                await self.miner_offload.start()
+                started = len(self.miner_registration)
+            else:
+                started = await self.data_miners.start()
+            logger.info("DATA MINERS %d runnable of %d declared (%s)",
+                        started, len(self.miner_registration),
+                        "offloaded thread" if self.miner_offload.report()["status"] != "OFF"
+                        else "main loop")
             # Event callbacks write to the PIT builder, hazard tracker, and
             # research graphs. Start the stream only after all consumers exist.
             if self.rpc_program_stream:
@@ -977,7 +1002,10 @@ class MemecoinQuantDesk:
         except Exception as exc:  # pragma: no cover - shutdown only
             logger.warning("source mesh shutdown: %s", exc)
         try:
-            await self.data_miners.stop()
+            if self.miner_offload is not None:
+                await self.miner_offload.stop()
+            else:
+                await self.data_miners.stop()
         except Exception as exc:  # pragma: no cover - shutdown only
             logger.warning("data miner shutdown: %s", exc)
         try:
@@ -1196,6 +1224,7 @@ class MemecoinQuantDesk:
             self._record_blocked_decision(token, "DATA_BLOCKED_candidate_pipeline_saturated", {})
             self._candidate_drops += 1
             return False
+        self.latency.mark(token, "decode_to_dispatch")
         task = asyncio.create_task(self._candidate_pipeline(candidate))
         self._candidate_pipelines[token] = task
         self._background_tasks.add(task)
@@ -1234,6 +1263,7 @@ class MemecoinQuantDesk:
         if candidate.chain != "solana" or not candidate.address:
             return
         token = candidate.address
+        self.latency.mark(token, "dispatch_to_decide")
         if token in self.elogw_engine.open_positions:
             return
         # A token we have already exited is not an ordinary candidate. The
@@ -1395,7 +1425,12 @@ class MemecoinQuantDesk:
                              "contested_for_capital": True})
         decision_id = self.counterfactual_lab.record_decision(token, _jsonable(prediction), decision)
         if not should_trade:
+            # A launch we screened is a closed trace, not an abandoned one.
+            # Screening is most of the funnel, and a ledger that only ever saw
+            # the trades would report the latency of the easy cases.
+            self.latency.close(token, "screened")
             return
+        self.latency.mark(token, "decide_to_build")
         result = await self.execution_engine.execute_swap(
             candidate.base_token or WSOL_MINT, token, int(trade_info["position_size_sol"] * 1e9),
             slippage_bps=100,
@@ -1415,6 +1450,13 @@ class MemecoinQuantDesk:
                            * max(self.wallet_equity_usd, 0.0))),
             sol_price_usd=float(self.sol_price_usd or 0.0),
         )
+        # Build, sign and submission happen inside the engine, which reports
+        # its own split; from here the whole call is one stage. Marked before
+        # the result is inspected so a rejected submission is timed the same
+        # as an accepted one -- the failure path is the one that has to be
+        # fast too, because a failed entry is a slot spent.
+        self.latency.mark(token, "sign_to_submit")
+        self.latency.close(token, "entered" if result.success else "submit_failed")
         self.dataset_builder.record_execution_attempt(token, _jsonable(result))
         self._record_ops_event("execution_attempts", {
             "token": token, "side": "buy", "success": bool(result.success),
@@ -4669,6 +4711,15 @@ class MemecoinQuantDesk:
         kind = str(event.get("type", "") or "unknown")
         self._stream_events[kind] = self._stream_events.get(kind, 0) + 1
         token = event.get("token", "")
+        if kind == "token_created" and token:
+            # Opened on the first line the handler owns, so `receive_to_decode`
+            # measures the monitor's decode and hand-off and nothing of ours.
+            # `block_time` is the cluster's, so chain_to_receive carries this
+            # box's NTP skew -- the ledger reports that caveat rather than
+            # quoting the number as though it were exact.
+            self.latency.open(token, block_time=event.get("timestamp"),
+                              slot=event.get("slot"))
+            self.latency.mark(token, "receive_to_decode")
         if not token:
             self._stream_events[f"{kind}:no_token"] = (
                 self._stream_events.get(f"{kind}:no_token", 0) + 1)
@@ -4943,6 +4994,14 @@ class MemecoinQuantDesk:
             # is dark. A domain running on its third rung is fine and is
             # reported as such; a domain with no rung left is a question the
             # desk asks continuously and currently cannot answer.
+            # Where the milliseconds go. The only thing on this page that
+            # can tell you whether the next hour belongs to code or to money.
+            "latency": self.latency.report(),
+            "event_loop": os.getenv("MEMECOIN_EVENT_LOOP", "unmeasured"),
+            "miner_offload": (self.miner_offload.report()
+                              if self.miner_offload is not None
+                              else {"status": "OFF",
+                                    "detail": "miners are running on the main loop"}),
             "substitution": self.substitution.report(),
             "telegram_channels": (self.channel_book.report()
                                   if self.channel_book is not None
@@ -5461,6 +5520,12 @@ def main():
     args = parser.parse_args()
     logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # Before the loop exists, not after: a policy set once the loop is running
+    # changes nothing, which is the quiet way this optimisation gets applied
+    # and has no effect.
+    loop_status = install_fast_event_loop()
+    logging.getLogger(__name__).info("EVENT LOOP %s", loop_status)
+    os.environ.setdefault("MEMECOIN_EVENT_LOOP", loop_status)
     asyncio.run(_run(args))
 
 

@@ -10,11 +10,14 @@ pub mod filter;
 pub mod helpers;
 pub mod generated_flags;
 pub mod instruction;
+pub mod message;
 pub mod policy;
+pub mod pubkey;
 pub mod pumpswap;
 pub mod safety;
 pub mod state;
 pub mod telemetry;
+pub mod transaction;
 
 #[cfg(feature = "python")]
 mod bindings;

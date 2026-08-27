@@ -11,6 +11,10 @@ crate-type = ["cdylib", "rlib"]
 bs58 = "0.5"
 sha2 = "0.10"
 pyo3 = { version = "0.23", features = ["abi3-py310"], optional = true }
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "precomputed-tables"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["fast"] }
+base64 = "0.22"
+zeroize = "1"
 
 [features]
 # On by default so `maturin build` and `pip install .` produce a working

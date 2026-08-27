@@ -17842,3 +17842,286 @@ class TestBreadthHealthAndRemedies(unittest.TestCase):
         fired = [remedy.name for remedy in standard_remedies()
                  if remedy.applies(health)]
         self.assertEqual(fired, [])
+
+
+class TestRustTransactionParity(unittest.TestCase):
+    """Byte-identical to solders, or it does not go near real capital.
+
+    A message that groups accounts correctly but orders them differently
+    inside a group is VALID -- the runtime does not care -- and is not the
+    same bytes anyone else produces. Only a diff catches that, and the first
+    time this ran it caught exactly that bug.
+    """
+
+    def setUp(self):
+        try:
+            import solana_fastpath  # noqa: F401
+        except ImportError:
+            self.skipTest("solana_fastpath is not built on this host")
+
+    @staticmethod
+    def _case(seed, accounts=27, data_len=24):
+        import random
+        from solders.keypair import Keypair
+        from solders.pubkey import Pubkey
+        from solders.instruction import AccountMeta, Instruction
+        from solders.hash import Hash
+        random.seed(seed)
+        kp = Keypair.from_seed(bytes(random.randrange(256) for _ in range(32)))
+        payer = kp.pubkey()
+        bh = Hash(bytes(random.randrange(256) for _ in range(32)))
+        prog = Pubkey(bytes(random.randrange(256) for _ in range(32)))
+        metas = [AccountMeta(Pubkey(bytes(random.randrange(256) for _ in range(32))),
+                             False, index % 3 == 0) for index in range(accounts - 1)]
+        metas.append(AccountMeta(payer, True, True))
+        data = bytes(random.randrange(256) for _ in range(data_len))
+        return kp, payer, bh, Instruction(prog, data, metas), prog, metas, data
+
+    def test_the_compiled_message_is_byte_identical_to_solders(self):
+        import solana_fastpath as fp
+        from solders.message import MessageV0, to_bytes_versioned
+        for seed in range(25):
+            kp, payer, bh, ix, prog, metas, data = self._case(seed)
+            expected = bytes(to_bytes_versioned(
+                MessageV0.try_compile(payer, [ix], [], bh)))
+            raw = [(bytes(prog),
+                    [(bytes(m.pubkey), m.is_signer, m.is_writable) for m in metas],
+                    data)]
+            actual = bytes(fp.compile_v0_message(bytes(payer), raw, bytes(bh)))
+            self.assertEqual(expected, actual, f"seed {seed}")
+
+    def test_the_signed_transaction_is_byte_identical_to_solders(self):
+        import base64
+        import solana_fastpath as fp
+        from solders.message import MessageV0
+        from solders.transaction import VersionedTransaction
+        for seed in range(25):
+            kp, payer, bh, ix, prog, metas, data = self._case(seed)
+            message = MessageV0.try_compile(payer, [ix], [], bh)
+            expected = base64.b64encode(bytes(VersionedTransaction(message, [kp]))).decode()
+            raw = [(bytes(prog),
+                    [(bytes(m.pubkey), m.is_signer, m.is_writable) for m in metas],
+                    data)]
+            actual, signature = fp.build_signed_transaction(
+                bytes(payer), raw, bytes(bh), [bytes(kp)])
+            self.assertEqual(expected, actual, f"seed {seed}")
+            self.assertEqual(
+                str(VersionedTransaction(message, [kp]).signatures[0]), signature)
+
+    def test_program_derived_addresses_match_solders(self):
+        import solana_fastpath as fp
+        from solders.pubkey import Pubkey
+        program = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+        for seed in (b"global", b"bonding-curve", b"creator-vault", b"fee_config"):
+            expected, expected_bump = Pubkey.find_program_address([seed], program)
+            address, bump = fp.find_program_address([seed], bytes(program))
+            self.assertEqual(bytes(expected), bytes(address))
+            self.assertEqual(expected_bump, bump)
+
+    def test_associated_token_addresses_match_solders(self):
+        import solana_fastpath as fp
+        from solders.pubkey import Pubkey
+        ata_program = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+        token_program = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+        mint = Pubkey.from_string("So11111111111111111111111111111111111111112")
+        owner = Pubkey.from_string("11111111111111111111111111111111")
+        expected, _ = Pubkey.find_program_address(
+            [bytes(owner), bytes(token_program), bytes(mint)], ata_program)
+        actual = fp.associated_token_address(
+            bytes(owner), bytes(token_program), bytes(mint), bytes(ata_program))
+        self.assertEqual(bytes(expected), bytes(actual))
+
+    def test_a_mismatched_keypair_is_refused_rather_than_signing_as_someone_else(self):
+        import solana_fastpath as fp
+        bad = bytes([7] * 32) + bytes([9] * 32)
+        with self.assertRaises(ValueError):
+            fp.public_key_of(bad)
+
+    def test_a_wrong_length_key_is_refused(self):
+        import solana_fastpath as fp
+        with self.assertRaises(ValueError):
+            fp.public_key_of(bytes([1, 2, 3]))
+
+    def test_the_public_key_derived_here_matches_solders(self):
+        import solana_fastpath as fp
+        from solders.keypair import Keypair
+        kp = Keypair.from_seed(bytes([5] * 32))
+        self.assertEqual(bytes(kp.pubkey()), bytes(fp.public_key_of(bytes(kp))))
+
+
+class TestLatencyLedger(unittest.TestCase):
+    """The first end-to-end timing this desk has ever had."""
+
+    def test_an_empty_ledger_says_nothing_is_verified(self):
+        from src.runtime.latency import LatencyLedger
+        report = LatencyLedger().report()
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertIn("unverified", report["detail"])
+
+    def test_an_unmarked_stage_is_blocked_not_zero(self):
+        from src.runtime.latency import LatencyLedger
+        ledger = LatencyLedger()
+        ledger.open("m1")
+        ledger.mark("m1", "receive_to_decode")
+        ledger.close("m1", "screened")
+        stages = ledger.report()["stages"]
+        self.assertEqual(stages["receive_to_decode"]["data_status"], "OK")
+        # A stage that never ran must not read as the fastest one.
+        self.assertEqual(stages["build_to_sign"]["data_status"], "DATA_BLOCKED")
+        self.assertIsNone(stages["build_to_sign"]["p50_us"])
+
+    def test_the_first_mark_wins_so_a_retry_cannot_flatter_the_path(self):
+        from src.runtime.latency import LatencyLedger, now_ns
+        ledger = LatencyLedger()
+        trace = ledger.open("m1")
+        ledger.mark("m1", "receive_to_decode", at_ns=trace.started_ns + 5_000_000)
+        ledger.mark("m1", "receive_to_decode", at_ns=trace.started_ns + 1_000)
+        closed = ledger.close("m1")
+        self.assertAlmostEqual(closed.elapsed_us("receive_to_decode",
+                                                 "receive_to_decode") or 0.0, 0.0)
+        self.assertGreater(ledger.report()["stages"]["receive_to_decode"]["p50_us"], 4_000)
+
+    def test_it_names_the_slowest_stage_we_control(self):
+        from src.runtime.latency import LatencyLedger
+        ledger = LatencyLedger()
+        for index in range(20):
+            trace = ledger.open(f"m{index}")
+            base = trace.started_ns
+            ledger.mark(f"m{index}", "receive_to_decode", at_ns=base + 100_000)
+            ledger.mark(f"m{index}", "dispatch_to_decide", at_ns=base + 9_000_000)
+            ledger.mark(f"m{index}", "sign_to_submit", at_ns=base + 9_500_000)
+            ledger.close(f"m{index}", "entered")
+        report = ledger.report()
+        self.assertEqual(report["dominant_controllable_stage"], "dispatch_to_decide")
+
+    def test_a_dominant_wire_is_called_a_money_problem_not_a_code_one(self):
+        from src.runtime.latency import LatencyLedger
+        ledger = LatencyLedger()
+        for index in range(10):
+            # 250ms behind the block: a provider and geography term.
+            trace = ledger.open(f"m{index}", block_time=time.time() - 0.25)
+            ledger.mark(f"m{index}", "receive_to_decode",
+                        at_ns=trace.started_ns + 200_000)
+            ledger.close(f"m{index}", "entered")
+        detail = ledger.report()["detail"]
+        self.assertIn("wire dominates", detail)
+        self.assertIn("not a code one", detail)
+
+    def test_the_chain_term_carries_its_clock_caveat(self):
+        from src.runtime.latency import LatencyLedger
+        caveat = LatencyLedger().report()["chain_to_receive_caveat"]
+        self.assertIn("NTP skew", caveat)
+
+    def test_open_traces_are_bounded_so_screened_launches_cannot_leak(self):
+        from src.runtime.latency import LatencyLedger
+        ledger = LatencyLedger(max_open=10)
+        for index in range(100):
+            ledger.open(f"m{index}")
+        self.assertLessEqual(len(ledger._open), 10)
+        self.assertEqual(ledger.abandoned, 90)
+
+    def test_a_mark_on_an_unknown_trace_cannot_raise_on_the_hot_path(self):
+        from src.runtime.latency import LatencyLedger
+        ledger = LatencyLedger()
+        ledger.mark("never-opened", "decide_to_build")
+        self.assertIsNone(ledger.close("never-opened"))
+
+    def test_a_budget_breach_is_named(self):
+        from src.runtime.latency import LatencyLedger
+        ledger = LatencyLedger()
+        for index in range(10):
+            trace = ledger.open(f"m{index}")
+            ledger.mark(f"m{index}", "dispatch_to_decide",
+                        at_ns=trace.started_ns + 20_000_000)
+            ledger.close(f"m{index}")
+        report = ledger.budget_report({"dispatch_to_decide": 5_000.0})
+        self.assertEqual(report["status"], "DEGRADED")
+        self.assertIn("dispatch_to_decide", report["breaching"])
+
+
+class TestMinerOffload(unittest.IsolatedAsyncioTestCase):
+    """Miners must not be able to stop the decision path."""
+
+    class _Pool:
+        def __init__(self):
+            self.on_records = None
+            self.started = False
+            self.stopped = False
+
+        async def start(self):
+            self.started = True
+            return 1
+
+        async def stop(self):
+            self.stopped = True
+
+    def test_records_reach_the_sink_only_through_the_drain(self):
+        from src.runtime.offload import OffloadedPool
+        seen = []
+        pool = self._Pool()
+        offload = OffloadedPool(pool, sink=lambda mid, rows: seen.append((mid, rows)))
+        offload._publish("web:x", [{"a": 1}])
+        # Published from the miner side; nothing has touched desk state yet.
+        self.assertEqual(seen, [])
+        self.assertEqual(offload.drain(), 1)
+        self.assertEqual(seen, [("web:x", [{"a": 1}])])
+
+    def test_a_full_queue_drops_the_oldest_and_counts_it(self):
+        from src.runtime.offload import OffloadedPool
+        offload = OffloadedPool(self._Pool(), sink=lambda mid, rows: None,
+                                queue_depth=3)
+        for index in range(6):
+            offload._publish("m", [{"i": index}])
+        self.assertGreater(offload.dropped, 0)
+        self.assertEqual(offload._queue.qsize(), 3)
+        report = offload.report()
+        # Loss is reported, never absorbed.
+        self.assertEqual(report["dropped"], offload.dropped)
+
+    def test_draining_is_bounded_so_a_burst_does_not_become_the_stall(self):
+        from src.runtime.offload import OffloadedPool
+        offload = OffloadedPool(self._Pool(), sink=lambda mid, rows: None,
+                                queue_depth=500)
+        for index in range(200):
+            offload._publish("m", [{"i": index}])
+        self.assertEqual(offload.drain(budget=10), 10)
+        self.assertEqual(offload._queue.qsize(), 190)
+
+    def test_a_raising_sink_does_not_stop_the_drain(self):
+        from src.runtime.offload import OffloadedPool
+        def bad(mid, rows):
+            raise RuntimeError("consumer exploded")
+        offload = OffloadedPool(self._Pool(), sink=bad)
+        offload._publish("m", [{"a": 1}])
+        offload._publish("m", [{"a": 2}])
+        self.assertEqual(offload.drain(), 2)
+        self.assertEqual(offload.sink_errors, 2)
+
+    def test_not_started_reports_off_rather_than_healthy(self):
+        from src.runtime.offload import OffloadedPool
+        report = OffloadedPool(self._Pool(), sink=lambda mid, rows: None).report()
+        self.assertEqual(report["status"], "OFF")
+
+    async def test_the_pool_actually_starts_on_another_thread(self):
+        from src.runtime.offload import OffloadedPool
+        import threading
+        pool = self._Pool()
+        where = {}
+        original = pool.start
+        async def start():
+            where["thread"] = threading.current_thread().name
+            return await original()
+        pool.start = start
+        offload = OffloadedPool(pool, sink=lambda mid, rows: None)
+        await offload.start()
+        for _ in range(50):
+            if "thread" in where:
+                break
+            await asyncio.sleep(0.02)
+        await offload.stop()
+        self.assertIn("offload-miners", where.get("thread", ""))
+
+    def test_the_fast_event_loop_reports_what_actually_happened(self):
+        from src.runtime.offload import install_fast_event_loop
+        status = install_fast_event_loop()
+        self.assertTrue(status.startswith("OK:") or status.startswith("DEGRADED:"))
