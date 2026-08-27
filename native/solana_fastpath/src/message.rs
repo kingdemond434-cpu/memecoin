@@ -159,7 +159,7 @@ pub fn compile(payer: &Pubkey, instructions: &[Instruction], recent_blockhash: &
     // produces a valid message that is not byte-identical to anyone else's.
     for group in [&mut writable_signers, &mut readonly_signers,
                   &mut writable_others, &mut readonly_others] {
-        group.sort_by(|left, right| left.key.cmp(&right.key));
+        group.sort_by_key(|slot| slot.key);
     }
     writable_signers.insert(0, Slot { key: *payer, is_signer: true, is_writable: true });
 

@@ -561,6 +561,26 @@ def check_breadth(readiness: Dict[str, Any]) -> List[Check]:
         checks.append(Check("breadth_discovery", State.OK, "",
                             evidence={"coverage": discovery.get("coverage")}))
 
+    router = readiness.get("landing_router") or {}
+    if not router:
+        checks.append(Check("breadth_landing_routes", State.DATA_BLOCKED,
+                            "the landing router has not reported"))
+    elif router.get("status") == "DATA_BLOCKED":
+        checks.append(Check(
+            "breadth_landing_routes", State.CRITICAL,
+            router.get("detail") or "no landing route is enabled; a signed "
+                                    "transaction has nowhere to go",
+            escalate=True))
+    elif router.get("status") == "DEGRADED":
+        checks.append(Check(
+            "breadth_landing_routes", State.WARN, router.get("detail", ""),
+            evidence={"mechanisms": router.get("mechanisms"),
+                      "enabled": router.get("enabled")}))
+    else:
+        checks.append(Check("breadth_landing_routes", State.OK, "",
+                            evidence={"mechanisms": router.get("mechanisms"),
+                                      "measured": router.get("measured_routes")}))
+
     identity = readiness.get("identity_watch") or {}
     if not identity:
         checks.append(Check("breadth_identity", State.DATA_BLOCKED,

@@ -26,6 +26,7 @@ from solders.signature import Signature
 from solders.transaction import VersionedTransaction
 
 from src.chains.pump_curve import quote_buy, quote_sell
+from src.execution.landing_router import LandingRouter, Route
 from src.execution.landing_model import Attempt, LandingModel
 from src.chains.blockhash import BlockhashCache
 from src.execution.slot_value import urgency_adjusted_edge
@@ -677,6 +678,13 @@ class ExecutionEngine:
         # landed or not: a model fed only successes learns that everything
         # lands.
         self.landing_model = LandingModel()
+        # Independent landing MECHANISMS, not regions. Jito already races
+        # seven regions of one auction; when that auction is the problem, all
+        # seven fail together. Registered here so the set is visible in
+        # /status even before any of it has been measured.
+        self.landing_router = LandingRouter()
+        self.last_race: Any = None
+        self._register_landing_routes()
         # What the last bid decision was, and whether it was measured
         # or fell back. Surfaced so a desk running on the ladder knows.
         self.last_bid: Dict[str, Any] = {}
@@ -1182,14 +1190,28 @@ class ExecutionEngine:
         """
         signature: Optional[str] = None
         bundle_id: Optional[str] = None
-        if use_jito:
-            bundle_id = await self.jito.send_bundle([signed_tx])
-            if not bundle_id:
-                return ExecutionResult(False, TransactionStatus.FAILED,
-                                       error="Jito bundle rejected")
+        # One signed string, fanned across every enabled mechanism. The
+        # runtime executes a signature at most once, so this is redundancy
+        # rather than duplication -- and the bundle lane is only offered the
+        # payload when the caller built one for it.
+        race = await self.landing_router.race(signed_tx, bundle_capable=use_jito)
+        self.last_race = race
+        if not race.submitted:
+            return ExecutionResult(
+                False, TransactionStatus.FAILED,
+                error="every landing route refused: "
+                      + "; ".join(f"{name}: {why}" for name, why in race.errors.items())
+                      or "no landing route accepted the transaction")
+        bundle_id = race.accepted.get("jito_bundle")
+        if bundle_id:
+            # A bundle id is not a signature. Resolve it to one where we can;
+            # if the auction never reports, the ordinary lanes carried the
+            # same bytes and confirmation below still finds them.
             signature = await self._wait_for_bundle(bundle_id)
-        else:
-            signature = await self._send_raw_transaction(signed_tx)
+        if not signature:
+            signature = next((identifier for name, identifier
+                              in race.accepted.items() if name != "jito_bundle"),
+                             None)
         if not signature:
             return ExecutionResult(
                 False, TransactionStatus.TIMEOUT, bundle_id=bundle_id,
@@ -1202,6 +1224,12 @@ class ExecutionEngine:
             else TransactionStatus.LANDED if fill.get("landed")
             else TransactionStatus.TIMEOUT
         )
+        # The router learns from LANDING, not from acceptance. A route that
+        # acknowledges instantly and never lands is worse than one that is
+        # slow and always does, and an accept count ranks them backwards.
+        if race.identifier:
+            self.landing_router.record_landing(
+                race.identifier, landed=bool(fill.get("landed")))
         self.landing_model.record(Attempt(
             bid_lamports=int(jito_tip if use_jito else 0),
             landed=bool(fill.get("landed")),
@@ -1245,6 +1273,82 @@ class ExecutionEngine:
             error=None if fill.get("filled")
             else "landed transaction had no verified output balance delta",
         )
+
+    def _register_landing_routes(self) -> None:
+        """Declare every mechanism that can carry a signed transaction.
+
+        All of them receive the SAME base64 string. That is what makes this
+        safe: one signature, executed at most once by the runtime, delivered
+        by whoever gets there first. A route needing different transaction
+        contents would be a second transaction and a second position, and it
+        does not belong in a race.
+
+        `SOLANA_STAKED_RPC_URL` and `SOLANA_SENDER_URL` are declared whether or
+        not they are set. An unset one registers disabled and says so, because
+        a landing mechanism that is silently absent is exactly the redundancy
+        an operator believes they have and does not.
+        """
+        # Bound through the client rather than to a method object, and only
+        # when the client actually carries that lane. A relay missing a lane
+        # registers DISABLED with the reason, which is what an operator needs
+        # to see; binding a missing method would instead raise mid-race, on
+        # the one path where an exception costs a slot.
+        self.landing_router.register(Route(
+            name="jito_bundle", kind="jito_bundle", requires_bundle=True,
+            enabled=hasattr(self.jito, "send_bundle"),
+            submit=lambda tx: self.jito.send_bundle([tx]),
+            detail=("bundle auction across every configured Jito region"
+                    if hasattr(self.jito, "send_bundle")
+                    else "this relay client has no send_bundle")))
+        self.landing_router.register(Route(
+            name="jito_tx", kind="jito_tx",
+            enabled=hasattr(self.jito, "send_transaction"),
+            submit=lambda tx: self.jito.send_transaction(tx),
+            detail=("Jito's single-transaction lane; different path, same relay"
+                    if hasattr(self.jito, "send_transaction")
+                    else "this relay client has no send_transaction")))
+        self.landing_router.register(Route(
+            name="rpc", kind="rpc",
+            submit=self._send_raw_transaction,
+            detail="our ordinary RPC; slowest, and it fails for its own reasons"))
+        for name, kind, variable, detail in (
+            ("staked_rpc", "staked_rpc", "SOLANA_STAKED_RPC_URL",
+             "a staked or SWQoS-prioritised endpoint; the closest thing to a "
+             "direct TPU path available without running a validator"),
+            ("sender", "sender", "SOLANA_SENDER_URL",
+             "a multi-path forwarder that fans out across its own regions"),
+        ):
+            url = os.getenv(variable, "").strip()
+            self.landing_router.register(Route(
+                name=name, kind=kind, enabled=bool(url),
+                submit=self._forwarder(url),
+                detail=detail if url else f"{variable} is not set"))
+
+    def _forwarder(self, url: str) -> Any:
+        """A sendTransaction poster against one specific endpoint."""
+        async def submit(signed_tx: str) -> Optional[str]:
+            if not url:
+                return None
+            session = await self._landing_session()
+            payload = {"jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
+                       "params": [signed_tx, {"encoding": "base64",
+                                              "skipPreflight": True,
+                                              "maxRetries": 0}]}
+            async with session.post(url, json=payload) as response:
+                body = await response.json(content_type=None)
+            if isinstance(body, dict) and body.get("error"):
+                raise RuntimeError(str(body["error"])[:200])
+            return (body or {}).get("result") if isinstance(body, dict) else None
+
+        return submit
+
+    async def _landing_session(self):
+        session = getattr(self, "_landing_http", None)
+        if session is None or session.closed:
+            session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=5))
+            self._landing_http = session
+        return session
 
     async def _send_raw_transaction(self, signed_tx: str) -> Optional[str]:
         try:
