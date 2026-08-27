@@ -392,11 +392,18 @@ box.
 Three units, on timers, so the node needs no laptop.
 
 ```bash
-cp deploy/systemd/memecoin-supervisor.* ~/.config/systemd/user/
+cp deploy/systemd/memecoin-supervisor.* deploy/systemd/memecoin-liveness.* \
+   ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now memecoin-supervisor.timer
+systemctl --user enable --now memecoin-liveness.timer memecoin-supervisor.timer
 systemctl --user list-timers | grep memecoin
 ```
+
+Two cadences, because they cost different amounts. The liveness probe is one
+HTTP call and runs every **30 seconds**, so a wedged desk is restarted within
+half a minute. The full pass reads the whole status document, evaluates thirty
+checks and may run the test suite, so it runs every **60 seconds**. Splitting
+them is what makes the fast cadence affordable.
 
 Every two minutes the supervisor does three things in order:
 

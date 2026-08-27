@@ -5027,6 +5027,29 @@ class MemecoinQuantDesk:
     #: and it says so instead of serving a blank page.
     _dashboard_cache: Optional[str] = None
 
+    async def _flush_endpoint(self, _request):
+        """Persist the ledgers now, and say what was written.
+
+        Exists so a stale-persistence fault has a remedy that is not a
+        restart. A restart at that moment discards everything since the last
+        successful save, which is precisely the loss the check exists to
+        prevent.
+        """
+        try:
+            self._flush_ledgers()
+        except Exception as exc:
+            return web.json_response(
+                {"ok": False, "detail": f"{type(exc).__name__}: {exc}"},
+                status=500)
+        root = Path(self.global_config.get("ops_state_dir", "data/state"))
+        written = {}
+        for name in ("forward_evidence.json", "launch_census.json",
+                     "calibration.json"):
+            path = root / name
+            written[name] = (round(time.time() - path.stat().st_mtime, 1)
+                             if path.exists() else None)
+        return web.json_response({"ok": True, "age_seconds": written})
+
     async def _dashboard_endpoint(self, _request):
         """Serve the operator terminal from the desk itself.
 
@@ -5052,6 +5075,11 @@ class MemecoinQuantDesk:
         app.router.add_get("/health", self._health_endpoint)
         app.router.add_get("/metrics", self._metrics_endpoint)
         app.router.add_get("/status", self._status_endpoint)
+        # Force the evidence ledgers to disk. The supervisor calls this when
+        # persistence goes stale, because the alternative -- restarting -- is
+        # the one action that would LOSE the very data the check is worried
+        # about. Loopback only, like everything else here.
+        app.router.add_post("/flush", self._flush_endpoint)
         # The desk's own terminal. Same origin as /status, so it polls the
         # live desk directly instead of asking anyone to paste JSON around.
         app.router.add_get("/", self._dashboard_endpoint)
