@@ -1484,7 +1484,9 @@ class MemecoinQuantDesk:
             # reached yet -- which is the same false alarm as reporting a live
             # module missing, and would have trained an operator to ignore it.
             try:
-                await self._refresh_open_safety(token, position)
+                refresh = getattr(self, "_refresh_open_safety", None)
+                if refresh is not None:
+                    await refresh(token, position)
                 await self._manage_one_position(token, position)
             finally:
                 try:
@@ -1559,12 +1561,17 @@ class MemecoinQuantDesk:
 
     async def _manage_one_position(self, token: str, position: Dict[str, Any]) -> None:
         """One position, one cycle. Returns early where the cycle is resolved."""
-        dev_state = self.dev_wallet_monitor.state(token)
+        dev_monitor = getattr(self, "dev_wallet_monitor", None)
+        holder_monitor = getattr(self, "holder_trajectory", None)
+        dev_state = (dev_monitor.state(token) if dev_monitor else {
+            "status": "DATA_BLOCKED", "detail": "developer monitor unavailable"})
         position["dev_wallet"] = dev_state
-        position["holder_trajectory"] = self.holder_trajectory.state(token)
+        position["holder_trajectory"] = (holder_monitor.state(token) if holder_monitor else {
+            "status": "DATA_BLOCKED", "detail": "holder monitor unavailable"})
         risk = position.get("risk_object")
-        if risk is not None:
-            veto = self.risk_veto.evaluate(
+        veto_engine = getattr(self, "risk_veto", None)
+        if risk is not None and veto_engine is not None:
+            veto = veto_engine.evaluate(
                 risk, dev_state=dev_state,
                 connected_holder_pct=getattr(risk, "connected_cluster_pct", None))
             position["risk_veto"] = veto.to_dict()
@@ -1892,15 +1899,23 @@ class MemecoinQuantDesk:
     def _memecoin_state_features(self, token: str,
                                  as_of: Optional[float] = None) -> Dict[str, Any]:
         """The same PIT memecoin state used by snapshots and live inference."""
+        holder = getattr(self, "holder_trajectory", None)
+        developer = getattr(self, "dev_wallet_monitor", None)
+        rotation = getattr(self, "rotation_tracker", None)
         return {
-            "holder_trajectory": self.holder_trajectory.state(token, as_of),
-            "dev_wallet": self.dev_wallet_monitor.state(token, as_of),
-            "capital_rotation": self.rotation_tracker.report(as_of),
+            "holder_trajectory": (holder.state(token, as_of) if holder else {
+                "status": "DATA_BLOCKED", "detail": "holder monitor unavailable"}),
+            "dev_wallet": (developer.state(token, as_of) if developer else {
+                "status": "DATA_BLOCKED", "detail": "developer monitor unavailable"}),
+            "capital_rotation": (rotation.report(as_of) if rotation else {
+                "status": "DATA_BLOCKED", "detail": "rotation tracker unavailable"}),
         }
 
     def _position_intelligence(self, token: str, position: Dict[str, Any]) -> Dict[str, Any]:
         """One slot per module that must be visible in an open-position decision."""
         hazard = self.rug_hazard.get_hazard(token)
+        holder = getattr(self, "holder_trajectory", None)
+        developer = getattr(self, "dev_wallet_monitor", None)
         return {
             "distribution": position.get("distribution")
             or {"status": "DATA_BLOCKED", "reason": "not read this cycle"},
@@ -1924,8 +1939,10 @@ class MemecoinQuantDesk:
                         "urgency": hazard.exit_urgency}
                        if hazard is not None
                        else {"status": "DATA_BLOCKED", "reason": "token not registered"}),
-            "holder_trajectory": self.holder_trajectory.state(token),
-            "dev_wallet": self.dev_wallet_monitor.state(token),
+            "holder_trajectory": (holder.state(token) if holder else {
+                "status": "DATA_BLOCKED", "reason": "holder monitor unavailable"}),
+            "dev_wallet": (developer.state(token) if developer else {
+                "status": "DATA_BLOCKED", "reason": "developer monitor unavailable"}),
         }
 
     def ingest_curve_account(self, token: str, data: bytes) -> bool:
@@ -3854,11 +3871,16 @@ class MemecoinQuantDesk:
             "decision_contribution": self.contribution_ledger.report(),
             "trade_evidence": (self.trade_evidence.report()
                                if self.trade_evidence else {"status": "DATA_BLOCKED"}),
-            "holder_trajectory": {"tracked_tokens": len(self.holder_trajectory._history)},
+            "holder_trajectory": {"tracked_tokens": len(
+                getattr(getattr(self, "holder_trajectory", None), "_history", {}))},
             "developer_monitor": {
-                "tracked_tokens": len(self.dev_wallet_monitor._developers),
-                "tokens_with_events": len(self.dev_wallet_monitor._events)},
-            "capital_rotation": self.rotation_tracker.report(),
+                "tracked_tokens": len(getattr(
+                    getattr(self, "dev_wallet_monitor", None), "_developers", {})),
+                "tokens_with_events": len(getattr(
+                    getattr(self, "dev_wallet_monitor", None), "_events", {}))},
+            "capital_rotation": (self.rotation_tracker.report()
+                                 if getattr(self, "rotation_tracker", None) else {
+                                     "status": "DATA_BLOCKED"}),
             "profit_isolation": (self.profit_isolation.plan(
                 equity_usd=(self.wallet_equity_usd
                             if self.equity_status == "OK" else None),
