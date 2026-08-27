@@ -16583,3 +16583,60 @@ class TestStreamDeliveryIsVisible(unittest.IsolatedAsyncioTestCase):
         # The suffixed key is diagnostic, not a second event.
         self.assertEqual(report["total"], 3)
         self.assertIn("token_created:no_token", report["by_type"])
+
+
+class TestStreamingMeansDelivering(unittest.TestCase):
+    """Opening a gRPC call proves a socket and nothing else."""
+
+    def _client(self):
+        from src.chains.yellowstone_grpc import YellowstoneClient
+        return YellowstoneClient("https://example.invalid", "token")
+
+    def test_an_open_call_that_delivers_nothing_is_blocked_not_streaming(self):
+        client = self._client()
+        client.status = "CONNECTED"
+        client._opened_at = time.time() - 300
+        health = client.health()
+        self.assertEqual(health["status"], "DATA_BLOCKED")
+        self.assertIn("delivered nothing", health["detail"])
+        self.assertIn("token may be rejected", health["detail"])
+        self.assertEqual(health["responses"], 0)
+
+    def test_delivering_reads_streaming(self):
+        client = self._client()
+        client.status = "STREAMING"
+        client.responses = 500
+        client.last_response_at = time.time()
+        self.assertEqual(client.health()["status"], "STREAMING")
+
+    def test_a_stream_that_went_quiet_is_degraded_with_its_duration(self):
+        client = self._client()
+        client.status = "STREAMING"
+        client.responses = 500
+        client.last_response_at = time.time() - 400
+        health = client.health()
+        self.assertEqual(health["status"], "DEGRADED")
+        self.assertIn("no response for 400s", health["detail"])
+
+    def test_the_status_is_not_claimed_before_the_first_response(self):
+        source = inspect.getsource(
+            __import__("src.chains.yellowstone_grpc", fromlist=["x"]).YellowstoneClient._stream_loop)
+        opened = source.index('self.status = "CONNECTED"')
+        streaming = source.index('self.status = "STREAMING"')
+        self.assertLess(opened, streaming,
+                        "STREAMING is claimed before a response arrives")
+        # And it is claimed inside the response loop, not beside it.
+        self.assertIn("self.responses += 1", source)
+
+    def test_responses_for_a_type_nobody_consumes_are_visible(self):
+        client = self._client()
+        asyncio.run(client._dispatch("slot", object()))
+        self.assertEqual(client.dispatched["slot"], 1)
+        # Identical to silence from outside unless it is counted.
+        self.assertEqual(client.dispatched["slot:unhandled"], 1)
+
+    def test_status_reports_delivery_rather_than_connection(self):
+        client = self._client()
+        client.status = "CONNECTED"
+        client._opened_at = time.time() - 300
+        self.assertEqual(client.get_status()["status"], "DATA_BLOCKED")
