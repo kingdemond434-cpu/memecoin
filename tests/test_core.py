@@ -16438,3 +16438,101 @@ class TestTheIsolatedSignerWorksEndToEnd(unittest.IsolatedAsyncioTestCase):
         self.assertIn("signer_from_env(self.keypair)", source)
         self.assertNotIn("SolanaTransactionBuilder(self.solana_rpc, self.keypair)",
                          source)
+
+
+class TestTheLandingCorpusSurvivesARestart(unittest.TestCase):
+    """The only dataset real fills produce, and it lived in memory alone."""
+
+    def _attempt(self, **kw):
+        from src.execution.landing_model import Attempt
+        base = dict(bid_lamports=100_000, landed=True, congestion=0.2,
+                    route="jito", leader="val1", region="hel", real=True,
+                    slot=9_000, compute_units=200_000, tip_lamports=100_000,
+                    blockhash_age_slots=3, slot_value=0.12)
+        base.update(kw)
+        return Attempt(**base)
+
+    def test_attempts_are_reloaded_with_their_conditioning_intact(self):
+        from src.execution.landing_model import LandingModel
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "attempts.jsonl"
+            model = LandingModel(path=path)
+            for index in range(25):
+                model.record(self._attempt(landed=index % 2 == 0, slot=9000 + index))
+            model.close()
+
+            revived = LandingModel(path=path)
+            self.assertEqual(revived.load(), 25)
+            first = revived._attempts[0]
+            # Every label a future leader/route/region model will need.
+            self.assertEqual(first.leader, "val1")
+            self.assertEqual(first.region, "hel")
+            self.assertEqual(first.compute_units, 200_000)
+            self.assertEqual(first.blockhash_age_slots, 3)
+            self.assertTrue(first.real)
+
+    def test_the_curve_is_the_same_after_a_reload(self):
+        from src.execution.landing_model import LandingModel
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "attempts.jsonl"
+            model = LandingModel(path=path)
+            for index in range(40):
+                model.record(self._attempt(landed=index % 4 == 0))
+            before = model.probability(100_000, 0.2)
+            model.close()
+            after = LandingModel(path=path)
+            after.load()
+            self.assertEqual(after.probability(100_000, 0.2).probability,
+                             before.probability)
+
+    def test_a_reload_does_not_duplicate_the_log(self):
+        from src.execution.landing_model import LandingModel
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "attempts.jsonl"
+            model = LandingModel(path=path)
+            for _ in range(10):
+                model.record(self._attempt())
+            model.close()
+            revived = LandingModel(path=path)
+            revived.load()
+            revived.close()
+            # Replaying must not append the replayed rows back.
+            self.assertEqual(sum(1 for _ in path.open()), 10)
+
+    def test_a_torn_line_does_not_discard_the_corpus(self):
+        from src.execution.landing_model import LandingModel
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "attempts.jsonl"
+            model = LandingModel(path=path)
+            for _ in range(5):
+                model.record(self._attempt())
+            model.close()
+            with path.open("a") as handle:
+                handle.write('{"bid_lamports": 1, "lan\n')  # crash mid-write
+            revived = LandingModel(path=path)
+            self.assertEqual(revived.load(), 5)
+
+    def test_an_unwritable_log_stops_remembering_not_trading(self):
+        from src.execution.landing_model import LandingModel
+        with tempfile.TemporaryDirectory() as tmp:
+            # A regular file where a directory must be: mkdir raises, which is
+            # the closest portable stand-in for a full or read-only disk.
+            blocker = Path(tmp) / "blocker"
+            blocker.write_text("not a directory")
+            model = LandingModel(path=blocker / "attempts.jsonl")
+            model.record(self._attempt())
+            # Recorded in memory; persistence failed without stopping the desk.
+            self.assertEqual(len(model._attempts), 1)
+            self.assertEqual(model.appended, 0)
+
+    def test_paper_and_real_attempts_are_distinguishable(self):
+        # A landing curve fitted across both describes neither.
+        paper = self._attempt(real=False)
+        real = self._attempt(real=True)
+        self.assertFalse(paper.to_dict()["real"])
+        self.assertTrue(real.to_dict()["real"])
+
+    def test_the_runtime_gives_it_a_durable_path_and_reloads(self):
+        source = inspect.getsource(MemecoinQuantDesk._setup_execution)
+        self.assertIn("landing_attempts.jsonl", source)
+        self.assertIn("landing_model.load()", source)

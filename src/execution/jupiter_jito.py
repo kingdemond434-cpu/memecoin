@@ -515,6 +515,10 @@ class SolanaTransactionBuilder:
         # refuses on every trade has removed nothing.
         self.blockhash_fallbacks = 0
         self.last_blockhash_status = ""
+        # How stale the hash was when last handed out. A transaction built on
+        # an old hash races an expiry as well as a leader, and that is a
+        # different reason to miss than losing the auction.
+        self.last_blockhash_age_slots: Optional[int] = None
 
     async def build_and_sign(self, instructions: List[Any], *,
                              compute_unit_limit: int = 0,
@@ -563,6 +567,7 @@ class SolanaTransactionBuilder:
         state = self.blockhash_cache.current()
         self.last_blockhash_status = state.status
         if state.ok:
+            self.last_blockhash_age_slots = getattr(state, "age_slots", None)
             return Hash.from_string(state.blockhash)
         self.blockhash_fallbacks += 1
         if state.detail:
@@ -681,6 +686,10 @@ class ExecutionEngine:
         # bid clearing in calm conditions misses in a rush -- which is the one
         # thing conditioning on congestion exists to learn.
         self.congestion_provider: Optional[Any] = None
+        # Where this desk submits from. One label per deployment, set by the
+        # operator, because a landing curve fitted across Helsinki and
+        # Frankfurt is a curve describing neither.
+        self.region: str = os.getenv("MEMECOIN_REGION", "").strip()
         self.execution_history: deque = deque(maxlen=10_000)
         self.route_performance: Dict[RouteType, Dict[str, float]] = defaultdict(
             lambda: {"total": 0, "landed": 0, "filled": 0, "failed": 0, "avg_latency": 0}
@@ -1130,7 +1139,26 @@ class ExecutionEngine:
             # Recorded with the conditions it was attempted under. An attempt
             # stored without them is pooled with every other, and the pooled
             # curve is the average of two regimes we never trade in.
-            congestion=self.current_congestion()))
+            congestion=self.current_congestion(),
+            # Conditioning for models that do not exist yet. None of this is
+            # recoverable after the fact -- which validator held the slot,
+            # what compute limit we set, how stale the blockhash was -- so it
+            # is recorded now and read later.
+            region=self.region,
+            leader=str(fill.get("leader", "") or ""),
+            slot=fill.get("slot"),
+            compute_units=int(compute_unit_limit or 0),
+            tip_lamports=int(jito_tip if use_jito else 0),
+            blockhash_age_slots=self.tx_builder.last_blockhash_age_slots,
+            slot_value=(float(getattr(slot_value, "decay_per_slot", 0.0))
+                        if slot_value is not None else None),
+            # Paper and real fills must never share a curve: one of them
+            # describes the market and the other describes a simulator.
+            real=not self.dry_run,
+            submitted_at=started,
+            landed_at=(time.time() if fill.get("landed") else None),
+            signature=str(signature or ""),
+            failure=("" if fill.get("filled") else str(fill.get("error", "") or ""))))
         return ExecutionResult(
             success=bool(fill.get("filled")), status=status, signature=signature,
             bundle_id=bundle_id, input_amount=amount,
