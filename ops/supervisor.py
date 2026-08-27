@@ -56,6 +56,30 @@ def build_health(status: Optional[Dict[str, Any]], previous: Optional[Dict[str, 
                        for check in checks]}
 
 
+def _fast_pass(args, root: Path, state: Path, now: float) -> int:
+    """Is the desk answering at all. Nothing else.
+
+    Deliberately minimal: one HTTP call and, at most, one restart. The full
+    pass reads a large status document, evaluates thirty checks and may run
+    the test suite -- none of which should stand between a wedged desk and a
+    restart. Splitting them is what makes a thirty-second cadence affordable.
+    """
+    alive = read_status(args.status_url.replace("/status", "/health"),
+                        timeout=5.0) is not None
+    if alive:
+        return 0
+    health = {"checks": [{"name": "readiness_freshness", "state": "CRITICAL",
+                          "detail": "the desk did not answer /health",
+                          "evidence": {}, "escalate": True}]}
+    fixer = AutoFixer(state_path=state / "autofix.json")
+    for remedy in standard_remedies(args.service, root=root):
+        fixer.register(remedy)
+    acted = [] if args.no_fix else fixer.run(health, now)
+    print(json.dumps({"at": now, "fast": True, "alive": False,
+                      "acted": [item.to_dict() for item in acted]}))
+    return 1
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=str(Path.home() / ".local/opt/memecoin-shadow"))
@@ -68,6 +92,11 @@ def main(argv=None) -> int:
                         help="report only; take no corrective action")
     parser.add_argument("--no-alert", action="store_true",
                         help="do not notify; still writes the paper trail")
+    parser.add_argument("--fast", action="store_true",
+                        help=("liveness only: is the desk answering. Cheap "
+                              "enough to run every thirty seconds, so the "
+                              "worst case for a wedged desk is half a minute "
+                              "rather than a full pass"))
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s supervisor %(message)s")
@@ -75,6 +104,9 @@ def main(argv=None) -> int:
     root = Path(args.root)
     state = root / "data" / "state"
     now = time.time()
+
+    if args.fast:
+        return _fast_pass(args, root, state, now)
 
     # Deploy first. A fault the newest commit fixes should not be "corrected"
     # by restarting the code that has it.
@@ -101,7 +133,8 @@ def main(argv=None) -> int:
     health = build_health(status, previous, now, root)
 
     fixer = AutoFixer(state_path=state / "autofix.json")
-    for remedy in standard_remedies(args.service):
+    for remedy in standard_remedies(args.service, root=root,
+                                    status_base=args.status_url.rsplit("/", 1)[0]):
         fixer.register(remedy)
     acted = [] if args.no_fix else fixer.run(health, now)
 

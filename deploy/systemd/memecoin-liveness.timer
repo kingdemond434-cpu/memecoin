@@ -1,0 +1,13 @@
+[Unit]
+Description=Probe desk liveness every thirty seconds
+
+[Timer]
+OnBootSec=90s
+# Thirty seconds is the floor worth having: the probe is one HTTP call, and
+# every second a wedged desk stays wedged is a second of launches nobody is
+# counting. The expensive checks stay on the two-minute pass.
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

@@ -223,15 +223,77 @@ class AutoFixer:
         self.escalations = list(state.get("escalations") or [])
 
 
-def _critical(health: Dict[str, Any], *names: str) -> bool:
-    """True when any named check is CRITICAL in the monitor's output."""
+def _in_state(health: Dict[str, Any], state: str, names: Sequence[str]) -> bool:
     for check in health.get("checks") or []:
-        if check.get("name") in names and check.get("state") == "CRITICAL":
+        if check.get("name") in names and check.get("state") == state:
             return True
     return False
 
 
-def standard_remedies(service: str = "memecoin-shadow.service"
+def _critical(health: Dict[str, Any], *names: str) -> bool:
+    """True when any named check is CRITICAL in the monitor's output."""
+    return _in_state(health, "CRITICAL", names)
+
+
+def _warn(health: Dict[str, Any], *names: str) -> bool:
+    """True when any named check is WARN.
+
+    Kept separate on purpose. A warning is a reason to act slowly and rarely;
+    treating it like a crisis is how a supervisor turns a degraded subsystem
+    into a restart loop.
+    """
+    return _in_state(health, "WARN", names)
+
+
+def post(url: str, timeout: float = 20.0) -> bool:
+    """One POST to the desk's own loopback API. Never raises."""
+    import urllib.error
+    import urllib.request
+
+    try:
+        request = urllib.request.Request(url, data=b"", method="POST")
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return 200 <= response.status < 300
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        logger.error("POST %s failed: %s", url, exc)
+        return False
+
+
+def prune_spill(root: Path, *, keep_bytes: int = 512 * 1024**2) -> bool:
+    """Trim the append-only spill logs when the disk is filling.
+
+    These are the only files here that grow without bound and can be shortened
+    without losing anything the totals depend on: the launch census counts
+    before it spills, and the landing model replays only its most recent rows.
+    Oldest lines go first, so the newest history -- the part a model would
+    actually train on -- is what survives.
+
+    Nothing else is touched. Deleting a model artefact or an evidence ledger
+    to free space would trade the thing the desk is for the ability to keep
+    running, which is not a trade a supervisor gets to make.
+    """
+    spills = [root / "data" / "state" / "launch_census.jsonl",
+              root / "data" / "state" / "landing_attempts.jsonl"]
+    trimmed = False
+    for path in spills:
+        try:
+            if not path.exists() or path.stat().st_size <= keep_bytes:
+                continue
+            lines = path.read_text(errors="replace").splitlines()
+            keep = lines[len(lines) // 2:]
+            path.write_text("\n".join(keep) + "\n")
+            logger.warning("pruned %s from %d to %d rows",
+                           path.name, len(lines), len(keep))
+            trimmed = True
+        except OSError as exc:
+            logger.error("could not prune %s: %s", path, exc)
+    return trimmed
+
+
+def standard_remedies(service: str = "memecoin-shadow.service",
+                      *, root: Optional[Path] = None,
+                      status_base: str = "http://127.0.0.1:18080",
+                      trainer: str = "memecoin-shadow-trainer.service"
                       ) -> List[Remedy]:
     """The fixed repertoire.
 
@@ -263,4 +325,45 @@ def standard_remedies(service: str = "memecoin-shadow.service"
             applies=lambda health: _critical(health, "feed_yellowstone"),
             act=lambda: systemctl("restart", service),
             why="the feed is reported dead by the monitor"),
+        Remedy(
+            name="flush_stale_ledgers",
+            applies=lambda health: _critical(
+                health, "persistence_evidence", "persistence_census"),
+            act=lambda: post(f"{status_base}/flush"),
+            why=("the evidence ledgers have gone stale; a restart here would "
+                 "lose exactly what the check is worried about, so force a "
+                 "save instead"),
+            # Cheap and non-destructive, so it may run more often than a
+            # restart and needs almost no cooldown.
+            budget=10, cooldown_s=60.0),
+        Remedy(
+            name="restart_on_stale_market_data",
+            applies=lambda health: _critical(health, "data_market_observations"),
+            act=lambda: systemctl("restart", service),
+            why=("market observations stopped arriving; episodes are being "
+                 "built blind")),
+        Remedy(
+            name="restart_on_silent_miners",
+            applies=lambda health: _warn(health, "subsystem_miners"),
+            act=lambda: systemctl("restart", service),
+            why=("the miner pool has gone quiet; the context that explains a "
+                 "price path is not being collected"),
+            # A warning, not a crisis. Acted on rarely and slowly, so a
+            # briefly rate-limited miner never causes a restart.
+            budget=1, cooldown_s=3_600.0),
+        Remedy(
+            name="free_disk_space",
+            applies=lambda health: _critical(health, "resource_disk"),
+            act=lambda: prune_spill(root or Path.cwd()),
+            why=("the disk is nearly full; trim the append-only spill logs "
+                 "before it stops the evidence ledgers being written"),
+            budget=4, cooldown_s=600.0),
+        Remedy(
+            name="retrain_stale_models",
+            applies=lambda health: _warn(
+                health, "model_rug_hazard", "model_exit_policy",
+                "model_prediction"),
+            act=lambda: systemctl("start", trainer),
+            why="a model artefact is stale; the trainer already exists to fix that",
+            budget=2, cooldown_s=7_200.0),
     ]

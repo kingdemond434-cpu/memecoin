@@ -17233,3 +17233,137 @@ class TestTheSupervisorWatchesEverySubsystem(unittest.TestCase):
             found = next(c for c in checks if c["name"] == "persistence_evidence")
             self.assertEqual(found["state"], "CRITICAL")
             self.assertIn("would lose everything", found["detail"])
+
+
+class TestEveryFixerIsMatchedToADetectorItCanSafelyFix(unittest.TestCase):
+    """Coverage is not the goal; safe coverage is. Some detectors must never
+    have a fixer at all."""
+
+    def _health(self, name, state="CRITICAL"):
+        return {"checks": [{"name": name, "state": state, "detail": ""}]}
+
+    def _fixer(self, tmp=None):
+        from ops.autofix import AutoFixer, standard_remedies
+        fixer = AutoFixer()
+        for remedy in standard_remedies(root=Path(tmp or "/tmp")):
+            fixer.register(remedy)
+        return fixer
+
+    def test_stale_persistence_flushes_rather_than_restarting(self):
+        # A restart here loses exactly what the check is worried about.
+        from ops.autofix import standard_remedies
+        remedy = next(r for r in standard_remedies()
+                      if r.name == "flush_stale_ledgers")
+        self.assertTrue(remedy.applies(self._health("persistence_evidence")))
+        self.assertIn("would lose exactly what the check", remedy.why)
+        restarts = [r for r in standard_remedies()
+                    if "restart" in r.name
+                    and r.applies(self._health("persistence_evidence"))]
+        self.assertEqual(restarts, [])
+
+    def test_a_full_disk_trims_spill_logs_and_nothing_else(self):
+        from ops.autofix import prune_spill
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "data" / "state"
+            state.mkdir(parents=True)
+            spill = state / "launch_census.jsonl"
+            spill.write_text("\n".join(f'{{"row":{i}}}' for i in range(1000)) + "\n")
+            evidence = state / "forward_evidence.json"
+            evidence.write_text('{"decisions": 5000}')
+            model = state / "rug-hazard.joblib"
+            model.write_text("x" * 100)
+
+            prune_spill(Path(tmp), keep_bytes=100)
+            self.assertLess(len(spill.read_text().splitlines()), 1000)
+            # The newest rows are what a model would train on, so they survive.
+            self.assertIn('{"row":999}', spill.read_text())
+            # Evidence and artefacts are never touched to free space.
+            self.assertEqual(evidence.read_text(), '{"decisions": 5000}')
+            self.assertTrue(model.exists())
+
+    def test_a_quiet_miner_pool_is_treated_as_a_warning_not_a_crisis(self):
+        from ops.autofix import standard_remedies
+        remedy = next(r for r in standard_remedies()
+                      if r.name == "restart_on_silent_miners")
+        self.assertTrue(remedy.applies(self._health("subsystem_miners", "WARN")))
+        # Once an hour at most: a briefly rate-limited miner must never cause
+        # a restart loop.
+        self.assertEqual(remedy.budget, 1)
+        self.assertGreaterEqual(remedy.cooldown_s, 3_600.0)
+
+    def test_stale_models_trigger_the_trainer_not_a_restart(self):
+        from ops.autofix import standard_remedies
+        remedy = next(r for r in standard_remedies()
+                      if r.name == "retrain_stale_models")
+        self.assertTrue(remedy.applies(self._health("model_rug_hazard", "WARN")))
+
+    def test_the_kill_switch_is_never_auto_cleared(self):
+        # It is a safety stop. A supervisor that clears it has removed the
+        # one thing standing between a losing day and a worse one.
+        fixer = self._fixer()
+        self.assertEqual(fixer.run(self._health("safety_kill_switch"), now=1.0), [])
+
+    def test_a_high_execution_failure_rate_is_never_auto_fixed(self):
+        # That is a real signal about the market or the route, not a fault to
+        # restart away.
+        fixer = self._fixer()
+        self.assertEqual(
+            fixer.run(self._health("execution_failure_rate", "WARN"), now=1.0), [])
+
+    def test_miscalibration_is_never_auto_fixed(self):
+        # A miscalibrated model needs data, not a restart. Restarting would
+        # hide the finding without changing it.
+        fixer = self._fixer()
+        self.assertEqual(
+            fixer.run(self._health("subsystem_calibration", "WARN"), now=1.0), [])
+
+    def test_a_missing_credential_is_never_auto_fixed(self):
+        fixer = self._fixer()
+        for name in ("source_social", "subsystem_signer"):
+            self.assertEqual(fixer.run(self._health(name, "WARN"), now=1.0), [],
+                             name)
+
+    def test_warnings_and_criticals_are_kept_distinct(self):
+        from ops.autofix import _critical, _warn
+        health = self._health("x", "WARN")
+        self.assertFalse(_critical(health, "x"))
+        self.assertTrue(_warn(health, "x"))
+
+
+class TestTheFastLaneIsCheapEnoughToRunConstantly(unittest.IsolatedAsyncioTestCase):
+
+    def test_the_fast_pass_only_probes_liveness(self):
+        source = inspect.getsource(
+            __import__("ops.supervisor", fromlist=["x"])._fast_pass)
+        self.assertIn("/health", source)
+        # It must not read the full status document, evaluate every check, or
+        # deploy -- none of that should stand between a wedged desk and a
+        # restart.
+        for expensive in ("build_health", "AutoDeployer", "check_subsystems"):
+            self.assertNotIn(expensive, source)
+
+    def test_a_live_desk_costs_one_call_and_exits(self):
+        from ops import supervisor
+        args = SimpleNamespace(status_url="http://x/status", service="s",
+                               no_fix=True, root="/tmp")
+        with mock.patch.object(supervisor, "read_status", return_value={"ok": 1}):
+            code = supervisor._fast_pass(args, Path("/tmp"), Path("/tmp"), 1.0)
+        self.assertEqual(code, 0)
+
+    def test_a_dead_desk_is_actionable_from_the_fast_pass(self):
+        from ops import supervisor
+        args = SimpleNamespace(status_url="http://x/status", service="s",
+                               no_fix=False, root="/tmp")
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(supervisor, "read_status", return_value=None), \
+             mock.patch("ops.autofix.systemctl", return_value=True) as restart:
+            code = supervisor._fast_pass(args, Path(tmp), Path(tmp), 1.0)
+        self.assertEqual(code, 1)
+        restart.assert_called_once()
+
+    def test_the_timers_are_as_frequent_as_each_probe_can_afford(self):
+        root = Path(__file__).resolve().parents[1] / "deploy" / "systemd"
+        liveness = (root / "memecoin-liveness.timer").read_text()
+        supervisor = (root / "memecoin-supervisor.timer").read_text()
+        self.assertIn("OnUnitActiveSec=30s", liveness)
+        self.assertIn("OnUnitActiveSec=60s", supervisor)
