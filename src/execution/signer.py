@@ -145,8 +145,15 @@ class TransactionInspector:
             from solders.message import MessageV0
         except ImportError as exc:  # pragma: no cover - solders is a hard dep
             return Decision(allowed=False, reason=f"cannot decode: {exc}")
+        raw = bytes(message_bytes)
+        # What gets SIGNED on Solana is the versioned payload -- the message
+        # with a 0x80 version prefix -- but the decoder wants it without.
+        # Strip for reading, sign what we were handed. Getting this backwards
+        # is invisible to a local signer, which never decodes, and refuses
+        # every single transaction once the signer is isolated.
+        decodable = raw[1:] if raw and raw[0] & 0x80 else raw
         try:
-            message = MessageV0.from_bytes(bytes(message_bytes))
+            message = MessageV0.from_bytes(decodable)
         except Exception as exc:
             # An undecodable message is refused. Signing bytes we cannot read
             # is signing a blank cheque.

@@ -46,6 +46,7 @@ from src.research.feature_engine import build_features
 from src.research.global_research_miner import GlobalResearchMiner
 from src.research.calibration import CalibrationBook
 from src.research.chain_miners import register_chain_miners
+from src.execution.signer import signer_from_env
 from src.research.calibration import Provenance
 from src.research.fallback import FallbackResolver, Rung, Source
 from src.runtime.memory_governor import Band, MemoryGovernor, Relief
@@ -780,7 +781,11 @@ class MemecoinQuantDesk:
     async def _setup_execution(self):
         self.jupiter = JupiterClient()
         self.jito = JitoClient()
-        builder = SolanaTransactionBuilder(self.solana_rpc, self.keypair)
+        # Isolated when MEMECOIN_SIGNER_SOCKET names a socket, local otherwise.
+        # Chosen once, here, and reported on /status -- so "the key is in this
+        # process" is a stated configuration rather than an unexamined default.
+        builder = SolanaTransactionBuilder(
+            self.solana_rpc, signer_from_env(self.keypair))
         # Nothing here is an operator secret any more: the program addresses
         # come from the vendored IDLs and the fee recipients from Pump's own
         # published list. What remains configurable is the pair of token

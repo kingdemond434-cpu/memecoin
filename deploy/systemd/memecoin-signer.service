@@ -1,0 +1,45 @@
+[Unit]
+Description=Memecoin isolated signer (holds the key the desk must not)
+Documentation=file:%h/.local/opt/memecoin-shadow/RUNBOOK.md
+# Ordered before the desk so the socket exists when the desk looks for it.
+# NOT a Requires: the desk starting without a signer must fail to sign rather
+# than fail to start, so the operator sees a refusal and not a boot loop.
+Before=memecoin-shadow.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/opt/memecoin-shadow
+# Only the key. Deliberately NOT the desk's env file: this process needs no
+# RPC endpoint, no API key and no Telegram credential, and every variable it
+# does not read is one it cannot leak.
+EnvironmentFile=-%h/.config/memecoin-shadow/signer-env
+Environment=PYTHONUNBUFFERED=1
+RuntimeDirectory=memecoin
+RuntimeDirectoryMode=0700
+ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.execution.signer_daemon \
+    --socket %t/memecoin/signer.sock \
+    --kill-file %h/.local/opt/memecoin-shadow/data/state/HALT_SIGNING
+Restart=on-failure
+RestartSec=5
+
+# The key is in this process's memory; make that memory as hard to reach as
+# a user unit can.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%t/memecoin
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+# No network at all. The signer talks to one unix socket and nothing else, so
+# a compromise cannot exfiltrate the key over the wire.
+PrivateNetwork=true
+MemoryMax=256M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=memecoin-signer
+
+[Install]
+WantedBy=default.target

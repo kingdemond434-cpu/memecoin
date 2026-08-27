@@ -87,10 +87,12 @@ from src.research.web_miners import (
     wikipedia_attention_miner, youtube_recent_miner,
 )
 from src.chains import pumpswap_route
+from solders.message import to_bytes_versioned
 from src.research.launch_census import (
     LaunchCensus, LaunchRecord, MONSTER_MULTIPLE, Stage as CensusStage,
 )
 from src.research import rug_mechanism
+from src.execution import signer_daemon
 from src.runtime.memory_governor import Band, MemoryGovernor, Relief
 from src.research.fallback import (
     FallbackResolver, FactLadder, Resolution, Rung, Source,
@@ -16328,3 +16330,111 @@ class TestWhereTheKeyLivesIsAlwaysVisible(unittest.TestCase):
         # /status serves readiness(), which is where the payload is assembled.
         source = inspect.getsource(MemecoinQuantDesk.readiness)
         self.assertIn("self.signer_report()", source)
+
+
+class TestTheIsolatedSignerWorksEndToEnd(unittest.IsolatedAsyncioTestCase):
+    """A socket that is never exercised is a socket that fails on the first
+    real trade."""
+
+    async def _serve(self, tmp, **policy):
+        from solders.keypair import Keypair as KP
+        from src.execution.signer import SignerServer, SignerService, SignerPolicy
+        policy.setdefault("require_live_ack", False)
+        policy.setdefault("kill_file", Path(tmp) / "HALT")
+        keypair = KP()
+        service = SignerService(keypair, SignerPolicy(**policy))
+        server = SignerServer(service, Path(tmp) / "signer.sock")
+        await server.start()
+        self.addAsyncCleanup(server.stop)
+        return keypair, service, server
+
+    def _transfer_message(self, keypair, lamports=1_000):
+        from solders.system_program import transfer, TransferParams
+        from solders.message import MessageV0
+        from solders.hash import Hash
+        from solders.pubkey import Pubkey
+        ix = transfer(TransferParams(from_pubkey=keypair.pubkey(),
+                                     to_pubkey=Pubkey.default(),
+                                     lamports=lamports))
+        return MessageV0.try_compile(keypair.pubkey(), [ix], [], Hash.default())
+
+    async def test_the_desk_signs_without_ever_holding_the_key(self):
+        from src.execution.signer import SignerClient
+        with tempfile.TemporaryDirectory() as tmp:
+            keypair, service, server = await self._serve(tmp)
+            client = SignerClient(server.socket_path)
+            self.assertEqual(await client.pubkey(), str(keypair.pubkey()))
+
+            builder = SolanaTransactionBuilder(FakeRpc(), client)
+            self.assertFalse(hasattr(builder, "keypair"))
+            self.assertTrue(builder.signer.isolated)
+
+            message = self._transfer_message(keypair)
+            signature = await client.sign_message(bytes(to_bytes_versioned(message)))
+            signed = VersionedTransaction.populate(
+                message, [Signature.from_bytes(signature)])
+            self.assertTrue(signed.verify_with_results()[0])
+            self.assertEqual(service.signed, 1)
+
+    async def test_the_socket_is_owner_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _kp, _svc, server = await self._serve(tmp)
+            mode = server.socket_path.stat().st_mode & 0o777
+            # The socket IS the signing authority; it gets a key file's mode.
+            self.assertEqual(mode, 0o600, oct(mode))
+
+    async def test_policy_is_enforced_across_the_socket_not_only_in_process(self):
+        from src.execution.signer import SignerClient
+        with tempfile.TemporaryDirectory() as tmp:
+            keypair, _svc, server = await self._serve(
+                tmp, max_transfer_lamports=1_000)
+            client = SignerClient(server.socket_path)
+            message = self._transfer_message(keypair, lamports=50_000)
+            with self.assertRaises(PermissionError) as caught:
+                await client.sign_message(bytes(to_bytes_versioned(message)))
+            self.assertIn("above the", str(caught.exception))
+            self.assertEqual(client.refusals, 1)
+
+    async def test_the_kill_file_stops_signing_over_the_socket(self):
+        from src.execution.signer import SignerClient
+        with tempfile.TemporaryDirectory() as tmp:
+            keypair, _svc, server = await self._serve(tmp)
+            client = SignerClient(server.socket_path)
+            message = bytes(to_bytes_versioned(self._transfer_message(keypair)))
+            await client.sign_message(message)
+            (Path(tmp) / "HALT").write_text("stop")
+            with self.assertRaises(PermissionError):
+                await client.sign_message(message)
+
+    async def test_an_absent_signer_fails_rather_than_falling_back(self):
+        from src.execution.signer import SignerClient
+        client = SignerClient(Path("/nonexistent/signer.sock"), timeout_s=0.5)
+        with self.assertRaises(Exception) as caught:
+            await client.sign_message(b"whatever")
+        # Any failure is acceptable; silently signing locally is not.
+        self.assertNotIsInstance(caught.exception, bytes)
+
+    def test_the_daemon_never_logs_private_material(self):
+        source = inspect.getsource(signer_daemon)
+        self.assertIn("service.public_key", source)
+        for leak in ("keypair)", "to_bytes()", "SOLANA_PRIVATE_KEY}",
+                     "encoded)"):
+            self.assertNotIn(f"logger.info({leak}", source)
+
+    def test_the_unit_gives_the_signer_no_network_and_not_the_desks_env(self):
+        unit = (Path(__file__).resolve().parents[1] / "deploy" / "systemd"
+                / "memecoin-signer.service").read_text()
+        # It talks to one unix socket; a compromise must not reach the wire.
+        self.assertIn("PrivateNetwork=true", unit)
+        self.assertIn("RestrictAddressFamilies=AF_UNIX", unit)
+        # Its own env file, not the desk's: every variable it cannot read is
+        # one it cannot leak.
+        self.assertIn("signer-env", unit)
+        self.assertNotIn("memecoin-shadow/env", unit)
+        self.assertIn("RuntimeDirectoryMode=0700", unit)
+
+    def test_main_chooses_the_signer_rather_than_always_holding_the_key(self):
+        source = inspect.getsource(MemecoinQuantDesk._setup_execution)
+        self.assertIn("signer_from_env(self.keypair)", source)
+        self.assertNotIn("SolanaTransactionBuilder(self.solana_rpc, self.keypair)",
+                         source)
