@@ -28,10 +28,14 @@ attempts to earn it -- and that promotion is a decision made from the data,
 not from a comment.
 """
 
+import json
 import logging
 import math
+import os
+import tempfile
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -72,12 +76,77 @@ def congestion_bucket(congestion: Optional[float]) -> str:
 
 @dataclass
 class Attempt:
+    """One submission and what happened to it.
+
+    The fields beyond bid/landed exist for models that do not exist yet --
+    leader-specific, route-specific, region-specific landing curves. They are
+    recorded now because they CANNOT be recovered later: which validator was
+    leader for a slot three months ago, what compute limit we set, how old the
+    blockhash was at submit. An attempt stored without them is permanently
+    unusable for conditioning, and no amount of future work brings it back.
+
+    Recording a label years before the model that reads it is cheap. Not
+    recording it is the one mistake that compounds.
+    """
+
     bid_lamports: int
     landed: bool
     congestion: Optional[float] = None
     route: str = ""
     region: str = ""
     latency_ms: int = 0
+    # --- conditioning, for models not yet built ---------------------------
+    #: Validator identity for the slot we targeted. The single strongest
+    #: conditioning variable a mature landing model has, and the least
+    #: recoverable after the fact.
+    leader: str = ""
+    slot: Optional[int] = None
+    compute_units: int = 0
+    tip_lamports: int = 0
+    #: How stale the blockhash was when we submitted. A transaction built
+    #: against an old hash is racing an expiry as well as a leader.
+    blockhash_age_slots: Optional[int] = None
+    #: What one slot of delay was worth on this opportunity, from the slot
+    #: value model. Lets a later analysis ask whether we bid correctly given
+    #: what was at stake, not merely whether we landed.
+    slot_value: Optional[float] = None
+    #: Real money or paper. A landing curve fitted across both is a curve
+    #: describing neither.
+    real: bool = False
+    submitted_at: float = 0.0
+    landed_at: Optional[float] = None
+    signature: str = ""
+    failure: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "bid_lamports": self.bid_lamports, "landed": self.landed,
+            "congestion": self.congestion, "route": self.route,
+            "region": self.region, "latency_ms": self.latency_ms,
+            "leader": self.leader, "slot": self.slot,
+            "compute_units": self.compute_units, "tip_lamports": self.tip_lamports,
+            "blockhash_age_slots": self.blockhash_age_slots,
+            "slot_value": self.slot_value, "real": self.real,
+            "submitted_at": self.submitted_at, "landed_at": self.landed_at,
+            "signature": self.signature, "failure": self.failure,
+        }
+
+    @classmethod
+    def from_dict(cls, row: Dict[str, Any]) -> "Attempt":
+        return cls(
+            bid_lamports=int(row.get("bid_lamports", 0) or 0),
+            landed=bool(row.get("landed")),
+            congestion=row.get("congestion"), route=row.get("route", ""),
+            region=row.get("region", ""),
+            latency_ms=int(row.get("latency_ms", 0) or 0),
+            leader=row.get("leader", ""), slot=row.get("slot"),
+            compute_units=int(row.get("compute_units", 0) or 0),
+            tip_lamports=int(row.get("tip_lamports", 0) or 0),
+            blockhash_age_slots=row.get("blockhash_age_slots"),
+            slot_value=row.get("slot_value"), real=bool(row.get("real")),
+            submitted_at=float(row.get("submitted_at", 0.0) or 0.0),
+            landed_at=row.get("landed_at"), signature=row.get("signature", ""),
+            failure=row.get("failure", ""))
 
 
 @dataclass
@@ -115,12 +184,20 @@ class LandingModel:
     """An empirical landing curve over our own attempts."""
 
     def __init__(self, capacity: int = 20_000,
-                 min_bucket_attempts: int = MIN_BUCKET_ATTEMPTS):
+                 min_bucket_attempts: int = MIN_BUCKET_ATTEMPTS,
+                 path: Optional[Path] = None):
         self.capacity = max(1, int(capacity))
         self.min_bucket_attempts = max(1, int(min_bucket_attempts))
         self._attempts: Deque[Attempt] = deque(maxlen=self.capacity)
         self._counts: Dict[Tuple[str, int], List[int]] = defaultdict(lambda: [0, 0])
         self._route_counts: Dict[str, List[int]] = defaultdict(lambda: [0, 0])
+        # Attempts are the ONLY dataset real fills produce, and they were held
+        # in memory alone -- so every restart destroyed the entire landing
+        # corpus, and a desk restarted a dozen times in a day had none. There
+        # is no way to reconstruct a landing attempt after the fact.
+        self.path = Path(path) if path else None
+        self.appended = 0
+        self._log: Optional[Any] = None
 
     def record(self, attempt: Attempt) -> None:
         """One attempt. Landed or not -- both are evidence, and only one is fun.
@@ -142,6 +219,71 @@ class LandingModel:
             route = self._route_counts[attempt.route]
             route[0] += 1
             route[1] += int(attempt.landed)
+        self._append(attempt)
+
+    def _append(self, attempt: Attempt) -> None:
+        """Write one attempt to the durable log, immediately.
+
+        Appended rather than batched: an attempt is a few hundred bytes, they
+        arrive at most a few times a minute, and the whole point is that a
+        crash between batches would lose exactly the attempts a crash makes
+        interesting. Failures are swallowed -- a full disk must not stop the
+        desk from trading, only from remembering.
+        """
+        if self.path is None:
+            return
+        try:
+            if self._log is None:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self._log = self.path.open("a", buffering=1)
+            self._log.write(json.dumps(attempt.to_dict()) + "\n")
+            self.appended += 1
+        except OSError as exc:
+            logger.warning("landing attempt not persisted: %s", exc)
+
+    def load(self) -> int:
+        """Replay the durable log into the in-memory curve.
+
+        Only the most recent `capacity` rows are kept, matching the deque, so
+        a long-running desk reloads its recent history rather than every
+        attempt it has ever made.
+        """
+        if self.path is None or not self.path.exists():
+            return 0
+        rows: List[Attempt] = []
+        try:
+            with self.path.open("r") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(Attempt.from_dict(json.loads(line)))
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        # One malformed line is a torn write, not a reason to
+                        # discard the corpus.
+                        continue
+        except OSError as exc:
+            logger.warning("landing attempts unreadable: %s", exc)
+            return 0
+        restored = 0
+        keep = rows[-self.capacity:]
+        saved_path, self.path = self.path, None  # replay must not re-append
+        try:
+            for attempt in keep:
+                self.record(attempt)
+                restored += 1
+        finally:
+            self.path = saved_path
+        return restored
+
+    def close(self) -> None:
+        if self._log is not None:
+            try:
+                self._log.close()
+            except OSError:
+                pass
+            self._log = None
 
     def probability(self, bid_lamports: int,
                     congestion: Optional[float] = None) -> LandingEstimate:

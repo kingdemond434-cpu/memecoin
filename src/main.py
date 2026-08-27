@@ -808,6 +808,16 @@ class MemecoinQuantDesk:
                                                 builder, self.counterfactual_lab, dry_run=self.dry_run,
                                                 pump_route=self.pump_route,
                                                 pumpswap_route=self.pumpswap_route)
+        # The landing corpus is the only dataset real fills produce, and it
+        # was held in memory alone -- so every restart destroyed it and a desk
+        # restarted a dozen times in a day had none. A landing attempt cannot
+        # be reconstructed after the fact by any means.
+        self.execution_engine.landing_model.path = (
+            Path(self.global_config.get("ops_state_dir", "data/state"))
+            / "landing_attempts.jsonl")
+        restored = self.execution_engine.landing_model.load()
+        if restored:
+            logger.info("landing model restored %d attempts from disk", restored)
         # The desk owns the streamed curve state; the engine reads it through
         # this rather than keeping its own, because two views of the price we
         # are about to trade at is one view too many.
@@ -958,6 +968,12 @@ class MemecoinQuantDesk:
                 ledger.save()
             except Exception as exc:
                 logger.warning("could not flush %s on shutdown: %s", name, exc)
+        engine = getattr(self, "execution_engine", None)
+        if engine is not None:
+            try:
+                engine.landing_model.close()
+            except Exception as exc:
+                logger.warning("could not close the landing log: %s", exc)
 
     def _spawn_background(self, coroutine):
         task = asyncio.create_task(coroutine)
