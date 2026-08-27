@@ -44,6 +44,8 @@ from src.execution.jupiter_jito import (
 from src.research.dataset_builder import PointInTimeDatasetBuilder
 from src.research.feature_engine import build_features
 from src.research.global_research_miner import GlobalResearchMiner
+from src.research.data_miners import DataMinerPool
+from src.research.solana_miners import register_solana_miners
 from src.research.forward_evidence import ForwardEvidence, Outcome as ForwardOutcome
 from src.research.contribution import (
     ContributionLedger, GateFlip, action_value_contributions,
@@ -309,6 +311,13 @@ class MemecoinQuantDesk:
         # that moved two minutes ago and has been flat since is not decaying
         # now, and a long history would say it was.
         self._mark_history: Dict[str, Any] = {}
+        # Market-wide state from the context miner. One row, not per token:
+        # what the market was doing belongs to every episode running at the
+        # time, and copying it into each one would be the same fact stored a
+        # thousand times and updated in none of them.
+        self._market_context: Dict[str, Any] = {}
+        self.data_miners = DataMinerPool()
+        self.miner_registration: Dict[str, bool] = {}
         self.slot_value = SlotValueModel()
         self._mark_checked_at: Dict[str, float] = {}
         self._mark_checks = 0
@@ -757,9 +766,23 @@ class MemecoinQuantDesk:
         if hasattr(self.genealogy, "set_outcome_provider"):
             self.genealogy.set_outcome_provider(self.dataset_builder.get_outcome)
         self.global_research = GlobalResearchMiner(self.champion_challenger)
+        # Market and chain context, each source on its own clock. The program
+        # stream is the fastest and most trustworthy data the desk has; what
+        # it does not carry is why a price path looks the way it does, and
+        # that is what a forward ledger needs to explain an outcome rather
+        # than only record it.
+        self.data_miners = DataMinerPool(
+            concurrency=int(self.global_config.get("data_miner_concurrency", 6)),
+            on_records=self._ingest_mined_records)
+        self.miner_registration = register_solana_miners(
+            self.data_miners, rpc=self.solana_rpc, http=self.http_client,
+            watched_tokens=self._mineable_tokens)
         if not self.offline:
             await self.dataset_builder.start()
             await self.global_research.start()
+            started = await self.data_miners.start()
+            logger.info("DATA MINERS %d runnable of %d declared",
+                        started, len(self.miner_registration))
             # Event callbacks write to the PIT builder, hazard tracker, and
             # research graphs. Start the stream only after all consumers exist.
             if self.rpc_program_stream:
@@ -792,6 +815,10 @@ class MemecoinQuantDesk:
             await self.source_mesh.stop()
         except Exception as exc:  # pragma: no cover - shutdown only
             logger.warning("source mesh shutdown: %s", exc)
+        try:
+            await self.data_miners.stop()
+        except Exception as exc:  # pragma: no cover - shutdown only
+            logger.warning("data miner shutdown: %s", exc)
         try:
             await stop_transports(self.transports, self.http_client)
         except Exception as exc:  # pragma: no cover - shutdown only
@@ -3168,6 +3195,69 @@ class MemecoinQuantDesk:
         ("REDDIT_CLIENT_SECRET", "approved Reddit application-only OAuth"),
     )
 
+    def _mineable_tokens(self) -> List[str]:
+        """Which mints are worth spending a miner pass on, most urgent first.
+
+        Open positions before candidates before merely-observed launches.
+        Mining the holder structure of every mint on Solana is impossible and
+        useless; the ones that matter are the ones a position is in or might
+        be taken in, and a miner pass spent elsewhere is a pass not spent
+        here.
+        """
+        ordered: List[str] = []
+        seen = set()
+        for group in (self.elogw_engine.open_positions,
+                      self._latest_curve_state,
+                      self._latest_pool_state):
+            for token in group:
+                if token and token not in seen:
+                    seen.add(token)
+                    ordered.append(token)
+        return ordered
+
+    def _ingest_mined_records(self, miner_id: str,
+                              records: List[Dict[str, Any]]) -> None:
+        """Route mined records into the lake and the models that use them.
+
+        Written as observations rather than as state: a mined fact is
+        something we were told at a time, and the point-in-time builder is
+        what keeps it usable for training later. Overwriting live state from a
+        source polled every fifteen seconds would put a stale number in front
+        of a decision the stream had already updated.
+        """
+        for record in records:
+            mint = str(record.get("mint", "") or "")
+            if not mint:
+                # A market-wide row belongs to every episode, not to one.
+                self._market_context = dict(record)
+                continue
+            try:
+                self.dataset_builder.record_market_observation(
+                    mint, {"type": "mined", "measurement": miner_id,
+                           "timestamp": float(record.get("_fetched_at", time.time())),
+                           **record})
+            except Exception as exc:
+                logger.debug("mined record for %s not recorded: %s", mint, exc)
+            # Holder concentration is a hazard input, not a curiosity: a top
+            # holder at 40% of supply is a rug that has not happened yet.
+            if record.get("top1_share") is not None:
+                self.rug_hazard.record_observation(mint, {
+                    "type": "holder_structure",
+                    "timestamp": float(record.get("_fetched_at", time.time())),
+                    "top1_share": record.get("top1_share"),
+                    "top10_share": record.get("top10_share"),
+                    "concentration_hhi": record.get("concentration_hhi"),
+                    "data_status": "OK"})
+            # Retained mint or freeze authority is the difference between a
+            # coin that CAN be rugged by its creator and one that cannot.
+            if record.get("mint_renounced") is not None:
+                self.rug_hazard.record_observation(mint, {
+                    "type": "authority",
+                    "timestamp": float(record.get("_fetched_at", time.time())),
+                    "mint_renounced": record.get("mint_renounced"),
+                    "freeze_renounced": record.get("freeze_renounced"),
+                    "data_status": "OK"})
+
     def credential_report(self) -> Dict[str, Any]:
         """Which credentials are present, by NAME.
 
@@ -4055,6 +4145,10 @@ class MemecoinQuantDesk:
             # Presence only, never a value. An env file loaded by the wrong
             # unit and a missing key look identical from outside.
             "credentials": self.credential_report(),
+            # What is being mined, what is dark, and why. A miner that has
+            # never returned a record reads differently from one that is
+            # failing, and the two need different fixes.
+            "data_miners": self.data_miners.report(),
             "entity_registry": self.entity_registry.report(),
             # What following the wallets we watch has actually returned, at
             # fills we could have got. A watch list nobody has scored is a

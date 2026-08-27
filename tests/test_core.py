@@ -69,6 +69,12 @@ from src.collectors.adapters import (
 from src.collectors.event_source import (
     Event, EventSource, SourceClass, SourceMesh, SourceState,
 )
+from src.research.data_miners import (
+    DataMinerPool, Enriches, MinerSpec, RateLimited,
+)
+from src.research.solana_miners import (
+    holder_structure_miner, register_solana_miners, token_metadata_miner,
+)
 from src.research import telegram_authorize
 from src.strategies.ignition import (
     IgnitionModel, IgnitionReading, KolRole, NarrativeState, SourceTouch,
@@ -12650,6 +12656,354 @@ class TestTelegramNeverPromptsUnderSystemd(unittest.TestCase):
         self.assertIn("await self.client.connect()", block)
         self.assertNotIn("await self.client.start()", block)
         self.assertIn("is_user_authorized", block)
+
+
+class TestEachSourceMinesOnItsOwnClock(unittest.IsolatedAsyncioTestCase):
+    """A token list that changes hourly and a holder distribution that changes
+    every block do not belong on one clock."""
+
+    def _spec(self, **overrides):
+        args = dict(miner_id="m", enriches=Enriches.MARKET_CONTEXT,
+                    cadence_seconds=10.0, endpoint="https://example.test/x")
+        args.update(overrides)
+        return MinerSpec(**args)
+
+    def _pool(self, **overrides):
+        seen = []
+        pool = DataMinerPool(on_records=lambda name, rows: seen.append((name, rows)),
+                             **overrides)
+        pool.seen = seen
+        return pool
+
+    def _fetch(self, records=None, raises=None):
+        calls = []
+
+        async def fetch():
+            calls.append(time.time())
+            if raises is not None:
+                raise raises
+            return list(records or [{"mint": "m1", "value": 1}])
+
+        fetch.calls = calls
+        return fetch
+
+    async def test_a_miner_runs_when_its_cadence_comes_round_and_not_before(self):
+        pool = self._pool()
+        fetch = self._fetch()
+        pool.register(self._spec(cadence_seconds=100.0), fetch)
+        now = time.time() + 1_000
+        self.assertEqual(len(await pool.run_due(now)), 1)
+        # Immediately after, it is not due again.
+        self.assertEqual(await pool.run_due(now + 1), [])
+        self.assertEqual(len(await pool.run_due(now + 101)), 1)
+        self.assertEqual(len(fetch.calls), 2)
+
+    async def test_every_record_carries_where_it_came_from(self):
+        """A number whose origin cannot be recovered is one that cannot be
+        trusted later, and later is when a model is trained on it."""
+        pool = self._pool()
+        pool.register(self._spec(miner_id="market:x"), self._fetch())
+        result = (await pool.run_due(time.time() + 1_000))[0]
+        record = result.records[0]
+        self.assertEqual(record["_miner"], "market:x")
+        self.assertEqual(record["_enriches"], "market_context")
+        self.assertEqual(record["_endpoint"], "https://example.test/x")
+        self.assertGreater(record["_fetched_at"], 0)
+
+    async def test_a_rate_limit_backs_off_that_miner_alone(self):
+        """A pool that retries into a limit gets blocked and then reports
+        every source as dead."""
+        pool = self._pool()
+        pool.register(self._spec(miner_id="slow"),
+                      self._fetch(raises=RateLimited("too fast")))
+        healthy = self._fetch()
+        pool.register(self._spec(miner_id="fine"), healthy)
+        now = time.time() + 1_000
+        results = {item.miner_id: item for item in await pool.run_due(now)}
+        self.assertEqual(results["slow"].status, "RATE_LIMITED")
+        self.assertEqual(results["fine"].status, "OK")
+        # The limited one sits out; the healthy one keeps running.
+        later = {item.miner_id for item in await pool.run_due(now + 20)}
+        self.assertIn("fine", later)
+        self.assertNotIn("slow", later)
+
+    async def test_backoff_doubles_rather_than_retrying_at_the_same_rate(self):
+        """Deriving the next backoff from a deadline that has already passed
+        collapses it to the base every time, so a source that limits us
+        repeatedly is retried at a constant interval for ever."""
+        pool = self._pool()
+        pool.register(self._spec(miner_id="slow", cadence_seconds=1.0),
+                      self._fetch(raises=RateLimited("wait")))
+        now = time.time() + 1_000
+        widths = []
+        for _ in range(3):
+            await pool.run_due(now)
+            widths.append(pool._health["slow"].backoff_seconds)
+            now += widths[-1] + 1
+        self.assertEqual(widths, sorted(widths))
+        self.assertGreater(widths[-1], widths[0])
+        self.assertEqual(widths[1], widths[0] * 2)
+
+    async def test_a_pass_that_works_clears_the_penalty(self):
+        """Keeping it would punish a source for a limit it recovered from."""
+        pool = self._pool()
+        calls = {"n": 0}
+
+        async def flaky():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RateLimited("wait")
+            return [{"mint": "m"}]
+
+        pool.register(self._spec(miner_id="flaky", cadence_seconds=1.0), flaky)
+        now = time.time() + 1_000
+        await pool.run_due(now)
+        self.assertGreater(pool._health["flaky"].backoff_seconds, 0)
+        await pool.run_due(now + pool._health["flaky"].backoff_seconds + 1)
+        self.assertEqual(pool._health["flaky"].backoff_seconds, 0.0)
+        self.assertEqual(pool._health["flaky"].backoff_until, 0.0)
+
+    async def test_a_rate_limit_is_not_counted_as_a_failure(self):
+        """The miner is working and the source is asking us to wait."""
+        pool = self._pool()
+        pool.register(self._spec(), self._fetch(raises=RateLimited("wait")))
+        await pool.run_due(time.time() + 1_000)
+        health = pool._health["m"]
+        self.assertEqual(health.rate_limited, 1)
+        self.assertEqual(health.failures, 0)
+
+    async def test_a_failing_miner_does_not_stop_the_others(self):
+        pool = self._pool()
+        pool.register(self._spec(miner_id="broken"),
+                      self._fetch(raises=RuntimeError("boom")))
+        pool.register(self._spec(miner_id="fine"), self._fetch())
+        results = {item.miner_id: item.status
+                   for item in await pool.run_due(time.time() + 1_000)}
+        self.assertEqual(results["broken"], "DATA_BLOCKED")
+        self.assertEqual(results["fine"], "OK")
+
+    async def test_a_miner_needing_an_absent_key_is_declared_but_not_runnable(self):
+        """A miner that runs and fails every pass is noise; one absent for a
+        missing key is a coverage gap with a fix."""
+        pool = self._pool()
+        registered = pool.register(
+            self._spec(miner_id="paid", requires_env=("NOT_SET_ANYWHERE",)),
+            self._fetch())
+        self.assertFalse(registered)
+        report = pool.report()
+        self.assertIn("paid", report["awaiting_credentials"])
+        self.assertEqual(report["registered"], 1)
+        self.assertEqual(report["runnable"], 0)
+
+    async def test_a_flood_is_truncated_rather_than_passed_on(self):
+        """A source suddenly returning fifty thousand rows is backfilling or
+        broken, and handing all of them downstream is worse."""
+        pool = self._pool()
+        pool.register(self._spec(max_records=5),
+                      self._fetch(records=[{"mint": f"m{i}"} for i in range(500)]))
+        result = (await pool.run_due(time.time() + 1_000))[0]
+        self.assertEqual(len(result.records), 5)
+
+    async def test_the_consumer_sees_records_as_they_arrive(self):
+        pool = self._pool()
+        pool.register(self._spec(miner_id="chain:x"), self._fetch())
+        await pool.run_due(time.time() + 1_000)
+        self.assertEqual(pool.seen[0][0], "chain:x")
+        self.assertEqual(len(pool.seen[0][1]), 1)
+
+    async def test_a_consumer_that_raises_does_not_lose_the_pass(self):
+        def explode(name, rows):
+            raise ValueError("downstream is broken")
+
+        pool = DataMinerPool(on_records=explode)
+        pool.register(self._spec(), self._fetch())
+        result = (await pool.run_due(time.time() + 1_000))[0]
+        self.assertEqual(result.status, "OK")
+        self.assertEqual(pool._health["m"].passes, 1)
+
+    async def test_miners_are_staggered_rather_than_all_due_at_once(self):
+        """Forty miners firing in one tick is a thundering herd against forty
+        hosts and a latency spike on ours."""
+        pool = self._pool()
+        for index in range(8):
+            pool.register(self._spec(miner_id=f"m{index}", cadence_seconds=60.0),
+                          self._fetch())
+        self.assertGreater(len(set(pool._next_due.values())), 1)
+
+    async def test_the_report_separates_silent_from_failing(self):
+        """A wrong endpoint and a broken network need different fixes."""
+        pool = self._pool()
+        pool.register(self._spec(miner_id="broken"),
+                      self._fetch(raises=RuntimeError("boom")))
+        pool.register(self._spec(miner_id="fine"), self._fetch())
+        await pool.run_due(time.time() + 1_000)
+        report = pool.report()
+        self.assertEqual(report["status"], "OK")
+        self.assertEqual(report["producing"], 1)
+        self.assertEqual(report["failing"], 1)
+        self.assertEqual(report["total_records"], 1)
+
+    async def test_an_empty_pool_says_the_lake_is_fed_by_the_chain_alone(self):
+        report = DataMinerPool().report()
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertIn("chain stream alone", report["detail"])
+
+
+class TestSolanaMinersMeasureWhatPriceCannot(unittest.IsolatedAsyncioTestCase):
+    """Holder concentration is the most predictive non-price fact about a new
+    launch, and the one a price path cannot tell you."""
+
+    def _rpc(self, largest=None, supply=None, account=None):
+        async def request(method, params):
+            if method == "getTokenLargestAccounts":
+                return largest
+            if method == "getTokenSupply":
+                return supply
+            if method == "getAccountInfo":
+                return account
+            return None
+
+        return SimpleNamespace(request=request)
+
+    def test_holder_concentration_is_computed_from_the_real_top_holders(self):
+        rpc = self._rpc(
+            largest={"value": [{"amount": "500"}, {"amount": "200"},
+                               {"amount": "100"}, {"amount": "100"}]},
+            supply={"value": {"amount": "1000"}})
+        rows = asyncio.run(holder_structure_miner(rpc, lambda: ["mint"])())
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["top1_share"], 0.5)
+        self.assertAlmostEqual(rows[0]["top5_share"], 0.9)
+        self.assertGreater(rows[0]["concentration_hhi"], 0.0)
+
+    def test_an_undecodable_holder_list_yields_no_row_rather_than_a_safe_one(self):
+        """An unmeasured concentration is not a well-distributed one, and that
+        error runs in the expensive direction."""
+        rpc = self._rpc(largest={"value": []}, supply={"value": {"amount": "1000"}})
+        self.assertEqual(asyncio.run(holder_structure_miner(rpc, lambda: ["m"])()), [])
+
+    def test_zero_supply_yields_no_row_rather_than_a_division(self):
+        rpc = self._rpc(largest={"value": [{"amount": "5"}]},
+                        supply={"value": {"amount": "0"}})
+        self.assertEqual(asyncio.run(holder_structure_miner(rpc, lambda: ["m"])()), [])
+
+    def test_renounced_and_unlooked_authorities_never_read_alike(self):
+        rpc = self._rpc(account={"value": {"data": {"parsed": {
+            "type": "mint",
+            "info": {"decimals": 6, "supply": "1000",
+                     "mintAuthority": None, "freezeAuthority": "someone"}}}}})
+        row = asyncio.run(token_metadata_miner(rpc, lambda: ["m"])())[0]
+        self.assertTrue(row["mint_renounced"])
+        self.assertFalse(row["freeze_renounced"])
+        self.assertIsNone(row["mint_authority"])
+        # An account that is not a mint yields nothing at all.
+        other = self._rpc(account={"value": {"data": {"parsed": {"type": "account"}}}})
+        self.assertEqual(asyncio.run(token_metadata_miner(other, lambda: ["m"])()), [])
+
+    def test_only_watched_mints_are_mined_and_the_pass_is_bounded(self):
+        """Mining every mint on Solana is impossible and useless."""
+        seen = []
+
+        async def request(method, params):
+            seen.append(params[0])
+            return {"value": []}
+
+        rpc = SimpleNamespace(request=request)
+        asyncio.run(holder_structure_miner(
+            rpc, lambda: [f"m{i}" for i in range(100)], per_pass=4)())
+        self.assertEqual(len(set(seen)), 4)
+
+    def test_the_standard_set_covers_every_enrichment_it_claims(self):
+        pool = DataMinerPool()
+        registered = register_solana_miners(
+            pool, rpc=SimpleNamespace(request=None), http=SimpleNamespace(get=None),
+            watched_tokens=lambda: [])
+        self.assertTrue(all(registered.values()), registered)
+        covered = {spec.enriches for spec in pool._specs.values()}
+        for expected in (Enriches.HOLDER_STRUCTURE, Enriches.TOKEN_METADATA,
+                         Enriches.VENUE_LIQUIDITY, Enriches.MARKET_CONTEXT,
+                         Enriches.NARRATIVE):
+            self.assertIn(expected, covered)
+
+    def test_cadence_follows_what_is_measured_not_appetite(self):
+        pool = DataMinerPool()
+        register_solana_miners(pool, rpc=SimpleNamespace(), http=SimpleNamespace(),
+                               watched_tokens=lambda: [])
+        cadences = {miner_id: spec.cadence_seconds
+                    for miner_id, spec in pool._specs.items()}
+        # Holder structure moves every block; a routable token list moves over
+        # hours. Mining the list fast reads the same answer repeatedly while
+        # burning a public rate limit everything else here shares.
+        self.assertLess(cadences["chain:holder_structure"],
+                        cadences["market:jupiter_tokens"])
+        self.assertGreaterEqual(cadences["market:jupiter_tokens"], 3_600)
+
+
+class TestMinedFactsReachTheModelsThatUseThem(unittest.TestCase):
+    """A miner whose output nothing consumes is dead weight."""
+
+    def _desk(self):
+        hazard = []
+        observations = []
+        desk = SimpleNamespace(
+            _market_context={},
+            rug_hazard=SimpleNamespace(
+                record_observation=lambda token, obs: hazard.append((token, obs))),
+            dataset_builder=SimpleNamespace(
+                record_market_observation=lambda token, obs:
+                observations.append((token, obs))),
+            elogw_engine=SimpleNamespace(open_positions={"held": {}}),
+            _latest_curve_state={"watched": None},
+            _latest_pool_state={"migrated": None},
+        )
+        desk.hazard_calls = hazard
+        desk.observations = observations
+        return desk
+
+    def test_holder_concentration_reaches_the_hazard_model(self):
+        """A top holder at 40% of supply is a rug that has not happened yet."""
+        desk = self._desk()
+        MemecoinQuantDesk._ingest_mined_records(desk, "chain:holder_structure", [
+            {"mint": "m", "top1_share": 0.4, "top10_share": 0.8,
+             "concentration_hhi": 0.2, "_fetched_at": 100.0}])
+        self.assertEqual(len(desk.hazard_calls), 1)
+        token, observation = desk.hazard_calls[0]
+        self.assertEqual(token, "m")
+        self.assertEqual(observation["type"], "holder_structure")
+        self.assertEqual(observation["top1_share"], 0.4)
+
+    def test_authority_reaches_the_hazard_model_too(self):
+        desk = self._desk()
+        MemecoinQuantDesk._ingest_mined_records(desk, "chain:mint_authority", [
+            {"mint": "m", "mint_renounced": False, "freeze_renounced": True,
+             "_fetched_at": 100.0}])
+        kinds = {observation["type"] for _token, observation in desk.hazard_calls}
+        self.assertIn("authority", kinds)
+
+    def test_every_mined_fact_lands_in_the_lake_as_an_observation(self):
+        """A mined fact is something we were told at a time, which is what
+        keeps it usable for training later."""
+        desk = self._desk()
+        MemecoinQuantDesk._ingest_mined_records(desk, "market:dexscreener_pairs", [
+            {"mint": "m", "liquidity_usd": 5_000, "_fetched_at": 100.0}])
+        token, observation = desk.observations[0]
+        self.assertEqual(token, "m")
+        self.assertEqual(observation["measurement"], "market:dexscreener_pairs")
+        self.assertEqual(observation["timestamp"], 100.0)
+
+    def test_a_market_wide_row_belongs_to_every_episode_not_to_one(self):
+        desk = self._desk()
+        MemecoinQuantDesk._ingest_mined_records(desk, "market:context", [
+            {"sol_usd": 150.0, "btc_dominance": 55.0, "_fetched_at": 100.0}])
+        self.assertEqual(desk._market_context["sol_usd"], 150.0)
+        self.assertEqual(desk.observations, [])
+
+    def test_open_positions_are_mined_before_anything_else(self):
+        """A miner pass spent elsewhere is a pass not spent here."""
+        desk = self._desk()
+        ordered = MemecoinQuantDesk._mineable_tokens(desk)
+        self.assertEqual(ordered[0], "held")
+        self.assertEqual(set(ordered), {"held", "watched", "migrated"})
 
 class TestPumpSwapConstruction(unittest.TestCase):
     """The last DATA_BLOCKED that was never about missing information.
