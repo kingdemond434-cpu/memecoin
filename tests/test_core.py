@@ -16640,3 +16640,69 @@ class TestStreamingMeansDelivering(unittest.TestCase):
         client.status = "CONNECTED"
         client._opened_at = time.time() - 300
         self.assertEqual(client.get_status()["status"], "DATA_BLOCKED")
+
+
+class TestResponsesRouteByWhatIsActuallySet(unittest.IsolatedAsyncioTestCase):
+    """An unset protobuf submessage is still a truthy object."""
+
+    def _client(self):
+        from src.chains.yellowstone_grpc import YellowstoneClient
+        return YellowstoneClient("https://example.invalid", "token")
+
+    class _Update:
+        """Mimics a protobuf oneof: every field readable, one actually set."""
+
+        def __init__(self, which):
+            self._which = which
+            for name in ("account", "transaction", "slot", "block"):
+                # Truthy objects regardless of being set -- the exact trap.
+                setattr(self, name, SimpleNamespace(payload=name))
+
+        def WhichOneof(self, name):
+            return self._which if name == "update_oneof" else None
+
+    async def test_a_transaction_is_not_filed_as_an_account(self):
+        client = self._client()
+        seen = []
+        client.on("transaction", lambda data: seen.append(data))
+        await client._handle_response(self._Update("transaction"))
+        self.assertEqual(client.dispatched.get("transaction"), 1)
+        self.assertIsNone(client.dispatched.get("account"))
+        self.assertEqual(len(seen), 1)
+
+    async def test_an_account_update_still_routes_to_account(self):
+        client = self._client()
+        await client._handle_response(self._Update("account"))
+        self.assertEqual(client.dispatched.get("account"), 1)
+        self.assertIsNone(client.dispatched.get("transaction"))
+
+    async def test_it_falls_back_to_hasfield_not_to_truthiness(self):
+        class NoOneof:
+            def __init__(self):
+                for name in ("account", "transaction", "slot"):
+                    setattr(self, name, SimpleNamespace(payload=name))
+
+            def WhichOneof(self, _name):
+                raise AttributeError("no oneof on this revision")
+
+            def HasField(self, name):
+                return name == "transaction"
+
+        client = self._client()
+        await client._handle_response(NoOneof())
+        self.assertEqual(client.dispatched.get("transaction"), 1)
+        self.assertIsNone(client.dispatched.get("account"))
+
+    async def test_an_unroutable_update_is_counted_rather_than_guessed(self):
+        client = self._client()
+        await client._handle_response(self._Update(None))
+        self.assertEqual(client.dispatched.get("unroutable"), 1)
+
+    def test_the_router_never_decides_by_truthiness_again(self):
+        source = inspect.getsource(
+            __import__("src.chains.yellowstone_grpc",
+                       fromlist=["x"]).YellowstoneClient._handle_response)
+        self.assertIn("WhichOneof", source)
+        # The bug was `data = getattr(...)` followed by `if data:` picking the
+        # first name in a list. Routing must not depend on a field's value.
+        self.assertNotIn("if data:", source)

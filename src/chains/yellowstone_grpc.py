@@ -233,12 +233,45 @@ class YellowstoneClient:
                 target.account_required.extend(tx_filter.accounts_required)
         return grpc_request
 
+    #: The oneof carrying the payload in Geyser's SubscribeUpdate. Named so a
+    #: proto revision that renames it fails loudly here rather than silently
+    #: routing everything to the first field again.
+    UPDATE_ONEOF = "update_oneof"
+
     async def _handle_response(self, response: Any):
-        for event_type in ("account", "transaction", "block", "block_meta", "slot", "entry", "ping"):
-            data = getattr(response, event_type, None)
-            if data:
-                await self._dispatch(event_type, data)
-                return
+        """Route one update by which field is ACTUALLY set.
+
+        This used to iterate the field names and take the first whose value
+        was truthy. An unset protobuf submessage is still an object, and
+        protobuf messages define no __bool__, so every field was truthy and
+        every response -- transactions included -- was dispatched as the first
+        name in the list. The stream delivered a thousand updates an hour,
+        every one was filed as an account update nobody consumes, and the
+        launch census stayed empty behind a green status.
+
+        WhichOneof is the only reliable answer to "which field is set".
+        """
+        field = None
+        try:
+            field = response.WhichOneof(self.UPDATE_ONEOF)
+        except (AttributeError, ValueError):
+            # Not a oneof on this proto revision. Fall back to HasField, which
+            # is still correct, rather than to truthiness, which is not.
+            for name in ("transaction", "account", "block", "block_meta",
+                         "slot", "entry", "ping"):
+                try:
+                    if response.HasField(name):
+                        field = name
+                        break
+                except (AttributeError, ValueError):
+                    continue
+        if not field:
+            self.dispatched["unroutable"] = self.dispatched.get("unroutable", 0) + 1
+            return
+        data = getattr(response, field, None)
+        if data is None:
+            return
+        await self._dispatch(field, data)
 
     async def _dispatch(self, event_type: str, data: Any):
         self.dispatched[event_type] = self.dispatched.get(event_type, 0) + 1
