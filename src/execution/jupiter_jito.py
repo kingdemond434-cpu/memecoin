@@ -22,6 +22,7 @@ from solders.instruction import AccountMeta as SoldersAccountMeta, Instruction
 from solders.keypair import Keypair
 from solders.message import MessageV0, to_bytes_versioned
 from solders.pubkey import Pubkey
+from solders.signature import Signature
 from solders.transaction import VersionedTransaction
 
 from src.chains.pump_curve import quote_buy, quote_sell
@@ -484,11 +485,27 @@ class JitoClient:
 
 
 class SolanaTransactionBuilder:
-    def __init__(self, rpc: RPCManager, keypair: Keypair,
+    """Builds transactions. Does NOT hold the key.
+
+    Signing goes through a signer object, which is either an isolated process
+    over a socket or -- when none is configured -- an explicit LocalSigner
+    that says so in its report. The builder itself no longer keeps a Keypair,
+    so there is no code path here that can sign without going through whatever
+    policy the signer enforces.
+    """
+
+    def __init__(self, rpc: RPCManager, signer: Any,
                  blockhash_cache: Optional[BlockhashCache] = None):
+        from src.execution.signer import LocalSigner
+
+        # A bare Keypair is wrapped rather than rejected: every existing caller
+        # keeps working, and the wrapping is what makes "the key is in this
+        # process" a reported state instead of the silent default.
+        if hasattr(signer, "pubkey") and not hasattr(signer, "sign_message_async"):
+            signer = signer if hasattr(signer, "report") else LocalSigner(signer)
         self.rpc = rpc
-        self.keypair = keypair
-        self.public_key = str(keypair.pubkey())
+        self.signer = signer
+        self.public_key = getattr(signer, "public_key", "")
         # Continuously refreshed in the background. Fetching per transaction
         # put an RPC round trip inside the window the system exists to win,
         # and did it after the decision while the opportunity aged.
@@ -516,7 +533,7 @@ class SolanaTransactionBuilder:
         and paying for headroom is cheaper than losing the fill.
         """
         blockhash = await self._recent_blockhash()
-        payer = self.keypair.pubkey()
+        payer = Pubkey.from_string(self.public_key)
         program_instructions: List[Instruction] = []
         if compute_unit_limit > 0:
             program_instructions.append(set_compute_unit_limit(int(compute_unit_limit)))
@@ -525,7 +542,12 @@ class SolanaTransactionBuilder:
                 set_compute_unit_price(int(compute_unit_price_micro_lamports)))
         program_instructions.extend(instructions)
         message = MessageV0.try_compile(payer, program_instructions, [], blockhash)
-        signed = VersionedTransaction(message, [self.keypair])
+        # Signed by the signer, which may refuse. A refusal propagates: an
+        # unsigned transaction continuing as though it were signed is the
+        # failure the whole isolation exists to prevent, and a local fallback
+        # here would quietly undo it.
+        signature = await self.signer.sign_message(bytes(to_bytes_versioned(message)))
+        signed = VersionedTransaction.populate(message, [Signature.from_bytes(signature)])
         return base64.b64encode(bytes(signed)).decode("ascii")
 
     async def _recent_blockhash(self) -> Hash:
@@ -559,18 +581,25 @@ class SolanaTransactionBuilder:
                 "synchronous_fallbacks": self.blockhash_fallbacks,
                 "last_status": self.last_blockhash_status}
 
-    def sign_versioned_transaction(self, versioned_tx_bytes: bytes) -> str:
+    async def sign_versioned_transaction(self, versioned_tx_bytes: bytes) -> str:
+        """Sign somebody else's bytes -- a Jupiter route we did not compose.
+
+        Async because the signer may be another process. This is the riskier
+        of the two paths by construction: the message was built elsewhere, so
+        the signer's own decoding and policy check is not a formality here.
+        """
         tx = VersionedTransaction.from_bytes(versioned_tx_bytes)
         required = tx.message.header.num_required_signatures
         signer_keys = list(tx.message.account_keys[:required])
         try:
-            signer_index = signer_keys.index(self.keypair.pubkey())
+            signer_index = signer_keys.index(Pubkey.from_string(self.public_key))
         except ValueError as exc:
             raise ValueError("wallet is not a required signer of the Jupiter transaction") from exc
         signatures = list(tx.signatures)
         if len(signatures) != required:
             raise ValueError("malformed VersionedTransaction signature vector")
-        signatures[signer_index] = self.keypair.sign_message(to_bytes_versioned(tx.message))
+        raw = await self.signer.sign_message(bytes(to_bytes_versioned(tx.message)))
+        signatures[signer_index] = Signature.from_bytes(raw)
         signed = VersionedTransaction.populate(tx.message, signatures)
         if not signed.verify_with_results()[signer_index]:
             raise ValueError("VersionedTransaction signature verification failed")
@@ -1004,7 +1033,8 @@ class ExecutionEngine:
         if not swap_tx:
             return ExecutionResult(False, TransactionStatus.REJECTED, error="transaction build failed")
         try:
-            signed_tx = self.tx_builder.sign_versioned_transaction(base64.b64decode(swap_tx.transaction))
+            signed_tx = await self.tx_builder.sign_versioned_transaction(
+                base64.b64decode(swap_tx.transaction))
         except (ValueError, TypeError) as exc:
             return ExecutionResult(False, TransactionStatus.REJECTED, error=f"signing failed: {exc}")
 

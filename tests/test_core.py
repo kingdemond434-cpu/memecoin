@@ -91,6 +91,7 @@ from src.research.launch_census import (
     LaunchCensus, LaunchRecord, MONSTER_MULTIPLE, Stage as CensusStage,
 )
 from src.research import rug_mechanism
+from src.runtime.memory_governor import Band, MemoryGovernor, Relief
 from src.research.fallback import (
     FallbackResolver, FactLadder, Resolution, Rung, Source,
 )
@@ -2329,7 +2330,8 @@ class TestExecution(unittest.IsolatedAsyncioTestCase):
         keypair = Keypair()
         message = MessageV0.try_compile(keypair.pubkey(), [], [], Hash.default())
         unsigned = VersionedTransaction.populate(message, [Signature.default()])
-        encoded = SolanaTransactionBuilder(FakeRpc(), keypair).sign_versioned_transaction(bytes(unsigned))
+        encoded = await SolanaTransactionBuilder(
+            FakeRpc(), keypair).sign_versioned_transaction(bytes(unsigned))
         signed = VersionedTransaction.from_bytes(base64.b64decode(encoded))
         self.assertTrue(signed.verify_with_results()[0])
 
@@ -15994,3 +15996,255 @@ class TestGradedScreensReachTheActualDecision(unittest.TestCase):
         # It reached a decision; recording it as screened-out would corrupt
         # the missed-monster attribution.
         self.assertEqual(screen.census_reason, "")
+
+
+class TestTheBuilderNoLongerHoldsTheKey(unittest.IsolatedAsyncioTestCase):
+    """Isolation that can be bypassed is a diagram, not a boundary."""
+
+    def test_the_builder_keeps_no_keypair_at_all(self):
+        from solders.keypair import Keypair as KP
+        builder = SolanaTransactionBuilder(None, KP())
+        self.assertFalse(hasattr(builder, "keypair"),
+                         "the builder still holds a private key")
+
+    def test_a_bare_keypair_is_wrapped_and_reports_itself_as_unisolated(self):
+        from solders.keypair import Keypair as KP
+        from src.execution.signer import LocalSigner
+        keypair = KP()
+        builder = SolanaTransactionBuilder(None, keypair)
+        self.assertIsInstance(builder.signer, LocalSigner)
+        self.assertFalse(builder.signer.isolated)
+        report = builder.signer.report()
+        self.assertEqual(report["mode"], "local")
+        self.assertIn("held in the trading process", report["detail"])
+        self.assertEqual(builder.public_key, str(keypair.pubkey()))
+
+    def test_an_isolated_signer_is_used_as_given(self):
+        from src.execution.signer import SignerClient
+        client = SignerClient(Path("/tmp/nonexistent.sock"))
+        client._public_key = "11111111111111111111111111111111"
+        builder = SolanaTransactionBuilder(None, client)
+        self.assertIs(builder.signer, client)
+        self.assertTrue(client.isolated)
+
+    def test_the_env_chooses_isolation_and_never_falls_back(self):
+        from solders.keypair import Keypair as KP
+        from src.execution.signer import LocalSigner, SignerClient, signer_from_env
+        keypair = KP()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MEMECOIN_SIGNER_SOCKET", None)
+            self.assertIsInstance(signer_from_env(keypair), LocalSigner)
+        with mock.patch.dict(os.environ,
+                             {"MEMECOIN_SIGNER_SOCKET": "/run/signer.sock"}):
+            chosen = signer_from_env(keypair)
+        self.assertIsInstance(chosen, SignerClient)
+        # No code path returns to the local key once isolation is configured.
+        source = inspect.getsource(signer_from_env)
+        self.assertIn("no runtime fallback", source)
+
+    async def test_a_refusal_stops_the_transaction_rather_than_falling_back(self):
+        from solders.keypair import Keypair as KP
+        keypair = KP()
+
+        class Refusing:
+            isolated = True
+            public_key = str(keypair.pubkey())
+            async def sign_message(self, message_bytes):
+                raise PermissionError("signer refused: policy")
+            def report(self):
+                return {}
+
+        message = MessageV0.try_compile(keypair.pubkey(), [], [], Hash.default())
+        unsigned = VersionedTransaction.populate(message, [Signature.default()])
+        builder = SolanaTransactionBuilder(FakeRpc(), Refusing())
+        # The refusal propagates. It must never be caught and retried with a
+        # local key, which would silently undo the isolation.
+        with self.assertRaises(PermissionError):
+            await builder.sign_versioned_transaction(bytes(unsigned))
+
+    async def test_both_signing_paths_go_through_the_signer(self):
+        """Neither path may reach a key directly."""
+        for name in ("build_and_sign", "sign_versioned_transaction"):
+            source = inspect.getsource(getattr(SolanaTransactionBuilder, name))
+            self.assertIn("self.signer.sign_message", source, name)
+            self.assertNotIn("self.keypair", source, name)
+
+    async def test_a_locally_signed_transaction_still_verifies(self):
+        from solders.keypair import Keypair as KP
+        keypair = KP()
+        cache = SimpleNamespace(
+            current=lambda: SimpleNamespace(ok=True, status="OK",
+                                            blockhash=str(Hash.default()),
+                                            detail=""),
+            report=lambda: {})
+        builder = SolanaTransactionBuilder(FakeRpc(), keypair,
+                                           blockhash_cache=cache)
+        encoded = await builder.build_and_sign([])
+        signed = VersionedTransaction.from_bytes(base64.b64decode(encoded))
+        self.assertTrue(signed.verify_with_results()[0])
+        self.assertEqual(builder.signer.signed, 1)
+
+
+class TestTheDeskShedsContextBeforeTheKernelShedsIt(unittest.TestCase):
+    """It was OOM-killed once already, taking twelve hours of evidence."""
+
+    def _gov(self, rss, ceiling=1000, **kw):
+        box = {"rss": rss}
+        kw.setdefault("dwell_s", 0.0)
+        gov = MemoryGovernor(ceiling_bytes=ceiling,
+                             read_rss=lambda: box["rss"], **kw)
+        gov._box = box
+        return gov
+
+    def test_an_unreadable_footprint_disables_it_rather_than_assuming_calm(self):
+        gov = MemoryGovernor(ceiling_bytes=1000, read_rss=lambda: None)
+        self.assertIs(gov.observe(), Band.UNMEASURED)
+        report = gov.report()
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertIn("disabled rather than assuming", report["detail"])
+
+    def test_it_trims_then_sheds_as_the_footprint_climbs(self):
+        gov = self._gov(500)
+        self.assertIs(gov.observe(), Band.CALM)
+        gov._box["rss"] = 750
+        self.assertIs(gov.observe(), Band.TRIM)
+        gov._box["rss"] = 900
+        self.assertIs(gov.observe(), Band.SHED)
+
+    def test_reliefs_fire_in_the_right_band(self):
+        gov = self._gov(500)
+        calls = []
+        gov.register(Relief(name="cache",
+                            trim=lambda: calls.append("trim"),
+                            shed=lambda: calls.append("shed"),
+                            restore=lambda: calls.append("restore")))
+        gov._box["rss"] = 750; gov.observe()
+        self.assertEqual(calls, ["trim"])
+        gov._box["rss"] = 900; gov.observe()
+        # Shedding does everything trimming does, plus more.
+        self.assertEqual(calls, ["trim", "trim", "shed"])
+        gov._box["rss"] = 100
+        # De-escalation takes two observations even at zero dwell: the first
+        # nominates the calmer band, the second confirms it. Coming down on a
+        # single reading would restore the caches that caused the pressure and
+        # oscillate straight back.
+        gov.observe()
+        self.assertEqual(calls[-1], "shed", "restored on a single reading")
+        gov.observe()
+        self.assertEqual(calls[-1], "restore")
+
+    def test_escalation_is_immediate_and_recovery_must_dwell(self):
+        gov = self._gov(500, dwell_s=30.0)
+        gov._box["rss"] = 900
+        # Straight to SHED with no waiting: a spike that kills the process
+        # does not observe a dwell time.
+        self.assertIs(gov.observe(now=100.0), Band.SHED)
+        gov._box["rss"] = 100
+        self.assertIs(gov.observe(now=101.0), Band.SHED)
+        self.assertIs(gov.observe(now=140.0), Band.CALM)
+
+    def test_a_relief_that_throws_cannot_kill_the_desk_it_protects(self):
+        gov = self._gov(500)
+        gov.register(Relief(name="broken",
+                            trim=lambda: (_ for _ in ()).throw(RuntimeError("x"))))
+        gov.register(Relief(name="works", trim=lambda: gov.history.append({"ok": 1})))
+        gov._box["rss"] = 750
+        self.assertIs(gov.observe(), Band.TRIM)
+
+    def test_the_registered_reliefs_never_touch_the_decision_path(self):
+        """A desk under pressure gets quieter, never dumber."""
+        source = inspect.getsource(MemecoinQuantDesk._register_memory_reliefs)
+        for forbidden in ("predictor", "elogw_engine.size", "rug_hazard",
+                          "action_value", "champion_challenger"):
+            self.assertNotIn(forbidden, source,
+                             f"a relief reaches into {forbidden}")
+
+    def test_the_health_loop_polls_it_more_often_than_it_logs(self):
+        source = inspect.getsource(MemecoinQuantDesk._health_loop)
+        self.assertIn("self.memory.observe()", source)
+
+
+class TestEveryStatedProbabilityGetsScored(unittest.TestCase):
+    """Without a feed the calibration harness is inert."""
+
+    def _desk(self, dry_run=True):
+        desk = SimpleNamespace(
+            calibration=CalibrationBook(min_samples=1), dry_run=dry_run)
+        desk._record_calibration = types.MethodType(
+            MemecoinQuantDesk._record_calibration, desk)
+        return desk
+
+    def test_rug_probabilities_are_scored_at_every_stated_horizon(self):
+        desk = self._desk()
+        desk._record_calibration({
+            "timestamp": 5.0, "rugged": True,
+            "stated_probabilities": {"p_rug_30s": 0.2, "p_rug_5m": 0.4}})
+        self.assertIn("rug_30s", desk.calibration.models)
+        self.assertIn("rug_5m", desk.calibration.models)
+        self.assertEqual(desk.calibration.models["rug_30s"].count, 1)
+
+    def test_a_probability_the_desk_never_stated_is_not_invented(self):
+        desk = self._desk()
+        desk._record_calibration({"rugged": True, "stated_probabilities": {}})
+        # Scoring an unconsulted model against a default would manufacture
+        # calibration evidence out of the model's absence.
+        self.assertEqual(desk.calibration.models, {})
+
+    def test_an_unresolved_outcome_scores_nothing(self):
+        desk = self._desk()
+        desk._record_calibration({
+            "rugged": None, "stated_probabilities": {"p_rug_30s": 0.2}})
+        self.assertEqual(desk.calibration.models, {})
+
+    def test_monster_probability_is_scored_against_the_shared_threshold(self):
+        desk = self._desk()
+        desk._record_calibration({
+            "max_feasible_multiple": 12.0,
+            "stated_probabilities": {"p_monster": 0.1}})
+        book = desk.calibration.models["monster_p"]
+        self.assertEqual(book.count, 1)
+        # 12x cleared the 10x threshold, so the event occurred.
+        self.assertEqual(book.bins[1].observed_sum, 1.0)
+
+    def test_the_monster_threshold_has_exactly_one_definition(self):
+        from src.main import rug_mechanism_monster_threshold
+        from src.research.launch_census import MONSTER_MULTIPLE
+        self.assertEqual(rug_mechanism_monster_threshold(), MONSTER_MULTIPLE)
+
+    def test_landing_is_only_scoreable_on_an_actual_attempt(self):
+        desk = self._desk()
+        desk._record_calibration({
+            "attempted": False, "entered": False,
+            "stated_probabilities": {"p_land": 0.8}})
+        self.assertNotIn("landing_p", desk.calibration.models)
+        desk._record_calibration({
+            "attempted": True, "entered": True,
+            "stated_probabilities": {"p_land": 0.8}})
+        self.assertEqual(desk.calibration.models["landing_p"].count, 1)
+
+    def test_a_paper_fill_is_never_stamped_as_a_real_one(self):
+        desk = self._desk(dry_run=True)
+        desk._record_calibration({
+            "entered": True, "rugged": False,
+            "stated_probabilities": {"p_rug_30s": 0.1}})
+        self.assertEqual(desk.calibration.models["rug_30s"].by_provenance,
+                         {"shadow": 1})
+
+    def test_a_real_fill_is_stamped_as_one(self):
+        desk = self._desk(dry_run=False)
+        desk._record_calibration({
+            "entered": True, "rugged": False,
+            "stated_probabilities": {"p_rug_30s": 0.1}})
+        self.assertEqual(desk.calibration.models["rug_30s"].by_provenance,
+                         {"forward_real": 1})
+
+    def test_escape_is_scored_only_when_an_escape_was_attempted(self):
+        desk = self._desk()
+        desk._record_calibration({
+            "escape_attempted": True, "escaped": False,
+            "stated_probabilities": {"p_escape": 0.6}})
+        self.assertEqual(desk.calibration.models["escape_p"].count, 1)
+
+    def test_the_outcome_path_actually_calls_it(self):
+        source = inspect.getsource(MemecoinQuantDesk._record_ops_event)
+        self.assertIn("self._record_calibration(payload)", source)

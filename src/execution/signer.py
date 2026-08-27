@@ -344,16 +344,21 @@ class SignerServer:
 class SignerClient:
     """What the desk holds instead of a key.
 
+    ``isolated`` is True: the key is in another process.
+
     Shaped like the part of a Keypair the desk actually uses, so the execution
     path does not need to know whether it is talking to a local key or to an
     isolated signer -- which is what makes adopting this a configuration
     change rather than a rewrite of the hot path.
     """
 
+    isolated = True
+
     def __init__(self, socket_path: Path, *, timeout_s: float = 2.0):
         self.socket_path = Path(socket_path)
         self.timeout_s = float(timeout_s)
         self._public_key: Optional[str] = None
+        self.signed = 0
         self.refusals = 0
         self.last_refusal = ""
 
@@ -395,4 +400,70 @@ class SignerClient:
             self.refusals += 1
             self.last_refusal = reason
             raise PermissionError(f"signer refused: {reason}")
+        self.signed += 1
         return base64.b64decode(response["signature"])
+
+    def report(self) -> Dict[str, Any]:
+        return {
+            "schema": SIGNER_SCHEMA_VERSION,
+            "mode": "isolated",
+            "isolated": True,
+            "public_key": self._public_key or "not yet resolved",
+            "socket": str(self.socket_path),
+            "signed": self.signed,
+            "refused": self.refusals,
+            "last_refusal": self.last_refusal,
+            "detail": "",
+        }
+
+
+class LocalSigner:
+    """The key in this process. What the desk used to do everywhere.
+
+    Kept as an explicit, named class rather than as a bare Keypair so that
+    "the key is in the trading process" is a visible configuration state that
+    reports itself, instead of the silent default it used to be. A desk
+    running this in live mode is a desk taking a risk it should have chosen
+    deliberately.
+    """
+
+    isolated = False
+
+    def __init__(self, keypair: Any):
+        self._keypair = keypair
+        self.public_key = str(keypair.pubkey())
+        self.signed = 0
+        self.refused = 0
+        self.last_refusal = ""
+
+    async def sign_message(self, message_bytes: bytes) -> bytes:
+        self.signed += 1
+        return bytes(self._keypair.sign_message(bytes(message_bytes)))
+
+    def report(self) -> Dict[str, Any]:
+        return {
+            "schema": SIGNER_SCHEMA_VERSION,
+            "mode": "local",
+            "isolated": False,
+            "public_key": self.public_key,
+            "signed": self.signed,
+            "refused": 0,
+            "detail": ("the private key is held in the trading process; an "
+                       "isolated signer is not configured"),
+        }
+
+
+def signer_from_env(keypair: Any, socket_path: Optional[Path] = None
+                    ) -> Any:
+    """A SignerClient when a socket is configured, otherwise a LocalSigner.
+
+    The choice is made once, at startup, and reported. There is deliberately
+    no runtime fallback from the isolated signer to the local one: a fallback
+    would mean a compromised or misconfigured signer silently returns the
+    desk to holding its own key, which is precisely the state isolation
+    exists to leave.
+    """
+    configured = socket_path or os.getenv("MEMECOIN_SIGNER_SOCKET", "").strip()
+    if configured:
+        return SignerClient(Path(configured))
+    return LocalSigner(keypair)

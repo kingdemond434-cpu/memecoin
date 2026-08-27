@@ -451,3 +451,166 @@ sources:
     degraded_after_seconds: 86400
     dead_after_seconds: 604800
     options: {url: "https://ec.europa.eu/commission/presscorner/api/rss?language=en"}
+
+  # ---- Asian crypto-native media -------------------------------------------
+  # The chain says WHAT happened. These often say WHO noticed first and WHY it
+  # started -- and they say it in a language most Western snipers do not read,
+  # which is the whole point. Every one is a public RSS feed needing no
+  # account. Cadence is set by how fast each actually publishes: a daily
+  # polled every minute is a block waiting to happen.
+  - id: rss:cn-odaily
+    kind: rss
+    tier: 1
+    language: zh
+    region: cn
+    poll_interval_seconds: 120
+    degraded_after_seconds: 7200
+    dead_after_seconds: 172800
+    options: {url: "https://www.odaily.news/feed", language: zh}
+  - id: rss:cn-panews
+    kind: rss
+    tier: 1
+    language: zh
+    region: cn
+    poll_interval_seconds: 120
+    degraded_after_seconds: 7200
+    dead_after_seconds: 172800
+    options: {url: "https://www.panewslab.com/zh/rss", language: zh}
+  - id: rss:cn-techflow
+    kind: rss
+    tier: 2
+    language: zh
+    region: cn
+    poll_interval_seconds: 300
+    degraded_after_seconds: 21600
+    dead_after_seconds: 259200
+    options: {url: "https://www.techflowpost.com/rss.xml", language: zh}
+  - id: rss:cn-chaincatcher
+    kind: rss
+    tier: 2
+    language: zh
+    region: cn
+    poll_interval_seconds: 300
+    degraded_after_seconds: 21600
+    dead_after_seconds: 259200
+    options: {url: "https://www.chaincatcher.com/rss.xml", language: zh}
+  - id: rss:jp-coinpost
+    kind: rss
+    tier: 1
+    language: ja
+    region: jp
+    poll_interval_seconds: 180
+    degraded_after_seconds: 21600
+    dead_after_seconds: 259200
+    options: {url: "https://coinpost.jp/?feed=rss2", language: ja}
+  - id: rss:jp-cointelegraph
+    kind: rss
+    tier: 2
+    language: ja
+    region: jp
+    poll_interval_seconds: 300
+    degraded_after_seconds: 21600
+    dead_after_seconds: 259200
+    options: {url: "https://jp.cointelegraph.com/rss", language: ja}
+  - id: rss:kr-blockmedia
+    kind: rss
+    tier: 2
+    language: ko
+    region: kr
+    poll_interval_seconds: 300
+    degraded_after_seconds: 21600
+    dead_after_seconds: 259200
+    options: {url: "https://www.blockmedia.co.kr/feed", language: ko}
+  - id: rss:kr-tokenpost
+    kind: rss
+    tier: 2
+    language: ko
+    region: kr
+    poll_interval_seconds: 300
+    degraded_after_seconds: 21600
+    dead_after_seconds: 259200
+    options: {url: "https://www.tokenpost.kr/rss", language: ko}
+
+  # ---- crypto-native, other regions ----------------------------------------
+  - id: rss:tr-koinbulteni
+    kind: rss
+    tier: 3
+    language: tr
+    region: tr
+    poll_interval_seconds: 600
+    degraded_after_seconds: 43200
+    dead_after_seconds: 259200
+    options: {url: "https://koinbulteni.com/feed", language: tr}
+  - id: rss:ru-forklog
+    kind: rss
+    tier: 3
+    language: ru
+    region: ru
+    poll_interval_seconds: 600
+    degraded_after_seconds: 43200
+    dead_after_seconds: 259200
+    options: {url: "https://forklog.com/feed", language: ru}
+  - id: rss:br-livecoins
+    kind: rss
+    tier: 3
+    language: pt
+    region: br
+    poll_interval_seconds: 600
+    degraded_after_seconds: 43200
+    dead_after_seconds: 259200
+    options: {url: "https://livecoins.com.br/feed", language: pt}
+  - id: rss:es-criptonoticias
+    kind: rss
+    tier: 3
+    language: es
+    region: latam
+    poll_interval_seconds: 600
+    degraded_after_seconds: 43200
+    dead_after_seconds: 259200
+    options: {url: "https://www.criptonoticias.com/feed", language: es}
+  - id: rss:in-cryptobriefing
+    kind: rss
+    tier: 3
+    language: en
+    region: in
+    poll_interval_seconds: 600
+    degraded_after_seconds: 43200
+    dead_after_seconds: 259200
+    options: {url: "https://cryptobriefing.com/feed", language: en}
+
+  # ---- coverage targets: named, unverified, deliberately endpoint-less -----
+  # These are regions and ecosystems worth reading whose public feed this
+  # operator has not yet confirmed. Each carries its real kind and NO endpoint,
+  # which is how the registry already reports a coverage gap by name. A guessed URL here would report DEAD, an operator
+  # would assume a missing key, and the coverage number would stay wrong in
+  # the flattering direction -- which is the one direction that matters.
+  - id: pending:kr-public-telegram
+    kind: telegram
+    tier: 1
+    language: ko
+    region: kr
+  - id: pending:cn-public-telegram
+    kind: telegram
+    tier: 1
+    language: zh
+    region: cn
+  - id: pending:vn-crypto-media
+    kind: rss
+    tier: 3
+    language: vi
+    region: vn
+  - id: pending:id-crypto-media
+    kind: rss
+    tier: 3
+    language: id
+    region: id
+  - id: pending:ar-crypto-media
+    kind: rss
+    tier: 3
+    language: ar
+    region: mena
+  - id: pending:jp-public-youtube
+    kind: youtube
+    tier: 2
+    language: ja
+    region: jp

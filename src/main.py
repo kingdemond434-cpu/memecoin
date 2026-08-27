@@ -46,9 +46,22 @@ from src.research.feature_engine import build_features
 from src.research.global_research_miner import GlobalResearchMiner
 from src.research.calibration import CalibrationBook
 from src.research.chain_miners import register_chain_miners
+from src.research.calibration import Provenance
 from src.research.fallback import FallbackResolver, Rung, Source
+from src.runtime.memory_governor import Band, MemoryGovernor, Relief
 from src.research.launch_census import LaunchCensus
 from src.research import rug_mechanism
+from src.research.launch_census import MONSTER_MULTIPLE
+
+
+def rug_mechanism_monster_threshold() -> float:
+    """One definition of "monster", shared by the census and calibration.
+
+    Two thresholds that drift apart would make "missed monster" and
+    "monster probability" answer subtly different questions, and nothing
+    would look wrong.
+    """
+    return MONSTER_MULTIPLE
 from src.strategies.screen_policy import (
     ScreenPolicy, ScreenReading, Verdict as ScreenVerdict, graded, veto,
 )
@@ -266,6 +279,14 @@ class MemecoinQuantDesk:
         # answer, never a forgotten guess.
         self.facts = FallbackResolver()
         self._last_screen: Dict[str, Any] = {}
+        # Shed context before the kernel sheds the process. This desk was
+        # OOM-killed once already, twelve hours in, taking the accumulated
+        # evidence with it -- the worst failure available to a system whose
+        # only real bottleneck is evidence, because it deletes rather than
+        # degrades.
+        self.memory = MemoryGovernor(
+            soft_fraction=float(self.global_config.get("memory_soft_fraction", 0.70)),
+            hard_fraction=float(self.global_config.get("memory_hard_fraction", 0.85)))
         self.launch_census = LaunchCensus(
             Path(self.global_config.get("ops_state_dir", "data/state"))
             / "launch_census.json")
@@ -866,6 +887,7 @@ class MemecoinQuantDesk:
             for _ in range(int(self.global_config.get("redecision_workers", 4)))]
         self._safety_task = asyncio.create_task(self._safety_sweep_loop())
         self._intelligence_task = asyncio.create_task(self._intelligence_loop())
+        self._register_memory_reliefs()
         self._health_task = asyncio.create_task(self._health_loop())
         self._market_task = asyncio.create_task(self._market_observer_loop())
         self._source_task = asyncio.create_task(self._source_consumer_loop())
@@ -4548,6 +4570,7 @@ class MemecoinQuantDesk:
             "execution_conditions": self.execution_conditions_report(),
             "launch_census": self.launch_census.report(),
             "screen_policy": self.screen_policy.report(),
+            "memory": self.memory.report(),
             "fact_ladder": self.facts.report(),
             "calibration": self.calibration.report(),
             "entity_registry": self.entity_registry.report(),
@@ -4628,10 +4651,72 @@ class MemecoinQuantDesk:
 
     async def _health_loop(self):
         while self._running:
+            # Checked far more often than health is logged: an allocation
+            # spike that kills the process does not wait for the minute mark.
+            for _ in range(6):
+                if not self._running:
+                    break
+                try:
+                    self.memory.observe()
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug("memory governor read failed: %s", exc)
+                await asyncio.sleep(10)
             snapshot = _jsonable(self.readiness())
             logger.info("HEALTH %s", json.dumps(snapshot, separators=(",", ":")))
             self._persist_readiness(snapshot)
-            await asyncio.sleep(60)
+
+    def _register_memory_reliefs(self) -> None:
+        """What the desk gives up under pressure, in order of cheapness.
+
+        Every one of these costs context, and none touches the decision path.
+        A desk under memory pressure must get quieter, never dumber -- shedding
+        the models to keep running trades the thing the desk is for the
+        ability to keep going, and it is better to die loudly and restart than
+        to trade blind.
+        """
+        census = self.launch_census
+        original_cap = census.max_records
+
+        def trim_census():
+            census.max_records = max(100, original_cap // 2)
+            census._evict_if_needed()
+
+        def shed_census():
+            census.max_records = max(100, original_cap // 8)
+            census._evict_if_needed()
+            census.save()
+
+        self.memory.register(Relief(
+            name="launch_census", trim=trim_census, shed=shed_census,
+            restore=lambda: setattr(census, "max_records", original_cap),
+            detail="spill per-launch detail sooner; totals are already counted"))
+
+        miners = self.data_miners
+        original_concurrency = miners.concurrency
+
+        def trim_miners():
+            miners.concurrency = max(1, original_concurrency // 2)
+            miners._semaphore = asyncio.Semaphore(miners.concurrency)
+
+        self.memory.register(Relief(
+            name="data_miners", trim=trim_miners,
+            restore=lambda: (setattr(miners, "concurrency", original_concurrency),
+                             setattr(miners, "_semaphore",
+                                     asyncio.Semaphore(original_concurrency))),
+            detail="fewer simultaneous fetches; context is not on the hot path"))
+
+        def trim_marks():
+            # Shorter price paths for tokens we hold no position in. Slot
+            # value degrades slightly for exactly the tokens whose slot value
+            # we are not currently spending.
+            held = set(self.elogw_engine.open_positions)
+            for token in list(self._mark_history):
+                if token not in held:
+                    self._mark_history.pop(token, None)
+
+        self.memory.register(Relief(
+            name="mark_history", trim=trim_marks,
+            detail="drop price paths for tokens we hold nothing in"))
 
     @property
     def current_regime(self) -> str:
@@ -4700,6 +4785,61 @@ class MemecoinQuantDesk:
             self.launch_census.save()
             self.calibration.save()
 
+    def _record_calibration(self, payload: Dict[str, Any]) -> None:
+        """Score every stated probability against what actually happened.
+
+        Without this the calibration harness is inert -- it can measure, and
+        nothing feeds it. Each pair is stamped with where it came from, so a
+        model validated on shadow decisions is never mistaken for one proven
+        on real fills.
+
+        Probabilities the desk did not state are skipped rather than defaulted.
+        A model that was never consulted has no prediction to score, and
+        scoring it against a default would manufacture calibration evidence
+        out of the model's absence.
+        """
+        provenance = (Provenance.FORWARD_REAL.value
+                      if payload.get("entered") and not self.dry_run
+                      else Provenance.SHADOW.value)
+        when = float(payload.get("timestamp", time.time()))
+        rugged = payload.get("rugged")
+        stated = payload.get("stated_probabilities") or {}
+
+        # Rug hazards, at each horizon the desk states one for.
+        for model, key in (("rug_30s", "p_rug_30s"), ("rug_5m", "p_rug_5m")):
+            probability = stated.get(key)
+            if probability is None or rugged is None:
+                continue
+            self.calibration.record(model, float(probability), bool(rugged),
+                                    at=when, provenance=provenance)
+
+        # Monster: did the token reach the multiple the desk said it might?
+        monster_p = stated.get("p_monster")
+        multiple = payload.get("max_feasible_multiple")
+        if monster_p is not None and multiple is not None:
+            self.calibration.record(
+                "monster_p", float(monster_p),
+                float(multiple) >= rug_mechanism_monster_threshold(),
+                at=when, provenance=provenance)
+
+        # Landing: only scoreable on an attempt, and only real when the
+        # attempt spent real money.
+        landing_p = stated.get("p_land")
+        if landing_p is not None and payload.get("attempted"):
+            self.calibration.record(
+                "landing_p", float(landing_p), bool(payload.get("entered")),
+                at=when,
+                provenance=(Provenance.FORWARD_REAL.value if not self.dry_run
+                            else Provenance.SHADOW.value))
+
+        # Escape: stated when a hazard exit was chosen, scored on whether the
+        # position actually got out before the catastrophe.
+        escape_p = stated.get("p_escape")
+        if escape_p is not None and payload.get("escape_attempted"):
+            self.calibration.record(
+                "escape_p", float(escape_p), bool(payload.get("escaped")),
+                at=when, provenance=provenance)
+
     def _record_ops_event(self, stream: str, payload: Dict[str, Any]) -> None:
         """Append one operational telemetry row for the monitor and audit pack.
 
@@ -4722,6 +4862,12 @@ class MemecoinQuantDesk:
                 if payload.get("entered"):
                     self.launch_census.enter(token)
             self._record_forward_evidence(payload)
+            # Every stated probability, scored against what happened. The
+            # harness measures; this is what gives it something to measure.
+            try:
+                self._record_calibration(payload)
+            except (TypeError, ValueError) as exc:
+                logger.debug("calibration record failed: %s", exc)
         try:
             root = Path(self.global_config.get("ops_state_dir", "data/state"))
             root.mkdir(parents=True, exist_ok=True)
@@ -4753,11 +4899,40 @@ class MemecoinQuantDesk:
         except OSError as exc:
             logger.warning("could not persist readiness snapshot to %s: %s", path, exc)
 
+    #: Read once at first request and cached. The file ships with the repo,
+    #: so a missing one is a broken install rather than a runtime condition,
+    #: and it says so instead of serving a blank page.
+    _dashboard_cache: Optional[str] = None
+
+    async def _dashboard_endpoint(self, _request):
+        """Serve the operator terminal from the desk itself.
+
+        Bound to the same loopback interface as /status, and carrying the same
+        exposure: this page renders the desk's whole interior, so it must not
+        reach a public interface any more than /status may.
+        """
+        if MemecoinQuantDesk._dashboard_cache is None:
+            path = Path(__file__).resolve().parent / "runtime" / "assets" / "dashboard.html"
+            try:
+                MemecoinQuantDesk._dashboard_cache = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                return web.Response(
+                    status=500, content_type="text/plain",
+                    text=(f"dashboard asset missing at {path}: {exc}\n"
+                          "This ships with the repository; a missing file means "
+                          "an incomplete install rather than a runtime fault."))
+        return web.Response(text=MemecoinQuantDesk._dashboard_cache,
+                            content_type="text/html")
+
     async def _setup_health_server(self):
         app = web.Application()
         app.router.add_get("/health", self._health_endpoint)
         app.router.add_get("/metrics", self._metrics_endpoint)
         app.router.add_get("/status", self._status_endpoint)
+        # The desk's own terminal. Same origin as /status, so it polls the
+        # live desk directly instead of asking anyone to paste JSON around.
+        app.router.add_get("/", self._dashboard_endpoint)
+        app.router.add_get("/dashboard", self._dashboard_endpoint)
         self._web_runner = web.AppRunner(app)
         await self._web_runner.setup()
         # Loopback by default. /status serves the desk's whole interior --
