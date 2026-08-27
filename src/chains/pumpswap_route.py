@@ -83,6 +83,10 @@ class PoolState:
     creator: str = ""
     base_mint: str = ""
     quote_mint: str = ""
+    # Read by the layout and, until now, discarded. It is the only handle on
+    # who controls the pool after migration: LP supply says how much power
+    # exists, this says whose accounts to look in for it.
+    lp_mint: str = ""
     pool_base_token_account: str = ""
     pool_quote_token_account: str = ""
     lp_supply: int = 0
@@ -100,7 +104,8 @@ class PoolState:
         return {"status": self.status, "pool": self.pool, "index": self.index,
                 "creator": self.creator, "coin_creator": self.coin_creator,
                 "base_mint": self.base_mint, "quote_mint": self.quote_mint,
-                "lp_supply": self.lp_supply, "is_mayhem_mode": self.is_mayhem_mode,
+                "lp_mint": self.lp_mint, "lp_supply": self.lp_supply,
+                "is_mayhem_mode": self.is_mayhem_mode,
                 "is_cashback_coin": self.is_cashback_coin,
                 "virtual_quote_reserves": self.virtual_quote_reserves,
                 "detail": self.detail}
@@ -140,7 +145,7 @@ def parse_pool(data: bytes, address: str = "") -> PoolState:
     return PoolState(
         status="OK", pool=address, index=values["index"],
         creator=values["creator"], base_mint=values["base_mint"],
-        quote_mint=values["quote_mint"],
+        quote_mint=values["quote_mint"], lp_mint=values["lp_mint"],
         pool_base_token_account=values["pool_base_token_account"],
         pool_quote_token_account=values["pool_quote_token_account"],
         lp_supply=values["lp_supply"],

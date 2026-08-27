@@ -78,16 +78,46 @@ def load_credentials() -> tuple:
     return api_id, api_hash, ""
 
 
+def _diagnosis() -> str:
+    """Say which file was read and what it actually defined.
+
+    "Required" on its own sends someone to check a key they have already set.
+    The three failures that produce this message -- no file, the wrong file,
+    a file missing these two names -- need different fixes and look identical
+    from the outside, so each is named. Key NAMES only; no value is read into
+    the message.
+    """
+    lines = ["TELEGRAM_API_ID and TELEGRAM_API_HASH are required.", ""]
+    found_any = False
+    for candidate in ENV_CANDIDATES:
+        if not candidate.exists():
+            lines.append(f"  {candidate}  (no such file)")
+            continue
+        found_any = True
+        names = sorted(parse_env_file(candidate))
+        if not names:
+            lines.append(f"  {candidate}  (readable, defines nothing)")
+        else:
+            lines.append(f"  {candidate}  defines: {', '.join(names)}")
+    lines.append("")
+    if found_any:
+        lines.append(
+            "The file was found and read; it does not define those two names. "
+            "Add them to it -- the same file the shadow unit loads through "
+            "EnvironmentFile= -- then run this again.")
+    else:
+        lines.append(
+            "No environment file was found at all. The shadow unit reads one "
+            "through EnvironmentFile=, which an interactive shell does not, so "
+            "a variable exported in your shell is invisible to the service and "
+            "a variable in that file is invisible here until it exists.")
+    return "\n".join(lines)
+
+
 async def authorize() -> None:
     api_id, api_hash, origin = load_credentials()
     if not api_id or not api_hash:
-        searched = "\n  ".join(str(path) for path in ENV_CANDIDATES)
-        raise SystemExit(
-            "TELEGRAM_API_ID and TELEGRAM_API_HASH are required.\n"
-            "Not found in the environment, nor in any of:\n  " + searched
-            + "\n\nThe shadow unit reads them through EnvironmentFile=, which an "
-              "interactive shell does not. Either add them to that file, or "
-              "export them for this one command.")
+        raise SystemExit(_diagnosis())
     print(f"Using credentials from {origin}; no value is displayed.")
     SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
     client = TelegramClient(str(SESSION_PATH), int(api_id), api_hash,

@@ -646,6 +646,12 @@ class ExecutionEngine:
         # What the last bid decision was, and whether it was measured
         # or fell back. Surfaced so a desk running on the ladder knows.
         self.last_bid: Dict[str, Any] = {}
+        # Measured chain congestion in [0, 1], supplied by the runtime from
+        # the network-health miner. Until this was wired the landing model
+        # bucketed EVERY attempt as "unknown", so it could never learn that a
+        # bid clearing in calm conditions misses in a rush -- which is the one
+        # thing conditioning on congestion exists to learn.
+        self.congestion_provider: Optional[Any] = None
         self.execution_history: deque = deque(maxlen=10_000)
         self.route_performance: Dict[RouteType, Dict[str, float]] = defaultdict(
             lambda: {"total": 0, "landed": 0, "filled": 0, "failed": 0, "avg_latency": 0}
@@ -927,7 +933,8 @@ class ExecutionEngine:
                 # nothing on a launch drifting sideways and a third of the
                 # edge on a curve moving every slot; one bid for both is the
                 # error in both directions.
-                slot_value=slot_value)
+                slot_value=slot_value,
+                congestion=self.current_congestion())
             if chosen.get("measured"):
                 # The observed floor says what cleared; the curve says what is
                 # worth paying. Under the floor is not a bid at all.
@@ -1089,7 +1096,11 @@ class ExecutionEngine:
             bid_lamports=int(jito_tip if use_jito else 0),
             landed=bool(fill.get("landed")),
             route=route_type.value,
-            latency_ms=int((time.time() - started) * 1000)))
+            latency_ms=int((time.time() - started) * 1000),
+            # Recorded with the conditions it was attempted under. An attempt
+            # stored without them is pooled with every other, and the pooled
+            # curve is the average of two regimes we never trade in.
+            congestion=self.current_congestion()))
         return ExecutionResult(
             success=bool(fill.get("filled")), status=status, signature=signature,
             bundle_id=bundle_id, input_amount=amount,
@@ -1296,6 +1307,22 @@ class ExecutionEngine:
         if index >= len(before) or index >= len(after):
             return 0
         return int(after[index]) - int(before[index])
+
+    def current_congestion(self) -> Optional[float]:
+        """Measured congestion, or None. Never a default.
+
+        None means unmeasured and the landing model buckets it as such. A
+        default of "calm" would be the expensive direction of that error:
+        it bids low into exactly the conditions where bidding low misses.
+        """
+        provider = self.congestion_provider
+        if provider is None:
+            return None
+        try:
+            value = provider()
+        except Exception:
+            return None
+        return None if value is None else float(value)
 
     def choose_bid(self, expected_value_usd: float, sol_price_usd: float,
                    fallback_lamports: int, congestion: Optional[float] = None,
