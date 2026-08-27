@@ -47,6 +47,14 @@ sources:
   # UNCONFIGURED, which an operator reads as "needs a key" rather than as
   # "nobody has picked one". Add `options: {channel: <public channel>}` per
   # entry; until then each is reported as pending an endpoint, by name.
+  #
+  # These are the MTProto path: lowest latency, needs an authorised session.
+  # They are no longer the only Telegram coverage. src/research/telegram_miners
+  # reads public t.me/s/<channel> previews with no account at all, discovers
+  # handles from t.me links the desk already mines, and verifies each one by
+  # fetching its own preview before reading it. That path needs no
+  # configuration and fills itself; these entries are worth naming when you
+  # want a specific channel at MTProto speed rather than preview speed.
   - id: telegram:calls-en-1
     kind: telegram
     tier: 1

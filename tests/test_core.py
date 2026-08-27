@@ -17367,3 +17367,478 @@ class TestTheFastLaneIsCheapEnoughToRunConstantly(unittest.IsolatedAsyncioTestCa
         supervisor = (root / "memecoin-supervisor.timer").read_text()
         self.assertIn("OnUnitActiveSec=30s", liveness)
         self.assertIn("OnUnitActiveSec=60s", supervisor)
+
+
+class TestSourceSubstitution(unittest.TestCase):
+    """A dead endpoint must cost one pass, not a whole domain."""
+
+    def _registry(self):
+        from src.research.source_substitution import Endpoint, SubstitutionRegistry
+        registry = SubstitutionRegistry(failures_before_rotate=2,
+                                        quarantine_base_s=100.0)
+        registry.declare("prices", [
+            Endpoint("primary", "https://a/{mint}", region="global"),
+            Endpoint("secondary", "https://b/{mint}", region="asia"),
+            Endpoint("tertiary", "https://c/{mint}", region="kr"),
+        ])
+        return registry
+
+    def test_one_failure_does_not_rotate(self):
+        registry = self._registry()
+        registry.note_failure("prices", "primary", "timeout", now=0.0)
+        self.assertEqual(registry.current("prices", now=0.0).name, "primary")
+
+    def test_repeated_failure_rotates_to_a_different_operator(self):
+        registry = self._registry()
+        for _ in range(2):
+            registry.note_failure("prices", "primary", "HTTP 403", now=0.0)
+        self.assertEqual(registry.current("prices", now=0.0).name, "secondary")
+        self.assertEqual(registry.substitutions, 1)
+
+    def test_recovery_is_automatic_once_the_quarantine_lapses(self):
+        registry = self._registry()
+        for _ in range(2):
+            registry.note_failure("prices", "primary", "down", now=0.0)
+        self.assertEqual(registry.current("prices", now=50.0).name, "secondary")
+        # Nothing has to notice it came back: current() always re-evaluates
+        # from the top of the ladder.
+        self.assertEqual(registry.current("prices", now=200.0).name, "primary")
+
+    def test_a_success_clears_the_penalty_rather_than_decaying_it(self):
+        registry = self._registry()
+        registry.note_failure("prices", "primary", "blip", now=0.0)
+        registry.note_success("prices", "primary", now=1.0)
+        registry.note_failure("prices", "primary", "blip", now=2.0)
+        self.assertEqual(registry.current("prices", now=2.0).name, "primary")
+
+    def test_quarantine_doubles_so_a_dead_rung_is_not_retried_for_ever(self):
+        registry = self._registry()
+        for _ in range(2):
+            registry.note_failure("prices", "primary", "dead", now=0.0)
+        for _ in range(2):
+            registry.note_failure("prices", "primary", "dead", now=200.0)
+        # Second quarantine is 200s from t=200, so still dark at t=300.
+        self.assertEqual(registry.current("prices", now=300.0).name, "secondary")
+
+    def test_an_exhausted_ladder_is_reported_as_dark_not_as_healthy(self):
+        registry = self._registry()
+        for name in ("primary", "secondary", "tertiary"):
+            for _ in range(2):
+                registry.note_failure("prices", name, "down", now=0.0)
+        self.assertIsNone(registry.current("prices", now=0.0))
+        report = registry.report(now=0.0)
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertIn("prices", report["dark"])
+
+    def test_release_lifts_a_shared_cause_without_deleting_history(self):
+        registry = self._registry()
+        for name in ("primary", "secondary", "tertiary"):
+            for _ in range(2):
+                registry.note_failure("prices", name, "proxy blip", now=0.0)
+        released = registry.release(now=0.0)
+        self.assertEqual(len(released), 3)
+        self.assertEqual(registry.current("prices", now=0.0).name, "primary")
+        # Failure counts survive: the release is about timers, not amnesia.
+        row = registry.report(now=0.0)["ladders"][0]["rungs"][0]
+        self.assertEqual(row["failures"], 2)
+
+    def test_a_missing_credential_is_skipped_rather_than_tried_and_failed(self):
+        from src.research.source_substitution import Endpoint, SubstitutionRegistry
+        registry = SubstitutionRegistry()
+        registry.declare("rpc", [
+            Endpoint("paid", "https://x", requires_env=("DEFINITELY_UNSET_KEY_XYZ",)),
+            Endpoint("free", "https://y"),
+        ])
+        self.assertEqual(registry.current("rpc").name, "free")
+
+    def test_coverage_separates_declared_regions_from_proven_ones(self):
+        registry = self._registry()
+        registry.note_success("prices", "secondary", now=1.0)
+        coverage = registry.coverage(now=1.0)
+        self.assertEqual(coverage["regions_declared"], 3)
+        self.assertEqual(coverage["regions_proven"], 1)
+        self.assertIn("kr", coverage["unproven_regions"])
+
+    def test_the_shipped_catalogue_carries_real_regional_breadth(self):
+        from src.research.source_catalogue import DOMAINS, regions
+        counts = regions()
+        # Not a vanity number: these are the regions whose flow leads the US
+        # session, and a catalogue without them is blind for those hours.
+        for region in ("kr", "jp", "asia", "in", "tr"):
+            self.assertGreater(counts.get(region, 0), 0, region)
+        for domain, endpoints in DOMAINS.items():
+            self.assertGreaterEqual(len(endpoints), 1, domain)
+            names = [endpoint.name for endpoint in endpoints]
+            self.assertEqual(len(names), len(set(names)), domain)
+
+
+class TestLadderFetcherRotatesInPractice(unittest.IsolatedAsyncioTestCase):
+
+    def _fetcher(self, responses):
+        from src.research.regional_miners import LadderFetcher
+        from src.research.source_substitution import Endpoint, SubstitutionRegistry
+
+        registry = SubstitutionRegistry(failures_before_rotate=1)
+        registry.declare("thing", [
+            Endpoint("first", "https://first", shape="s1"),
+            Endpoint("second", "https://second", shape="s2"),
+        ])
+
+        class Client:
+            def __init__(self):
+                self.urls = []
+
+            async def get(self, url, headers=None):
+                self.urls.append(url)
+                return responses.pop(0)
+
+        client = Client()
+        return LadderFetcher(client, registry), registry, client
+
+    async def test_a_failing_rung_is_replaced_within_the_same_pass(self):
+        fetcher, registry, client = self._fetcher(
+            [(500, "boom", {}), (200, '{"ok": true}', {})])
+        payload, endpoint = await fetcher.get("thing")
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(endpoint.name, "second")
+        self.assertEqual(len(client.urls), 2)
+
+    async def test_a_rate_limit_does_not_quarantine_a_healthy_endpoint(self):
+        from src.research.data_miners import RateLimited
+        fetcher, registry, _client = self._fetcher([(429, "slow down", {})])
+        with self.assertRaises(RateLimited):
+            await fetcher.get("thing")
+        # Still the preferred rung: being asked to wait is the endpoint
+        # working, and rotating away from it spends the ladder on nothing.
+        self.assertEqual(registry.current("thing").name, "first")
+
+    async def test_an_exhausted_ladder_raises_rather_than_returning_empty(self):
+        fetcher, _registry, _client = self._fetcher(
+            [(500, "a", {}), (500, "b", {})])
+        with self.assertRaises(RuntimeError):
+            await fetcher.get("thing")
+
+
+class TestRegionalParsers(unittest.TestCase):
+    """Every venue dialect must land in one row shape, or none of it composes."""
+
+    def _endpoint(self, shape):
+        from src.research.source_substitution import Endpoint
+        return Endpoint("venue", "https://x", region="kr", shape=shape)
+
+    def test_korean_and_japanese_venues_parse_into_the_same_shape(self):
+        from src.research.regional_miners import _parse_tickers
+        rows = _parse_tickers(
+            {"data": {"BTC": {"closing_price": "100", "acc_trade_value_24H": "5"}}},
+            self._endpoint("bithumb_ticker"))
+        self.assertEqual(rows[0]["symbol"], "BTC")
+        self.assertEqual(rows[0]["last"], 100.0)
+        self.assertEqual(rows[0]["quote"], "KRW")
+        rows = _parse_tickers(
+            {"data": [{"symbol": "BTC_JPY", "last": "42", "volume": "1"}]},
+            self._endpoint("gmo_ticker"))
+        self.assertEqual(rows[0]["last"], 42.0)
+
+    def test_an_unparseable_price_is_dropped_rather_than_recorded_as_zero(self):
+        from src.research.regional_miners import _parse_tickers
+        rows = _parse_tickers(
+            [{"symbol": "SOLUSDT", "lastPrice": "not a number"}],
+            self._endpoint("binance_ticker"))
+        self.assertEqual(rows, [])
+
+    def test_a_new_regional_market_is_a_listing_not_a_price(self):
+        from src.research.regional_miners import _parse_tickers
+        rows = _parse_tickers([{"market": "KRW-SOL", "korean_name": "솔라나"}],
+                              self._endpoint("upbit_markets"))
+        self.assertEqual(rows[0]["kind"], "market_listed")
+        self.assertIsNone(rows[0]["last"])
+
+    def test_pool_discovery_keeps_the_operator_that_answered(self):
+        from src.research.regional_miners import _parse_pools
+        from src.research.source_substitution import Endpoint
+        endpoint = Endpoint("geckoterminal_new", "https://x",
+                            shape="geckoterminal_pools")
+        rows = _parse_pools({"data": [{
+            "attributes": {"address": "POOL1", "name": "AAA/SOL",
+                           "reserve_in_usd": "1234.5"},
+            "relationships": {"base_token": {"data": {"id": "solana_MINT1"}}},
+        }]}, endpoint)
+        self.assertEqual(rows[0]["mint"], "MINT1")
+        self.assertEqual(rows[0]["liquidity_usd"], 1234.5)
+        self.assertEqual(rows[0]["_source"], "geckoterminal_new")
+
+    def test_missing_liquidity_is_none_not_zero(self):
+        from src.research.regional_miners import _parse_pools
+        from src.research.source_substitution import Endpoint
+        rows = _parse_pools({"data": [{
+            "attributes": {"address": "POOL1"},
+            "relationships": {"base_token": {"data": {"id": "solana_MINT1"}}},
+        }]}, Endpoint("g", "https://x", shape="geckoterminal_pools"))
+        self.assertIsNone(rows[0]["liquidity_usd"])
+
+
+class TestPublicTelegram(unittest.TestCase):
+    """Public previews only, and a broken parser must never read as calm."""
+
+    PAGE = ('<div data-post="alpha/10">'
+            '<div class="tgme_widget_message_text js-message_text">'
+            'CA So11111111111111111111111111111111111111112 also t.me/secondchan'
+            '</div><time datetime="2026-08-27T10:00:00+00:00"></time>'
+            '<span class="tgme_widget_message_views">4.2K</span></div>')
+
+    def test_a_preview_yields_text_address_views_and_linked_handles(self):
+        from src.research.telegram_miners import parse_preview
+        rows = parse_preview(self.PAGE, "alpha")
+        self.assertEqual(rows[0]["message_id"], 10)
+        self.assertEqual(rows[0]["views"], 4200.0)
+        self.assertIn("So11111111111111111111111111111111111111112", rows[0]["mints"])
+        self.assertEqual(rows[0]["handles"], ["secondchan"])
+
+    def test_telegrams_own_surfaces_are_not_treated_as_channels(self):
+        from src.research.telegram_miners import extract_handles
+        self.assertEqual(extract_handles("see t.me/telegram and t.me/share/url"), [])
+
+    def test_a_discovered_handle_is_a_candidate_and_never_read_unverified(self):
+        from src.research.telegram_miners import ChannelBook
+        with tempfile.TemporaryDirectory() as tmp:
+            book = ChannelBook(path=str(Path(tmp) / "book.json"))
+            book.harvest("join us at https://t.me/somecaller", source="test")
+            self.assertIn("somecaller", book.pending())
+            self.assertEqual(book.verified(), [])
+            self.assertEqual(book.next_batch(5), [])
+
+    def test_verification_promotes_a_real_channel_and_records_a_dead_one(self):
+        from src.research.telegram_miners import ChannelBook
+        with tempfile.TemporaryDirectory() as tmp:
+            book = ChannelBook(path=str(Path(tmp) / "book.json"))
+            book.observe("realone", "test")
+            book.observe("deadone", "test")
+            book.mark_verified("realone", 12)
+            book.mark_rejected("deadone", "404")
+            self.assertEqual(book.verified(), ["realone"])
+            self.assertNotIn("deadone", book.pending())
+
+    def test_a_rejected_handle_is_remembered_so_discovery_converges(self):
+        from src.research.telegram_miners import ChannelBook
+        with tempfile.TemporaryDirectory() as tmp:
+            book = ChannelBook(path=str(Path(tmp) / "book.json"))
+            book.observe("deadone", "test")
+            book.mark_rejected("deadone", "404")
+            book.harvest("t.me/deadone again", source="test")
+            self.assertNotIn("deadone", book.pending())
+
+    def test_the_book_survives_a_restart(self):
+        from src.research.telegram_miners import ChannelBook
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "book.json")
+            book = ChannelBook(path=path)
+            book.observe("keepme", "test")
+            book.mark_verified("keepme", 3)
+            self.assertTrue(book.save())
+            self.assertEqual(ChannelBook(path=path).verified(), ["keepme"])
+
+    def test_no_verified_channel_reads_as_blocked_not_as_healthy(self):
+        from src.research.telegram_miners import ChannelBook
+        with tempfile.TemporaryDirectory() as tmp:
+            book = ChannelBook(path=str(Path(tmp) / "book.json"))
+            self.assertEqual(book.report()["status"], "DATA_BLOCKED")
+
+
+class TestPublicTelegramMiner(unittest.IsolatedAsyncioTestCase):
+
+    async def test_a_layout_change_is_reported_as_a_parser_fault(self):
+        from src.research.telegram_miners import ChannelBook, preview_miner
+
+        class Client:
+            async def get(self, url, headers=None):
+                return 200, "<html>nothing we recognise</html>", {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            book = ChannelBook(path=str(Path(tmp) / "book.json"))
+            book.observe("alpha", "test")
+            book.mark_verified("alpha", 1)
+            records = await preview_miner(Client(), book)()
+        self.assertEqual(records, [])
+        # The distinction that matters: our parser, not an empty channel.
+        self.assertIn("parser", book.channels["alpha"].last_error)
+
+    async def test_reading_a_channel_discovers_the_channels_it_links(self):
+        from src.research.telegram_miners import ChannelBook, preview_miner
+        page = TestPublicTelegram.PAGE
+
+        class Client:
+            async def get(self, url, headers=None):
+                return 200, page, {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            book = ChannelBook(path=str(Path(tmp) / "book.json"))
+            book.observe("alpha", "test")
+            book.mark_verified("alpha", 1)
+            records = await preview_miner(Client(), book)()
+        self.assertEqual(len(records), 1)
+        self.assertIn("secondchan", book.pending())
+
+
+class TestIdentityWatch(unittest.TestCase):
+    """A claim and a confirmation are opposite trades and must never merge."""
+
+    def _watch(self):
+        from src.research.identity_watch import Category, Figure, IdentityWatch
+        watch = IdentityWatch()
+        watch.register(Figure(key="nova", display="Nova Star",
+                              category=Category.CELEBRITY, aliases=("nova",),
+                              channels=("novaofficial",)))
+        return watch
+
+    def test_an_unclaimed_launch_is_not_dressed_up_as_one(self):
+        from src.research.identity_watch import Verdict
+        watch = self._watch()
+        assessment = watch.assess("M1", symbol="WIF", name="dogwifhat")
+        self.assertIs(assessment.verdict, Verdict.NO_CLAIM)
+        self.assertFalse(assessment.claimed)
+
+    def test_a_claim_with_nothing_confirming_it_is_uncorroborated(self):
+        from src.research.identity_watch import Verdict
+        assessment = self._watch().assess("M2", symbol="NOVA")
+        self.assertIs(assessment.verdict, Verdict.UNCORROBORATED)
+
+    def test_the_figures_own_channel_inside_the_window_is_an_announcement(self):
+        from src.research.identity_watch import Verdict
+        watch = self._watch()
+        watch.note_channel_message("novaofficial", ["M3"], at=100.0)
+        assessment = watch.assess("M3", symbol="NOVA", created_at=90.0, now=110.0)
+        self.assertIs(assessment.verdict, Verdict.ANNOUNCED)
+        self.assertEqual(assessment.corroboration_lag_s, 10.0)
+
+    def test_the_same_mention_hours_later_is_a_reaction_not_an_announcement(self):
+        from src.research.identity_watch import Verdict
+        watch = self._watch()
+        watch.note_channel_message("novaofficial", ["M4"], at=100_000.0)
+        assessment = watch.assess("M4", symbol="NOVA", created_at=1.0, now=100_001.0)
+        self.assertIs(assessment.verdict, Verdict.UNCORROBORATED)
+
+    def test_a_channel_we_never_registered_cannot_confirm_anything(self):
+        from src.research.identity_watch import Verdict
+        watch = self._watch()
+        # This is the whole defence against a launch supplying its own
+        # corroboration through a channel it controls.
+        self.assertEqual(watch.note_channel_message("randomcaller", ["M5"]), 0)
+        assessment = watch.assess("M5", symbol="NOVA", created_at=1.0, now=2.0)
+        self.assertIs(assessment.verdict, Verdict.UNCORROBORATED)
+
+    def test_a_repeat_deployer_is_named_as_a_serial_impersonator(self):
+        from src.research.identity_watch import Verdict
+        watch = self._watch()
+        for index in range(3):
+            assessment = watch.assess(f"S{index}", symbol="NOVA", deployer="D1")
+        self.assertIs(assessment.verdict, Verdict.SERIAL_IMPERSONATOR)
+        self.assertEqual(assessment.prior_impersonations, 2)
+
+    def test_a_declared_canonical_token_contradicts_every_later_claim(self):
+        from src.research.identity_watch import Verdict
+        watch = self._watch()
+        watch.declare_canonical("nova", "REALMINT")
+        assessment = watch.assess("FAKEMINT", symbol="NOVA")
+        self.assertIs(assessment.verdict, Verdict.CONTRADICTED)
+
+    def test_a_linked_owned_channel_is_a_claim_on_that_figure(self):
+        watch = self._watch()
+        claims = watch.match(links=["https://t.me/novaofficial"])
+        self.assertEqual(claims[0].figure_key, "nova")
+        self.assertEqual(claims[0].evidence, "channel_link")
+
+    def test_a_two_character_alias_is_refused_as_unidentifiable(self):
+        from src.research.identity_watch import Category, Figure, IdentityWatch
+        watch = IdentityWatch()
+        watch.register(Figure(key="x", display="X", category=Category.BRAND,
+                              aliases=("ab",)))
+        self.assertEqual(watch.match(symbol="AB"), [])
+
+    def test_an_unmeasured_verdict_class_reports_blocked_not_zero(self):
+        watch = self._watch()
+        watch.assess("M6", symbol="NOVA")
+        report = watch.report()
+        row = report["outcomes"]["uncorroborated"]
+        self.assertEqual(row["data_status"], "DATA_BLOCKED")
+        self.assertIsNone(row["hit_rate"])
+        self.assertIn("uncorroborated", report["unmeasured_classes"])
+
+    def test_a_registry_with_no_channels_says_it_cannot_corroborate(self):
+        from src.research.identity_watch import Category, Figure, IdentityWatch
+        watch = IdentityWatch()
+        watch.register(Figure(key="a", display="Someone",
+                              category=Category.POLITICIAN, aliases=("someone",)))
+        report = watch.report()
+        self.assertEqual(report["status"], "DEGRADED")
+        self.assertIn("corroborated", report["detail"])
+
+    def test_the_shipped_registry_loads_and_indexes(self):
+        from src.research.identity_watch import IdentityWatch
+        watch = IdentityWatch()
+        root = Path(__file__).resolve().parents[1]
+        loaded = watch.load_yaml(str(root / "config" / "figures.yaml"))
+        self.assertGreater(loaded, 40)
+        self.assertGreater(len(watch._terms), loaded)
+
+
+class TestBreadthHealthAndRemedies(unittest.TestCase):
+
+    def test_a_substituted_domain_is_healthy_and_a_dark_one_is_not(self):
+        from ops.health import State, check_breadth
+        healthy = check_breadth({"substitution": {
+            "dark": [], "substituted": ["prices -> secondary"], "domains": 10,
+            "coverage": {"regions_declared": 5, "regions_proven": 3}}})
+        by_name = {check.name: check for check in healthy}
+        self.assertIs(by_name["breadth_substitution"].state, State.OK)
+
+        dark = check_breadth({"substitution": {
+            "dark": ["prices"], "substituted": [], "domains": 10,
+            "coverage": {"regions_declared": 5, "regions_proven": 3}}})
+        by_name = {check.name: check for check in dark}
+        self.assertIs(by_name["breadth_substitution"].state, State.CRITICAL)
+        self.assertTrue(by_name["breadth_substitution"].escalate)
+
+    def test_declared_regions_that_never_answered_are_a_warning(self):
+        from ops.health import State, check_breadth
+        checks = {check.name: check for check in check_breadth({"substitution": {
+            "dark": [], "substituted": [], "domains": 10,
+            "coverage": {"regions_declared": 11, "regions_proven": 0,
+                         "unproven_regions": ["kr", "jp"]}}})}
+        self.assertIs(checks["breadth_regions"].state, State.WARN)
+
+    def test_a_decoder_gap_is_reported_as_a_gap_not_as_a_quiet_market(self):
+        from ops.health import State, check_breadth
+        checks = {check.name: check for check in check_breadth({
+            "discovery": {"status": "DEGRADED", "detail": "gap",
+                          "missed_by_our_stream": 40,
+                          "external_pools_seen": 100}})}
+        self.assertIs(checks["breadth_discovery"].state, State.WARN)
+
+    def test_a_dark_domain_has_a_fixer_that_is_not_a_restart(self):
+        from ops.autofix import standard_remedies
+        remedies = {remedy.name: remedy for remedy in standard_remedies()}
+        self.assertIn("substitute_blocked_sources", remedies)
+        remedy = remedies["substitute_blocked_sources"]
+        health = {"checks": [{"name": "breadth_substitution", "state": "CRITICAL"}]}
+        self.assertTrue(remedy.applies(health))
+        with mock.patch("ops.autofix.post", return_value=True) as posted, \
+             mock.patch("ops.autofix.systemctl") as restarted:
+            remedy.act()
+        posted.assert_called_once()
+        self.assertIn("release-sources", posted.call_args[0][0])
+        restarted.assert_not_called()
+
+    def test_a_silent_telegram_side_has_its_own_fixer(self):
+        from ops.autofix import standard_remedies
+        remedies = {remedy.name: remedy for remedy in standard_remedies()}
+        remedy = remedies["reseed_channel_discovery"]
+        health = {"checks": [{"name": "breadth_telegram", "state": "WARN"}]}
+        self.assertTrue(remedy.applies(health))
+
+    def test_a_healthy_substitution_fires_nothing(self):
+        from ops.autofix import standard_remedies
+        health = {"checks": [{"name": "breadth_substitution", "state": "OK"},
+                             {"name": "breadth_telegram", "state": "OK"}]}
+        fired = [remedy.name for remedy in standard_remedies()
+                 if remedy.applies(health)]
+        self.assertEqual(fired, [])

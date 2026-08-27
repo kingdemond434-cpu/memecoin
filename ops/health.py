@@ -478,6 +478,105 @@ def check_subsystems(readiness: Dict[str, Any], root: Path, now: float,
     return checks
 
 
+def check_breadth(readiness: Dict[str, Any]) -> List[Check]:
+    """Whether the global data universe is actually answering.
+
+    Four separate questions, deliberately not merged. A substituted domain is
+    healthy -- that is the ladder working. A DARK domain is a question the
+    desk asks continuously and cannot answer. A silent channel book is a
+    Telegram side that has stopped reading. A discovery gap is a hole in our
+    own decoder, and it is the one that looks like a calm market from inside.
+    """
+    checks: List[Check] = []
+
+    substitution = readiness.get("substitution") or {}
+    dark = substitution.get("dark") or []
+    substituted = substitution.get("substituted") or []
+    if not substitution:
+        checks.append(Check("breadth_substitution", State.DATA_BLOCKED,
+                            "the substitution registry has not reported"))
+    elif dark:
+        checks.append(Check(
+            "breadth_substitution", State.CRITICAL,
+            "no endpoint left for: " + ", ".join(dark[:6])
+            + "; these questions currently have no answer at all",
+            evidence={"dark": dark, "substitutions": substitution.get("substitutions")},
+            escalate=True))
+    elif substituted:
+        # Not a warning. This is the ladder doing exactly its job, and paging
+        # on it would train an operator to ignore the page that matters.
+        checks.append(Check("breadth_substitution", State.OK, "",
+                            evidence={"running_on_substitute": substituted[:8]}))
+    else:
+        checks.append(Check("breadth_substitution", State.OK, "",
+                            evidence={"domains": substitution.get("domains")}))
+
+    coverage = (substitution.get("coverage") or {})
+    declared = coverage.get("regions_declared")
+    proven = coverage.get("regions_proven")
+    if declared is None or proven is None:
+        checks.append(Check("breadth_regions", State.DATA_BLOCKED,
+                            "regional coverage has not been measured"))
+    elif proven == 0 and declared:
+        checks.append(Check(
+            "breadth_regions", State.WARN,
+            f"{declared} regions declared and none has returned a record; "
+            "the breadth is configuration, not coverage",
+            evidence={"unproven": coverage.get("unproven_regions")}))
+    else:
+        checks.append(Check("breadth_regions", State.OK, "",
+                            evidence={"proven": proven, "declared": declared}))
+
+    telegram = readiness.get("telegram_channels") or {}
+    status = telegram.get("status")
+    if status == "DATA_BLOCKED":
+        checks.append(Check(
+            "breadth_telegram", State.WARN,
+            telegram.get("detail")
+            or "no verified public Telegram channel; discovery has not converged",
+            evidence={"candidates": telegram.get("candidates"),
+                      "rejected": telegram.get("rejected")}))
+    elif status == "DEGRADED":
+        checks.append(Check("breadth_telegram", State.WARN,
+                            telegram.get("detail") or "verified channels have gone silent",
+                            evidence={"silent": (telegram.get("silent") or [])[:10]}))
+    elif not telegram:
+        checks.append(Check("breadth_telegram", State.DATA_BLOCKED,
+                            "the channel book has not reported"))
+    else:
+        checks.append(Check("breadth_telegram", State.OK, "",
+                            evidence={"verified": telegram.get("verified"),
+                                      "mints_seen": telegram.get("mints_seen")}))
+
+    discovery = readiness.get("discovery") or {}
+    if not discovery or discovery.get("status") == "DATA_BLOCKED":
+        checks.append(Check("breadth_discovery", State.DATA_BLOCKED,
+                            "no external pool discovery yet this run"))
+    elif discovery.get("status") == "DEGRADED":
+        checks.append(Check(
+            "breadth_discovery", State.WARN, discovery.get("detail", ""),
+            evidence={"missed": discovery.get("missed_by_our_stream"),
+                      "seen": discovery.get("external_pools_seen")}))
+    else:
+        checks.append(Check("breadth_discovery", State.OK, "",
+                            evidence={"coverage": discovery.get("coverage")}))
+
+    identity = readiness.get("identity_watch") or {}
+    if not identity:
+        checks.append(Check("breadth_identity", State.DATA_BLOCKED,
+                            "the figure registry has not reported"))
+    elif identity.get("status") == "DEGRADED":
+        checks.append(Check(
+            "breadth_identity", State.WARN, identity.get("detail", ""),
+            evidence={"figures": identity.get("figures"),
+                      "with_channels": identity.get("figures_with_channels")}))
+    else:
+        checks.append(Check("breadth_identity", State.OK, "",
+                            evidence={"figures": identity.get("figures"),
+                                      "claims_found": identity.get("claims_found")}))
+    return checks
+
+
 def check_resources(root: Path, thresholds: HealthThresholds) -> List[Check]:
     """Disk and memory. Measured, and DATA_BLOCKED where the platform hides them."""
     checks: List[Check] = []
@@ -728,6 +827,7 @@ def run_health_checks(
         checks.extend(check_sources(readiness))
         checks.extend(check_intelligence_coverage(readiness))
         checks.append(check_champions(readiness))
+        checks.extend(check_breadth(readiness))
     else:
         # Everything that reads the snapshot degrades together, and says so.
         # Reporting these as OK would manufacture confidence exactly where

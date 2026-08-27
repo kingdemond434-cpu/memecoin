@@ -185,6 +185,15 @@ class LaunchCensus:
         self._evict_if_needed()
         return record
 
+    def knows(self, mint: str) -> bool:
+        """Has this launch been counted at all.
+
+        Asked by discovery: a pool an outside operator reported that this
+        never saw is a hole in our own decoding, and from the inside that
+        failure is indistinguishable from a quiet market.
+        """
+        return bool(mint) and mint in self._records
+
     def screen(self, mint: str, reason: str) -> None:
         """A launch filtered out before it reached a decision.
 

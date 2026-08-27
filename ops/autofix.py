@@ -359,6 +359,29 @@ def standard_remedies(service: str = "memecoin-shadow.service",
                  "before it stops the evidence ledgers being written"),
             budget=4, cooldown_s=600.0),
         Remedy(
+            name="substitute_blocked_sources",
+            applies=lambda health: _critical(health, "breadth_substitution"),
+            act=lambda: post(f"{status_base}/release-sources"),
+            why=("every rung of a data domain is quarantined at once, which "
+                 "is almost always one shared cause -- this address rate "
+                 "limited everywhere, DNS wobbling, an outbound proxy blip -- "
+                 "rather than every operator independently dying; lift the "
+                 "penalties and let the ladder re-sort itself rather than "
+                 "waiting out four separate timers for a cause that has "
+                 "already passed"),
+            # Cheap, non-destructive and idempotent: it clears timers and
+            # nothing else. If the cause has not passed the rungs simply fail
+            # again and re-quarantine, so it can run often.
+            budget=12, cooldown_s=120.0),
+        Remedy(
+            name="reseed_channel_discovery",
+            applies=lambda health: _warn(health, "breadth_telegram"),
+            act=lambda: post(f"{status_base}/verify-channels"),
+            why=("the public-Telegram side has no verified channel or has "
+                 "gone silent; run the verification pass now rather than "
+                 "waiting for its hourly slot"),
+            budget=4, cooldown_s=900.0),
+        Remedy(
             name="retrain_stale_models",
             applies=lambda health: _warn(
                 health, "model_rug_hazard", "model_exit_policy",

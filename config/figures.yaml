@@ -1,0 +1,171 @@
+# Public figures, projects and brands whose names get minted.
+#
+# This registry exists to answer one question: when a token's metadata claims
+# a famous name, is the claim confirmed by that name's own public channel, or
+# is it one of the very many that are not? Both outcomes are tradeable and
+# they are opposite trades, so the desk must never collapse them.
+#
+# Nothing here asserts anything about the people named. An entry means "this
+# name shows up in launch metadata and we want to detect it", which is a
+# statement about the market, not about the person.
+#
+# FIELDS
+#   key             stable identifier, never displayed
+#   display         the name as it is usually written
+#   category        politician | celebrity | influencer | founder | athlete
+#                   | project | exchange | brand | event
+#   aliases         other spellings, surnames alone, common tickers. Terms
+#                   under three characters are ignored by the matcher: a
+#                   two-letter alias matches half the market.
+#   channels        handles the figure PUBLISHES AS THEIR OWN, copied from
+#                   their own verified profile. This field is what makes
+#                   corroboration possible, and it is deliberately EMPTY here.
+#                   A handle nobody can point at a self-published source for
+#                   would turn a stranger's channel into an oracle for that
+#                   person's intentions, which is worse than having no oracle.
+#                   Fill these in from the figure's own verified profile and
+#                   the desk starts being able to say ANNOUNCED instead of
+#                   only UNCORROBORATED.
+#   canonical_mint  a token the figure has publicly declared theirs. Once set,
+#                   any OTHER token claiming them is CONTRADICTED by their own
+#                   statement rather than merely unconfirmed.
+#
+# Until channels are filled, every claim resolves UNCORROBORATED, and
+# /status reports the registry as DEGRADED with exactly that reason. That is
+# the honest state, not a broken one: name matching, serial-impersonator
+# detection and contradiction all work without a single channel.
+
+schema_version: v1
+
+figures:
+  # ---- politics and public office -----------------------------------------
+  - {key: trump, display: Donald Trump, category: politician,
+     aliases: [trump, djt, donaldtrump, maga], region: us}
+  - {key: melania, display: Melania Trump, category: politician,
+     aliases: [melania, melaniatrump], region: us}
+  - {key: biden, display: Joe Biden, category: politician,
+     aliases: [biden, joebiden], region: us}
+  - {key: harris, display: Kamala Harris, category: politician,
+     aliases: [kamala, kamalaharris], region: us}
+  - {key: obama, display: Barack Obama, category: politician, aliases: [obama], region: us}
+  - {key: milei, display: Javier Milei, category: politician,
+     aliases: [milei, javiermilei], region: latam}
+  - {key: bukele, display: Nayib Bukele, category: politician,
+     aliases: [bukele, nayib], region: latam}
+  - {key: modi, display: Narendra Modi, category: politician,
+     aliases: [modi, narendramodi], region: in}
+  - {key: putin, display: Vladimir Putin, category: politician,
+     aliases: [putin], region: cis}
+  - {key: zelensky, display: Volodymyr Zelensky, category: politician,
+     aliases: [zelensky, zelenskyy], region: cis}
+  - {key: erdogan, display: Recep Tayyip Erdogan, category: politician,
+     aliases: [erdogan], region: tr}
+  - {key: xijinping, display: Xi Jinping, category: politician,
+     aliases: [xijinping], region: cn}
+  - {key: kimjongun, display: Kim Jong Un, category: politician,
+     aliases: [kimjongun], region: kr}
+  - {key: bolsonaro, display: Jair Bolsonaro, category: politician,
+     aliases: [bolsonaro], region: latam}
+  - {key: lula, display: Luiz Inacio Lula da Silva, category: politician,
+     aliases: [lula], region: latam}
+
+  # ---- founders and technology --------------------------------------------
+  - {key: musk, display: Elon Musk, category: founder,
+     aliases: [elon, elonmusk, musk], region: us}
+  - {key: cz, display: Changpeng Zhao, category: founder,
+     aliases: [czbinance, changpengzhao], region: asia}
+  - {key: sbf, display: Sam Bankman-Fried, category: founder,
+     aliases: [bankmanfried, sambankmanfried], region: us}
+  - {key: vitalik, display: Vitalik Buterin, category: founder,
+     aliases: [vitalik, buterin], region: global}
+  - {key: satoshi, display: Satoshi Nakamoto, category: founder,
+     aliases: [satoshi, nakamoto], region: global}
+  - {key: toly, display: Anatoly Yakovenko, category: founder,
+     aliases: [aeyakovenko, yakovenko], region: us}
+  - {key: raj, display: Raj Gokal, category: founder, aliases: [rajgokal], region: us}
+  - {key: justinsun, display: Justin Sun, category: founder,
+     aliases: [justinsun, sunyuchen], region: cn}
+  - {key: dokwon, display: Do Kwon, category: founder, aliases: [dokwon], region: kr}
+  - {key: saylor, display: Michael Saylor, category: founder,
+     aliases: [saylor, michaelsaylor], region: us}
+  - {key: zuckerberg, display: Mark Zuckerberg, category: founder,
+     aliases: [zuckerberg, zuck], region: us}
+  - {key: bezos, display: Jeff Bezos, category: founder, aliases: [bezos], region: us}
+  - {key: altman, display: Sam Altman, category: founder,
+     aliases: [samaltman, altman], region: us}
+  - {key: hayes, display: Arthur Hayes, category: founder,
+     aliases: [arthurhayes], region: asia}
+
+  # ---- entertainment ------------------------------------------------------
+  - {key: kanye, display: Kanye West, category: celebrity,
+     aliases: [kanye, kanyewest, yeezy], region: us}
+  - {key: drake, display: Drake, category: celebrity, aliases: [drake], region: us}
+  - {key: snoop, display: Snoop Dogg, category: celebrity,
+     aliases: [snoop, snoopdogg], region: us}
+  - {key: iggy, display: Iggy Azalea, category: celebrity,
+     aliases: [iggyazalea], region: us}
+  - {key: caitlynjenner, display: Caitlyn Jenner, category: celebrity,
+     aliases: [caitlynjenner, jenner], region: us}
+  - {key: hilton, display: Paris Hilton, category: celebrity,
+     aliases: [parishilton], region: us}
+  - {key: mrbeast, display: MrBeast, category: influencer,
+     aliases: [mrbeast, beast], region: us}
+  - {key: loganpaul, display: Logan Paul, category: influencer,
+     aliases: [loganpaul], region: us}
+  - {key: jakepaul, display: Jake Paul, category: influencer,
+     aliases: [jakepaul], region: us}
+  - {key: andrewtate, display: Andrew Tate, category: influencer,
+     aliases: [andrewtate, tate, topg], region: global}
+  - {key: haliey, display: Haliey Welch, category: influencer,
+     aliases: [hawktuah, hailey], region: us}
+  - {key: psy, display: Psy, category: celebrity, aliases: [gangnam], region: kr}
+  - {key: bts, display: BTS, category: celebrity, aliases: [bangtan], region: kr}
+  - {key: blackpink, display: Blackpink, category: celebrity,
+     aliases: [blackpink], region: kr}
+  - {key: shahrukh, display: Shah Rukh Khan, category: celebrity,
+     aliases: [shahrukh, srk], region: in}
+  - {key: jackiechan, display: Jackie Chan, category: celebrity,
+     aliases: [jackiechan], region: cn}
+
+  # ---- sport --------------------------------------------------------------
+  - {key: ronaldo, display: Cristiano Ronaldo, category: athlete,
+     aliases: [ronaldo, cristiano, cr7], region: eu}
+  - {key: messi, display: Lionel Messi, category: athlete,
+     aliases: [messi, leomessi], region: latam}
+  - {key: neymar, display: Neymar, category: athlete, aliases: [neymar], region: latam}
+  - {key: mbappe, display: Kylian Mbappe, category: athlete,
+     aliases: [mbappe], region: eu}
+  - {key: lebron, display: LeBron James, category: athlete,
+     aliases: [lebron, lebronjames], region: us}
+  - {key: mcgregor, display: Conor McGregor, category: athlete,
+     aliases: [mcgregor, conormcgregor], region: eu}
+  - {key: kohli, display: Virat Kohli, category: athlete,
+     aliases: [viratkohli, kohli], region: in}
+
+  # ---- projects, venues and brands ----------------------------------------
+  - {key: pumpfun, display: Pump.fun, category: project,
+     aliases: [pumpfun, pumpdotfun], region: global}
+  - {key: solana, display: Solana, category: project,
+     aliases: [solana], region: global}
+  - {key: jupiter, display: Jupiter Exchange, category: project,
+     aliases: [jupiterexchange, jupag], region: global}
+  - {key: binance, display: Binance, category: exchange,
+     aliases: [binance], region: asia}
+  - {key: coinbase, display: Coinbase, category: exchange,
+     aliases: [coinbase], region: us}
+  - {key: upbit, display: Upbit, category: exchange, aliases: [upbit], region: kr}
+  - {key: okx, display: OKX, category: exchange, aliases: [okex], region: asia}
+  - {key: bybit, display: Bybit, category: exchange, aliases: [bybit], region: asia}
+  - {key: tether, display: Tether, category: project, aliases: [tether], region: global}
+  - {key: blackrock, display: BlackRock, category: brand,
+     aliases: [blackrock], region: us}
+  - {key: nvidia, display: Nvidia, category: brand, aliases: [nvidia], region: us}
+  - {key: openai, display: OpenAI, category: brand,
+     aliases: [openai, chatgpt], region: us}
+  - {key: deepseek, display: DeepSeek, category: brand,
+     aliases: [deepseek], region: cn}
+  - {key: nintendo, display: Nintendo, category: brand,
+     aliases: [nintendo], region: jp}
+  - {key: mcdonalds, display: McDonald's, category: brand,
+     aliases: [mcdonalds], region: global}
+  - {key: tesla, display: Tesla, category: brand, aliases: [tesla], region: us}

@@ -66,6 +66,49 @@ The entity registry stays empty until entries are verified from the entity's
 own published pages (`tools/verify_entities.py`). Empty is not "nothing is a
 copycat" -- it is "we cannot tell", and the desk sizes accordingly.
 
+The substitution catalogue -- sixty public endpoints across eleven regions,
+each a rung the desk falls back to when the one above it refuses this address
+-- is a claim until it is probed from the node that will use it:
+
+```bash
+.venv/bin/python tools/verify_substitution.py                 # all ten domains
+.venv/bin/python tools/verify_substitution.py --domain regional_venues
+.venv/bin/python tools/verify_substitution.py --json data/state/substitution_probe.json
+```
+
+It exits non-zero only when a DOMAIN has no working endpoint at all. A few
+dead rungs is what the ladder is for; a domain with none is a question the
+desk asks continuously and cannot answer, and `/status.substitution.dark`
+names it. A completely dark domain is usually one shared cause rather than
+every operator dying at once, so the fixer for it lifts every quarantine
+rather than restarting anything:
+
+```bash
+curl -s -X POST http://127.0.0.1:18080/release-sources | python3 -m json.tool
+```
+
+Public Telegram needs no configuration at all. The desk reads
+`t.me/s/<channel>` previews with no account, harvests handles from the t.me
+links it already mines (a Pump token's own profile links its own channel),
+and verifies each candidate by fetching its preview before reading it. To run
+a verification pass immediately rather than waiting for its hourly slot:
+
+```bash
+curl -s -X POST http://127.0.0.1:18080/verify-channels | python3 -m json.tool
+curl -s http://127.0.0.1:18080/status | python3 -c "
+import json,sys; d=json.load(sys.stdin)['telegram_channels']
+print('verified :', d['verified'], '| candidates:', d['candidates'],
+      '| addresses seen:', d['mints_seen'])"
+```
+
+`config/figures.yaml` ships 68 public figures, projects and brands with names
+and NO channels, deliberately. Name matching, serial-impersonator detection
+and contradiction all work without a single channel; what does not work is
+saying ANNOUNCED. Filling a figure's `channels` from their own verified
+profile is what lets the desk distinguish a real celebrity launch from the
+very many that only claim one, and `/status.identity_watch` reports the
+registry as DEGRADED with exactly that reason until you do.
+
 ## 2a. Confirm the desk sees your keys, and authorise Telegram
 
 Setting a key and the desk seeing it are different facts. An env file loaded
