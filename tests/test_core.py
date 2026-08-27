@@ -69,6 +69,7 @@ from src.collectors.adapters import (
 from src.collectors.event_source import (
     Event, EventSource, SourceClass, SourceMesh, SourceState,
 )
+from src.research import telegram_authorize
 from src.strategies.ignition import (
     IgnitionModel, IgnitionReading, KolRole, NarrativeState, SourceTouch,
     classify_role, touches_from_events,
@@ -12559,11 +12560,13 @@ class TestTelegramNeverPromptsUnderSystemd(unittest.TestCase):
 
     def test_it_looks_where_the_authorize_tool_actually_writes(self):
         """A transport looking elsewhere finds no session, and Telethon's
-        response to no session is to ask for a phone number."""
-        tool = (Path(__file__).resolve().parents[1] / "src" / "research"
-                / "telegram_authorize.py").read_text()
-        self.assertIn('"data/telegram"', tool)
-        self.assertIn('"collector"', tool)
+        response to no session is to ask for a phone number.
+
+        Compared as values rather than matched as source text: a string check
+        passes while the two drift, which is the failure it exists to catch.
+        """
+        self.assertEqual(str(telegram_authorize.SESSION_PATH),
+                         TelegramChannelTransport.SESSION_PATH)
         self.assertEqual(TelegramChannelTransport.SESSION_PATH,
                          "data/telegram/collector")
 
@@ -12585,6 +12588,59 @@ class TestTelegramNeverPromptsUnderSystemd(unittest.TestCase):
         with self.assertRaises(TransportError) as raised:
             asyncio.run(transport.start())
         self.assertIn("NOT_SET_ID", str(raised.exception))
+
+    def test_the_authorize_tool_reads_the_file_systemd_reads(self):
+        """A tool whose documented invocation does not work is a tool that
+        will be run wrong every time.
+
+        The credentials live in the environment file systemd loads through
+        EnvironmentFile=, which an interactive shell does not -- and the
+        runbook tells a person to run this from an interactive shell.
+        """
+        directory = Path(tempfile.mkdtemp())
+        env_file = directory / "env"
+        env_file.write_text(
+            "# operator env\n"
+            'export TELEGRAM_API_ID="4242"\n'
+            "TELEGRAM_API_HASH='deadbeef'\n")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(telegram_authorize, "ENV_CANDIDATES", (env_file,)):
+                api_id, api_hash, origin = telegram_authorize.load_credentials()
+        self.assertEqual(api_id, "4242")
+        self.assertEqual(api_hash, "deadbeef")
+        self.assertEqual(origin, str(env_file))
+
+    def test_the_environment_still_wins_over_the_file(self):
+        with mock.patch.dict(os.environ, {"TELEGRAM_API_ID": "1",
+                                          "TELEGRAM_API_HASH": "2"}, clear=True):
+            _id, _hash, origin = telegram_authorize.load_credentials()
+        self.assertEqual(origin, "the environment")
+
+    def test_a_malformed_env_file_yields_what_it_can_rather_than_raising(self):
+        """One bad line must not stop the tool from finding the keys."""
+        directory = Path(tempfile.mkdtemp())
+        env_file = directory / "env"
+        env_file.write_text("NOT AN ASSIGNMENT\nTELEGRAM_API_ID=7\nEMPTY=\n")
+        parsed = telegram_authorize.parse_env_file(env_file)
+        self.assertEqual(parsed["TELEGRAM_API_ID"], "7")
+        self.assertEqual(parsed["EMPTY"], "")
+        self.assertNotIn("NOT AN ASSIGNMENT", parsed)
+
+    def test_a_missing_file_is_not_an_error(self):
+        self.assertEqual(
+            telegram_authorize.parse_env_file(Path("/nonexistent/env")), {})
+
+    def test_the_failure_message_names_where_it_looked(self):
+        """'Required' without saying where it looked is a message that sends
+        someone to re-set a variable that was already set."""
+        source = (Path(__file__).resolve().parents[1] / "src" / "research"
+                  / "telegram_authorize.py").read_text()
+        self.assertIn("Not found in the environment, nor in any of", source)
+        self.assertIn("EnvironmentFile=", source)
+
+    def test_the_tool_and_the_transport_agree_on_the_session_path(self):
+        self.assertEqual(str(telegram_authorize.SESSION_PATH),
+                         TelegramChannelTransport.SESSION_PATH)
 
     def test_the_source_never_calls_the_prompting_entry_point(self):
         """Telethon's start() is the one that prompts; connect() is not."""

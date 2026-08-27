@@ -100,6 +100,12 @@ cd ~/.local/opt/memecoin-shadow
 systemctl --user restart memecoin-shadow.service
 ```
 
+It reads `~/.config/memecoin-shadow/env` itself, so it works from a plain
+shell -- systemd loads that file through `EnvironmentFile=` and an interactive
+shell does not, and a tool that fails at the exact moment this page tells you
+to run it is a tool that gets run wrong every time. If it still cannot find
+the keys it prints every path it looked in.
+
 That writes `data/telegram/collector.session`, which both the social collector
 and the source mesh read. It survives restarts and reinstalls.
 
