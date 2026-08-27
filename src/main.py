@@ -3148,7 +3148,12 @@ class MemecoinQuantDesk:
     CREDENTIALS: Tuple[Tuple[str, str], ...] = (
         ("YELLOWSTONE_GRPC_URL", "lowest-latency program stream"),
         ("YELLOWSTONE_GRPC_TOKEN", "authenticates the Yellowstone stream"),
-        ("HELIUS_API_KEY", "wallet transaction history for round-trip scoring"),
+        ("HELIUS_API_KEY", "wallet transaction history, and the Solana RPC endpoint"),
+        # The RPC endpoints in config/chains.yaml interpolate this. Without it
+        # the desk falls back to public RPC, which is rate limited to the point
+        # of being unusable for a sniper -- so its absence is not a missing
+        # nice-to-have, it is the chain read path degraded.
+        ("ALCHEMY_KEY", "Solana and EVM RPC endpoints in config/chains.yaml"),
         ("TELEGRAM_API_ID", "public Telegram channels"),
         ("TELEGRAM_API_HASH", "public Telegram channels"),
         ("TELEGRAM_CHANNELS", "which channels the mesh watches"),
@@ -3196,6 +3201,42 @@ class MemecoinQuantDesk:
                 "authorise_with": (
                     "" if telegram_ready
                     else ".venv/bin/python -m src.research.telegram_authorize"),
+            },
+            # Which of the always-on miners each key actually feeds, and how
+            # often that miner runs. "The key is set" and "something is using
+            # it" are different facts, and only the second one produces data.
+            "miners": {
+                "chain_stream": {
+                    "keys": ["YELLOWSTONE_GRPC_URL", "YELLOWSTONE_GRPC_TOKEN"],
+                    "cadence": "push",
+                    "active": bool(os.getenv("YELLOWSTONE_GRPC_URL")),
+                    "detail": "gRPC program stream; falls back to RPC polling",
+                },
+                "rpc": {
+                    "keys": ["ALCHEMY_KEY", "HELIUS_API_KEY"],
+                    "cadence": "on demand",
+                    "active": bool(os.getenv("ALCHEMY_KEY") or os.getenv("HELIUS_API_KEY")),
+                    "detail": "account reads, wallet history, liquidity probes",
+                },
+                "social_watcher": {
+                    "keys": ["TELEGRAM_API_ID", "TELEGRAM_API_HASH", "YOUTUBE_API_KEY"],
+                    "cadence": "5s",
+                    "active": bool(os.getenv("TELEGRAM_API_ID")
+                                   or os.getenv("YOUTUBE_API_KEY")),
+                    "detail": "watched accounts and token mentions",
+                },
+                "source_mesh": {
+                    "keys": ["TELEGRAM_API_ID", "TELEGRAM_CHANNELS"],
+                    "cadence": "per source, 1s to 30m",
+                    "active": telegram_ready,
+                    "detail": "MTProto push for Telegram; needs the authorised session",
+                },
+                "global_research": {
+                    "keys": ["GITHUB_TOKEN"],
+                    "cadence": "hourly",
+                    "active": True,
+                    "detail": "public research mining; the token raises the quota",
+                },
             },
             "live_trading_acknowledged": (
                 os.getenv("ALLOW_LIVE_TRADING", "").lower() == "yes-i-understand"),

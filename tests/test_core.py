@@ -12444,6 +12444,44 @@ class TestTheOperatorCanSeeWhatTheDeskSees(unittest.TestCase):
         self.assertTrue(telegram["ready"])
         self.assertEqual(telegram["authorise_with"], "")
 
+    def test_the_rpc_key_the_chain_config_interpolates_is_reported(self):
+        """config/chains.yaml interpolates ALCHEMY_KEY into every endpoint.
+
+        Omitting it from the report meant an operator could set it and never
+        see it mentioned -- and its absence is not a missing nice-to-have, it
+        is the chain read path degraded to public RPC.
+        """
+        names = {name for name, _ in MemecoinQuantDesk.CREDENTIALS}
+        self.assertIn("ALCHEMY_KEY", names)
+        chains = (Path(__file__).resolve().parents[1]
+                  / "config" / "chains.yaml").read_text()
+        self.assertIn("${ALCHEMY_KEY}", chains)
+
+    def test_each_key_names_the_miner_it_feeds_and_how_often_it_runs(self):
+        """'The key is set' and 'something is using it' are different facts,
+        and only the second one produces data."""
+        with mock.patch.dict(os.environ, {}, clear=True):
+            miners = MemecoinQuantDesk.credential_report(self._desk())["miners"]
+        for name, row in miners.items():
+            self.assertTrue(row["cadence"], name)
+            self.assertTrue(row["detail"], name)
+            self.assertTrue(row["keys"] or name == "global_research", name)
+        # With nothing set, only the miner that needs no key is active.
+        self.assertFalse(miners["chain_stream"]["active"])
+        self.assertFalse(miners["rpc"]["active"])
+        self.assertFalse(miners["source_mesh"]["active"])
+        self.assertTrue(miners["global_research"]["active"])
+
+    def test_telegram_keys_alone_do_not_make_the_mesh_miner_active(self):
+        """The session is the thing that makes MTProto push work."""
+        with mock.patch.dict(os.environ, {"TELEGRAM_API_ID": "1",
+                                          "TELEGRAM_API_HASH": "2"}, clear=True):
+            with mock.patch.object(Path, "exists", return_value=False):
+                miners = MemecoinQuantDesk.credential_report(self._desk())["miners"]
+        # The 5s watcher runs on the keys alone; the push mesh does not.
+        self.assertTrue(miners["social_watcher"]["active"])
+        self.assertFalse(miners["source_mesh"]["active"])
+
     def test_the_live_lock_is_reported_as_the_boolean_it_is(self):
         with mock.patch.dict(os.environ, {"ALLOW_LIVE_TRADING": "yes"}, clear=True):
             self.assertFalse(MemecoinQuantDesk.credential_report(
