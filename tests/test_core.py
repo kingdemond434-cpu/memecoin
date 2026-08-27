@@ -11390,7 +11390,17 @@ class TestKernelParityWithTheNativeExtension(unittest.TestCase):
                 return Decision(status="OK", action=ActionValue.EXIT, q=99.0)
 
         kernel.policy = Contrarian()
-        kernel.score(self._state(survival), survival=survival, **self.RESERVES)
+        decision = kernel.score(self._state(survival), survival=survival, **self.RESERVES)
+        # Promoted: Rust decided alone and Python was never called, so the
+        # disagreement is not visible yet. This is the acknowledged cost of
+        # taking Python off the hot path -- the trade has already gone.
+        self.assertEqual(decision.kernel["source"], "rust")
+        self.assertFalse(kernel.demoted_reason)
+        self.assertTrue(kernel.rust_authoritative)
+
+        # The deferred check is what finds it, off the decision path. Every
+        # promoted decision since promotion is queued, not only this one.
+        self.assertGreaterEqual(kernel.drain_parity(), 1)
         self.assertTrue(kernel.demoted_reason)
         self.assertFalse(kernel.rust_authoritative)
         # And it stays demoted however many agreements follow.
@@ -18125,3 +18135,322 @@ class TestMinerOffload(unittest.IsolatedAsyncioTestCase):
         from src.runtime.offload import install_fast_event_loop
         status = install_fast_event_loop()
         self.assertTrue(status.startswith("OK:") or status.startswith("DEGRADED:"))
+
+
+class TestPromotedRustKeepsPythonOffTheHotPath(unittest.TestCase):
+    """After promotion Rust decides alone. Python verifies afterwards.
+
+    A kernel that is "authoritative" while Python is still computed
+    synchronously in front of it has not removed one microsecond of Python
+    from the trade. That was the shape until now.
+    """
+
+    RESERVES = {"virtual_sol": 30_000_000_000, "virtual_token": 1_073_000_000_000_000}
+
+    def setUp(self):
+        try:
+            import solana_fastpath  # noqa: F401
+        except ImportError:
+            self.skipTest("solana_fastpath is not built on this host")
+
+    def _kernel(self, **kwargs):
+        from src.strategies.action_value import ActionValuePolicy
+        from src.strategies.t0_kernel import T0Kernel
+        return T0Kernel(ActionValuePolicy(min_edge=1e-4, max_add_fraction=0.5), **kwargs)
+
+    @staticmethod
+    def _survival():
+        from src.strategies.t0_kernel import SurvivalInputs
+        return SurvivalInputs(levels=[0.62, 0.41, 0.24, 0.13, 0.06, 0.03, 0.012, 0.004],
+                              p_rug_30s=0.09, p_rug_5m=0.31,
+                              expected_feasible_multiple=2.4)
+
+    @staticmethod
+    def _state():
+        from src.strategies.action_value import PositionState
+        return PositionState(held_fraction=0.5, current_multiple=1.8,
+                             exit_cost=0.01, entry_cost=0.01,
+                             exit_capacity_ratio=0.9, escape_probability=0.8,
+                             expected_remaining_seconds=90.0,
+                             alternative_growth_per_second=0.0,
+                             add_fraction=0.1, probe_fraction=0.05)
+
+    class _CountingPolicy:
+        min_edge = 1e-4
+        max_add_fraction = 0.5
+
+        def __init__(self, inner):
+            self.inner = inner
+            self.calls = 0
+
+        def score(self, state):
+            self.calls += 1
+            return self.inner.score(state)
+
+    def test_python_is_not_called_once_rust_is_authoritative(self):
+        from src.strategies.action_value import ActionValuePolicy
+        kernel = self._kernel(mode="auto", promote_after=2)
+        survival = self._survival()
+        for _ in range(2):
+            kernel.score(self._state(), survival=survival, **self.RESERVES)
+        self.assertTrue(kernel.rust_authoritative)
+
+        counting = self._CountingPolicy(ActionValuePolicy(min_edge=1e-4,
+                                                          max_add_fraction=0.5))
+        kernel.policy = counting
+        decision = kernel.score(self._state(), survival=survival, **self.RESERVES)
+        self.assertEqual(decision.kernel["source"], "rust")
+        # The whole point: zero Python policy calls on the decision path.
+        self.assertEqual(counting.calls, 0)
+        # And the check is not skipped, only deferred.
+        self.assertEqual(kernel.report()["parity_pending"], 1)
+        kernel.drain_parity()
+        self.assertEqual(counting.calls, 1)
+
+    def test_before_promotion_python_still_decides_and_is_called(self):
+        from src.strategies.action_value import ActionValuePolicy
+        kernel = self._kernel(mode="auto", promote_after=1000)
+        counting = self._CountingPolicy(ActionValuePolicy(min_edge=1e-4,
+                                                          max_add_fraction=0.5))
+        kernel.policy = counting
+        decision = kernel.score(self._state(), survival=self._survival(),
+                                **self.RESERVES)
+        self.assertEqual(decision.kernel["source"], "python")
+        self.assertEqual(counting.calls, 1)
+        self.assertEqual(kernel.report()["parity_pending"], 0)
+
+    def test_the_snapshot_survives_the_caller_mutating_state_afterwards(self):
+        kernel = self._kernel(mode="rust")
+        survival = self._survival()
+        state = self._state()
+        kernel.score(state, survival=survival, **self.RESERVES)
+        # The caller keeps trading: the position is banked down after the
+        # decision. A parity check against the mutated state would report a
+        # disagreement nobody made.
+        state.held_fraction = 0.01
+        state.current_multiple = 40.0
+        kernel.drain_parity()
+        self.assertFalse(kernel.demoted_reason)
+
+    def test_a_full_parity_queue_is_reported_as_unverified_not_as_agreement(self):
+        kernel = self._kernel(mode="rust", parity_queue=4)
+        survival = self._survival()
+        for _ in range(12):
+            kernel.score(self._state(), survival=survival, **self.RESERVES)
+        report = kernel.report()
+        self.assertGreater(report["parity_dropped"], 0)
+        # Dropped snapshots are decisions nobody will ever check. They must
+        # never be folded into the agreement count.
+        self.assertEqual(report["parity_unverified"], report["parity_dropped"])
+        self.assertLessEqual(report["parity_pending"], 4)
+
+    def test_the_report_says_whether_python_is_on_the_hot_path(self):
+        kernel = self._kernel(mode="auto", promote_after=2)
+        survival = self._survival()
+        self.assertTrue(kernel.report()["python_on_hot_path"])
+        for _ in range(2):
+            kernel.score(self._state(), survival=survival, **self.RESERVES)
+        self.assertFalse(kernel.report()["python_on_hot_path"])
+
+    def test_a_deferred_divergence_still_latches_the_demotion(self):
+        from src.strategies.action_value import Action as ActionValue, Decision
+        kernel = self._kernel(mode="rust")
+        survival = self._survival()
+        kernel.score(self._state(), survival=survival, **self.RESERVES)
+
+        class Contrarian:
+            min_edge = 1e-4
+            max_add_fraction = 0.5
+
+            def score(self, state):
+                return Decision(status="OK", action=ActionValue.EXIT, q=99.0)
+
+        kernel.policy = Contrarian()
+        kernel.drain_parity()
+        self.assertTrue(kernel.demoted_reason)
+        self.assertFalse(kernel.rust_authoritative)
+
+    def test_draining_an_empty_queue_is_free(self):
+        kernel = self._kernel(mode="auto")
+        self.assertEqual(kernel.drain_parity(), 0)
+
+    def test_a_rust_exception_on_the_promoted_path_still_falls_back(self):
+        kernel = self._kernel(mode="rust")
+
+        class Exploding:
+            def t0_decide(self, *args, **kwargs):
+                raise RuntimeError("boom")
+
+        kernel.native = Exploding()
+        decision = kernel.score(self._state(), survival=self._survival(),
+                                **self.RESERVES)
+        # Whatever Python answers -- including DATA_BLOCKED, which is the
+        # honest answer for a state carrying no forward distribution -- the
+        # desk gets an answer rather than an exception.
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.kernel["source"], "python")
+        self.assertEqual(kernel.report()["rust_errors"], 1)
+        self.assertIn("rust raised", decision.kernel["reason"])
+        # A raised kernel must not queue a parity snapshot for a decision it
+        # never made.
+        self.assertEqual(kernel.report()["parity_pending"], 0)
+
+
+class TestLandingRouter(unittest.IsolatedAsyncioTestCase):
+    """One signature, many carriers. Never two transactions."""
+
+    @staticmethod
+    def _route(name, kind, result, delay=0.0, raises=None):
+        from src.execution.landing_router import Route
+
+        async def submit(signed_tx):
+            if delay:
+                await asyncio.sleep(delay)
+            if raises is not None:
+                raise raises
+            return result
+
+        return Route(name=name, kind=kind, submit=submit)
+
+    def _router(self, *routes, **kwargs):
+        from src.execution.landing_router import LandingRouter
+        router = LandingRouter(**kwargs)
+        for route in routes:
+            router.register(route)
+        return router
+
+    async def test_the_first_acknowledgement_wins_and_is_named(self):
+        router = self._router(
+            self._route("slow", "rpc", "SIG", delay=0.05),
+            self._route("fast", "jito_bundle", "BUNDLE"))
+        outcome = await router.race("SIGNEDBYTES")
+        self.assertEqual(outcome.winner, "fast")
+        self.assertEqual(outcome.identifier, "BUNDLE")
+        self.assertIsNotNone(outcome.ack_ms)
+
+    async def test_every_route_receives_the_identical_payload(self):
+        from src.execution.landing_router import Route
+        seen = []
+
+        def make(name):
+            async def submit(signed_tx):
+                seen.append((name, signed_tx))
+                return name
+            return Route(name=name, kind=name, submit=submit)
+
+        router = self._router(make("a"), make("b"), make("c"))
+        await router.race("EXACTBYTES")
+        await asyncio.sleep(0.05)
+        # Same signature everywhere is what makes racing redundancy rather
+        # than a double-size position.
+        self.assertEqual({payload for _name, payload in seen}, {"EXACTBYTES"})
+
+    async def test_a_route_that_raises_is_counted_not_propagated(self):
+        router = self._router(
+            self._route("bad", "rpc", None, raises=RuntimeError("relay down")),
+            self._route("good", "jito_tx", "SIG"))
+        outcome = await router.race("TX")
+        self.assertEqual(outcome.winner, "good")
+        self.assertIn("bad", outcome.errors)
+        self.assertIn("relay down", outcome.errors["bad"])
+
+    async def test_every_route_refusing_is_reported_as_a_failed_submission(self):
+        router = self._router(
+            self._route("a", "rpc", None),
+            self._route("b", "jito_tx", None))
+        outcome = await router.race("TX")
+        self.assertFalse(outcome.submitted)
+        self.assertEqual(outcome.winner, "")
+        self.assertEqual(router.report()["races_with_no_acceptance"], 1)
+
+    async def test_a_bundle_only_route_is_skipped_when_no_bundle_was_built(self):
+        from src.execution.landing_router import Route
+        called = []
+
+        async def bundle(tx):
+            called.append("bundle")
+            return "B"
+
+        router = self._router(self._route("rpc", "rpc", "SIG"))
+        router.register(Route(name="jito_bundle", kind="jito_bundle",
+                              requires_bundle=True, submit=bundle))
+        outcome = await router.race("TX", bundle_capable=False)
+        self.assertNotIn("jito_bundle", outcome.attempted)
+        self.assertEqual(called, [])
+
+    async def test_landing_is_credited_to_every_route_that_carried_it(self):
+        router = self._router(
+            self._route("a", "rpc", "SIG"),
+            self._route("b", "jito_tx", "SIG"))
+        outcome = await router.race("TX")
+        await asyncio.sleep(0.05)
+        router.record_landing(outcome.identifier, landed=True, net_usd=12.0)
+        rows = router.report()["by_route"]
+        # Which relay the leader took it from is not observable from here.
+        # Inventing an attribution would build the routing table on a guess.
+        self.assertEqual(rows["a"]["landed"], 1)
+        self.assertEqual(rows["b"]["landed"], 1)
+
+    async def test_a_rate_is_blocked_until_there_are_enough_attempts(self):
+        router = self._router(self._route("a", "rpc", "SIG"), min_attempts=30)
+        for _ in range(3):
+            outcome = await router.race("TX")
+            router.record_landing(outcome.identifier, landed=True)
+        row = router.report()["by_route"]["a"]
+        # Three landings out of three is three attempts, not a 100% route.
+        self.assertEqual(row["data_status"], "DATA_BLOCKED")
+        self.assertIsNone(row["land_rate"])
+
+    async def test_ranking_does_not_starve_an_unmeasured_route(self):
+        from src.execution.landing_router import MIN_ATTEMPTS_FOR_RATE
+        router = self._router(self._route("measured", "rpc", "SIG"),
+                              self._route("fresh", "sender", "SIG2"))
+        for index in range(MIN_ATTEMPTS_FOR_RATE):
+            router._stats["measured"].resolved += 1
+            if index < 2:
+                router._stats["measured"].landed += 1
+        ranked = router.ranked()
+        # A route ranked worst is never attempted, so it is never measured,
+        # so it stays worst. Unmeasured keeps its declared position.
+        self.assertIn("fresh", ranked)
+        self.assertEqual(len(ranked), 2)
+
+    def test_one_mechanism_is_reported_as_degraded_redundancy(self):
+        router = self._router(self._route("a", "jito_bundle", "S"),
+                              self._route("b", "jito_bundle", "S"))
+        report = router.report()
+        self.assertEqual(report["status"], "DEGRADED")
+        self.assertIn("fail together", report["detail"])
+
+    def test_no_enabled_route_is_blocked_not_healthy(self):
+        from src.execution.landing_router import LandingRouter, Route
+        router = LandingRouter()
+        router.register(Route(name="off", kind="rpc", enabled=False,
+                              submit=lambda tx: None))
+        self.assertEqual(router.report()["status"], "DATA_BLOCKED")
+
+    def test_the_engine_registers_more_than_one_mechanism(self):
+        from src.execution.jupiter_jito import ExecutionEngine
+        engine = ExecutionEngine.__new__(ExecutionEngine)
+        from src.execution.landing_router import LandingRouter
+        engine.landing_router = LandingRouter()
+        engine.jito = SimpleNamespace(
+            send_bundle=lambda txs: None, send_transaction=lambda tx: None)
+        engine._send_raw_transaction = lambda tx: None
+        engine._forwarder = lambda url: (lambda tx: None)
+        ExecutionEngine._register_landing_routes(engine)
+        report = engine.landing_router.report()
+        self.assertGreaterEqual(len(report["mechanisms"]), 3)
+        # Unset providers register disabled WITH a reason, so an operator can
+        # see the redundancy they do not have.
+        rows = engine.landing_router._routes
+        self.assertIn("staked_rpc", rows)
+        self.assertIn("sender", rows)
+
+    def test_a_dark_router_has_a_health_check_that_escalates(self):
+        from ops.health import State, check_breadth
+        checks = {check.name: check for check in check_breadth({
+            "landing_router": {"status": "DATA_BLOCKED",
+                               "detail": "no landing route is enabled"}})}
+        self.assertIs(checks["breadth_landing_routes"].state, State.CRITICAL)
+        self.assertTrue(checks["breadth_landing_routes"].escalate)

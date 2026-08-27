@@ -315,6 +315,7 @@ class MemecoinQuantDesk:
         self._redecision_tasks: List[asyncio.Task] = []
         self._safety_task: Optional[asyncio.Task] = None
         self._intelligence_task: Optional[asyncio.Task] = None
+        self._parity_task: Optional[asyncio.Task] = None
         self._source_task: Optional[asyncio.Task] = None
         # Coverage says a module was consulted; this says whether it mattered.
         # A component that is disconnected and one that is connected but inert
@@ -988,6 +989,7 @@ class MemecoinQuantDesk:
             for _ in range(int(self.global_config.get("redecision_workers", 4)))]
         self._safety_task = asyncio.create_task(self._safety_sweep_loop())
         self._intelligence_task = asyncio.create_task(self._intelligence_loop())
+        self._parity_task = asyncio.create_task(self._parity_loop())
         self._register_memory_reliefs()
         self._health_task = asyncio.create_task(self._health_loop())
         self._market_task = asyncio.create_task(self._market_observer_loop())
@@ -1018,6 +1020,7 @@ class MemecoinQuantDesk:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
         for task in (self._main_task, self._health_task, self._market_task,
                      self._safety_task, self._intelligence_task, self._source_task,
+                     self._parity_task,
                      *self._redecision_tasks):
             if task:
                 task.cancel()
@@ -1186,6 +1189,25 @@ class MemecoinQuantDesk:
                 await self._update_intelligence()
             except Exception as exc:
                 logger.exception("Intelligence loop error: %s", exc)
+
+    async def _parity_loop(self):
+        """Verify promoted Rust decisions against Python, off the money path.
+
+        Its own loop rather than a line in the intelligence sweep, and on a
+        much shorter clock: this is the only thing standing between a Rust
+        kernel that has quietly started disagreeing and a session of trades
+        nobody checked. The queue is bounded, so falling behind loses checks
+        rather than memory -- and `parity_dropped` in /status is what makes
+        that loss visible instead of silent.
+        """
+        while self._running:
+            await asyncio.sleep(float(self.global_config.get(
+                "parity_sweep_seconds", 0.5)))
+            try:
+                self.t0_kernel.drain_parity(
+                    budget=int(self.global_config.get("parity_budget", 64)))
+            except Exception as exc:
+                logger.exception("Parity loop error: %s", exc)
 
     async def _market_observer_loop(self):
         """Keep research quotes off the latency-sensitive decision loop."""
@@ -4997,6 +5019,14 @@ class MemecoinQuantDesk:
             # Where the milliseconds go. The only thing on this page that
             # can tell you whether the next hour belongs to code or to money.
             "latency": self.latency.report(),
+            # Independent landing MECHANISMS, and which ones actually land.
+            # Seven Jito regions is one mechanism; a router reporting one
+            # mechanism has the redundancy of having none.
+            "landing_router": (self.execution_engine.landing_router.report()
+                               if getattr(self.execution_engine, "landing_router", None)
+                               is not None else
+                               {"status": "DATA_BLOCKED",
+                                "detail": "no execution engine yet"}),
             "event_loop": os.getenv("MEMECOIN_EVENT_LOOP", "unmeasured"),
             "miner_offload": (self.miner_offload.report()
                               if self.miner_offload is not None

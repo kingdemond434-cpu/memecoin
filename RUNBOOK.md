@@ -66,6 +66,39 @@ The entity registry stays empty until entries are verified from the entity's
 own published pages (`tools/verify_entities.py`). Empty is not "nothing is a
 copycat" -- it is "we cannot tell", and the desk sizes accordingly.
 
+Landing redundancy is mechanisms, not regions. Jito's seven regions are one
+auction; when that auction is the problem all seven fail together. Two more
+mechanisms register automatically when their variables are set, and register
+DISABLED with the reason when they are not:
+
+```bash
+export SOLANA_STAKED_RPC_URL=...     # a staked / SWQoS-prioritised endpoint
+export SOLANA_SENDER_URL=...         # a multi-path forwarder
+```
+
+Every route receives the SAME signed base64 string. That is what makes racing
+safe: one signature, executed at most once by the runtime, delivered by
+whoever arrives first. Racing two differently-signed variants of one intent
+would be two transactions and a double-size position, and the router refuses
+it by construction -- it fans out a string, not a decision.
+
+```bash
+curl -s http://127.0.0.1:18080/status | python3 -c "
+import json,sys; d=json.load(sys.stdin)['landing_router']
+print(d['status'], '|', d['detail'])
+print('mechanisms :', d['mechanisms'])
+print('measured   :', d['measured_routes'])"
+```
+
+`mechanisms` under two is reported DEGRADED. A route's landing rate stays
+DATA_BLOCKED until thirty resolved attempts, because three landings out of
+three is three attempts and not a perfect route.
+
+After promotion the Rust kernel decides ALONE and Python verifies afterwards.
+`/status.t0_kernel.python_on_hot_path` is the line that says which shape is
+running; `parity_dropped` counts promoted decisions nobody will ever check,
+and unverified is never reported as agreement.
+
 Measure the wire before arguing about geography. Run it ON THE NODE, never
 from a laptop or a sandbox -- a proxy in the path makes Tokyo look 5ms away
 and the tool refuses to draw a conclusion when it detects that:
