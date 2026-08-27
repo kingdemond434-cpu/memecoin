@@ -46,8 +46,12 @@ from src.research.feature_engine import build_features
 from src.research.global_research_miner import GlobalResearchMiner
 from src.research.calibration import CalibrationBook
 from src.research.chain_miners import register_chain_miners
+from src.research.fallback import FallbackResolver, Rung, Source
 from src.research.launch_census import LaunchCensus
 from src.research import rug_mechanism
+from src.strategies.screen_policy import (
+    ScreenPolicy, ScreenReading, Verdict as ScreenVerdict, graded, veto,
+)
 from src.research.data_miners import DataMinerPool
 from src.research.solana_miners import register_solana_miners
 from src.research.web_miners import register_web_miners
@@ -252,6 +256,16 @@ class MemecoinQuantDesk:
         # computed downstream of our own filters cannot see what those filters
         # discarded, and a screen that throws away monsters looks like a clean
         # record from inside.
+        # Screens that shrink a position rather than discard the launch. The
+        # census measured what hard screens cost in monsters, and the answer
+        # was that the losses they prevent are bounded at one position while
+        # the gains they forgo are not.
+        self.screen_policy = ScreenPolicy(
+            size_floor=float(self.global_config.get("screen_size_floor", 0.05)))
+        # Facts resolve down a graded ladder instead of blocking. Always an
+        # answer, never a forgotten guess.
+        self.facts = FallbackResolver()
+        self._last_screen: Dict[str, Any] = {}
         self.launch_census = LaunchCensus(
             Path(self.global_config.get("ops_state_dir", "data/state"))
             / "launch_census.json")
@@ -1131,11 +1145,13 @@ class MemecoinQuantDesk:
                 token, item.get("to", ""), item.get("from", ""),
                 float(item.get("lamports", 0) or 0) / 1e9, candidate.timestamp,
             )
-        if risk.risk_level.value in {"high", "critical", "honeypot", "rugged"}:
-            self._record_blocked_decision(token, "safety_rejection", risk_data)
-            return
-        if risk.data_status == "DATA_BLOCKED" and self.global_config.get("reject_data_blocked_safety_checks", True):
-            self._record_blocked_decision(token, "DATA_BLOCKED_safety_checks", risk_data)
+        # Safety is graded, not binary. HONEYPOT, RUGGED and CRITICAL are
+        # untradeable at any size and stay vetoes; HIGH is a worse token, not
+        # an impossible one, and a hard reject on it discards the launches
+        # whose upside pays for the ones it prevents.
+        screen = self._screen_entry(token, risk)
+        if screen.rejected:
+            self._record_blocked_decision(token, screen.census_reason, risk_data)
             return
         if not self.predictor._is_trained:
             self._record_blocked_decision(token, "DATA_BLOCKED_prediction_model", {})
@@ -1175,6 +1191,11 @@ class MemecoinQuantDesk:
             trade_info = self.elogw_engine.size_candidate(
                 prediction, self.sol_price_usd, liquidity,
                 disagreement=disagreement)
+            # The screens' verdict, applied as size rather than as a gate.
+            # Composed multiplicatively with the disagreement shrink already
+            # in trade_info: two independent reasons to be smaller are two
+            # reasons, not the larger of the two.
+            trade_info = self._apply_screen_size(trade_info, screen)
             has_room, room = self.elogw_engine.portfolio_room(trade_info)
             if not has_room:
                 trade_info = {**trade_info, **room}
@@ -1322,6 +1343,64 @@ class MemecoinQuantDesk:
         self.trade_count += 1
         logger.info("%s BUY %s %.4f SOL status=%s", "PAPER" if self.dry_run else "LIVE", token,
                     trade_info["position_size_sol"], result.status.value)
+
+    #: Risk levels that are untradeable at any size, as opposed to merely
+    #: worse. Enumerated rather than implied, so the line between a veto and a
+    #: discount is visible in one place.
+    VETO_RISK_LEVELS = frozenset({"honeypot", "rugged", "critical"})
+
+    #: How much of full size each surviving risk level justifies. HIGH is a
+    #: quarter position, not a rejection: the launches a hard reject on HIGH
+    #: discards include the ones whose upside pays for the rest.
+    RISK_LEVEL_SIZE = {"safe": 1.0, "low": 1.0, "medium": 0.6, "high": 0.25}
+
+    def _screen_entry(self, token: str, risk: Any):
+        """Grade this launch's screens into a size, or decline with a reason.
+
+        Everything the desk knows against a launch composes into one
+        multiplier. Only genuine impossibilities veto.
+        """
+        readings: List[ScreenReading] = []
+        level = str(getattr(getattr(risk, "risk_level", None), "value", "") or "")
+        if level in self.VETO_RISK_LEVELS:
+            readings.append(veto("safety", f"risk level {level}"))
+        elif level:
+            readings.append(ScreenReading(
+                name="safety", multiplier=self.RISK_LEVEL_SIZE.get(level, 0.5),
+                reason=f"risk level {level}"))
+        if getattr(risk, "data_status", "") == "DATA_BLOCKED":
+            # Unmeasured safety is not safe. Previously this rejected
+            # outright, which threw away every launch too young to have been
+            # checked -- which is most of them, at the moment that matters.
+            readings.append(ScreenReading(
+                name="safety_unmeasured", multiplier=0.35,
+                reason="safety checks could not complete in time"))
+        hazard = self.rug_hazard.get_hazard(token)
+        p_rug = getattr(hazard, "p_rug_5m", None) if hazard else None
+        readings.append(graded(
+            "rug_hazard", p_rug, benign=0.05, severe=0.60,
+            confidence=1.0 if p_rug is not None else 0.0))
+        outcome = self.screen_policy.evaluate(readings)
+        self._last_screen[token] = outcome
+        return outcome
+
+    def _apply_screen_size(self, trade_info: Dict[str, Any],
+                           screen: Any) -> Dict[str, Any]:
+        """Scale a sized position by the screens' composed multiplier."""
+        multiplier = float(getattr(screen, "size_multiplier", 1.0) or 0.0)
+        if multiplier >= 0.999:
+            return trade_info
+        scaled = dict(trade_info)
+        for field in ("position_size_sol", "position_value_usd",
+                      "risk_contribution"):
+            if scaled.get(field) is not None:
+                try:
+                    scaled[field] = float(scaled[field]) * multiplier
+                except (TypeError, ValueError):
+                    continue
+        scaled["screen_multiplier"] = multiplier
+        scaled["screen_detail"] = getattr(screen, "reason", "")
+        return scaled
 
     def _record_blocked_decision(self, token: str, reason: str, evidence: Dict[str, Any]):
         # Recorded so the weekly audit can ask what the rejected launches went
@@ -4468,6 +4547,8 @@ class MemecoinQuantDesk:
             "data_miners": self.data_miners.report(),
             "execution_conditions": self.execution_conditions_report(),
             "launch_census": self.launch_census.report(),
+            "screen_policy": self.screen_policy.report(),
+            "fact_ladder": self.facts.report(),
             "calibration": self.calibration.report(),
             "entity_registry": self.entity_registry.report(),
             # What following the wallets we watch has actually returned, at

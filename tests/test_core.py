@@ -101,6 +101,7 @@ from src.research.history_warehouse import (
 from src.strategies.screen_policy import (
     ScreenPolicy, ScreenReading, Verdict, graded, veto,
 )
+from src.strategies.screen_policy import Verdict as ScreenVerdict
 from src.research.rug_mechanism import RugMechanism
 from src.research.calibration import (
     CalibrationBook, ModelCalibration, Provenance,
@@ -15891,3 +15892,105 @@ class TestHistoryIsExtractedNotWaitedFor(unittest.TestCase):
         self.assertEqual([(w.start_slot, w.end_slot) for w in windows],
                          [(1000, 2000), (2000, 3000), (3000, 3500)])
         self.assertEqual(windows_between(500, 500), [])
+
+
+class TestGradedScreensReachTheActualDecision(unittest.TestCase):
+    """Wired, not merely written: the multiplier must reach the position."""
+
+    def _desk(self, p_rug=None):
+        desk = SimpleNamespace(
+            screen_policy=ScreenPolicy(size_floor=0.05),
+            _last_screen={},
+            rug_hazard=SimpleNamespace(
+                get_hazard=lambda token: (SimpleNamespace(p_rug_5m=p_rug)
+                                          if p_rug is not None else None)))
+        for name in ("_screen_entry", "_apply_screen_size"):
+            setattr(desk, name,
+                    types.MethodType(getattr(MemecoinQuantDesk, name), desk))
+        desk.VETO_RISK_LEVELS = MemecoinQuantDesk.VETO_RISK_LEVELS
+        desk.RISK_LEVEL_SIZE = MemecoinQuantDesk.RISK_LEVEL_SIZE
+        return desk
+
+    def _risk(self, level, status="OK"):
+        return SimpleNamespace(risk_level=SimpleNamespace(value=level),
+                               data_status=status)
+
+    def test_honeypot_and_rugged_still_veto(self):
+        for level in ("honeypot", "rugged", "critical"):
+            outcome = self._desk()._screen_entry("t", self._risk(level))
+            self.assertEqual(outcome.verdict, ScreenVerdict.VETOED, level)
+            self.assertTrue(outcome.rejected)
+
+    def test_high_risk_is_reduced_rather_than_rejected(self):
+        """This is the leak being repaired: HIGH used to reject outright."""
+        outcome = self._desk()._screen_entry("t", self._risk("high"))
+        self.assertFalse(outcome.rejected)
+        self.assertEqual(outcome.verdict, ScreenVerdict.REDUCED)
+        self.assertGreater(outcome.size_multiplier, 0.0)
+        self.assertLess(outcome.size_multiplier, 0.5)
+
+    def test_safe_launches_keep_full_size(self):
+        outcome = self._desk()._screen_entry("t", self._risk("safe"))
+        self.assertEqual(outcome.verdict, ScreenVerdict.FULL)
+        self.assertAlmostEqual(outcome.size_multiplier, 1.0)
+
+    def test_unmeasured_safety_shrinks_instead_of_discarding(self):
+        outcome = self._desk()._screen_entry(
+            "t", self._risk("low", status="DATA_BLOCKED"))
+        self.assertFalse(outcome.rejected)
+        self.assertLess(outcome.size_multiplier, 0.5)
+        names = [r.name for r in outcome.readings]
+        self.assertIn("safety_unmeasured", names)
+
+    def test_hazard_grades_continuously_rather_than_at_a_threshold(self):
+        low = self._desk(p_rug=0.06)._screen_entry("t", self._risk("safe"))
+        high = self._desk(p_rug=0.55)._screen_entry("t", self._risk("safe"))
+        self.assertGreater(low.size_multiplier, high.size_multiplier)
+        self.assertGreater(high.size_multiplier, 0.0)
+
+    def test_an_unmeasured_hazard_does_not_pretend_to_be_benign(self):
+        outcome = self._desk(p_rug=None)._screen_entry("t", self._risk("safe"))
+        hazard = next(r for r in outcome.readings if r.name == "rug_hazard")
+        self.assertEqual(hazard.confidence, 0.0)
+        self.assertIn("unmeasured", hazard.reason)
+
+    def test_several_concerns_can_still_decline_on_economics(self):
+        desk = self._desk(p_rug=0.9)
+        outcome = desk._screen_entry("t", self._risk("high", status="DATA_BLOCKED"))
+        self.assertEqual(outcome.verdict, ScreenVerdict.UNECONOMIC)
+        self.assertTrue(outcome.rejected)
+        self.assertIn("uneconomic_", outcome.census_reason)
+
+    def test_the_multiplier_actually_scales_the_position(self):
+        desk = self._desk()
+        screen = desk._screen_entry("t", self._risk("high"))
+        trade = {"position_size_sol": 1.0, "position_value_usd": 200.0,
+                 "risk_contribution": 0.4, "reason": "sized"}
+        scaled = desk._apply_screen_size(trade, screen)
+        self.assertAlmostEqual(scaled["position_size_sol"], screen.size_multiplier)
+        self.assertAlmostEqual(scaled["position_value_usd"],
+                               200.0 * screen.size_multiplier)
+        self.assertEqual(scaled["screen_multiplier"], screen.size_multiplier)
+        # Untouched fields survive.
+        self.assertEqual(scaled["reason"], "sized")
+
+    def test_a_full_size_screen_leaves_the_trade_untouched(self):
+        desk = self._desk()
+        screen = desk._screen_entry("t", self._risk("safe"))
+        trade = {"position_size_sol": 1.0}
+        self.assertIs(desk._apply_screen_size(trade, screen), trade)
+
+    def test_the_decision_path_calls_both_halves(self):
+        """Orphan code is the failure this codebase keeps catching."""
+        source = inspect.getsource(MemecoinQuantDesk._evaluate_candidate)
+        self.assertIn("self._screen_entry(", source)
+        self.assertIn("self._apply_screen_size(", source)
+        # And the old binary reject is gone.
+        self.assertNotIn('"safety_rejection"', source)
+
+    def test_a_reduced_launch_is_not_filed_as_a_screen_in_the_census(self):
+        desk = self._desk()
+        screen = desk._screen_entry("t", self._risk("high"))
+        # It reached a decision; recording it as screened-out would corrupt
+        # the missed-monster attribution.
+        self.assertEqual(screen.census_reason, "")
