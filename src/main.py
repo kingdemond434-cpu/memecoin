@@ -44,7 +44,10 @@ from src.execution.jupiter_jito import (
 from src.research.dataset_builder import PointInTimeDatasetBuilder
 from src.research.feature_engine import build_features
 from src.research.global_research_miner import GlobalResearchMiner
+from src.research.calibration import CalibrationBook
 from src.research.chain_miners import register_chain_miners
+from src.research.launch_census import LaunchCensus
+from src.research import rug_mechanism
 from src.research.data_miners import DataMinerPool
 from src.research.solana_miners import register_solana_miners
 from src.research.web_miners import register_web_miners
@@ -245,6 +248,21 @@ class MemecoinQuantDesk:
         # waiting. This is the thing that makes the number go up, and it
         # persists so a restart does not put it back to zero -- a requirement
         # of five thousand decisions is unreachable by a counter that resets.
+        # Every launch, not only the ones we had an opinion about. Ratios
+        # computed downstream of our own filters cannot see what those filters
+        # discarded, and a screen that throws away monsters looks like a clean
+        # record from inside.
+        self.launch_census = LaunchCensus(
+            Path(self.global_config.get("ops_state_dir", "data/state"))
+            / "launch_census.json")
+        self.launch_census.load()
+        self._census_saved_at = 0.0
+        # Are the stated probabilities true? Kelly is exquisitely sensitive to
+        # them and nothing has ever checked.
+        self.calibration = CalibrationBook(
+            Path(self.global_config.get("ops_state_dir", "data/state"))
+            / "calibration.json")
+        self.calibration.load()
         self.forward_evidence = ForwardEvidence(
             Path(self.global_config.get("ops_state_dir", "data/state"))
             / "forward_evidence.json")
@@ -1309,6 +1327,7 @@ class MemecoinQuantDesk:
         # Recorded so the weekly audit can ask what the rejected launches went
         # on to do. A missed monster is invisible unless the rejection was
         # written down next to the outcome.
+        self.launch_census.screen(token, reason)
         self._record_ops_event("trade_outcomes", {
             "token": token, "entered": False, "attempted": False,
             "rejection_reason": reason,
@@ -3359,6 +3378,28 @@ class MemecoinQuantDesk:
                     terms.append(value)
         return terms
 
+    def _resolve_census_death(self, token: str) -> None:
+        """Classify how a token died and record it against the denominator.
+
+        Runs over the observations the hazard tracker already collects, so no
+        new stream is needed. A death with no mechanism evidence is recorded
+        as unclassified rather than being folded into slow bleed, because a
+        residual that absorbs every unexplained death is how a rug model
+        learns nothing while reporting full coverage.
+        """
+        observations = list(self.rug_hazard.observations.get(token, ()) or ())
+        if not observations:
+            return
+        pool = self._latest_pool_state.get(token)
+        verdict = rug_mechanism.classify(
+            observations, migrated=(pool is not None))
+        if verdict.mechanism is rug_mechanism.RugMechanism.SURVIVED:
+            return
+        self.launch_census.resolve(
+            token, rugged=True, rug_mechanism=verdict.mechanism.value)
+        self._record_ops_event("rug_mechanisms", {
+            "token": token, **verdict.to_dict()})
+
     def _measured_congestion(self) -> Optional[float]:
         """Chain congestion in [0, 1], or None when unmeasured.
 
@@ -4161,6 +4202,11 @@ class MemecoinQuantDesk:
         if not token:
             return
         if event.get("type") == "token_created":
+            # Counted before anything can filter it. This is the denominator.
+            self.launch_census.see(
+                token, creator=str(event.get("creator", "") or ""),
+                at=float(event.get("timestamp", time.time())),
+                regime=str(self.current_regime or "unknown"))
             self.wallet_intel.record_token_lifecycle(token, launch_at=event.get("timestamp", time.time()))
             self.dataset_builder.start_episode(
                 token, event.get("creator", ""), event.get("program", PumpFunMonitor.PUMP_FUN_PROGRAM),
@@ -4202,6 +4248,9 @@ class MemecoinQuantDesk:
         elif event.get("type") == "token_trade":
             if event.get("program") == PumpSwapMonitor.PUMP_AMM_PROGRAM:
                 self._update_pool_state(token, event)
+                # Migration is itself an outcome, and one that separates a
+                # curve that stalled from one that graduated and then died.
+                self.launch_census.resolve(token, migrated=True)
             curve_price = float(event.get("curve_price_raw", 0) or 0)
             virtual_sol = int(event.get("virtual_sol_reserves") or 0)
             virtual_token = int(event.get("virtual_token_reserves") or 0)
@@ -4240,6 +4289,12 @@ class MemecoinQuantDesk:
                 # it is moving is what a slot of delay costs.
                 self._mark_history.setdefault(token, deque(maxlen=32)).append(
                     (stamp, curve_multiple))
+                # Resolved from the stream, independent of whether we ever
+                # traded it. That independence is the whole value: a peak
+                # measured only on tokens we entered cannot price what a
+                # screen threw away.
+                self.launch_census.resolve(
+                    token, peak_multiple=curve_multiple, at=stamp)
             observation = {"type": "trade", "side": event.get("side"), "wallet": event.get("wallet"),
                            "amount": event.get("actual_token_amount_ui"),
                            "amount_raw": event.get("actual_token_delta_raw"),
@@ -4412,6 +4467,8 @@ class MemecoinQuantDesk:
             # failing, and the two need different fixes.
             "data_miners": self.data_miners.report(),
             "execution_conditions": self.execution_conditions_report(),
+            "launch_census": self.launch_census.report(),
+            "calibration": self.calibration.report(),
             "entity_registry": self.entity_registry.report(),
             # What following the wallets we watch has actually returned, at
             # fills we could have got. A watch list nobody has scored is a
@@ -4555,6 +4612,12 @@ class MemecoinQuantDesk:
         if time.time() - self._evidence_saved_at > 60.0:
             self._evidence_saved_at = time.time()
             self.forward_evidence.save()
+        # The census carries the denominator every ratio above is computed
+        # against; losing it to a restart would silently reset those ratios.
+        if time.time() - self._census_saved_at > 120.0:
+            self._census_saved_at = time.time()
+            self.launch_census.save()
+            self.calibration.save()
 
     def _record_ops_event(self, stream: str, payload: Dict[str, Any]) -> None:
         """Append one operational telemetry row for the monitor and audit pack.
@@ -4569,6 +4632,14 @@ class MemecoinQuantDesk:
         # Trade outcomes are the promotion ledger's only input, and this is
         # the one place every outcome passes through -- entered or declined.
         if stream == "trade_outcomes":
+            token = str(payload.get("token", "") or "")
+            if token and not payload.get("rejection_reason"):
+                # Screens are recorded by _record_blocked_decision; anything
+                # arriving here without one reached the decision path.
+                self.launch_census.decide(
+                    token, str(payload.get("action", "") or ""))
+                if payload.get("entered"):
+                    self.launch_census.enter(token)
             self._record_forward_evidence(payload)
         try:
             root = Path(self.global_config.get("ops_state_dir", "data/state"))
