@@ -79,6 +79,7 @@ from src.strategies.multihead_predictor import SURVIVAL_LEVELS, ElogwEngine, Mul
 from src.chains.pump_curve import (
     LAMPORTS_PER_SOL, BondingCurveState, parse_bonding_curve, quote_buy, quote_sell,
 )
+from src.chains.pump_curve import quote_sell as curve_quote_sell
 from src.chains.idl import report as idl_report
 from src.chains.pump_route import (
     TOKEN_2022_PROGRAM, TOKEN_PROGRAM, NativePumpRoute, PumpRouteConfig,
@@ -117,6 +118,7 @@ from src.strategies.wallet_intelligence import WalletIntelligenceEngine
 from src.strategies.wallet_value import FollowOutcome
 from src.strategies.t0_kernel import SurvivalInputs, T0Kernel
 from src.strategies.funder_ancestry import FunderAncestry, compress_independence
+from src.execution.staged_exits import StagedExits
 
 logger = logging.getLogger(__name__)
 
@@ -275,6 +277,16 @@ class MemecoinQuantDesk:
         # Marking provenance. A desk that believes it marks locally and in
         # fact pays a round trip on every decision looks identical from the
         # outside; these are what tell the two apart.
+        # Pure and cheap, and both are reached from the exit path -- so they
+        # are constructed here rather than in async setup. A desk that can
+        # execute an exit but has not run setup is a shape the tests build and
+        # the runtime can reach during teardown.
+        self.state_sequencer = StateSequencer()
+        # Exit instructions built before they are needed. Everything expensive
+        # about a sell is independent of the amount, so the escape path should
+        # never pay for account derivation at the moment it fires.
+        self.staged_exits = StagedExits(
+            bound_max_age_s=float(self.global_config.get("staged_bound_max_age_s", 2.0)))
         self._marks_local = 0
         self._marks_router = 0
         self._mark_checked_at: Dict[str, float] = {}
@@ -514,7 +526,7 @@ class MemecoinQuantDesk:
             promote_after=int(self.global_config.get("t0_kernel_promote_after", 500)))
         logger.info("T0 kernel: mode=%s native=%s",
                     self.t0_kernel.mode.value, self.t0_kernel.native_status)
-        self.state_sequencer = StateSequencer()
+
         # Re-entry is a post-exit candidate, not an action an open
         # position can take: `Action.REENTER` is only scorable at zero held
         # fraction, so the book lives outside the position loop and gates
@@ -837,6 +849,14 @@ class MemecoinQuantDesk:
             position = self.elogw_engine.open_positions.get(token)
             if position is None:
                 continue
+            # The market moved, so the ladder's protective bounds were priced
+            # against a state that no longer holds. Refreshed BEFORE the
+            # decision, so that if this redecision chooses to leave, the rung
+            # it reaches for is already current.
+            try:
+                self._reprice_staged_exits(token)
+            except Exception as exc:
+                logger.debug("staged exit reprice failed for %s: %s", token, exc)
             try:
                 await self._manage_one_position(token, position)
             except Exception as exc:
@@ -1178,6 +1198,9 @@ class MemecoinQuantDesk:
             "ratchet_stages": [],
         }
         self.elogw_engine.update_position(token, position)
+        staged = self._stage_exits(token, position)
+        if staged is not None:
+            position["staged_exits"] = staged.detail
         if self.reentry_book.get(token) is not None:
             # Counted only on a fill, not on admission: the next re-entry into
             # this token has to clear a strictly higher bar, and a bar that
@@ -3047,6 +3070,92 @@ class MemecoinQuantDesk:
             "status": "OK" if self._marks_local else "DATA_BLOCKED",
         }
 
+    def _stage_exits(self, token: str, position: Dict[str, Any]) -> Optional[Any]:
+        """Build the exit ladder for a position the moment it opens.
+
+        Everything expensive about an exit -- deriving accounts, resolving the
+        venue, encoding the discriminator -- does not depend on how much is
+        being sold. Doing it now means that when something changes and the
+        position has to be out, the work left is two integers.
+        """
+        size_tokens = int(position.get("size_tokens", 0) or 0)
+        if size_tokens <= 0 or self.execution_engine is None:
+            return None
+        builders = self._exit_builders(token, position)
+        if builders is None:
+            return None
+        build_sell, quote_sell, venue = builders
+        return self.staged_exits.stage(
+            token, size_tokens,
+            state_version=self.state_sequencer.current(token),
+            build_sell=build_sell, quote_sell=quote_sell,
+            slippage_bps=int(self.global_config.get("exit_slippage_bps", 500)),
+            venue=venue)
+
+    def _exit_builders(self, token: str, position: Dict[str, Any]):
+        """(build_sell, quote_sell, venue) for whichever venue owns this token.
+
+        Injected into the ladder rather than known by it: the ladder has the
+        same shape on a curve and on a pool, and a second copy of the routing
+        rules is a second thing to keep in step with the router.
+        """
+        engine = self.execution_engine
+        if engine is None:
+            return None
+        curve = self._latest_curve_state.get(token)
+        if curve is not None:
+            creator = str(getattr(curve, "creator", "") or "")
+            route = getattr(engine, "pump_route", None)
+            if route is None or not creator:
+                return None
+            user = engine.tx_builder.public_key
+
+            def build_sell(size: int, minimum: int):
+                return route.build_sell(token, creator, user, size, minimum)
+
+            def quote_sell(size: int) -> Optional[int]:
+                quote = curve_quote_sell(curve, size)
+                return int(quote.output_amount) if quote.data_status == "OK" else None
+
+            return build_sell, quote_sell, "pump_curve"
+
+        reserves = self._latest_pool_state.get(token)
+        account = self._pool_accounts.get(token)
+        route = getattr(engine, "pumpswap_route", None)
+        if (reserves is None or account is None or route is None
+                or reserves.blocked_reason() is not None):
+            return None
+        user = engine.tx_builder.public_key
+
+        def build_pool_sell(size: int, minimum: int):
+            return route.build_sell(account, user, size, minimum)
+
+        def quote_pool_sell(size: int) -> Optional[int]:
+            quote = pool_quote_sell(reserves, size)
+            return int(quote.output_amount) if quote.data_status == "OK" else None
+
+        return build_pool_sell, quote_pool_sell, "pumpswap"
+
+    def _reprice_staged_exits(self, token: str) -> int:
+        """Refresh the protective bounds after the market moved.
+
+        A minimum computed against a curve from thirty seconds ago is not
+        protection, it is an invitation -- and repricing costs one local quote
+        rather than a rebuild.
+        """
+        position = self.elogw_engine.open_positions.get(token)
+        if position is None:
+            return 0
+        builders = self._exit_builders(token, position)
+        if builders is None:
+            return 0
+        build_sell, quote_sell, venue = builders
+        return self.staged_exits.reprice(
+            token, state_version=self.state_sequencer.current(token),
+            build_sell=build_sell, quote_sell=quote_sell,
+            slippage_bps=int(self.global_config.get("exit_slippage_bps", 500)),
+            venue=venue)
+
     def _local_mark(self, token: str, position: Dict[str, Any]):
         """What this position is worth right now, from streamed state alone.
 
@@ -3233,6 +3342,19 @@ class MemecoinQuantDesk:
                             reason: str, expected_edge_usd: Optional[float] = None):
         current_tokens = int(position["size_tokens"])
         sold_tokens = min(current_tokens, max(1, int(current_tokens * min(max(exit_pct, 0), 1))))
+        # Whether the ladder had this exit prepared. Recorded on the attempt
+        # rather than acted on here: the engine owns submission, and a staged
+        # rung is an instruction, never a reason to sell.
+        rung, staged_status = self.staged_exits.take(
+            token, min(max(float(exit_pct), 0.0), 1.0),
+            state_version=self.state_sequencer.current(token))
+        if rung is not None and staged_status.startswith("STALE"):
+            # One local quote, not a rebuild. Still far cheaper than
+            # constructing the instruction from nothing at the worst moment.
+            self._reprice_staged_exits(token)
+            rung, staged_status = self.staged_exits.take(
+                token, min(max(float(exit_pct), 0.0), 1.0),
+                state_version=self.state_sequencer.current(token))
         result = await self.execution_engine.execute_sell(
             token, sold_tokens, slippage_bps=500, use_jito=True,
             decision_id=position.get("decision_id"),
@@ -3251,7 +3373,10 @@ class MemecoinQuantDesk:
         self.landing_latency.record(getattr(result, "latency_ms", 0),
                                     landed=bool(getattr(result, "landed", False)),
                                     simulated=bool(result.simulated))
-        attempt = {**_jsonable(result), "exit_reason": reason, "exit_pct": sold_tokens / max(current_tokens, 1)}
+        attempt = {**_jsonable(result), "exit_reason": reason,
+                   "exit_pct": sold_tokens / max(current_tokens, 1),
+                   "staged_exit": staged_status,
+                   "staged_rung": (rung.fraction if rung is not None else None)}
         self._record_ops_event("execution_attempts", {
             "token": token, "side": "sell", "success": bool(result.success),
             "status": getattr(result.status, "value", str(result.status)),
@@ -3291,6 +3416,17 @@ class MemecoinQuantDesk:
         # capital that had not been returned, and leaving `_closed_pnl` empty
         # so the eventual real close counted the same PnL a second time.
         remaining = int(position["size_tokens"])
+        # The position is a different size now, so every rung is priced for a
+        # size that no longer exists. Restaged on a partial, released on a
+        # close -- a ladder held for a position that is gone is a ladder that
+        # will one day be handed to the wrong token.
+        if remaining > 0:
+            try:
+                self._stage_exits(token, position)
+            except Exception as exc:
+                logger.debug("restaging exits for %s failed: %s", token, exc)
+        else:
+            self.staged_exits.release(token)
         if remaining <= 0:
             # The position is closed, so its outcome is now final and can be
             # attributed. Partial exits are deliberately not recorded here:
@@ -3648,6 +3784,9 @@ class MemecoinQuantDesk:
             "wallet_follow": self.follow_report(),
             # Local marking versus the router, and whether the two agree.
             "marking": self.mark_report(),
+            # Whether exits are actually served from the prepared ladder. One
+            # built for every position and used for none is pure cost.
+            "staged_exits": self.staged_exits.report(),
             "source_mesh": {**self.source_mesh.health(),
                             "registry": self.source_registry_report.to_dict(),
                             # What is wired, what answered, and what could not

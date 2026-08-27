@@ -68,6 +68,9 @@ from src.collectors.adapters import (
 from src.collectors.event_source import (
     Event, EventSource, SourceClass, SourceMesh, SourceState,
 )
+from src.execution.staged_exits import (
+    StagedExits, StagedLadder, StagedRung,
+)
 from src.collectors.transports import (
     BlueskyJetstreamTransport, GithubRepoTransport, JsonPollTransport,
     MastodonTimelineTransport, NostrRelayTransport, OfficialSiteTransport,
@@ -910,6 +913,10 @@ class TestPartialExitAccounting(unittest.IsolatedAsyncioTestCase):
         desk._exit_edge_usd = (
             lambda position, exit_pct, reason, supplied=None:
             MemecoinQuantDesk._exit_edge_usd(desk, position, exit_pct, reason, supplied))
+        desk.staged_exits = StagedExits()
+        desk.state_sequencer = StateSequencer()
+        desk._stage_exits = lambda token, position: None
+        desk._reprice_staged_exits = lambda token: 0
         return desk
 
     @staticmethod
@@ -8223,12 +8230,16 @@ class TestReentryIsLiveWired(unittest.TestCase):
         # A partial bank leaves the position open, so recording it would let
         # ADD be re-litigated through a path that believes the book is flat.
         # The one call must sit inside the remaining<=0 branch.
+        # Specifically the `remaining <= 0` branch. Matching any comparison
+        # on `remaining` would also match the restaging branch beside it, and
+        # a test that finds the wrong branch proves nothing about this one.
         closed_branch = next(
             node for node in ast.walk(exit_fn)
             if isinstance(node, ast.If)
             and isinstance(node.test, ast.Compare)
             and isinstance(node.test.left, ast.Name)
             and node.test.left.id == "remaining"
+            and isinstance(node.test.ops[0], ast.LtE)
         )
         self.assertTrue(any(call in ast.walk(closed_branch) for call in calls))
 
@@ -11662,6 +11673,182 @@ class TestFunderAncestryCompressesWallets(unittest.TestCase):
         # look like a launch with no shared funders.
         self.assertEqual(list(plain.vector(4))[16:20], [-1.0] * 4)
         self.assertEqual(funded.shares_funder_with_prior[1], 1.0)
+
+
+class TestExitsArePreparedBeforeTheyAreNeeded(unittest.TestCase):
+    """Every microsecond between deciding to escape and signing is spent
+    while the thing being escaped continues happening.
+
+    Almost all of that work is knowable in advance: the accounts for a sell do
+    not depend on the amount. What changes is two integers.
+    """
+
+    def _prepared(self, ok=True):
+        return SimpleNamespace(ok=ok)
+
+    def _builders(self, *, proceeds_per_token=100, buildable=True):
+        built = []
+
+        def build_sell(size, minimum):
+            built.append((size, minimum))
+            return self._prepared(buildable)
+
+        def quote_sell(size):
+            return int(size * proceeds_per_token) if proceeds_per_token else None
+
+        return build_sell, quote_sell, built
+
+    def _stage(self, staged, *, size=1_000, version=1, slippage=500, **kwargs):
+        build_sell, quote_sell, built = self._builders(**kwargs)
+        ladder = staged.stage(
+            "mint", size, state_version=version, build_sell=build_sell,
+            quote_sell=quote_sell, slippage_bps=slippage, venue="pump_curve")
+        return ladder, built
+
+    def test_a_position_gets_its_whole_ladder_at_open(self):
+        staged = StagedExits()
+        ladder, built = self._stage(staged)
+        self.assertEqual(sorted(ladder.rungs), [0.10, 0.25, 0.50, 0.75, 1.0])
+        self.assertEqual([size for size, _ in built], [100, 250, 500, 750, 1_000])
+        self.assertEqual(staged.report()["rungs_built"], 5)
+
+    def test_the_ladder_covers_the_actions_the_policy_can_choose(self):
+        """A ladder that misses the policy's own action set is a ladder that
+        will be missed on exactly the action chosen."""
+        staged = StagedExits()
+        for fraction in (0.10, 0.25, 0.50, 0.75, 1.00):
+            self.assertIn(fraction, staged.ladder)
+
+    def test_the_protective_bound_comes_off_a_local_quote(self):
+        staged = StagedExits()
+        _ladder, built = self._stage(staged, proceeds_per_token=1_000, slippage=500)
+        # 100 tokens at 1000 each, less 5%.
+        self.assertEqual(built[0], (100, 95_000))
+
+    def test_an_exit_takes_the_rung_at_or_below_what_was_asked(self):
+        """Rounding UP sells more than the policy chose."""
+        staged = StagedExits()
+        self._stage(staged)
+        rung, status = staged.take("mint", 0.60, state_version=1)
+        self.assertEqual(status, "OK")
+        self.assertEqual(rung.fraction, 0.50)
+
+    def test_an_exit_below_every_rung_is_a_miss_not_a_wrong_rung(self):
+        staged = StagedExits()
+        self._stage(staged)
+        rung, status = staged.take("mint", 0.05, state_version=1)
+        self.assertIsNone(rung)
+        self.assertIn("no rung", status)
+        self.assertEqual(staged.report()["missed"], 1)
+
+    def test_a_bound_priced_against_a_superseded_state_is_flagged(self):
+        """A minimum priced against a curve from thirty seconds ago is an
+        invitation, not protection."""
+        staged = StagedExits()
+        self._stage(staged, version=1)
+        rung, status = staged.take("mint", 1.0, state_version=2)
+        self.assertIsNotNone(rung)
+        self.assertTrue(status.startswith("STALE"))
+        self.assertEqual(staged.report()["served_stale"], 1)
+
+    def test_a_stale_rung_is_handed_over_rather_than_withheld(self):
+        """Withholding sends the escape down the slow path for something one
+        local quote fixes."""
+        staged = StagedExits()
+        self._stage(staged, version=1)
+        rung, _status = staged.take("mint", 1.0, state_version=9)
+        self.assertIsNotNone(rung.instruction)
+
+    def test_an_old_bound_goes_stale_on_time_as_well_as_on_version(self):
+        staged = StagedExits(bound_max_age_s=1.0)
+        self._stage(staged, version=1)
+        _rung, fresh = staged.take("mint", 1.0, state_version=1, now=time.time())
+        _rung, aged = staged.take("mint", 1.0, state_version=1, now=time.time() + 30)
+        self.assertEqual(fresh, "OK")
+        self.assertTrue(aged.startswith("STALE"))
+
+    def test_repricing_refreshes_only_the_volatile_half(self):
+        staged = StagedExits()
+        self._stage(staged, version=1)
+        build_sell, quote_sell, built = self._builders(proceeds_per_token=50)
+        refreshed = staged.reprice(
+            "mint", state_version=2, build_sell=build_sell, quote_sell=quote_sell,
+            slippage_bps=500)
+        self.assertEqual(refreshed, 5)
+        # Rebuilt at the same sizes, at the new price.
+        self.assertEqual([size for size, _ in built], [100, 250, 500, 750, 1_000])
+        self.assertEqual(staged.take("mint", 1.0, state_version=2)[1], "OK")
+
+    def test_repricing_a_current_ladder_does_nothing(self):
+        staged = StagedExits()
+        self._stage(staged, version=1)
+        build_sell, quote_sell, built = self._builders()
+        self.assertEqual(staged.reprice(
+            "mint", state_version=1, build_sell=build_sell,
+            quote_sell=quote_sell, slippage_bps=500), 0)
+        self.assertEqual(built, [])
+
+    def test_an_unquotable_venue_stages_nothing_rather_than_something_unbounded(self):
+        """An unbounded sell is not a prepared sell."""
+        staged = StagedExits()
+        ladder, built = self._stage(staged, proceeds_per_token=0)
+        self.assertEqual(ladder.rungs, {})
+        self.assertEqual(built, [])
+        self.assertEqual(staged.report()["build_failures"], 5)
+
+    def test_an_instruction_that_will_not_build_is_not_staged(self):
+        staged = StagedExits()
+        ladder, _built = self._stage(staged, buildable=False)
+        self.assertEqual(ladder.rungs, {})
+
+    def test_a_position_holding_nothing_stages_nothing(self):
+        staged = StagedExits()
+        ladder, _built = self._stage(staged, size=0)
+        self.assertEqual(ladder.rungs, {})
+        self.assertIn("no tokens", ladder.detail)
+
+    def test_a_released_position_keeps_no_ladder(self):
+        """A ladder for a position that is gone will one day be handed to the
+        wrong token."""
+        staged = StagedExits()
+        self._stage(staged)
+        staged.release("mint")
+        self.assertIsNone(staged.ladder_for("mint"))
+        self.assertIsNone(staged.take("mint", 1.0, state_version=1)[0])
+
+    def test_the_emergency_rung_is_the_same_machinery_as_the_others(self):
+        """A distinct emergency path is exercised only during emergencies,
+        which is the worst possible test schedule."""
+        staged = StagedExits()
+        ladder, _built = self._stage(staged)
+        self.assertEqual(ladder.rungs[1.0].venue, ladder.rungs[0.10].venue)
+        self.assertEqual(type(ladder.rungs[1.0]), type(ladder.rungs[0.10]))
+
+    def test_the_report_says_whether_the_ladder_is_actually_used(self):
+        """One built for every position and used for none is pure cost."""
+        staged = StagedExits()
+        self._stage(staged)
+        self.assertEqual(staged.report()["status"], "DATA_BLOCKED")
+        staged.take("mint", 0.5, state_version=1)
+        report = staged.report()
+        self.assertEqual(report["status"], "OK")
+        self.assertEqual(report["hit_rate"], 1.0)
+
+    def test_old_positions_are_evicted_rather_than_accumulated(self):
+        staged = StagedExits(max_positions=3)
+        for index in range(6):
+            build_sell, quote_sell, _built = self._builders()
+            staged.stage(f"mint{index}", 1_000, state_version=1,
+                         build_sell=build_sell, quote_sell=quote_sell, slippage_bps=500)
+        self.assertEqual(staged.report()["staged_positions"], 3)
+
+    def test_the_desk_stages_on_open_reprices_on_events_and_releases_on_close(self):
+        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        self.assertIn("staged = self._stage_exits(token, position)", source)
+        self.assertIn("self._reprice_staged_exits(token)", source)
+        self.assertIn("self.staged_exits.release(token)", source)
+        # And the exit path reaches for the rung before submitting.
+        self.assertIn("rung, staged_status = self.staged_exits.take(", source)
 
 class TestPumpSwapConstruction(unittest.TestCase):
     """The last DATA_BLOCKED that was never about missing information.
