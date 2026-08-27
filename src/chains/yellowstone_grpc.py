@@ -747,8 +747,42 @@ class PumpFunMonitor:
         self.callback = callback
         self._seen: Set[Tuple[str, str]] = set()
         self._seen_program_events: Set[Tuple[str, bytes]] = set()
+        # What the decoder is actually seeing. An instruction whose
+        # discriminator we do not recognise is skipped with `continue`, and a
+        # decode that throws is logged at debug -- so a decoder that names
+        # buys and sells but not creations looks exactly like a chain on which
+        # nobody is launching. These counters are the difference.
+        self.matched: Dict[str, int] = {}
+        self.unmatched: Dict[str, int] = {}
+        self.rejected: Dict[str, int] = {}
         yellowstone.on("transaction", self._on_transaction)
         yellowstone.on("program_data", self._on_program_data)
+
+    def decoder_report(self) -> Dict[str, Any]:
+        """Which Pump instructions we can name, and which we cannot.
+
+        `unmatched` is keyed by the first eight bytes in hex. If creations are
+        arriving under a discriminator this build does not know, they appear
+        here by their actual prefix -- which is both the diagnosis and the fix.
+        """
+        unmatched = dict(sorted(self.unmatched.items(),
+                                key=lambda item: item[1], reverse=True)[:12])
+        return {
+            "status": ("OK" if self.matched.get("create") or
+                       self.matched.get("create_v2") else
+                       "DEGRADED" if self.matched else "DATA_BLOCKED"),
+            "detail": ("" if self.matched.get("create") or
+                       self.matched.get("create_v2") else
+                       "instructions decode but no creation has been named; "
+                       "if unmatched prefixes appear below, one of them is "
+                       "probably the current create discriminator"
+                       if self.matched else
+                       "no Pump instruction has been decoded at all"),
+            "matched": dict(sorted(self.matched.items())),
+            "unmatched_prefixes": unmatched,
+            "rejected": dict(sorted(self.rejected.items())),
+            "known": sorted(self.DISCRIMINATORS.values()),
+        }
 
     async def _on_program_data(self, update: Dict[str, Any]):
         if update.get("program") != self.PUMP_FUN_PROGRAM:
@@ -837,14 +871,24 @@ class PumpFunMonitor:
         received_ns = time.time_ns()
         keys, instructions, signature, slot = transaction_parts(tx_data)
         for instruction_index, instruction in enumerate(instructions):
+            name: Optional[str] = None
             try:
                 program_index, accounts, data = instruction_fields(instruction)
                 if program_index < 0 or program_index >= len(keys) or len(data) < 8:
                     continue
                 program = keys[program_index]
-                name = self.DISCRIMINATORS.get(data[:8])
-                if not name or program != self.PUMP_FUN_PROGRAM:
+                if program != self.PUMP_FUN_PROGRAM:
                     continue
+                name = self.DISCRIMINATORS.get(data[:8])
+                if not name:
+                    # A Pump instruction we cannot name. Counted by its actual
+                    # prefix rather than dropped, because "we do not recognise
+                    # this" and "this did not happen" are different facts and
+                    # only one of them is ours to fix.
+                    prefix = data[:8].hex()
+                    self.unmatched[prefix] = self.unmatched.get(prefix, 0) + 1
+                    continue
+                self.matched[name] = self.matched.get(name, 0) + 1
                 dedupe = (signature, instruction_index)
                 if dedupe in self._seen:
                     continue
@@ -866,6 +910,11 @@ class PumpFunMonitor:
                     if asyncio.iscoroutine(result):
                         await result
             except (ValueError, IndexError, struct.error) as exc:
+                # Counted as well as logged. A creation that decodes to an
+                # exception on every single transaction is a decoder bug, and
+                # at debug level it is indistinguishable from silence.
+                label = f"{name or 'unknown'}:{type(exc).__name__}"
+                self.rejected[label] = self.rejected.get(label, 0) + 1
                 logger.debug("Pump instruction parse rejected: %s", exc)
 
     def _decode_instruction(

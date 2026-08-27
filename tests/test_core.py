@@ -16706,3 +16706,54 @@ class TestResponsesRouteByWhatIsActuallySet(unittest.IsolatedAsyncioTestCase):
         # The bug was `data = getattr(...)` followed by `if data:` picking the
         # first name in a list. Routing must not depend on a field's value.
         self.assertNotIn("if data:", source)
+
+
+class TestTheDecoderSaysWhatItCannotName(unittest.TestCase):
+    """An unnamed instruction is skipped with `continue`; a decode failure is
+    logged at debug. Both look exactly like a quiet chain."""
+
+    def _monitor(self):
+        from src.chains.yellowstone_grpc import PumpFunMonitor, YellowstoneClient
+        return PumpFunMonitor(YellowstoneClient("https://x"), lambda event: None)
+
+    def test_nothing_decoded_reads_blocked(self):
+        report = self._monitor().decoder_report()
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertIn("no Pump instruction has been decoded", report["detail"])
+
+    def test_trades_without_creations_is_degraded_and_says_why(self):
+        monitor = self._monitor()
+        monitor.matched = {"buy": 150, "sell": 48}
+        report = monitor.decoder_report()
+        self.assertEqual(report["status"], "DEGRADED")
+        self.assertIn("no creation has been named", report["detail"])
+        self.assertIn("current create discriminator", report["detail"])
+
+    def test_a_creation_named_reads_ok(self):
+        monitor = self._monitor()
+        monitor.matched = {"create": 3, "buy": 150}
+        self.assertEqual(monitor.decoder_report()["status"], "OK")
+
+    def test_unmatched_prefixes_are_reported_by_their_actual_bytes(self):
+        monitor = self._monitor()
+        monitor.matched = {"buy": 10}
+        monitor.unmatched = {"aabbccddeeff0011": 40, "1122334455667788": 2}
+        report = monitor.decoder_report()
+        # The diagnosis and the fix are the same eight bytes.
+        self.assertEqual(list(report["unmatched_prefixes"])[0], "aabbccddeeff0011")
+
+    def test_the_known_set_is_reported_for_comparison(self):
+        report = self._monitor().decoder_report()
+        self.assertIn("create", report["known"])
+        self.assertIn("buy", report["known"])
+
+    def test_rejections_are_counted_not_only_logged(self):
+        monitor = self._monitor()
+        monitor.rejected = {"create:ValueError": 88}
+        # A creation throwing on every transaction is a decoder bug, and at
+        # debug level it is indistinguishable from silence.
+        self.assertEqual(monitor.decoder_report()["rejected"]["create:ValueError"], 88)
+
+    def test_status_exposes_it(self):
+        source = inspect.getsource(MemecoinQuantDesk.readiness)
+        self.assertIn("decoder_report()", source)
