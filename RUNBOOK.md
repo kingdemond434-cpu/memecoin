@@ -330,3 +330,58 @@ concurrency halves, price paths for untraded tokens are dropped. None of it
 touches the decision path. Watch `memory.band` in `/status`; a desk that lives
 in `shed` is on a host too small for it, and trimming harder will not fix
 that.
+
+
+## Moving the key out of the desk
+
+Two units. The desk holds no key; the signer holds nothing else.
+
+```bash
+# 1. The signer's own env file -- ONLY the key. Not the desk's env: every
+#    variable the signer cannot read is one it cannot leak.
+install -m 700 -d ~/.config/memecoin-shadow
+printf 'SOLANA_PRIVATE_KEY=%s\n' "$YOUR_KEY" > ~/.config/memecoin-shadow/signer-env
+chmod 600 ~/.config/memecoin-shadow/signer-env
+
+# 2. Install and start the signer
+cp deploy/systemd/memecoin-signer.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now memecoin-signer.service
+systemctl --user status memecoin-signer.service --no-pager | head -5
+
+# 3. Point the desk at it and remove the key from the desk's own env
+sed -i '/^SOLANA_PRIVATE_KEY=/d' ~/.config/memecoin-shadow/env
+echo "MEMECOIN_SIGNER_SOCKET=%t/memecoin/signer.sock" >> ~/.config/memecoin-shadow/env
+systemctl --user restart memecoin-shadow.service
+```
+
+Confirm with `/status`: `signer.mode` should read `isolated` and
+`signer.isolated` `true`. While it reads `local`, the key is in the trading
+process -- which is a supported configuration, not a broken one, but it is
+not the one to run live capital on.
+
+The signer has `PrivateNetwork=true`: it talks to one unix socket and cannot
+reach the network at all, so a compromise cannot send the key anywhere.
+
+## Reading the dashboard from a laptop or phone
+
+The desk binds to loopback and should stay there. Reach it by tunnel.
+
+**Laptop** — forward the port, then open `http://127.0.0.1:18080/`:
+
+```
+ssh -N -L 18080:127.0.0.1:18080 quant@<vps>
+```
+
+**Phone, same WiFi as the laptop** — bind the forward to the laptop's LAN
+interface instead, then browse to the laptop's IP:
+
+```
+ssh -N -L 0.0.0.0:18080:127.0.0.1:18080 quant@<vps>
+```
+
+**Phone, anywhere** — put the VPS and the phone on the same private network
+with Tailscale, which runs without root in userspace mode, and browse to the
+VPS's Tailscale address. Do NOT set `HEALTH_HOST=0.0.0.0` to achieve this:
+that publishes the desk's whole interior to anything that can route to the
+box.
