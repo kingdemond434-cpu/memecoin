@@ -16279,3 +16279,52 @@ class TestAPlannedRestartLosesNothingItNeedNot(unittest.TestCase):
     def test_stop_actually_calls_it(self):
         source = inspect.getsource(MemecoinQuantDesk.stop)
         self.assertIn("self._flush_ledgers()", source)
+
+
+class TestWhereTheKeyLivesIsAlwaysVisible(unittest.TestCase):
+    """"Local" is the default, which is exactly why it must be stated."""
+
+    def _desk(self, signer):
+        builder = SimpleNamespace(signer=signer) if signer is not None else None
+        desk = SimpleNamespace(
+            execution_engine=SimpleNamespace(tx_builder=builder)
+            if builder else None)
+        desk.signer_report = types.MethodType(
+            MemecoinQuantDesk.signer_report, desk)
+        return desk
+
+    def test_a_local_signer_reports_degraded_not_ok(self):
+        from solders.keypair import Keypair as KP
+        from src.execution.signer import LocalSigner
+        report = self._desk(LocalSigner(KP())).signer_report()
+        self.assertEqual(report["mode"], "local")
+        self.assertFalse(report["isolated"])
+        self.assertEqual(report["status"], "DEGRADED")
+        self.assertIn("held in the trading process", report["detail"])
+
+    def test_an_isolated_signer_reports_ok(self):
+        from src.execution.signer import SignerClient
+        client = SignerClient(Path("/run/signer.sock"))
+        report = self._desk(client).signer_report()
+        self.assertEqual(report["mode"], "isolated")
+        self.assertTrue(report["isolated"])
+        self.assertEqual(report["status"], "OK")
+
+    def test_no_engine_yet_is_blocked_not_missing(self):
+        report = self._desk(None).signer_report()
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertEqual(report["mode"], "none")
+        self.assertIn("before setup completes", report["detail"])
+
+    def test_a_signer_whose_report_throws_cannot_break_status(self):
+        class Broken:
+            def report(self):
+                raise RuntimeError("boom")
+        report = self._desk(Broken()).signer_report()
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertIn("boom", report["detail"])
+
+    def test_status_actually_includes_it(self):
+        # /status serves readiness(), which is where the payload is assembled.
+        source = inspect.getsource(MemecoinQuantDesk.readiness)
+        self.assertIn("self.signer_report()", source)
