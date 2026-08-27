@@ -82,6 +82,7 @@ from src.execution.staged_exits import (
     StagedExits, StagedLadder, StagedRung,
 )
 from src.collectors.transports import (
+    HttpClient,
     BlueskyJetstreamTransport, GithubRepoTransport, JsonPollTransport,
     MastodonTimelineTransport, NostrRelayTransport, OfficialSiteTransport,
     QueueTransport, RssTransport, TelegramChannelTransport, TransportError,
@@ -12312,6 +12313,89 @@ class TestOneSlotOfDelayIsPricedPerOpportunity(unittest.TestCase):
         source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
         self.assertEqual(source.count("slot_value=self._entry_slot_value("), 2)
         self.assertIn("slot_value=self._exit_slot_value(", source)
+
+
+class TestTheSourceUniverseIsActuallyWired(unittest.TestCase):
+    """Architecture supporting five hundred sources is not five hundred
+    sources being watched."""
+
+    def _declaration(self, **overrides):
+        args = dict(source_id="s", kind="rss",
+                    options={"url": "https://example.test/f", "language": "ja"})
+        args.update(overrides)
+        return SourceDeclaration(**args)
+
+    def test_an_adapter_gets_only_the_options_it_declares(self):
+        """The transport needs the endpoint, the adapter needs the language.
+
+        Passing the whole block to both rejected every declaration that named
+        a URL as an unexpected keyword -- and reported NO_FETCHER, which reads
+        as a missing transport rather than as a misrouted option.
+        """
+        sources, report = build_sources([self._declaration()],
+                                        {"s": lambda: None})
+        self.assertEqual(report.ready, 1)
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0].language, "ja")
+
+    def test_a_declaration_can_set_its_own_polling_cadence(self):
+        """A regional newspaper polled every second is four thousand
+        pointless requests an hour and an eventual block."""
+        sources, _report = build_sources(
+            [self._declaration(poll_interval_seconds=900)], {"s": lambda: None})
+        self.assertEqual(sources[0].poll_interval_seconds, 900)
+
+    def test_a_declaration_without_a_cadence_keeps_the_default(self):
+        sources, _report = build_sources([self._declaration()], {"s": lambda: None})
+        self.assertEqual(sources[0].poll_interval_seconds, 1.0)
+
+    def test_every_source_that_is_not_ready_is_not_ready_for_a_named_reason(self):
+        """A share threshold would drift as coverage targets are added.
+
+        What matters is that nothing is dark for a WIRING reason: every
+        declaration either works, needs a credential the operator has not
+        supplied, or is a coverage target whose endpoint nobody has chosen.
+        """
+        declarations = load_declarations("config/sources.yaml")
+        transports, transport_report, _client = build_transports(
+            declarations, HttpClient())
+        _sources, report = build_sources(declarations, transports)
+        self.assertGreater(report.declared, 50)
+        # A real working core, not a forest of intentions.
+        self.assertGreater(report.ready, 30)
+        # Nothing is unsupported: every declared kind has a transport.
+        self.assertEqual(transport_report.unsupported, [])
+        self.assertEqual(report.by_state.get("UNKNOWN_KIND", 0), 0)
+        # And every non-ready declaration is accounted for by name in exactly
+        # one of the two answerable buckets.
+        named = {source for source, _ in transport_report.pending_endpoint}
+        named |= {source for source, _ in transport_report.unconfigured}
+        self.assertEqual(len(named), report.declared - report.ready)
+
+    def test_the_registry_spans_regions_and_languages(self):
+        report = build_sources(load_declarations("config/sources.yaml"), {})[1]
+        self.assertGreaterEqual(len(report.by_region), 8)
+        self.assertGreaterEqual(len(report.by_language), 6)
+
+    def test_cadences_are_spread_rather_than_all_realtime(self):
+        """Four hundred sources all polled every second is a registry that
+        will be rate-limited into uselessness by lunchtime."""
+        report = build_sources(load_declarations("config/sources.yaml"), {})[1]
+        buckets = report.to_dict()["by_cadence"]
+        self.assertGreater(len(buckets), 2)
+        self.assertGreater(sum(count for name, count in buckets.items()
+                               if name != "realtime"), buckets.get("realtime", 0))
+
+    def test_no_declaration_names_an_endpoint_nobody_checked(self):
+        """A placeholder URL is worse than none: the mesh reports it DEAD and
+        the coverage number stays wrong in the flattering direction."""
+        text = Path("config/sources.yaml").read_text(encoding="utf-8")
+        for marker in ("example_calls", "example.com", "changeme", "TODO"):
+            self.assertNotIn(marker, text, marker)
+        for declaration in load_declarations("config/sources.yaml"):
+            url = str(declaration.options.get("url", ""))
+            if url:
+                self.assertTrue(url.startswith("https://"), url)
 
 class TestPumpSwapConstruction(unittest.TestCase):
     """The last DATA_BLOCKED that was never about missing information.

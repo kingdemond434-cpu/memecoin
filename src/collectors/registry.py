@@ -84,6 +84,13 @@ class SourceDeclaration:
     # dead or lets the dead one look healthy.
     degraded_after_seconds: Optional[float] = None
     dead_after_seconds: Optional[float] = None
+    # How often this source is worth ASKING, which is a different number from
+    # how long its silence means something. A regional newspaper polled every
+    # second is four thousand pointless requests an hour and an eventual
+    # block; a chat channel polled hourly is a chat channel we are not
+    # reading. Declared per source because only the declaration knows which
+    # this is.
+    poll_interval_seconds: Optional[float] = None
 
     def missing_credentials(self) -> List[str]:
         """Which required environment variables are absent.
@@ -102,8 +109,12 @@ class RegistryReport:
     by_kind: Dict[str, int] = field(default_factory=dict)
     by_language: Dict[str, int] = field(default_factory=dict)
     by_region: Dict[str, int] = field(default_factory=dict)
+    by_cadence: Dict[str, int] = field(default_factory=dict)
     unconfigured: List[str] = field(default_factory=list)
     problems: List[Tuple[str, str]] = field(default_factory=list)
+
+    def ready_share_or_zero(self) -> float:
+        return (self.ready / self.declared) if self.declared else 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -114,12 +125,52 @@ class RegistryReport:
             "by_kind": dict(sorted(self.by_kind.items())),
             "by_language": dict(sorted(self.by_language.items())),
             "by_region": dict(sorted(self.by_region.items())),
+            # How the declared universe is spread across cadences. A registry
+            # of four hundred sources all polled every second is a registry
+            # that will be rate-limited into uselessness by lunchtime.
+            "by_cadence": dict(sorted(self.by_cadence.items())),
             # Named, because a source dropped for a missing key is a coverage
             # hole that no health check will ever mention.
             "unconfigured": sorted(self.unconfigured),
             "problems": [{"source": source, "reason": reason}
                          for source, reason in self.problems],
         }
+
+
+def _adapter_options(factory: Callable[..., EventSource],
+                     options: Dict[str, Any]) -> Dict[str, Any]:
+    """The subset of a declaration's options this adapter accepts.
+
+    Read off the factory's own signature rather than from a hand-kept list:
+    a list would be one more thing to update when an adapter gains a
+    parameter, and forgetting would silently drop the parameter.
+    """
+    import inspect
+
+    try:
+        parameters = inspect.signature(factory).parameters
+    except (TypeError, ValueError):
+        return dict(options)
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD
+           for parameter in parameters.values()):
+        return dict(options)
+    return {name: value for name, value in options.items() if name in parameters}
+
+
+def _cadence_bucket(seconds: float) -> str:
+    """Human bucket for a poll interval, for the coverage report."""
+    value = float(seconds)
+    if value <= 5:
+        return "realtime"
+    if value <= 60:
+        return "minute"
+    if value <= 900:
+        return "quarter_hour"
+    if value <= 3_600:
+        return "hourly"
+    if value <= 21_600:
+        return "six_hourly"
+    return "daily"
 
 
 def load_declarations(path: str) -> List[SourceDeclaration]:
@@ -169,6 +220,9 @@ def load_declarations(path: str) -> List[SourceDeclaration]:
                 dead_after_seconds=(float(entry["dead_after_seconds"])
                                     if entry.get("dead_after_seconds") is not None
                                     else None),
+                poll_interval_seconds=(float(entry["poll_interval_seconds"])
+                                       if entry.get("poll_interval_seconds") is not None
+                                       else None),
             ))
         except (KeyError, TypeError, ValueError) as exc:
             logger.error("skipping malformed source declaration %r: %s", entry, exc)
@@ -190,6 +244,9 @@ def build_sources(
 
     for declaration in declarations:
         report.by_kind[declaration.kind] = report.by_kind.get(declaration.kind, 0) + 1
+        if declaration.poll_interval_seconds is not None:
+            bucket = _cadence_bucket(declaration.poll_interval_seconds)
+            report.by_cadence[bucket] = report.by_cadence.get(bucket, 0) + 1
         if declaration.language:
             report.by_language[declaration.language] = (
                 report.by_language.get(declaration.language, 0) + 1)
@@ -218,11 +275,22 @@ def build_sources(
             continue
 
         try:
-            source = factory(declaration.source_id, fetch, **declaration.options)
+            # Only the options this adapter actually declares. A source's
+            # options describe the SOURCE, and its two consumers want
+            # different parts: the transport needs the endpoint, the adapter
+            # needs the language. Passing the whole block to both meant every
+            # declaration that named a URL was rejected by its own adapter as
+            # an unexpected keyword -- and reported NO_FETCHER, which reads as
+            # a missing transport rather than as a misrouted option.
+            source = factory(declaration.source_id, fetch,
+                             **_adapter_options(factory, declaration.options))
             if declaration.degraded_after_seconds is not None:
                 source.degraded_after_seconds = declaration.degraded_after_seconds
             if declaration.dead_after_seconds is not None:
                 source.dead_after_seconds = declaration.dead_after_seconds
+            if declaration.poll_interval_seconds is not None:
+                source.poll_interval_seconds = max(
+                    0.01, float(declaration.poll_interval_seconds))
             sources.append(source)
         except TypeError as exc:
             mark(DeclarationState.NO_FETCHER, f"adapter rejected its options: {exc}")

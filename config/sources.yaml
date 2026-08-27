@@ -12,9 +12,20 @@
 # src/strategies/source_genealogy.py from observed lead time and executable
 # return, and that measurement overrides this number.
 #
-# This file is a SEED. Real coverage is several hundred entries across the
-# regions and languages below; the shape is here and the breadth is an
-# operator task, since only the operator can decide what to subscribe to.
+# `poll_interval_seconds` is how often this source is worth ASKING, which is a
+# different number from how long its silence means something. A regional daily
+# polled every second is four thousand pointless requests an hour and an
+# eventual block; a chat channel polled hourly is a channel we are not reading.
+#
+# Every endpoint named here is a documented public interface requiring no
+# account. Entries with NO endpoint are coverage targets, reported by name as
+# pending -- never a placeholder URL, because a declaration naming an endpoint
+# nobody checked is worse than no declaration at all: the mesh reports it DEAD,
+# an operator assumes it needs a key, and the coverage number stays wrong in
+# the flattering direction.
+#
+# Verify on the node before trusting any of it:
+#   python tools/verify_sources.py --out config/sources.verified.yaml
 
 schema_version: v1
 
@@ -31,6 +42,11 @@ sources:
     options: {repo: pump-fun/pump-public-docs}
 
   # ---- Telegram: crypto-native, where a CA usually appears first -----------
+  # These declare which LANGUAGES are worth covering, not which channels. A
+  # placeholder channel name would read as a chosen channel and report
+  # UNCONFIGURED, which an operator reads as "needs a key" rather than as
+  # "nobody has picked one". Add `options: {channel: <public channel>}` per
+  # entry; until then each is reported as pending an endpoint, by name.
   - id: telegram:calls-en-1
     kind: telegram
     tier: 1
@@ -39,35 +55,30 @@ sources:
     language: en
     region: global
     requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
-    options: {channel: example_calls_en}
   - id: telegram:calls-zh-1
     kind: telegram
     tier: 1
     language: zh
     region: cn
     requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
-    options: {channel: example_calls_zh}
   - id: telegram:calls-ru-1
     kind: telegram
     tier: 1
     language: ru
     region: cis
     requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
-    options: {channel: example_calls_ru}
   - id: telegram:calls-tr-1
     kind: telegram
     tier: 1
     language: tr
     region: tr
     requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
-    options: {channel: example_calls_tr}
   - id: telegram:calls-ko-1
     kind: telegram
     tier: 1
     language: ko
     region: kr
     requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
-    options: {channel: example_calls_ko}
 
   # ---- open social firehoses: free, filtered locally -----------------------
   - id: bluesky:jetstream
@@ -103,96 +114,340 @@ sources:
     region: global
     requires_env: [TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET]
 
-  # ---- regional and local-language press ----------------------------------
-  # The local outlet breaking a story before global media is the case worth
-  # catching, and it is served by exactly the same RSS parser.
-  - id: rss:kr-local
+  # ---- open social firehoses, broadened -----------------------------------
+  # Federated instances are separate publics with separate crowds. One
+  # mastodon.social is not "Mastodon coverage" any more than one subreddit is
+  # Reddit.
+  - id: mastodon:mastodon-online
+    kind: mastodon
+    tier: 3
+    language: en
+    region: global
+    poll_interval_seconds: 20
+    options: {instance: "https://mastodon.online"}
+  - id: mastodon:mstdn-jp
+    kind: mastodon
+    tier: 3
+    language: ja
+    region: jp
+    poll_interval_seconds: 20
+    options: {instance: "https://mstdn.jp"}
+  - id: mastodon:pawoo
+    kind: mastodon
+    tier: 3
+    language: ja
+    region: jp
+    poll_interval_seconds: 30
+    options: {instance: "https://pawoo.net"}
+  - id: mastodon:mas-to
+    kind: mastodon
+    tier: 3
+    language: en
+    region: global
+    poll_interval_seconds: 30
+    options: {instance: "https://mas.to"}
+  - id: mastodon:fosstodon
+    kind: mastodon
+    tier: 3
+    language: en
+    region: global
+    poll_interval_seconds: 60
+    options: {instance: "https://fosstodon.org"}
+  - id: mastodon:troet-cafe
+    kind: mastodon
+    tier: 3
+    language: de
+    region: de
+    poll_interval_seconds: 60
+    options: {instance: "https://troet.cafe"}
+  - id: mastodon:piaille
+    kind: mastodon
+    tier: 3
+    language: fr
+    region: fr
+    poll_interval_seconds: 60
+    options: {instance: "https://piaille.fr"}
+
+  # Nostr relays are cheap, push-based and geographically spread. Several
+  # rather than one: a relay is a view of the network, not the network.
+  - id: nostr:relay-nos-lol
+    kind: nostr
+    tier: 2
+    region: global
+    poll_interval_seconds: 1
+    options: {relay: "wss://nos.lol"}
+  - id: nostr:relay-nostr-band
+    kind: nostr
+    tier: 2
+    region: global
+    poll_interval_seconds: 1
+    options: {relay: "wss://relay.nostr.band"}
+  - id: nostr:relay-primal
+    kind: nostr
+    tier: 2
+    region: global
+    poll_interval_seconds: 1
+    options: {relay: "wss://relay.primal.net"}
+
+  # ---- crypto-native press: fastest non-chain confirmation ----------------
+  - id: rss:coindesk
     kind: rss
     tier: 1
+    language: en
+    region: global
+    poll_interval_seconds: 60
     degraded_after_seconds: 3600
     dead_after_seconds: 21600
-    language: ko
-    region: kr
-    options: {language: ko}
-  - id: rss:jp-local
+    options: {url: "https://www.coindesk.com/arc/outboundfeeds/rss/"}
+  - id: rss:cointelegraph
+    kind: rss
+    tier: 1
+    language: en
+    region: global
+    poll_interval_seconds: 60
+    degraded_after_seconds: 3600
+    dead_after_seconds: 21600
+    options: {url: "https://cointelegraph.com/rss"}
+  - id: rss:theblock
+    kind: rss
+    tier: 1
+    language: en
+    region: global
+    poll_interval_seconds: 120
+    options: {url: "https://www.theblock.co/rss.xml"}
+  - id: rss:decrypt
+    kind: rss
+    tier: 2
+    language: en
+    region: global
+    poll_interval_seconds: 120
+    options: {url: "https://decrypt.co/feed"}
+  - id: rss:bitcoinmagazine
+    kind: rss
+    tier: 3
+    language: en
+    region: global
+    poll_interval_seconds: 300
+    options: {url: "https://bitcoinmagazine.com/feed"}
+
+  # ---- chain and venue status: a halt is a hazard, not news ---------------
+  - id: rss:solana-status
+    kind: rss
+    tier: 1
+    language: en
+    region: global
+    poll_interval_seconds: 60
+    degraded_after_seconds: 86400
+    dead_after_seconds: 604800
+    options: {url: "https://status.solana.com/history.rss"}
+
+  # ---- regional and local-language press ----------------------------------
+  # The local outlet breaking a story before global media is the case worth
+  # catching, and it is served by exactly the same RSS parser. Cadences are
+  # matched to how each outlet actually publishes: polling a daily every
+  # second is four thousand pointless requests an hour and an eventual block.
+  - id: rss:jp-nhk
     kind: rss
     tier: 2
     language: ja
     region: jp
-    options: {language: ja}
+    poll_interval_seconds: 600
+    degraded_after_seconds: 7200
+    dead_after_seconds: 43200
+    options: {url: "https://www.nhk.or.jp/rss/news/cat0.xml", language: ja}
+  - id: rss:de-dw
+    kind: rss
+    tier: 3
+    language: de
+    region: de
+    poll_interval_seconds: 900
+    degraded_after_seconds: 7200
+    dead_after_seconds: 43200
+    options: {url: "https://rss.dw.com/rdf/rss-en-all", language: de}
+  - id: rss:fr-lemonde
+    kind: rss
+    tier: 3
+    language: fr
+    region: fr
+    poll_interval_seconds: 900
+    options: {url: "https://www.lemonde.fr/rss/une.xml", language: fr}
+  - id: rss:es-elpais
+    kind: rss
+    tier: 3
+    language: es
+    region: es
+    poll_interval_seconds: 900
+    options: {url: "https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/portada", language: es}
+  - id: rss:br-g1
+    kind: rss
+    tier: 2
+    language: pt
+    region: br
+    poll_interval_seconds: 600
+    options: {url: "https://g1.globo.com/rss/g1/", language: pt}
+  - id: rss:gb-bbc-world
+    kind: rss
+    tier: 2
+    language: en
+    region: gb
+    poll_interval_seconds: 600
+    options: {url: "https://feeds.bbci.co.uk/news/world/rss.xml", language: en}
+  - id: rss:us-cnbc-markets
+    kind: rss
+    tier: 2
+    language: en
+    region: us
+    poll_interval_seconds: 600
+    options: {url: "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114", language: en}
+  # Languages and regions whose endpoint has not been CHOSEN yet. Declared,
+  # because the coverage gap is real and a gap nobody can name does not get
+  # filled -- and declared WITHOUT a URL, because a placeholder endpoint is
+  # worse than none: the mesh would report it DEAD, an operator would assume
+  # it needs a key, and the coverage number would stay wrong in the flattering
+  # direction. Each is reported by name as pending an endpoint until
+  # tools/verify_sources.py finds one that answers on the node.
+  - id: rss:kr-local
+    kind: rss
+    tier: 1
+    language: ko
+    region: kr
+    poll_interval_seconds: 600
+    degraded_after_seconds: 7200
+    dead_after_seconds: 43200
   - id: rss:cn-local
     kind: rss
     tier: 2
     language: zh
     region: cn
-    options: {language: zh}
-  - id: rss:br-local
+    poll_interval_seconds: 600
+  - id: rss:ru-local
     kind: rss
     tier: 2
-    language: pt
-    region: br
-    options: {language: pt}
+    language: ru
+    region: cis
+    poll_interval_seconds: 900
   - id: rss:tr-local
     kind: rss
     tier: 2
     language: tr
     region: tr
-    options: {language: tr}
+    poll_interval_seconds: 900
   - id: rss:mena-local
     kind: rss
     tier: 2
     language: ar
     region: mena
-    options: {language: ar}
+    poll_interval_seconds: 900
   - id: rss:in-local
     kind: rss
     tier: 3
     language: hi
     region: in
-    options: {language: hi}
-  - id: rss:latam-local
-    kind: rss
-    tier: 3
-    language: es
-    region: latam
-    options: {language: es}
+    poll_interval_seconds: 900
   - id: rss:id-local
     kind: rss
     tier: 3
     language: id
     region: sea
-    options: {language: id}
-  - id: rss:fr-local
+    poll_interval_seconds: 900
+  - id: rss:vn-local
     kind: rss
     tier: 3
-    language: fr
-    region: eu
-    options: {language: fr}
-  - id: rss:de-local
+    language: vi
+    region: sea
+    poll_interval_seconds: 1800
+  - id: rss:th-local
     kind: rss
     tier: 3
-    language: de
+    language: th
+    region: sea
+    poll_interval_seconds: 1800
+  - id: rss:ph-local
+    kind: rss
+    tier: 3
+    language: tl
+    region: sea
+    poll_interval_seconds: 1800
+  - id: rss:ng-local
+    kind: rss
+    tier: 3
+    language: en
+    region: africa
+    poll_interval_seconds: 1800
+  - id: rss:latam-local
+    kind: rss
+    tier: 3
+    language: es
+    region: latam
+    poll_interval_seconds: 900
+  - id: rss:it-local
+    kind: rss
+    tier: 3
+    language: it
     region: eu
-    options: {language: de}
+    poll_interval_seconds: 1800
+  - id: rss:pl-local
+    kind: rss
+    tier: 3
+    language: pl
+    region: eu
+    poll_interval_seconds: 1800
+  - id: rss:nl-local
+    kind: rss
+    tier: 3
+    language: nl
+    region: eu
+    poll_interval_seconds: 1800
+  - id: rss:se-local
+    kind: rss
+    tier: 3
+    language: sv
+    region: eu
+    poll_interval_seconds: 1800
 
-  # ---- official feeds: the strongest non-chain authenticity proof ----------
-  - id: rss:gov-press
-    kind: rss
-    tier: 1
-    language: en
-    region: global
-  - id: rss:exchange-announcements
-    kind: rss
-    tier: 1
-    language: en
-    region: global
-  - id: rss:sports-official
+  # ---- open aggregators and civic data ------------------------------------
+  - id: rss:hn-frontpage
     kind: rss
     tier: 3
     language: en
     region: global
-  - id: rss:entertainment-official
-    kind: rss
+    poll_interval_seconds: 300
+    options: {url: "https://hnrss.org/frontpage"}
+
+  # ---- code: a mint sometimes appears here before any marketing ----------
+  - id: code:solana-labs
+    kind: code_repo
     tier: 3
-    language: en
     region: global
+    poll_interval_seconds: 900
+    degraded_after_seconds: 86400
+    dead_after_seconds: 604800
+    options: {repo: solana-labs/solana}
+  - id: code:pump-swap-sdk
+    kind: code_repo
+    tier: 2
+    region: global
+    poll_interval_seconds: 900
+    degraded_after_seconds: 86400
+    dead_after_seconds: 604800
+    options: {repo: pump-fun/pump-public-docs}
+
+  # ---- official feeds: the strongest non-chain authenticity proof ---------
+  - id: rss:us-sec-press
+    kind: rss
+    tier: 1
+    language: en
+    region: us
+    poll_interval_seconds: 900
+    degraded_after_seconds: 86400
+    dead_after_seconds: 604800
+    options: {url: "https://www.sec.gov/news/pressreleases.rss"}
+  - id: rss:eu-commission-press
+    kind: rss
+    tier: 2
+    language: en
+    region: eu
+    poll_interval_seconds: 1800
+    degraded_after_seconds: 86400
+    dead_after_seconds: 604800
+    options: {url: "https://ec.europa.eu/commission/presscorner/api/rss?language=en"}
