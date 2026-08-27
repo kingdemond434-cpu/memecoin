@@ -6,6 +6,7 @@ import gzip
 import hashlib
 import json
 import functools
+import inspect
 import math
 import os
 import random
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 from collections import defaultdict, deque
 import unittest
 from dataclasses import asdict
@@ -75,6 +77,16 @@ from src.research.data_miners import (
 from src.research.solana_miners import (
     holder_structure_miner, register_solana_miners, token_metadata_miner,
 )
+from src.research.chain_miners import (
+    account_balance_miner, deployer_history_miner, lp_supply_miner,
+    network_health_miner, priority_fee_miner, register_chain_miners,
+)
+from src.research.web_miners import (
+    coingecko_trending_miner, dexscreener_search_miner, github_activity_miner,
+    hackernews_miner, reddit_new_miner, register_web_miners,
+    wikipedia_attention_miner, youtube_recent_miner,
+)
+from src.chains import pumpswap_route
 from src.research import telegram_authorize
 from src.strategies.ignition import (
     IgnitionModel, IgnitionReading, KolRole, NarrativeState, SourceTouch,
@@ -12638,11 +12650,20 @@ class TestTelegramNeverPromptsUnderSystemd(unittest.TestCase):
 
     def test_the_failure_message_names_where_it_looked(self):
         """'Required' without saying where it looked is a message that sends
-        someone to re-set a variable that was already set."""
-        source = (Path(__file__).resolve().parents[1] / "src" / "research"
-                  / "telegram_authorize.py").read_text()
-        self.assertIn("Not found in the environment, nor in any of", source)
-        self.assertIn("EnvironmentFile=", source)
+        someone to re-set a variable that was already set.
+
+        Asserted against the message the tool actually produces rather than
+        against its wording in the source: the point is that every candidate
+        path appears, not that a particular sentence does.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            candidates = (Path(tmp) / "first", Path(tmp) / "second")
+            with mock.patch.object(telegram_authorize, "ENV_CANDIDATES",
+                                   candidates):
+                message = telegram_authorize._diagnosis()
+        for candidate in candidates:
+            self.assertIn(str(candidate), message)
+        self.assertIn("EnvironmentFile=", message)
 
     def test_the_tool_and_the_transport_agree_on_the_session_path(self):
         self.assertEqual(str(telegram_authorize.SESSION_PATH),
@@ -14484,3 +14505,498 @@ class TestRustT0Safety(unittest.TestCase):
             p_rug_30s=0.5, p_rug_5m=0.6, live=True)
         self.assertIn(action, {"exit", "bank_75", "bank_50", "bank_25", "bank_10"})
         self.assertTrue(allowed, f"safety refused an exit: {refused}")
+
+
+class _StubRpc:
+    """Records the calls a miner makes and replays canned answers."""
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.calls = []
+
+    async def request(self, method, params):
+        self.calls.append((method, params))
+        answer = self.answers.get(method)
+        if isinstance(answer, Exception):
+            raise answer
+        if callable(answer):
+            return answer(params)
+        return answer
+
+
+class _StubHttp:
+    """Returns a canned body per URL prefix; records what was asked for."""
+
+    def __init__(self, routes, status=200):
+        self.routes = routes
+        self.status = status
+        self.urls = []
+        self.headers_seen = []
+
+    async def get(self, url, headers=None):
+        self.urls.append(url)
+        self.headers_seen.append(dict(headers or {}))
+        for prefix, body in self.routes.items():
+            if url.startswith(prefix):
+                if isinstance(body, int):
+                    return body, "", {}
+                return self.status, json.dumps(body), {}
+        return 404, "", {}
+
+
+class TestTheChainTellsUsWhatLandingCosts(unittest.TestCase):
+    """The bid is only measured if the fee it is measured against is."""
+
+    def test_fees_are_asked_for_the_accounts_we_will_actually_touch(self):
+        rpc = _StubRpc({"getRecentPrioritizationFees": [
+            {"slot": 1, "prioritizationFee": 0},
+            {"slot": 2, "prioritizationFee": 10_000},
+            {"slot": 3, "prioritizationFee": 50_000},
+            {"slot": 4, "prioritizationFee": 200_000}]})
+        fetch = priority_fee_miner(rpc, lambda: ["PoolA", "MintB"])
+        records = asyncio.run(fetch())
+        method, params = rpc.calls[0]
+        self.assertEqual(method, "getRecentPrioritizationFees")
+        # The contended accounts, not a chain-wide question.
+        self.assertEqual(params, [["PoolA", "MintB"]])
+        row = records[0]
+        self.assertEqual(row["scope"], "accounts")
+        self.assertEqual(row["slots_sampled"], 4)
+        self.assertAlmostEqual(row["contested_share"], 0.75)
+        self.assertLess(row["fee_p50_lamports"], row["fee_p90_lamports"])
+
+    def test_no_sample_is_not_a_free_chain(self):
+        rpc = _StubRpc({"getRecentPrioritizationFees": []})
+        fetch = priority_fee_miner(rpc, lambda: ["PoolA"])
+        # Nothing emitted rather than a comfortable zero: an unmeasured fee is
+        # not a fee of zero, and the difference is a bid that never lands.
+        self.assertEqual(asyncio.run(fetch()), [])
+
+    def test_slow_slots_are_reported_as_a_ratio_against_nominal(self):
+        rpc = _StubRpc({"getRecentPerformanceSamples": [
+            {"slot": 100, "numSlots": 50, "numTransactions": 5_000,
+             "samplePeriodSecs": 60}]})
+        records = asyncio.run(network_health_miner(rpc)())
+        row = records[0]
+        # 60s over 50 slots is 1.2s per slot: three times nominal.
+        self.assertAlmostEqual(row["observed_slot_seconds"], 1.2)
+        self.assertAlmostEqual(row["slot_time_ratio"], 3.0)
+        self.assertAlmostEqual(row["tps"], 5_000 / 60)
+
+    def test_a_degenerate_sample_is_dropped_not_divided_by(self):
+        rpc = _StubRpc({"getRecentPerformanceSamples": [
+            {"slot": 1, "numSlots": 0, "samplePeriodSecs": 60},
+            {"slot": 2, "numSlots": 100, "numTransactions": 1, "samplePeriodSecs": 0}]})
+        self.assertEqual(asyncio.run(network_health_miner(rpc)()), [])
+
+
+class TestSupplyControlIsMeasuredNotAssumed(unittest.TestCase):
+
+    def test_a_burned_lp_is_distinguished_from_a_pullable_one(self):
+        rpc = _StubRpc({
+            "getTokenSupply": lambda params: (
+                {"value": {"amount": "0"}} if params[0] == "BurnedLp"
+                else {"value": {"amount": "1000"}}),
+            "getTokenLargestAccounts": {"value": [
+                {"amount": "900"}, {"amount": "100"}]}})
+        records = asyncio.run(lp_supply_miner(rpc, lambda: ["BurnedLp", "LiveLp"])())
+        burned = next(r for r in records if r["lp_mint"] == "BurnedLp")
+        live = next(r for r in records if r["lp_mint"] == "LiveLp")
+        self.assertTrue(burned["lp_burned"])
+        # A burned pool has no holders worth asking about, so we do not ask.
+        self.assertNotIn("lp_top1_share", burned)
+        self.assertFalse(live["lp_burned"])
+        self.assertAlmostEqual(live["lp_top1_share"], 0.9)
+
+    def test_the_pool_decoder_now_surfaces_the_lp_mint_it_already_read(self):
+        # The layout has always parsed it; the dataclass dropped it, which is
+        # why nothing could ask who controlled a migrated pool.
+        self.assertIn("lp_mint", {name for name, _w, _k in
+                                  pumpswap_route._POOL_LAYOUT})
+        self.assertTrue(hasattr(pumpswap_route.PoolState(status="OK"), "lp_mint"))
+
+
+class TestDeployerHistoryComesFromThePublicLedgerOnly(unittest.TestCase):
+
+    def test_history_shape_is_derived_from_signatures(self):
+        now = time.time()
+        rpc = _StubRpc({"getSignaturesForAddress": [
+            {"signature": "a", "blockTime": now - 3600, "err": None},
+            {"signature": "b", "blockTime": now - 1800, "err": {"x": 1}},
+            {"signature": "c", "blockTime": now - 60, "err": None},
+            {"signature": "d", "blockTime": now - 10, "err": None}]})
+        records = asyncio.run(
+            deployer_history_miner(rpc, lambda: ["Dev1"], depth=100)())
+        row = records[0]
+        self.assertEqual(row["signatures_sampled"], 4)
+        self.assertFalse(row["sample_saturated"])
+        self.assertAlmostEqual(row["failed_share"], 0.25)
+        self.assertGreater(row["oldest_seen_age_s"], row["newest_seen_age_s"])
+        self.assertGreater(row["tx_per_hour"], 0)
+
+    def test_a_full_window_is_flagged_as_a_floor_not_a_count(self):
+        now = time.time()
+        rows = [{"signature": str(i), "blockTime": now - i, "err": None}
+                for i in range(5)]
+        rpc = _StubRpc({"getSignaturesForAddress": rows})
+        records = asyncio.run(
+            deployer_history_miner(rpc, lambda: ["Dev1"], depth=5)())
+        self.assertTrue(records[0]["sample_saturated"])
+
+    def test_a_closed_account_is_not_a_zero_balance(self):
+        rpc = _StubRpc({"getMultipleAccounts": {"value": [
+            None, {"lamports": 2_000_000_000, "owner": "sys",
+                   "executable": False}]}})
+        records = asyncio.run(
+            account_balance_miner(rpc, lambda: ["Gone", "Alive"])())
+        self.assertFalse(records[0]["exists"])
+        self.assertNotIn("sol", records[0])
+        self.assertTrue(records[1]["exists"])
+        self.assertAlmostEqual(records[1]["sol"], 2.0)
+
+
+class TestPublicWebIsMinedWithoutTouchingAnythingPrivate(unittest.TestCase):
+
+    def test_reddit_rotates_subs_so_none_is_hammered(self):
+        http = _StubHttp({"https://www.reddit.com/r/": {"data": {"children": [
+            {"data": {"id": "p1", "title": "t", "score": 12,
+                      "num_comments": 3, "created_utc": 1.0,
+                      "author": "a", "permalink": "/r/x/p1"}}]}}})
+        fetch = reddit_new_miner(http, subs=("one", "two", "three", "four"),
+                                 per_pass=2)
+        asyncio.run(fetch())
+        asyncio.run(fetch())
+        asked = [url.split("/r/")[1].split("/")[0] for url in http.urls]
+        self.assertEqual(asked, ["one", "two", "three", "four"])
+
+    def test_a_refused_address_is_reported_as_such_not_as_a_bad_query(self):
+        http = _StubHttp({"https://hn.algolia.com": 403})
+        with self.assertRaises(RuntimeError) as caught:
+            asyncio.run(hackernews_miner(http)())
+        self.assertIn("refusing this address", str(caught.exception))
+
+    def test_a_rate_limit_is_not_counted_as_a_failure(self):
+        http = _StubHttp({"https://api.coingecko.com": 429})
+        with self.assertRaises(RateLimited):
+            asyncio.run(coingecko_trending_miner(http)())
+
+    def test_attention_is_a_ratio_against_the_articles_own_baseline(self):
+        http = _StubHttp({"https://wikimedia.org": {"items": [
+            {"views": 100}, {"views": 100}, {"views": 100}, {"views": 400}]}})
+        records = asyncio.run(
+            wikipedia_attention_miner(http, articles=("Meme_coin",))())
+        row = records[0]
+        self.assertEqual(row["views_latest"], 400)
+        self.assertAlmostEqual(row["attention_ratio"], 4.0)
+
+    def test_the_name_corpus_measures_reuse_not_popularity(self):
+        http = _StubHttp({"https://api.dexscreener.com": {"pairs": [
+            {"chainId": "solana", "liquidity": {"usd": 0}},
+            {"chainId": "solana", "liquidity": {"usd": 0}},
+            {"chainId": "base", "liquidity": {"usd": 5_000}}]}})
+        records = asyncio.run(
+            dexscreener_search_miner(http, lambda: ["WIF"])())
+        row = records[0]
+        self.assertEqual(row["pairs_matching"], 3)
+        self.assertEqual(row["pairs_with_liquidity"], 1)
+        # Two of three abandoned: the name has been run before.
+        self.assertAlmostEqual(row["abandoned_share"], 2 / 3)
+        self.assertEqual(row["chains"], ["base", "solana"])
+
+    def test_a_single_character_term_is_not_searched(self):
+        http = _StubHttp({"https://api.dexscreener.com": {"pairs": []}})
+        asyncio.run(dexscreener_search_miner(http, lambda: ["X", ""])())
+        self.assertEqual(http.urls, [])
+
+    def test_youtube_asks_only_for_the_recent_window(self):
+        http = _StubHttp({"https://www.googleapis.com": {"items": [
+            {"id": {"videoId": "v1"},
+             "snippet": {"title": "t", "channelTitle": "c",
+                         "channelId": "c1", "publishedAt": "now"}}]}})
+        records = asyncio.run(
+            youtube_recent_miner(http, lambda: "key", queries=("pump.fun",),
+                                 lookback_hours=2)())
+        self.assertIn("publishedAfter=", http.urls[0])
+        self.assertIn("order=date", http.urls[0])
+        self.assertEqual(records[0]["id"], "v1")
+
+    def test_a_key_pulled_at_runtime_makes_the_miner_go_silent(self):
+        http = _StubHttp({})
+        with self.assertRaises(RuntimeError):
+            asyncio.run(youtube_recent_miner(http, lambda: "")())
+        # Not an empty list, which downstream would read as "nobody posted".
+        self.assertEqual(http.urls, [])
+
+    def test_a_github_token_is_sent_as_a_header_and_never_in_the_url(self):
+        http = _StubHttp({"https://api.github.com": {"items": [
+            {"full_name": "a/b", "html_url": "u", "stargazers_count": 3}]}})
+        asyncio.run(github_activity_miner(
+            http, lambda: "SECRET", queries=("pumpswap",))())
+        self.assertNotIn("SECRET", http.urls[0])
+        self.assertEqual(http.headers_seen[0]["Authorization"], "Bearer SECRET")
+
+
+class TestTheExpandedSetRegistersAndDeclaresItself(unittest.TestCase):
+
+    def test_every_chain_miner_registers_runnable(self):
+        pool = DataMinerPool()
+        registered = register_chain_miners(
+            pool, rpc=_StubRpc({}), hot_accounts=list, lp_mints=list,
+            deployers=list, watched_wallets=list)
+        self.assertTrue(all(registered.values()), registered)
+        report = pool.report()
+        self.assertEqual(report["runnable"], len(registered))
+
+    def test_keyed_web_miners_are_dark_by_name_when_the_key_is_absent(self):
+        pool = DataMinerPool()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("YOUTUBE_API_KEY", None)
+            os.environ.pop("GITHUB_TOKEN", None)
+            registered = register_web_miners(pool, http=_StubHttp({}),
+                                             search_terms=list)
+        self.assertFalse(registered["web:youtube_recent"])
+        self.assertFalse(registered["web:program_repos"])
+        # Keyless ones still run.
+        self.assertTrue(registered["web:reddit_new"])
+        awaiting = pool.report()["awaiting_credentials"]
+        self.assertIn("web:youtube_recent", awaiting)
+        self.assertIn("web:program_repos", awaiting)
+
+    def test_the_expanded_set_covers_the_new_enrichments(self):
+        pool = DataMinerPool()
+        register_chain_miners(pool, rpc=_StubRpc({}), hot_accounts=list,
+                              lp_mints=list, deployers=list,
+                              watched_wallets=list)
+        register_web_miners(pool, http=_StubHttp({}), search_terms=list)
+        declared = {spec.enriches for spec in pool._specs.values()}
+        for enrichment in (Enriches.EXECUTION_CONDITIONS,
+                           Enriches.SUPPLY_CONTROL,
+                           Enriches.SOCIAL_ATTENTION):
+            self.assertIn(enrichment, declared)
+
+    def test_no_two_miners_share_an_id_across_all_three_registries(self):
+        pool = DataMinerPool()
+        ids = set()
+        for registered in (
+                register_solana_miners(pool, rpc=_StubRpc({}),
+                                       http=_StubHttp({}), watched_tokens=list),
+                register_chain_miners(pool, rpc=_StubRpc({}), hot_accounts=list,
+                                      lp_mints=list, deployers=list,
+                                      watched_wallets=list),
+                register_web_miners(pool, http=_StubHttp({}), search_terms=list)):
+            for miner_id in registered:
+                self.assertNotIn(miner_id, ids, f"{miner_id} declared twice")
+                ids.add(miner_id)
+        # A collision would silently replace one miner with another and the
+        # only symptom would be a source that quietly stopped being read.
+        self.assertEqual(len(ids), len(pool._specs))
+
+
+class TestExecutionConditionsChangeTheBid(unittest.TestCase):
+    """A measured chain is the only thing that makes a measured bid measured."""
+
+    def _desk(self):
+        hazard = []
+        observations = []
+        desk = SimpleNamespace(
+            _market_context={}, _network_health={}, _priority_fees={},
+            _wallet_readings={}, _pool_accounts={},
+            rug_hazard=SimpleNamespace(
+                record_observation=lambda token, obs: hazard.append((token, obs))),
+            dataset_builder=SimpleNamespace(
+                record_market_observation=lambda token, obs:
+                observations.append((token, obs))),
+            elogw_engine=SimpleNamespace(open_positions={}),
+            _latest_curve_state={}, _latest_pool_state={})
+        for name in ("_ingest_lp_supply", "_ingest_wallet_record",
+                     "_tokens_deployed_by", "_measured_congestion"):
+            setattr(desk, name,
+                    types.MethodType(getattr(MemecoinQuantDesk, name), desk))
+        desk.hazard_calls = hazard
+        desk.observations = observations
+        return desk
+
+    def test_network_health_lands_as_conditions_not_as_a_token_fact(self):
+        desk = self._desk()
+        MemecoinQuantDesk._ingest_mined_records(desk, "chain:network_health", [
+            {"slot_time_ratio": 1.5, "tps": 2_000, "_fetched_at": 1.0}])
+        self.assertEqual(desk._network_health["slot_time_ratio"], 1.5)
+        # It belongs to no episode, so nothing was filed against a mint.
+        self.assertEqual(desk.observations, [])
+        self.assertEqual(desk._market_context, {})
+
+    def test_congestion_is_derived_from_the_observed_slot_time(self):
+        desk = self._desk()
+        self.assertIsNone(MemecoinQuantDesk._measured_congestion(desk))
+        desk._network_health = {"slot_time_ratio": 1.0}
+        self.assertAlmostEqual(MemecoinQuantDesk._measured_congestion(desk), 0.0)
+        desk._network_health = {"slot_time_ratio": 1.4}
+        self.assertAlmostEqual(MemecoinQuantDesk._measured_congestion(desk), 0.4)
+        # Clamped: three times nominal is as congested as the bucket goes.
+        desk._network_health = {"slot_time_ratio": 3.0}
+        self.assertAlmostEqual(MemecoinQuantDesk._measured_congestion(desk), 1.0)
+
+    def test_unmeasured_congestion_is_none_and_never_calm(self):
+        desk = self._desk()
+        desk._network_health = {"tps": 1_000}
+        # A ratio-free reading yields None, not zero. Zero would bid low into
+        # exactly the conditions where a low bid misses.
+        self.assertIsNone(MemecoinQuantDesk._measured_congestion(desk))
+
+    def test_the_bidder_reads_the_congestion_the_runtime_supplies(self):
+        engine = ExecutionEngine.__new__(ExecutionEngine)
+        engine.congestion_provider = None
+        self.assertIsNone(engine.current_congestion())
+        engine.congestion_provider = lambda: 0.75
+        self.assertAlmostEqual(engine.current_congestion(), 0.75)
+        # A provider that throws must not take an execution down with it.
+        engine.congestion_provider = lambda: (_ for _ in ()).throw(RuntimeError("x"))
+        self.assertIsNone(engine.current_congestion())
+
+    def test_the_bid_and_the_attempt_record_use_the_same_reading(self):
+        source = inspect.getsource(ExecutionEngine)
+        # Both the decision and the observation must be conditioned, or the
+        # model learns from attempts it cannot attribute to a regime.
+        self.assertIn("congestion=self.current_congestion()", source)
+        self.assertEqual(source.count("congestion=self.current_congestion()"), 2)
+
+    def test_lp_supply_reaches_the_hazard_of_the_token_that_pool_holds(self):
+        desk = self._desk()
+        desk._pool_accounts = {"tok": SimpleNamespace(lp_mint="LP1")}
+        MemecoinQuantDesk._ingest_mined_records(desk, "chain:lp_supply", [
+            {"lp_mint": "LP1", "lp_burned": False, "lp_supply": 1_000.0,
+             "lp_top1_share": 0.95, "_fetched_at": 5.0}])
+        self.assertEqual(len(desk.hazard_calls), 1)
+        token, observation = desk.hazard_calls[0]
+        self.assertEqual(token, "tok")
+        self.assertEqual(observation["type"], "lp_supply")
+        self.assertAlmostEqual(observation["lp_top1_share"], 0.95)
+
+    def test_an_lp_reading_for_a_pool_we_do_not_hold_changes_nothing(self):
+        desk = self._desk()
+        MemecoinQuantDesk._ingest_mined_records(desk, "chain:lp_supply", [
+            {"lp_mint": "Unknown", "lp_burned": True, "_fetched_at": 5.0}])
+        self.assertEqual(desk.hazard_calls, [])
+        self.assertEqual(desk.observations, [])
+
+    def test_deployer_history_lands_on_every_token_that_deployer_launched(self):
+        desk = self._desk()
+        desk._latest_curve_state = {
+            "tokA": SimpleNamespace(creator="Dev1"),
+            "tokB": SimpleNamespace(creator="Dev1"),
+            "tokC": SimpleNamespace(creator="Other")}
+        MemecoinQuantDesk._ingest_mined_records(desk, "chain:deployer_history", [
+            {"address": "Dev1", "signatures_sampled": 100,
+             "sample_saturated": True, "failed_share": 0.3,
+             "oldest_seen_age_s": 900.0, "_fetched_at": 7.0}])
+        touched = sorted(token for token, _ in desk.hazard_calls)
+        self.assertEqual(touched, ["tokA", "tokB"])
+        _token, observation = desk.hazard_calls[0]
+        self.assertEqual(observation["type"], "deployer_history")
+        self.assertEqual(observation["deployer"], "Dev1")
+
+    def test_a_wallet_we_hold_nothing_against_is_kept_but_not_pretended_about(self):
+        desk = self._desk()
+        MemecoinQuantDesk._ingest_mined_records(desk, "chain:wallet_balances", [
+            {"address": "Whale", "exists": True, "sol": 400.0, "_fetched_at": 8.0}])
+        self.assertEqual(desk.hazard_calls, [])
+        self.assertIn("Whale", desk._wallet_readings)
+        report = MemecoinQuantDesk.execution_conditions_report(desk)
+        self.assertEqual(report["unattributed_wallet_readings"], 1)
+
+    def test_conditions_report_says_blocked_before_the_first_pass(self):
+        desk = self._desk()
+        report = MemecoinQuantDesk.execution_conditions_report(desk)
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertIn("unknown congestion bucket", report["detail"])
+        desk._priority_fees = {"fee_p50_lamports": 10_000.0,
+                               "fee_p90_lamports": 90_000.0,
+                               "contested_share": 0.5, "accounts_sampled": 3}
+        report = MemecoinQuantDesk.execution_conditions_report(desk)
+        self.assertEqual(report["status"], "OK")
+        self.assertEqual(report["fee_p90_lamports"], 90_000.0)
+
+
+class TestTheMinerSelectorsAskAboutWhatWeActuallyTrade(unittest.TestCase):
+
+    def _desk(self):
+        desk = SimpleNamespace(
+            elogw_engine=SimpleNamespace(open_positions={"held": {}}),
+            _latest_curve_state={"held": SimpleNamespace(
+                creator="Dev1", symbol="WIF", name="dogwifhat")},
+            _latest_pool_state={"held": SimpleNamespace(
+                pool="PoolA", coin_creator="Dev2")},
+            _pool_accounts={"held": SimpleNamespace(lp_mint="LP1")},
+            wallet_intelligence=SimpleNamespace(elite_wallets={"E1": {}}),
+            _recent_funders={"F1": {}})
+        desk._mineable_tokens = types.MethodType(
+            MemecoinQuantDesk._mineable_tokens, desk)
+        return desk
+
+    def test_fees_are_asked_about_the_pool_and_the_mint(self):
+        desk = self._desk()
+        accounts = MemecoinQuantDesk._contended_accounts(desk)
+        self.assertEqual(accounts, ["PoolA", "held"])
+
+    def test_only_decoded_pools_contribute_an_lp_mint(self):
+        desk = self._desk()
+        self.assertEqual(MemecoinQuantDesk._known_lp_mints(desk), ["LP1"])
+        desk._pool_accounts = {}
+        # No derived PDA for a pool we never read: a confident answer about an
+        # account we cannot prove belongs to this token is worse than none.
+        self.assertEqual(MemecoinQuantDesk._known_lp_mints(desk), [])
+
+    def test_both_creator_fields_are_mined_and_neither_is_confused(self):
+        desk = self._desk()
+        self.assertEqual(MemecoinQuantDesk._known_deployers(desk),
+                         ["Dev1", "Dev2"])
+
+    def test_search_terms_come_from_the_tokens_we_are_deciding_on(self):
+        desk = self._desk()
+        self.assertEqual(MemecoinQuantDesk._name_search_terms(desk),
+                         ["WIF", "dogwifhat"])
+
+    def test_tracked_wallets_are_bounded_and_deduplicated(self):
+        desk = self._desk()
+        desk.wallet_intelligence = SimpleNamespace(
+            elite_wallets={f"W{i}": {} for i in range(200)})
+        desk._recent_funders = {"W0": {}}
+        wallets = MemecoinQuantDesk._tracked_wallets(desk)
+        self.assertEqual(len(wallets), 100)
+        self.assertEqual(len(set(wallets)), 100)
+
+
+class TestTheAuthorizeToolDiagnosesItsOwnFailure(unittest.TestCase):
+    """The three ways this fails look identical from the outside."""
+
+    def test_a_missing_file_is_distinguished_from_a_file_missing_the_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            present = Path(tmp) / "env"
+            present.write_text("SOLANA_RPC_URL=https://x\nALCHEMY_KEY=abc\n")
+            absent = Path(tmp) / "nowhere"
+            with mock.patch.object(telegram_authorize, "ENV_CANDIDATES",
+                                   (absent, present)):
+                message = telegram_authorize._diagnosis()
+        self.assertIn("no such file", message)
+        # The names it DOES define, so nobody re-checks a key they already set.
+        self.assertIn("ALCHEMY_KEY", message)
+        self.assertIn("SOLANA_RPC_URL", message)
+        self.assertIn("does not define those two names", message)
+
+    def test_no_value_is_ever_put_in_the_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            present = Path(tmp) / "env"
+            present.write_text("ALCHEMY_KEY=super-secret-value\n")
+            with mock.patch.object(telegram_authorize, "ENV_CANDIDATES",
+                                   (present,)):
+                message = telegram_authorize._diagnosis()
+        self.assertIn("ALCHEMY_KEY", message)
+        self.assertNotIn("super-secret-value", message)
+
+    def test_no_file_at_all_names_the_systemd_asymmetry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(telegram_authorize, "ENV_CANDIDATES",
+                                   (Path(tmp) / "nope",)):
+                message = telegram_authorize._diagnosis()
+        self.assertIn("No environment file was found", message)
+        self.assertIn("EnvironmentFile=", message)

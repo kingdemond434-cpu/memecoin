@@ -44,8 +44,10 @@ from src.execution.jupiter_jito import (
 from src.research.dataset_builder import PointInTimeDatasetBuilder
 from src.research.feature_engine import build_features
 from src.research.global_research_miner import GlobalResearchMiner
+from src.research.chain_miners import register_chain_miners
 from src.research.data_miners import DataMinerPool
 from src.research.solana_miners import register_solana_miners
+from src.research.web_miners import register_web_miners
 from src.research.forward_evidence import ForwardEvidence, Outcome as ForwardOutcome
 from src.research.contribution import (
     ContributionLedger, GateFlip, action_value_contributions,
@@ -316,6 +318,14 @@ class MemecoinQuantDesk:
         # time, and copying it into each one would be the same fact stored a
         # thousand times and updated in none of them.
         self._market_context: Dict[str, Any] = {}
+        # Chain-wide execution conditions, mined rather than assumed. Empty
+        # means unmeasured, which the bidder reads as None and the landing
+        # model buckets as unknown -- never as calm.
+        self._network_health: Dict[str, Any] = {}
+        self._priority_fees: Dict[str, Any] = {}
+        # Balance readings for wallets we hold no position against. Kept for
+        # the ledger, consumed by nothing right now, and reported as such.
+        self._wallet_readings: Dict[str, Any] = {}
         self.data_miners = DataMinerPool()
         self.miner_registration: Dict[str, bool] = {}
         self.slot_value = SlotValueModel()
@@ -749,6 +759,11 @@ class MemecoinQuantDesk:
         # only the pool these two providers describe is new.
         self.execution_engine.pool_state_provider = self._latest_pool_state.get
         self.execution_engine.pool_account_provider = self._pool_accounts.get
+        # Measured congestion for the bid and for the attempt record. Until
+        # this was supplied the landing model bucketed every attempt as
+        # "unknown", so it could never learn that a bid clearing in calm
+        # conditions misses in a rush.
+        self.execution_engine.congestion_provider = self._measured_congestion
         self.fee_optimizer = PriorityFeeOptimizer()
         if not self.offline:
             await self.execution_engine.start()
@@ -774,9 +789,25 @@ class MemecoinQuantDesk:
         self.data_miners = DataMinerPool(
             concurrency=int(self.global_config.get("data_miner_concurrency", 6)),
             on_records=self._ingest_mined_records)
-        self.miner_registration = register_solana_miners(
+        self.miner_registration = dict(register_solana_miners(
             self.data_miners, rpc=self.solana_rpc, http=self.http_client,
-            watched_tokens=self._mineable_tokens)
+            watched_tokens=self._mineable_tokens))
+        # Chain facts the program stream does not carry: what landing costs
+        # right now, whether the chain is keeping up, whether the supply is
+        # still under someone's control, and what the deployer did before.
+        self.miner_registration.update(register_chain_miners(
+            self.data_miners, rpc=self.solana_rpc,
+            hot_accounts=self._contended_accounts,
+            lp_mints=self._known_lp_mints,
+            deployers=self._known_deployers,
+            watched_wallets=self._tracked_wallets))
+        # Public web: measured attention rather than mentions, and the corpus
+        # a name has to be compared against before it means anything.
+        self.miner_registration.update(register_web_miners(
+            self.data_miners, http=self.http_client,
+            search_terms=self._name_search_terms,
+            youtube_key=lambda: os.getenv("YOUTUBE_API_KEY", ""),
+            github_token=lambda: os.getenv("GITHUB_TOKEN", "")))
         if not self.offline:
             await self.dataset_builder.start()
             await self.global_research.start()
@@ -3215,6 +3246,139 @@ class MemecoinQuantDesk:
                     ordered.append(token)
         return ordered
 
+    def execution_conditions_report(self) -> Dict[str, Any]:
+        """What the chain costs and whether it is keeping up.
+
+        Reported separately from the miner health because an operator asking
+        "why did that bid miss" wants the conditions, not the poll status of
+        the thing that measured them. DATA_BLOCKED here is honest: it means
+        every bid is being made against an unknown congestion bucket.
+        """
+        congestion = self._measured_congestion()
+        measured = bool(self._network_health or self._priority_fees)
+        return {
+            "status": "OK" if measured else "DATA_BLOCKED",
+            "detail": ("" if measured else
+                       "no execution-conditions pass has completed; bids are "
+                       "made against an unknown congestion bucket"),
+            "congestion": congestion,
+            "slot_time_ratio": self._network_health.get("slot_time_ratio"),
+            "tps": self._network_health.get("tps"),
+            "fee_p50_lamports": self._priority_fees.get("fee_p50_lamports"),
+            "fee_p90_lamports": self._priority_fees.get("fee_p90_lamports"),
+            "contested_share": self._priority_fees.get("contested_share"),
+            "accounts_sampled": self._priority_fees.get("accounts_sampled"),
+            "unattributed_wallet_readings": len(self._wallet_readings),
+        }
+
+    def _contended_accounts(self) -> List[str]:
+        """The accounts our next transaction will write to.
+
+        Prioritization fees are per-account: the fee that cleared on some
+        unrelated NFT mint says nothing about what it costs to land on THIS
+        curve. Asking about the pools and mints we are actually about to touch
+        is the difference between a measured bid and a chain-wide average
+        dressed up as one.
+        """
+        accounts: List[str] = []
+        seen = set()
+        for token in self._mineable_tokens()[:8]:
+            pool = self._latest_pool_state.get(token)
+            for address in (getattr(pool, "pool", ""), token):
+                if address and address not in seen:
+                    seen.add(address)
+                    accounts.append(address)
+        return accounts
+
+    def _known_lp_mints(self) -> List[str]:
+        """LP mints of pools we have actually decoded.
+
+        Only decoded pools appear here. Deriving the PDA and mining it for a
+        pool we have never read would produce a confident answer about an
+        account we cannot prove belongs to this token.
+        """
+        mints: List[str] = []
+        seen = set()
+        for account in self._pool_accounts.values():
+            lp_mint = getattr(account, "lp_mint", "")
+            if lp_mint and lp_mint not in seen:
+                seen.add(lp_mint)
+                mints.append(lp_mint)
+        return mints
+
+    def _known_deployers(self) -> List[str]:
+        """Deployers of the tokens currently worth spending a pass on.
+
+        Public chain addresses, read from the stream's own events. Their
+        history is mined from the public ledger and nowhere else.
+        """
+        addresses: List[str] = []
+        seen = set()
+        for token in self._mineable_tokens()[:12]:
+            curve = self._latest_curve_state.get(token)
+            pool = self._latest_pool_state.get(token)
+            for address in (getattr(curve, "creator", ""),
+                            getattr(pool, "coin_creator", "")):
+                if address and address not in seen:
+                    seen.add(address)
+                    addresses.append(address)
+        return addresses
+
+    def _tracked_wallets(self) -> List[str]:
+        """Wallets whose balance we want to watch move.
+
+        The elite set first, because a tracked wallet's balance dropping is it
+        deploying into something we have not seen yet -- which is the earliest
+        signal available that is not on the curve at all.
+        """
+        wallets: List[str] = []
+        seen = set()
+        for source in (getattr(self.wallet_intelligence, "elite_wallets", None) or {},
+                       getattr(self, "_recent_funders", None) or {}):
+            for address in source:
+                if address and address not in seen:
+                    seen.add(address)
+                    wallets.append(address)
+        return wallets[:100]
+
+    def _name_search_terms(self) -> List[str]:
+        """Names and symbols worth searching the wider venue set for.
+
+        A symbol is only meaningful against the corpus of everything else
+        called that. This supplies the queries; the corpus miner supplies the
+        comparison.
+        """
+        terms: List[str] = []
+        seen = set()
+        for token in self._mineable_tokens()[:8]:
+            curve = self._latest_curve_state.get(token)
+            for field in ("symbol", "name"):
+                value = str(getattr(curve, field, "") or "").strip()
+                if len(value) >= 2 and value.lower() not in seen:
+                    seen.add(value.lower())
+                    terms.append(value)
+        return terms
+
+    def _measured_congestion(self) -> Optional[float]:
+        """Chain congestion in [0, 1], or None when unmeasured.
+
+        Derived from the observed slot time against nominal: slots arriving
+        at twice their nominal spacing is a chain that is not keeping up, and
+        every latency budget expressed in slots is optimistic by that factor.
+        Returns None rather than a default, because a default of "calm" bids
+        low into exactly the conditions where a low bid misses.
+        """
+        health = getattr(self, "_network_health", None)
+        if not health:
+            return None
+        ratio = health.get("slot_time_ratio")
+        if ratio is None:
+            return None
+        # 1.0x nominal is calm, 2.0x or worse is fully congested. Linear
+        # between, clamped: the model buckets this anyway, so precision beyond
+        # the bucket boundaries would be false.
+        return max(0.0, min(1.0, (float(ratio) - 1.0)))
+
     def _ingest_mined_records(self, miner_id: str,
                               records: List[Dict[str, Any]]) -> None:
         """Route mined records into the lake and the models that use them.
@@ -3226,6 +3390,26 @@ class MemecoinQuantDesk:
         of a decision the stream had already updated.
         """
         for record in records:
+            # Chain-wide execution conditions belong to no episode: they are
+            # the state of the world every decision in this moment is made in.
+            if record.get("slot_time_ratio") is not None:
+                self._network_health = dict(record)
+                continue
+            if record.get("fee_p50_lamports") is not None:
+                self._priority_fees = dict(record)
+                continue
+            # Supply control on a migrated pool, keyed by LP mint rather than
+            # by the token's own mint.
+            lp_mint = str(record.get("lp_mint", "") or "")
+            if lp_mint:
+                self._ingest_lp_supply(lp_mint, record)
+                continue
+            # A wallet reading: the deployer's public history, or a tracked
+            # balance that moved.
+            address = str(record.get("address", "") or "")
+            if address:
+                self._ingest_wallet_record(address, record)
+                continue
             mint = str(record.get("mint", "") or "")
             if not mint:
                 # A market-wide row belongs to every episode, not to one.
@@ -3257,6 +3441,84 @@ class MemecoinQuantDesk:
                     "mint_renounced": record.get("mint_renounced"),
                     "freeze_renounced": record.get("freeze_renounced"),
                     "data_status": "OK"})
+
+    def _ingest_lp_supply(self, lp_mint: str, record: Dict[str, Any]) -> None:
+        """Route an LP reading onto the token whose pool it belongs to.
+
+        A rug after migration is an LP event: the pool is drained by whoever
+        holds the LP tokens. Burned LP means that cannot happen and the hazard
+        should fall; a live supply concentrated in one holder means it can
+        happen in one transaction and the hazard should rise. Neither is
+        visible on the curve until it has already happened.
+        """
+        token = ""
+        for mint, account in self._pool_accounts.items():
+            if getattr(account, "lp_mint", "") == lp_mint:
+                token = mint
+                break
+        if not token:
+            return
+        self.rug_hazard.record_observation(token, {
+            "type": "lp_supply",
+            "timestamp": float(record.get("_fetched_at", time.time())),
+            "lp_burned": record.get("lp_burned"),
+            "lp_supply": record.get("lp_supply"),
+            "lp_top1_share": record.get("lp_top1_share"),
+            "data_status": "OK"})
+        try:
+            self.dataset_builder.record_market_observation(
+                token, {"type": "mined", "measurement": "chain:lp_supply",
+                        "timestamp": float(record.get("_fetched_at", time.time())),
+                        **record})
+        except Exception as exc:
+            logger.debug("lp record for %s not recorded: %s", token, exc)
+
+    def _ingest_wallet_record(self, address: str, record: Dict[str, Any]) -> None:
+        """A wallet's public history, onto the tokens that wallet deployed.
+
+        Everything here is read from the open ledger: signature counts, their
+        timing, and a balance. It is behavioural inference over public chain
+        data and reaches nothing that is not already public.
+
+        The reading lands on the tokens this address deployed, because that is
+        where it changes a decision. A deployer account a few hours old whose
+        signature window is already saturated is the serial-launcher pattern,
+        and that is a hazard fact about every token it launched -- not a
+        curiosity filed against an address nobody looks up.
+        """
+        when = float(record.get("_fetched_at", time.time()))
+        observation = {
+            "type": "deployer_history",
+            "timestamp": when,
+            "deployer": address,
+            **{key: value for key, value in record.items()
+               if not key.startswith("_")},
+        }
+        touched = 0
+        for token in self._tokens_deployed_by(address):
+            self.rug_hazard.record_observation(token, dict(observation))
+            try:
+                self.dataset_builder.record_market_observation(
+                    token, {"measurement": "chain:deployer", **observation})
+            except Exception as exc:
+                logger.debug("deployer record for %s not recorded: %s", token, exc)
+            touched += 1
+        if not touched:
+            # A tracked wallet we hold no position against. Kept as a balance
+            # reading so a funder emptying itself is still visible later, but
+            # it changes no decision now and is not pretended to.
+            self._wallet_readings[address] = dict(record)
+
+    def _tokens_deployed_by(self, address: str) -> List[str]:
+        """Which watched tokens this address deployed, from stream state."""
+        tokens: List[str] = []
+        for token, curve in self._latest_curve_state.items():
+            if getattr(curve, "creator", "") == address:
+                tokens.append(token)
+        for token, pool in self._latest_pool_state.items():
+            if getattr(pool, "coin_creator", "") == address and token not in tokens:
+                tokens.append(token)
+        return tokens
 
     def credential_report(self) -> Dict[str, Any]:
         """Which credentials are present, by NAME.
@@ -4149,6 +4411,7 @@ class MemecoinQuantDesk:
             # never returned a record reads differently from one that is
             # failing, and the two need different fixes.
             "data_miners": self.data_miners.report(),
+            "execution_conditions": self.execution_conditions_report(),
             "entity_registry": self.entity_registry.report(),
             # What following the wallets we watch has actually returned, at
             # fills we could have got. A watch list nobody has scored is a

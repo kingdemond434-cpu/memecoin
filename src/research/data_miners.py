@@ -79,6 +79,16 @@ class Enriches(Enum):
     VENUE_LIQUIDITY = "venue_liquidity"
     WALLET_HISTORY = "wallet_history"
     NARRATIVE = "narrative"
+    # What it costs and how likely it is to land RIGHT NOW. Distinct from
+    # market context: the market can be calm while the chain is congested, and
+    # a bid sized for the wrong one of those is a bid that misses or overpays.
+    EXECUTION_CONDITIONS = "execution_conditions"
+    # Whether the supply we priced is the supply that will exist: mint
+    # authority, LP burn, vesting. A rug is usually a supply event first.
+    SUPPLY_CONTROL = "supply_control"
+    # Measured public attention, as opposed to a source having mentioned it.
+    # A mention is a touch; attention is how many people went looking.
+    SOCIAL_ATTENTION = "social_attention"
 
 
 @dataclass
