@@ -1014,15 +1014,26 @@ class MemecoinQuantDesk:
             candidate.base_token or WSOL_MINT, detected_at=candidate.timestamp,
             prelaunch_context=self._prelaunch_context(candidate.deployer or "", candidate.timestamp),
         )
-        risk = await self.rug_detector.analyze(token, candidate.pair, candidate.base_token)
-        risk_data = _jsonable(risk)
-        self.dataset_builder.record_risk_report(token, risk_data)
         self.rug_hazard.register_token(token, {"deployer": candidate.deployer or "", "pair": candidate.pair or ""})
         self.public_coordination.record_creator(token, candidate.deployer or "")
         # Shared launch funding is coordination evidence, not proof that the
         # creator controls every recipient. Only the identified creator is
         # placed in the developer set until the entity graph proves a link.
         self.dev_wallet_monitor.register(token, candidate.deployer or "")
+        # Wallets funded within the same atomic launch transaction as the pool
+        # creation. This is public coordination evidence, not proof that the
+        # creator controls every recipient.
+        for item in candidate.metadata.get("funding_transfers", []):
+            self.public_coordination.record_funding(
+                token, item.get("to", ""), item.get("from", ""),
+                float(item.get("lamports", 0) or 0) / 1e9, candidate.timestamp,
+            )
+        risk = await self.rug_detector.analyze(
+            token, candidate.pair, candidate.base_token, candidate.deployer or None)
+        self._enrich_holder_actor_concentration(
+            token, risk, candidate.deployer or "")
+        risk_data = _jsonable(risk)
+        self.dataset_builder.record_risk_report(token, risk_data)
         holder_payload = {
             "top_10_pct": getattr(risk, "top_10_pct", None),
             "top_20_pct": getattr(risk, "top_20_pct", None),
@@ -1041,17 +1052,6 @@ class MemecoinQuantDesk:
             self.dev_wallet_monitor.record_balance(
                 token, risk.deployer_balance_pct,
                 timestamp=getattr(risk, "timestamp", time.time()), source="native_spl")
-        # Wallets funded within the same atomic launch transaction as the pool
-        # creation -- the only funding evidence available without an extra
-        # RPC call. record_funding keys on the *funded* wallet so that N
-        # different wallets sharing one funder inside this transaction (a
-        # common bundled-sniper-bot pattern) is what actually trips the
-        # shared_funder coordination signal.
-        for item in candidate.metadata.get("funding_transfers", []):
-            self.public_coordination.record_funding(
-                token, item.get("to", ""), item.get("from", ""),
-                float(item.get("lamports", 0) or 0) / 1e9, candidate.timestamp,
-            )
         veto = self.risk_veto.evaluate(
             risk, dev_state=self.dev_wallet_monitor.state(token),
             connected_holder_pct=getattr(risk, "connected_cluster_pct", None))
@@ -1512,7 +1512,10 @@ class MemecoinQuantDesk:
             return
         previous = position.get("risk_object")
         current = await self.rug_detector.analyze(
-            token, getattr(candidate, "pair", None), getattr(candidate, "base_token", None))
+            token, getattr(candidate, "pair", None), getattr(candidate, "base_token", None),
+            getattr(candidate, "deployer", None))
+        self._enrich_holder_actor_concentration(
+            token, current, str(getattr(candidate, "deployer", "") or ""))
         position["risk_object"] = current
         position["risk_report"] = _jsonable(current)
         self.dataset_builder.record_risk_report(token, _jsonable(current))
@@ -1910,6 +1913,114 @@ class MemecoinQuantDesk:
             "capital_rotation": (rotation.report(as_of) if rotation else {
                 "status": "DATA_BLOCKED", "detail": "rotation tracker unavailable"}),
         }
+
+    def _enrich_holder_actor_concentration(self, token: str, risk: Any,
+                                           deployer: str) -> Dict[str, Any]:
+        """Attach evidence-backed actor lower bounds to native holder data.
+
+        The RPC layer resolves token accounts to wallet owners.  This method
+        joins those public owners to the already-observed genealogy and
+        coordination graphs.  A graph that has not linked a wallet does not
+        prove independence, so unobserved labels remain ``None``; positive
+        matches are safe lower bounds and can still trigger a hard veto.
+        """
+        checks = getattr(risk, "checks", None)
+        holders = checks.get("holders") if isinstance(checks, dict) else None
+        accounts = holders.get("accounts", []) if isinstance(holders, dict) else []
+        by_owner: Dict[str, float] = {}
+        for account in accounts:
+            owner = str(account.get("owner", "") or "")
+            if not owner:
+                continue
+            try:
+                share = float(account.get("supply_pct"))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(share) and share >= 0:
+                by_owner[owner] = by_owner.get(owner, 0.0) + share
+        if not by_owner:
+            result = {"status": "DATA_BLOCKED",
+                      "reason": "largest token-account owners unresolved"}
+            if isinstance(holders, dict):
+                holders["entity_enrichment"] = result
+            return result
+
+        evidence: Dict[str, Any] = {
+            "status": "PARTIAL", "semantics": "observed_lower_bounds",
+            "resolved_owners": len(by_owner),
+        }
+        whale_threshold = float(self.global_config.get(
+            "holder_whale_supply_pct", 1.0))
+        whale_owners = {owner for owner, pct in by_owner.items()
+                        if pct >= whale_threshold}
+        risk.whale_pct = sum(by_owner[owner] for owner in whale_owners)
+        evidence.update({
+            "whale_supply_threshold_pct": whale_threshold,
+            "whale_pct_lower_bound": risk.whale_pct,
+            "whale_owners": len(whale_owners),
+        })
+
+        coordination = getattr(self, "public_coordination", None)
+        coordinated_wallets = set()
+        kinds = set()
+        if coordination is not None:
+            for item in coordination.token_evidence.get(token, []):
+                if item.kind in {
+                    "same_slot_buy_cluster", "shared_funder",
+                    "near_identical_buy_sizes",
+                }:
+                    coordinated_wallets.update(item.wallets)
+                    kinds.add(item.kind)
+        if kinds:
+            risk.bundler_pct = sum(
+                pct for owner, pct in by_owner.items()
+                if owner in coordinated_wallets)
+            evidence.update({
+                "bundler_pct_lower_bound": risk.bundler_pct,
+                "bundler_evidence": sorted(kinds),
+                "coordinated_holders": len(set(by_owner) & coordinated_wallets),
+            })
+        else:
+            evidence["bundler_status"] = "DATA_BLOCKED: no qualifying public coordination evidence"
+
+        genealogy = getattr(self, "genealogy", None)
+        developer_cluster = (genealogy.find_cluster(deployer)
+                             if genealogy is not None and deployer else None)
+        if developer_cluster is not None:
+            cluster_wallets = set(developer_cluster.wallets)
+            risk.connected_cluster_pct = sum(
+                pct for owner, pct in by_owner.items()
+                if owner in cluster_wallets)
+            evidence.update({
+                "connected_cluster_pct_lower_bound": risk.connected_cluster_pct,
+                "connected_cluster_id": developer_cluster.cluster_id,
+                "connected_holders": len(set(by_owner) & cluster_wallets),
+            })
+        else:
+            evidence["connected_cluster_status"] = "DATA_BLOCKED: developer cluster unproven"
+
+        insider_wallets = set()
+        if genealogy is not None:
+            for owner in by_owner:
+                profile = genealogy.get_wallet_profile(owner)
+                if profile is not None and getattr(profile, "is_insider", False):
+                    insider_wallets.add(owner)
+        if insider_wallets:
+            risk.insider_pct = sum(by_owner[owner] for owner in insider_wallets)
+            evidence.update({
+                "insider_pct_lower_bound": risk.insider_pct,
+                "insider_holders": len(insider_wallets),
+            })
+        else:
+            evidence["insider_status"] = "DATA_BLOCKED: no evidence-labeled insider holder"
+
+        # Chain age is not derivable from a wallet's first local observation.
+        # Keep fresh-wallet concentration unavailable until an actual
+        # transaction-history timestamp is measured.
+        evidence["fresh_wallet_status"] = "DATA_BLOCKED: chain-age enrichment unavailable"
+        if isinstance(holders, dict):
+            holders["entity_enrichment"] = evidence
+        return evidence
 
     def _position_intelligence(self, token: str, position: Dict[str, Any]) -> Dict[str, Any]:
         """One slot per module that must be visible in an open-position decision."""

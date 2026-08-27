@@ -190,6 +190,9 @@ global:
   # setting this true makes that optional enrichment itself mandatory.
   require_complete_veto_inputs: false
   max_veto_exit_impact_pct: 0.20
+  # A reporting definition, not an alpha threshold. Owner shares are summed
+  # from native SPL token accounts and kept as observed lower bounds.
+  holder_whale_supply_pct: 1.0
   mutable_safety_refresh_seconds: 15
   # Planning only. No module is allowed to sign a sweep transaction; a cold
   # address and separate explicit authorization are still required.

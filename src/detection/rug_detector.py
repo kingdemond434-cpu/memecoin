@@ -5,6 +5,7 @@ not make ERC-20 ABI calls for Solana and treats unavailable safety evidence as
 ``DATA_BLOCKED`` rather than silently substituting zeroes.
 """
 
+import asyncio
 import base64
 import logging
 import struct
@@ -132,13 +133,17 @@ class RugDetector:
         token_address: str,
         pair_address: Optional[str] = None,
         base_token: Optional[str] = None,
+        deployer_address: Optional[str] = None,
     ) -> TokenRiskReport:
-        cache_key = f"{self.chain_config.name}:{token_address}"
+        # Developer ownership is part of the report, so a report produced
+        # without an identified creator must never satisfy a later request
+        # which does identify one.
+        cache_key = f"{self.chain_config.name}:{token_address}:{deployer_address or ''}"
         cached = self._cache.get(cache_key)
         if cached and time.time() - cached[1] < self._cache_ttl:
             return cached[0]
         if self.chain_config.chain_type == ChainType.SOLANA:
-            report = await self._analyze_solana(token_address)
+            report = await self._analyze_solana(token_address, deployer_address)
         else:
             report = TokenRiskReport(
                 token_address=token_address,
@@ -153,7 +158,8 @@ class RugDetector:
         self._cache[cache_key] = (report, time.time())
         return report
 
-    async def _analyze_solana(self, mint: str) -> TokenRiskReport:
+    async def _analyze_solana(self, mint: str,
+                              deployer_address: Optional[str] = None) -> TokenRiskReport:
         warnings: List[str] = []
         blocked: List[str] = []
         checks: Dict[str, Any] = {}
@@ -214,8 +220,16 @@ class RugDetector:
                 warnings.append(f"Token-2022 extension requires review: {name}")
                 score -= penalty
 
-        holders = await self._solana_holder_concentration(mint, mint_state["supply"])
+        holder_job = self._solana_holder_concentration(mint, mint_state["supply"])
+        route_job = self._solana_sell_route(mint, mint_state)
+        developer_job = self._solana_owner_token_share(
+            mint, deployer_address, mint_state["supply"])
+        # These are independent reads. Running them concurrently removes the
+        # extra owner-enrichment calls from the serial candidate latency path.
+        holders, route, developer = await asyncio.gather(
+            holder_job, route_job, developer_job)
         checks["holders"] = holders
+        checks["developer_balance"] = developer
         if holders.get("status") == "DATA_BLOCKED":
             blocked.append("holders")
         top10 = float(holders.get("top_10_pct", 0))
@@ -227,7 +241,6 @@ class RugDetector:
             warnings.append(f"Top token accounts hold {top10:.1f}% of supply")
             score -= 10
 
-        route = await self._solana_sell_route(mint, mint_state)
         checks["sell_route"] = route
         route_feasible = route.get("feasible")
         if route.get("status") == "DATA_BLOCKED":
@@ -255,6 +268,8 @@ class RugDetector:
             holder_count=None,
             top_10_pct=top10,
             top_20_pct=float(top20) if top20 is not None else None,
+            deployer_balance_pct=(float(developer["supply_pct"])
+                                  if developer.get("status") == "OK" else None),
             token_program=owner,
             token_extensions=extensions,
             extension_risk=min(1.0, sum(HIGH_RISK_EXTENSIONS.get(name, 0) for name in extensions) / 100.0),
@@ -304,18 +319,139 @@ class RugDetector:
             result = await self.rpc.request("getTokenLargestAccounts", [mint, {"commitment": "confirmed"}])
             values = (result or {}).get("value", [])
             amounts = [int(item.get("amount", 0) or 0) for item in values[:20]]
+            addresses = [str(item.get("address", "") or "") for item in values[:20]]
+            owners = await self._solana_token_account_owners(addresses)
+            accounts = []
+            resolved_amount = 0
+            for address, amount in zip(addresses, amounts):
+                owner = owners.get("owners", {}).get(address)
+                if owner:
+                    resolved_amount += amount
+                accounts.append({
+                    "token_account": address,
+                    "owner": owner,
+                    "amount_raw": amount,
+                    "supply_pct": 100.0 * amount / supply,
+                })
             return {
                 "status": "OK",
                 "largest_account_count": len(values),
                 "holder_count_status": "DATA_BLOCKED",
                 "top_10_pct": 100.0 * sum(amounts[:10]) / supply,
                 "top_20_pct": 100.0 * sum(amounts) / supply,
-                "owner_enrichment_status": "DATA_BLOCKED",
-                "note": ("largest token-account concentration; account owners, "
-                         "developer share and entity-cluster concentration are separate evidence"),
+                "owner_enrichment_status": owners.get("status", "DATA_BLOCKED"),
+                "owner_enrichment_error": owners.get("error"),
+                "owner_resolved_accounts": sum(1 for item in accounts if item["owner"]),
+                "owner_resolved_supply_pct": 100.0 * resolved_amount / supply,
+                "accounts": accounts,
+                "note": ("largest token-account concentration with native SPL owner "
+                         "resolution; entity labels remain separate evidence"),
             }
         except Exception as exc:
             return {"status": "DATA_BLOCKED", "error": str(exc), "count": 0}
+
+    async def _solana_token_account_owners(self, addresses: List[str]) -> Dict[str, Any]:
+        """Resolve SPL token-account addresses to controlling wallet owners."""
+        usable = [address for address in addresses if address]
+        if not usable:
+            return {"status": "OK", "owners": {}}
+        try:
+            result = await self.rpc.request("getMultipleAccounts", [
+                usable, {"encoding": "jsonParsed", "commitment": "confirmed"},
+            ])
+            values = (result or {}).get("value", [])
+            owners = {}
+            for address, account in zip(usable, values):
+                owner = self.parse_spl_token_account_owner(account)
+                if owner:
+                    owners[address] = owner
+            if len(owners) == len(usable):
+                status = "OK"
+            elif owners:
+                status = "PARTIAL"
+            else:
+                status = "DATA_BLOCKED"
+            return {"status": status, "owners": owners,
+                    "resolved": len(owners), "requested": len(usable)}
+        except Exception as exc:
+            return {"status": "DATA_BLOCKED", "owners": {}, "error": str(exc)}
+
+    async def _solana_owner_token_share(self, mint: str, owner: Optional[str],
+                                        supply: int) -> Dict[str, Any]:
+        """Measure an owner's complete balance for a mint using native RPC."""
+        if not owner:
+            return {"status": "DATA_BLOCKED", "reason": "deployer unavailable"}
+        if supply <= 0:
+            return {"status": "OK", "owner": owner, "amount_raw": 0,
+                    "supply_pct": 0.0, "token_accounts": 0}
+        try:
+            result = await self.rpc.request("getTokenAccountsByOwner", [
+                owner, {"mint": mint},
+                {"encoding": "jsonParsed", "commitment": "confirmed"},
+            ])
+            values = (result or {}).get("value", [])
+            amounts = [self.parse_spl_token_account_amount(item.get("account") or {})
+                       for item in values]
+            if any(amount is None for amount in amounts):
+                return {"status": "DATA_BLOCKED", "owner": owner,
+                        "reason": "one or more developer token accounts did not decode",
+                        "token_accounts": len(values)}
+            total = sum(int(amount or 0) for amount in amounts)
+            return {"status": "OK", "owner": owner, "amount_raw": total,
+                    "supply_pct": 100.0 * total / supply,
+                    "token_accounts": len(values)}
+        except Exception as exc:
+            return {"status": "DATA_BLOCKED", "owner": owner, "error": str(exc)}
+
+    @staticmethod
+    def parse_spl_token_account_owner(account: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not account:
+            return None
+        data = account.get("data")
+        if isinstance(data, dict):
+            info = ((data.get("parsed") or {}).get("info") or {})
+            owner = info.get("owner")
+            return str(owner) if owner else None
+        if isinstance(data, list) and data:
+            try:
+                raw = base64.b64decode(data[0], validate=True)
+            except (ValueError, TypeError):
+                return None
+            if len(raw) >= 64:
+                return RugDetector._base58_encode(raw[32:64])
+        return None
+
+    @staticmethod
+    def parse_spl_token_account_amount(account: Optional[Dict[str, Any]]) -> Optional[int]:
+        if not account:
+            return None
+        data = account.get("data")
+        if isinstance(data, dict):
+            info = ((data.get("parsed") or {}).get("info") or {})
+            token_amount = info.get("tokenAmount") or {}
+            try:
+                return int(token_amount.get("amount"))
+            except (TypeError, ValueError):
+                return None
+        if isinstance(data, list) and data:
+            try:
+                raw = base64.b64decode(data[0], validate=True)
+            except (ValueError, TypeError):
+                return None
+            if len(raw) >= 72:
+                return struct.unpack_from("<Q", raw, 64)[0]
+        return None
+
+    @staticmethod
+    def _base58_encode(raw: bytes) -> str:
+        alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+        number = int.from_bytes(raw, "big")
+        encoded = ""
+        while number:
+            number, remainder = divmod(number, 58)
+            encoded = alphabet[remainder] + encoded
+        zeros = len(raw) - len(raw.lstrip(b"\0"))
+        return "1" * zeros + encoded
 
     async def _solana_sell_route(self, mint: str, mint_state: Dict[str, Any]) -> Dict[str, Any]:
         if not self.quote_provider or not getattr(self.quote_provider, "_session", None):

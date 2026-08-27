@@ -735,7 +735,7 @@ class TestOfficialSocialCollectors(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine._telegram_client.target, -10012345)
 
 
-class TestNativeMintChecks(unittest.TestCase):
+class TestNativeMintChecks(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def mint_bytes(mint_tag=0, freeze_tag=0, supply=1_000_000, decimals=6):
         raw = bytearray(82)
@@ -762,6 +762,81 @@ class TestNativeMintChecks(unittest.TestCase):
     def test_invalid_authority_coption_is_rejected(self):
         with self.assertRaises(ValueError):
             RugDetector.parse_spl_mint(bytes(self.mint_bytes(2, 0)), TOKEN_PROGRAM)
+
+    def test_spl_token_account_owner_and_amount_decode_from_raw_layout(self):
+        owner_raw = bytes(range(1, 33))
+        raw = bytearray(165)
+        raw[32:64] = owner_raw
+        struct.pack_into("<Q", raw, 64, 123_456)
+        account = {"data": [base64.b64encode(bytes(raw)).decode(), "base64"]}
+        self.assertEqual(
+            RugDetector.parse_spl_token_account_owner(account), b58encode(owner_raw))
+        self.assertEqual(RugDetector.parse_spl_token_account_amount(account), 123_456)
+
+    async def test_native_holder_owner_and_developer_balance_enrichment(self):
+        class HolderRPC:
+            async def request(self, method, params):
+                if method == "getTokenLargestAccounts":
+                    return {"value": [
+                        {"address": "token-account-a", "amount": "400"},
+                        {"address": "token-account-b", "amount": "100"},
+                    ]}
+                if method == "getMultipleAccounts":
+                    return {"value": [
+                        {"data": {"parsed": {"info": {"owner": "developer"}}}},
+                        {"data": {"parsed": {"info": {"owner": "other"}}}},
+                    ]}
+                if method == "getTokenAccountsByOwner":
+                    return {"value": [
+                        {"account": {"data": {"parsed": {"info": {
+                            "tokenAmount": {"amount": "425"},
+                        }}}}},
+                    ]}
+                raise AssertionError(method)
+
+        detector = RugDetector(solana_chain(), HolderRPC())
+        holders = await detector._solana_holder_concentration("mint", 1_000)
+        developer = await detector._solana_owner_token_share(
+            "mint", "developer", 1_000)
+        self.assertEqual(holders["owner_enrichment_status"], "OK")
+        self.assertEqual(holders["accounts"][0]["owner"], "developer")
+        self.assertAlmostEqual(holders["owner_resolved_supply_pct"], 50.0)
+        self.assertEqual(developer["status"], "OK")
+        self.assertAlmostEqual(developer["supply_pct"], 42.5)
+
+    def test_holder_actor_join_uses_positive_public_evidence_as_lower_bounds(self):
+        desk = object.__new__(MemecoinQuantDesk)
+        desk.global_config = {"holder_whale_supply_pct": 5.0}
+        desk.public_coordination = SimpleNamespace(token_evidence={"mint": [
+            SimpleNamespace(kind="same_slot_buy_cluster", wallets=["bundle"]),
+        ]})
+
+        class Genealogy:
+            @staticmethod
+            def find_cluster(address):
+                return SimpleNamespace(cluster_id="dev-cluster",
+                                       wallets={"developer", "linked"})
+
+            @staticmethod
+            def get_wallet_profile(address):
+                return SimpleNamespace(is_insider=True) if address == "insider" else None
+
+        desk.genealogy = Genealogy()
+        risk = SimpleNamespace(checks={"holders": {"accounts": [
+            {"owner": "developer", "supply_pct": 8.0},
+            {"owner": "linked", "supply_pct": 6.0},
+            {"owner": "bundle", "supply_pct": 5.0},
+            {"owner": "insider", "supply_pct": 2.0},
+        ]}}, whale_pct=None, bundler_pct=None, connected_cluster_pct=None,
+                               insider_pct=None, fresh_wallet_pct=None)
+        result = desk._enrich_holder_actor_concentration(
+            "mint", risk, "developer")
+        self.assertEqual(result["semantics"], "observed_lower_bounds")
+        self.assertAlmostEqual(risk.whale_pct, 19.0)
+        self.assertAlmostEqual(risk.bundler_pct, 5.0)
+        self.assertAlmostEqual(risk.connected_cluster_pct, 14.0)
+        self.assertAlmostEqual(risk.insider_pct, 2.0)
+        self.assertIsNone(risk.fresh_wallet_pct)
 
 
 class TestProbabilityAndAccounting(unittest.TestCase):
