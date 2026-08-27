@@ -173,6 +173,15 @@ code{font-family:var(--mono);font-size:11.5px;background:#0B0B11;border:1px soli
 
   <div class="strip" id="strip"></div>
 
+  <div class="banner" id="samplewarn" hidden>
+    <div class="t" style="color:var(--warn)">No data</div>
+    <div class="d">
+      Nothing has been loaded yet, so every panel reads unmeasured. <strong>No placeholder numbers are shown</strong>
+      &mdash; a dashboard that invents plausible figures when it has none teaches its reader to trust figures it made
+      up. Served from the desk this fills itself within seconds; published, paste your <code>/status</code> below.
+    </div>
+  </div>
+
   <div class="banner">
     <div class="t">Reading this</div>
     <div class="d">
@@ -343,7 +352,7 @@ code{font-family:var(--mono);font-size:11.5px;background:#0B0B11;border:1px soli
       <textarea id="input" spellcheck="false" placeholder='{"launch_census": {...}, "calibration": {...}, "data_miners": {...}}'></textarea>
       <div class="btnrow">
         <button class="primary" id="load">Render status</button>
-        <button id="reset">Back to sample</button>
+        <button id="reset">Clear</button>
         <span class="msg" id="msg"></span>
       </div>
     </div>
@@ -362,116 +371,36 @@ code{font-family:var(--mono);font-size:11.5px;background:#0B0B11;border:1px soli
 /* A deliberately EARLY snapshot. Showing healthy fabricated numbers on a desk
    that has measured nothing would be the exact dishonesty the desk is built
    to avoid. */
-const SAMPLE = {
-  launch_census:{status:"OK",
-    funnel:{seen:18432,screened_out:17994,reached_a_decision:438,entered:61,unaccounted:0},
-    outcomes:{resolved:12207,monsters:57,rugs:8811,migrated:412,
-      rug_share_of_resolved:0.7218,monster_share_of_resolved:0.00467},
-    screens:{holder_concentration:6120,rug_hazard:4402,no_source_touch:3380,
-      first25_not_independent:2211,capacity:1102,reentry_bar:779},
-    rug_mechanisms:{unclassified:4402,slow_bleed:2610,migration_stall:1180,
-      creator_dump:361,sniper_cascade:180,lp_pull:62,mint_dilution:14,honeypot:2},
-    missed_monsters:{monsters_resolved:57,monsters_entered:9,
-      monsters_decided_not_entered:6,monsters_screened_out:42,
-      monster_capture_rate:0.2632,
-      costliest_screens:[
-        {reason:"holder_concentration",monsters_discarded:19,total_screened:6120,monster_share_of_rejections:0.0031},
-        {reason:"no_source_touch",monsters_discarded:11,total_screened:3380,monster_share_of_rejections:0.0033},
-        {reason:"first25_not_independent",monsters_discarded:7,total_screened:2211,monster_share_of_rejections:0.0032},
-        {reason:"rug_hazard",monsters_discarded:4,total_screened:4402,monster_share_of_rejections:0.0009},
-        {reason:"capacity",monsters_discarded:1,total_screened:1102,monster_share_of_rejections:0.0009}]},
-    memory:{in_memory:20000,cap:20000,spilled_to_disk:41209}},
-
-  calibration:{status:"MISCALIBRATED",models_tracked:5,models_measured:2,models_miscalibrated:1,
-    models:[
-      {model:"rug_30s",status:"MISCALIBRATED",observations:1244,brier:0.1832,
-        expected_calibration_error:0.1140,understates_risk_by:0.1102,overstates_risk_by:0.0038,
-        dominant_provenance:"shadow",evidence_weight:622.0,proven_on_real_fills:false},
-      {model:"landing_p",status:"OK",observations:906,brier:0.0921,
-        expected_calibration_error:0.0288,understates_risk_by:0.0121,overstates_risk_by:0.0167,
-        dominant_provenance:"reconstructed",evidence_weight:226.5,proven_on_real_fills:false},
-      {model:"rug_5m",status:"DATA_BLOCKED",observations:112,brier:null,
-        expected_calibration_error:null,understates_risk_by:null,overstates_risk_by:null,
-        dominant_provenance:"shadow",evidence_weight:56.0,proven_on_real_fills:false},
-      {model:"monster_p",status:"DATA_BLOCKED",observations:38,brier:null,
-        expected_calibration_error:null,understates_risk_by:null,overstates_risk_by:null,
-        dominant_provenance:"shadow",evidence_weight:19.0,proven_on_real_fills:false},
-      {model:"escape_p",status:"DATA_BLOCKED",observations:0,brier:null,
-        expected_calibration_error:null,understates_risk_by:null,overstates_risk_by:null,
-        dominant_provenance:"none",evidence_weight:0.0,proven_on_real_fills:false}]},
-
-  screen_policy:{status:"OK",evaluated:18432,full_size:344,reduced:17650,
-    declined_uneconomic:397,declined_veto:41,kept_but_reduced_share:0.9576,size_floor:0.05,
-    costliest_screens:[
-      {screen:"holder_concentration",size_forgone:5218.4,launches_touched:18432,mean_cut:0.2831},
-      {screen:"no_source_touch",size_forgone:3102.9,launches_touched:18432,mean_cut:0.1683},
-      {screen:"first25_not_independent",size_forgone:1944.1,launches_touched:18432,mean_cut:0.1055},
-      {screen:"rug_hazard",size_forgone:1610.7,launches_touched:18432,mean_cut:0.0874},
-      {screen:"capacity",size_forgone:402.2,launches_touched:18432,mean_cut:0.0218}]},
-
-  fact_ladder:{status:"DEGRADED",facts_declared:7,
-    degraded_facts:["escape_feasibility","creator_prior_rug_rate"],
-    facts:[
-      {fact:"holder_concentration",resolutions:18432,measured_share:0.881,
-        rungs:{measured:16241,proxy:1904,prior:287}},
-      {fact:"lp_control",resolutions:412,measured_share:0.972,
-        rungs:{measured:400,absent:12}},
-      {fact:"mint_authority",resolutions:18432,measured_share:0.994,
-        rungs:{measured:18321,prior:111}},
-      {fact:"funder_ancestry",resolutions:18432,measured_share:0.643,
-        rungs:{measured:11852,reconstructed:4901,proxy:1402,prior:277}},
-      {fact:"first25_independence",resolutions:18432,measured_share:0.712,
-        rungs:{measured:13123,reconstructed:3810,proxy:1499}},
-      {fact:"creator_prior_rug_rate",resolutions:18432,measured_share:0.212,
-        rungs:{reconstructed:3908,proxy:5220,prior:9304}},
-      {fact:"escape_feasibility",resolutions:61,measured_share:0.0,
-        rungs:{proxy:44,prior:17}}]},
-
-  execution_conditions:{status:"OK",congestion:0.31,slot_time_ratio:1.31,tps:3182.4,
-    fee_p50_lamports:41000,fee_p90_lamports:214000,contested_share:0.62,accounts_sampled:9,
-    unattributed_wallet_readings:73},
-
-  bid_explorer:{status:"OK",explorations:118,cells_covered:5,cells_total:24,coverage_target_per_cell:25,
-    cells:[
-      {cell:"calm@0.35",attempts:25,landed:4},{cell:"calm@0.50",attempts:25,landed:11},
-      {cell:"calm@0.70",attempts:25,landed:19},{cell:"calm@0.85",attempts:22,landed:20},
-      {cell:"calm@1.25",attempts:14,landed:14},{cell:"calm@1.60",attempts:6,landed:6},
-      {cell:"busy@0.35",attempts:9,landed:0},{cell:"busy@0.50",attempts:12,landed:2},
-      {cell:"busy@0.70",attempts:25,landed:9},{cell:"busy@0.85",attempts:18,landed:11},
-      {cell:"busy@1.25",attempts:7,landed:6},{cell:"busy@1.60",attempts:2,landed:2},
-      {cell:"contested@0.35",attempts:1,landed:0},{cell:"contested@0.50",attempts:3,landed:0},
-      {cell:"contested@0.70",attempts:4,landed:1},{cell:"contested@0.85",attempts:5,landed:2},
-      {cell:"contested@1.25",attempts:2,landed:1},{cell:"contested@1.60",attempts:0,landed:0},
-      {cell:"unknown@0.35",attempts:0,landed:0},{cell:"unknown@0.50",attempts:0,landed:0},
-      {cell:"unknown@0.70",attempts:0,landed:0},{cell:"unknown@0.85",attempts:0,landed:0},
-      {cell:"unknown@1.25",attempts:0,landed:0},{cell:"unknown@1.60",attempts:0,landed:0}]},
-
-  data_miners:{status:"OK",registered:18,runnable:16,producing:11,failing:2,
-    awaiting_credentials:["web:program_repos"],silent:["web:reddit_new"],total_records:284117,
-    miners:[
-      {miner_id:"chain:holder_structure",enriches:"holder_structure",cadence:15,records:41220,state:"OK"},
-      {miner_id:"chain:priority_fees",enriches:"execution_conditions",cadence:15,records:38104,state:"OK"},
-      {miner_id:"chain:network_health",enriches:"execution_conditions",cadence:60,records:9620,state:"OK"},
-      {miner_id:"chain:lp_supply",enriches:"supply_control",cadence:60,records:7710,state:"OK"},
-      {miner_id:"chain:deployer_history",enriches:"wallet_history",cadence:900,records:2044,state:"OK"},
-      {miner_id:"chain:mint_authority",enriches:"token_metadata",cadence:60,records:18866,state:"OK"},
-      {miner_id:"market:dexscreener_pairs",enriches:"venue_liquidity",cadence:15,records:52011,state:"OK"},
-      {miner_id:"market:jupiter_tokens",enriches:"token_metadata",cadence:3600,records:96400,state:"OK"},
-      {miner_id:"web:youtube_recent",enriches:"narrative",cadence:60,records:1188,state:"OK"},
-      {miner_id:"web:name_corpus",enriches:"token_metadata",cadence:60,records:14002,state:"OK"},
-      {miner_id:"web:wikipedia_attention",enriches:"market_context",cadence:86400,records:56,state:"OK"},
-      {miner_id:"web:reddit_new",enriches:"social_attention",cadence:60,records:0,state:"SILENT"},
-      {miner_id:"web:hackernews",enriches:"social_attention",cadence:900,records:288,state:"RATE_LIMITED"},
-      {miner_id:"web:program_repos",enriches:"narrative",cadence:3600,records:0,state:"NO_KEY"}]},
-
-  forward_evidence:{stage:"FORWARD_SHADOW",
-    distance:{decisions:{have:438,need:5000},real_fills:{have:0,need:250},
-      launch_cohorts:{have:11,need:40},regimes:{have:2,need:4},
-      net_log_growth:{have:0.0,need:0.0},catastrophic:{have:0,need:0}}},
-
-  signer:{public_key:"—  not configured  —",signed:0,refused:0,halted:true,
-    halt_reason:"ALLOW_LIVE_TRADING is not set to the acknowledgement",
-    recent_refusals:[]}
+/* Nothing is invented here. Before the desk answers, every panel reports what
+   it actually is: unmeasured. A dashboard that shows plausible numbers when it
+   has none teaches its reader to trust numbers it made up. */
+const EMPTY = {
+  launch_census:{status:"DATA_BLOCKED",
+    detail:"waiting for the desk",
+    funnel:{seen:null,screened_out:null,reached_a_decision:null,entered:null,unaccounted:null},
+    outcomes:{resolved:null,monsters:null,rugs:null,migrated:null,
+      rug_share_of_resolved:null,monster_share_of_resolved:null},
+    screens:{}, rug_mechanisms:{},
+    missed_monsters:{monsters_resolved:0,monsters_entered:null,
+      monsters_decided_not_entered:null,monsters_screened_out:null,
+      monster_capture_rate:null,costliest_screens:[]},
+    memory:{in_memory:null,cap:null,spilled_to_disk:null}},
+  calibration:{status:"DATA_BLOCKED",models_tracked:0,models_measured:0,
+    models_miscalibrated:0,models:[]},
+  execution_conditions:{status:"DATA_BLOCKED",congestion:null,slot_time_ratio:null,
+    tps:null,fee_p50_lamports:null,fee_p90_lamports:null,contested_share:null,
+    accounts_sampled:null,unattributed_wallet_readings:0},
+  bid_explorer:{status:"DATA_BLOCKED",explorations:0,cells_covered:0,cells_total:24,
+    coverage_target_per_cell:25,cells:[]},
+  data_miners:{status:"DATA_BLOCKED",registered:null,runnable:null,producing:null,
+    failing:null,awaiting_credentials:[],silent:[],total_records:null,miners:[]},
+  screen_policy:{status:"DATA_BLOCKED",evaluated:0,full_size:0,reduced:0,
+    declined_uneconomic:0,declined_veto:0,kept_but_reduced_share:null,
+    size_floor:null,costliest_screens:[]},
+  fact_ladder:{status:"DATA_BLOCKED",facts_declared:0,degraded_facts:[],facts:[]},
+  forward_evidence:{stage:"FORWARD_SHADOW",distance:{}},
+  signer:{mode:null,isolated:null,public_key:"—",signed:0,refused:0,
+    halted:null,halt_reason:"",recent_refusals:[]}
 };
 
 /* ---------- helpers ---------- */
@@ -690,12 +619,13 @@ $("load").addEventListener("click",()=>{
     render(parsed);
     $("msg").textContent="Rendered. Any panel your build does not emit shows as blocked.";
     $("src").textContent="SOURCE — pasted /status";
+    markSample(false);
     try{localStorage.setItem("aurum.status",raw);}catch(_){}
   }catch(e){$("msg").textContent="Rendered partially — "+e.message;}
 });
 $("reset").addEventListener("click",()=>{
-  render(SAMPLE);$("input").value="";$("msg").textContent="";
-  $("src").textContent="SOURCE — sample snapshot";
+  render(EMPTY);$("input").value="";$("msg").textContent="";
+  $("src").textContent="SOURCE — no data yet";markSample(true);
   try{localStorage.removeItem("aurum.status");}catch(_){}
 });
 
@@ -707,19 +637,25 @@ async function poll(){
     render(await r.json());
     $("src").textContent="SOURCE — live /status @ "+new Date().toISOString().slice(11,19)+"Z";
     $("msg").textContent="";
+    $("samplewarn").hidden=true;
   }catch(e){
     $("msg").textContent="live poll failed ("+e.message+"); showing last good render";
   }
 }
 if(location.protocol.startsWith("http")){ poll(); setInterval(poll,10000); }
 
-let boot=SAMPLE, label="SOURCE — sample snapshot";
+let boot=EMPTY, label="SOURCE — no data yet";
 try{
   const saved=localStorage.getItem("aurum.status");
   if(saved){boot=JSON.parse(saved);label="SOURCE — pasted /status";$("input").value=saved;}
 }catch(_){boot=SAMPLE;}
-try{render(boot);$("src").textContent=label;}
-catch(e){render(SAMPLE);$("src").textContent="SOURCE — sample snapshot";}
+function markSample(isSample){
+  const warn=$("samplewarn");
+  if(warn) warn.hidden=!isSample;
+  document.title=(isSample?"[NO DATA] ":"")+"Aurum Desk Terminal";
+}
+try{render(boot);$("src").textContent=label;markSample(boot===EMPTY);}
+catch(e){render(EMPTY);$("src").textContent="SOURCE — no data yet";markSample(true);}
 </script>
 </body>
 </html>
