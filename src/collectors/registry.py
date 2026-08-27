@@ -44,6 +44,24 @@ logger = logging.getLogger(__name__)
 
 REGISTRY_SCHEMA_VERSION = "v1"
 
+# Successful-poll cadence by transport. Push/stream adapters merely drain a
+# local queue and stay sub-second; remote HTTP/RSS endpoints are not hammered
+# once per second. Per-source YAML can override these measurements.
+DEFAULT_POLL_INTERVALS: Dict[str, float] = {
+    "telegram": 0.10,
+    "bluesky": 0.05,
+    "nostr": 0.05,
+    "discord": 0.10,
+    "youtube": 0.25,
+    "twitch": 0.25,
+    "farcaster": 10.0,
+    "mastodon": 15.0,
+    "rss": 60.0,
+    "official_site": 60.0,
+    "metadata": 30.0,
+    "code_repo": 300.0,
+}
+
 #: Declaration kind -> adapter factory. Every factory takes (source_id, fetch)
 #: plus its own keywords, so a new kind is one entry here.
 ADAPTER_KINDS: Dict[str, Callable[..., EventSource]] = {
@@ -110,6 +128,7 @@ class SourceDeclaration:
     # dead or lets the dead one look healthy.
     degraded_after_seconds: Optional[float] = None
     dead_after_seconds: Optional[float] = None
+    poll_interval_seconds: Optional[float] = None
 
     def missing_credentials(self) -> List[str]:
         """Which required environment variables are absent.
@@ -195,6 +214,9 @@ def load_declarations(path: str) -> List[SourceDeclaration]:
                 dead_after_seconds=(float(entry["dead_after_seconds"])
                                     if entry.get("dead_after_seconds") is not None
                                     else None),
+                poll_interval_seconds=(float(entry["poll_interval_seconds"])
+                                       if entry.get("poll_interval_seconds") is not None
+                                       else None),
             ))
         except (KeyError, TypeError, ValueError) as exc:
             logger.error("skipping malformed source declaration %r: %s", entry, exc)
@@ -249,6 +271,10 @@ def build_sources(
                 source.degraded_after_seconds = declaration.degraded_after_seconds
             if declaration.dead_after_seconds is not None:
                 source.dead_after_seconds = declaration.dead_after_seconds
+            source.poll_interval_seconds = max(
+                0.01, float(declaration.poll_interval_seconds
+                            if declaration.poll_interval_seconds is not None
+                            else DEFAULT_POLL_INTERVALS.get(declaration.kind, 30.0)))
             sources.append(source)
         except TypeError as exc:
             mark(DeclarationState.NO_FETCHER, f"adapter rejected its options: {exc}")

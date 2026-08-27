@@ -56,7 +56,7 @@ from src.strategies.multihead_predictor import (
     MultiHeadPredictor, PredictionFeatures, band_for,
 )
 from src.collectors.registry import (
-    ADAPTER_KINDS, SourceDeclaration, SourceDiscovery, build_sources,
+    ADAPTER_KINDS, DEFAULT_POLL_INTERVALS, SourceDeclaration, SourceDiscovery, build_sources,
     load_declarations,
 )
 from src.collectors.adapters import (
@@ -7383,6 +7383,13 @@ class TestSourceRegistry(unittest.TestCase):
         self.assertEqual(len(sources), 1)
         self.assertEqual(report.ready, 1)
         self.assertEqual(report.by_state["READY"], 1)
+        self.assertEqual(sources[0].poll_interval_seconds,
+                         DEFAULT_POLL_INTERVALS["rss"])
+
+    def test_a_source_can_override_its_kind_cadence(self):
+        declaration = self._declaration(poll_interval_seconds=7.5)
+        sources, _ = build_sources([declaration], self._fetchers("rss:kr"))
+        self.assertEqual(sources[0].poll_interval_seconds, 7.5)
 
     def test_transport_options_do_not_leak_into_record_adapters(self):
         declarations = [
@@ -8037,6 +8044,17 @@ class TestPerSourceCadence(unittest.IsolatedAsyncioTestCase):
         detail = source.health(self.NOW + 5).detail
         self.assertIn("degraded at 30s", detail)
         self.assertIn("dead at 90s", detail)
+
+    def test_failures_back_off_but_success_uses_declared_cadence(self):
+        source = self._Fake("rss", SourceClass.FEED,
+                            poll_interval_seconds=60)
+        self.assertEqual(source.retry_delay(), 60)
+        source._consecutive_failures = 1
+        self.assertEqual(source.retry_delay(), 60)
+        source._consecutive_failures = 4
+        self.assertEqual(source.retry_delay(), 300)
+        source._consecutive_failures = 20
+        self.assertEqual(source.retry_delay(), 300)
 
 
 class TestActorIntelligenceIsLiveWired(unittest.TestCase):
