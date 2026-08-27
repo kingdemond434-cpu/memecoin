@@ -80,6 +80,18 @@ class HealthThresholds:
     min_execution_attempts_for_verdict: int = 20
     training_stale_seconds: float = 172_800.0
     max_data_blocked_token_share: float = 0.50
+    # A stream that opened and delivers nothing looked healthy for hours. So
+    # did a router filing every update as the wrong type, and a decoder that
+    # never saw the instruction carrying launches. Each of those is a check
+    # now, because each produced an empty denominator behind a green status.
+    stream_silent_seconds: float = 180.0
+    census_stall_seconds: float = 900.0
+    min_dry_build_success: float = 0.90
+    miner_silent_seconds: float = 1_800.0
+    min_miners_producing: int = 3
+    evidence_stale_seconds: float = 600.0
+    max_source_dead_share: float = 0.60
+    landing_log_stale_seconds: float = 86_400.0
 
 
 def _read_json(path: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -261,6 +273,208 @@ def check_models(readiness: Dict[str, Any], model_dir: Path, now: float,
             f"{report.get('status', 'UNKNOWN')}",
             {"age_seconds": round(age, 1), "status": report.get("status"),
              "detail": report.get("detail") or report.get("reason")}))
+    return checks
+
+
+def check_pipeline(readiness: Dict[str, Any], now: float,
+                   thresholds: HealthThresholds,
+                   previous: Optional[Dict[str, Any]] = None) -> List[Check]:
+    """The chain from stream to denominator, checked at every joint.
+
+    Three separate defects produced an empty launch census behind a passing
+    status: a stream reporting a connection as delivery, a router filing every
+    update as the first field name in a list, and a decoder that never saw the
+    CPI-wrapped instruction carrying launches. None of them was visible as a
+    failure anywhere. Each is a check here now, at the joint where it broke.
+    """
+    checks: List[Check] = []
+
+    stream = readiness.get("stream_events") or {}
+    total = stream.get("total") or 0
+    creations = stream.get("token_created") or 0
+    if not total:
+        checks.append(Check(
+            "pipeline_stream_events", State.CRITICAL,
+            "no chain event has reached the desk; nothing downstream can fill",
+            evidence={"total": total}, escalate=True))
+    elif not creations:
+        checks.append(Check(
+            "pipeline_stream_events", State.CRITICAL,
+            f"{total} events delivered and not one creation; the decoder is "
+            "naming trades and missing launches",
+            evidence={"total": total, "by_type": stream.get("by_type")},
+            escalate=True))
+    else:
+        checks.append(Check("pipeline_stream_events", State.OK,
+                            f"{creations} creations of {total} events",
+                            evidence={"token_created": creations}))
+
+    yellow = readiness.get("yellowstone") or {}
+    quiet = yellow.get("seconds_since_response")
+    if yellow.get("status") == "DATA_BLOCKED":
+        checks.append(Check(
+            "pipeline_stream_delivery", State.CRITICAL,
+            yellow.get("detail") or "the stream is connected and silent",
+            evidence=dict(yellow), escalate=True))
+    elif quiet is not None and quiet > thresholds.stream_silent_seconds:
+        checks.append(Check(
+            "pipeline_stream_delivery", State.CRITICAL,
+            f"no stream response for {quiet:.0f}s",
+            evidence={"seconds_since_response": quiet}, escalate=True))
+    else:
+        checks.append(Check("pipeline_stream_delivery", State.OK, "",
+                            evidence={"responses": yellow.get("responses")}))
+
+    decoder = readiness.get("pump_decoder") or {}
+    if decoder.get("status") == "DEGRADED":
+        checks.append(Check(
+            "pipeline_decoder", State.CRITICAL, decoder.get("detail", ""),
+            evidence={"unmatched": decoder.get("unmatched_prefixes"),
+                      "matched": decoder.get("matched")}, escalate=True))
+    elif decoder.get("status") == "OK":
+        checks.append(Check("pipeline_decoder", State.OK, "",
+                            evidence={"matched": decoder.get("matched")}))
+
+    census = ((readiness.get("launch_census") or {}).get("funnel") or {})
+    seen = census.get("seen")
+    if seen is None:
+        checks.append(Check("pipeline_census", State.DATA_BLOCKED,
+                            "the census has not reported"))
+    elif previous is not None:
+        before = ((previous.get("launch_census") or {}).get("funnel") or {}).get("seen")
+        elapsed = now - float(previous.get("_observed_at", now))
+        if (before is not None and seen <= before
+                and elapsed > thresholds.census_stall_seconds):
+            checks.append(Check(
+                "pipeline_census", State.CRITICAL,
+                f"the denominator has not moved in {elapsed:.0f}s; launches "
+                "are arriving and not being counted, or none are arriving",
+                evidence={"seen": seen, "previous": before}, escalate=True))
+        else:
+            checks.append(Check("pipeline_census", State.OK, "",
+                                evidence={"seen": seen}))
+    else:
+        checks.append(Check("pipeline_census", State.OK, "",
+                            evidence={"seen": seen}))
+
+    build = readiness.get("dry_build") or {}
+    rate = build.get("success_rate")
+    if rate is not None and rate < thresholds.min_dry_build_success:
+        checks.append(Check(
+            "pipeline_execution_build", State.CRITICAL,
+            f"only {rate:.0%} of transactions build; with capital these are "
+            "rejected trades",
+            evidence={"failures": build.get("failures")}, escalate=True))
+    elif rate is not None:
+        checks.append(Check("pipeline_execution_build", State.OK, "",
+                            evidence={"built": build.get("built")}))
+    return checks
+
+
+def check_subsystems(readiness: Dict[str, Any], root: Path, now: float,
+                     thresholds: HealthThresholds) -> List[Check]:
+    """Everything that can degrade without stopping the process.
+
+    A desk does not usually fail by crashing. It fails by continuing to run
+    with one subsystem quietly producing nothing, which is why every one of
+    these is checked separately rather than inferred from the process being
+    alive.
+    """
+    checks: List[Check] = []
+
+    miners = readiness.get("data_miners") or {}
+    producing = miners.get("producing")
+    if producing is None:
+        checks.append(Check("subsystem_miners", State.DATA_BLOCKED,
+                            "the miner pool has not reported"))
+    elif producing < thresholds.min_miners_producing:
+        checks.append(Check(
+            "subsystem_miners", State.WARN,
+            f"only {producing} miner(s) producing; the context that explains "
+            "a price path is not being collected",
+            evidence={"silent": miners.get("silent"),
+                      "awaiting": miners.get("awaiting_credentials")}))
+    else:
+        checks.append(Check("subsystem_miners", State.OK, "",
+                            evidence={"producing": producing,
+                                      "records": miners.get("total_records")}))
+
+    memory = readiness.get("memory") or {}
+    band = memory.get("band")
+    if band == "shed":
+        checks.append(Check(
+            "subsystem_memory", State.CRITICAL,
+            "the governor is shedding context to stay inside the ceiling; "
+            "this host is undersized for this workload",
+            evidence=dict(memory), escalate=True))
+    elif band == "trim":
+        checks.append(Check("subsystem_memory", State.WARN,
+                            "trimming caches under memory pressure",
+                            evidence=dict(memory)))
+    elif band == "unmeasured":
+        checks.append(Check("subsystem_memory", State.DATA_BLOCKED,
+                            "the footprint cannot be read on this host"))
+    else:
+        checks.append(Check("subsystem_memory", State.OK, "",
+                            evidence={"fraction": memory.get("fraction")}))
+
+    signer = readiness.get("signer") or {}
+    if signer.get("halted") and signer.get("isolated"):
+        checks.append(Check(
+            "subsystem_signer", State.CRITICAL,
+            f"the isolated signer is halted: {signer.get('halt_reason', '')}",
+            evidence=dict(signer), escalate=True))
+    elif signer.get("mode") == "local":
+        checks.append(Check(
+            "subsystem_signer", State.WARN,
+            "the private key is held in the trading process; correct for "
+            "shadow, wrong for capital",
+            evidence={"mode": "local"}))
+    elif signer.get("mode"):
+        checks.append(Check("subsystem_signer", State.OK, "",
+                            evidence={"mode": signer.get("mode")}))
+
+    facts = readiness.get("fact_ladder") or {}
+    degraded = facts.get("degraded_facts") or []
+    if degraded:
+        checks.append(Check(
+            "subsystem_fact_ladder", State.WARN,
+            "these facts are usually inferred rather than read: "
+            + ", ".join(degraded[:5]),
+            evidence={"degraded": degraded}))
+
+    calibration = readiness.get("calibration") or {}
+    if calibration.get("models_miscalibrated"):
+        checks.append(Check(
+            "subsystem_calibration", State.WARN,
+            calibration.get("detail", "a model is miscalibrated"),
+            evidence={"count": calibration.get("models_miscalibrated")}))
+
+    conditions = readiness.get("execution_conditions") or {}
+    if conditions.get("status") == "DATA_BLOCKED":
+        checks.append(Check(
+            "subsystem_execution_conditions", State.WARN,
+            "bids are being made against an unknown congestion bucket",
+            evidence={}))
+
+    for name, filename, stale in (
+            ("evidence", "forward_evidence.json", thresholds.evidence_stale_seconds),
+            ("census", "launch_census.json", thresholds.evidence_stale_seconds)):
+        path = root / "data" / "state" / filename
+        if not path.exists():
+            checks.append(Check(f"persistence_{name}", State.DATA_BLOCKED,
+                                f"{filename} has never been written"))
+            continue
+        age = now - path.stat().st_mtime
+        if age > stale:
+            checks.append(Check(
+                f"persistence_{name}", State.CRITICAL,
+                f"{filename} has not been written for {age:.0f}s; a restart "
+                "now would lose everything since",
+                evidence={"age_s": age}, escalate=True))
+        else:
+            checks.append(Check(f"persistence_{name}", State.OK, "",
+                                evidence={"age_s": round(age, 1)}))
     return checks
 
 

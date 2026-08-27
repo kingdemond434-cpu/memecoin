@@ -16904,3 +16904,332 @@ class TestShadowExercisesTheExecutionPath(unittest.IsolatedAsyncioTestCase):
     def test_status_exposes_it(self):
         self.assertIn("dry_build_report()",
                       inspect.getsource(MemecoinQuantDesk.readiness))
+
+
+class TestTheAutoFixerCannotHideAFault(unittest.TestCase):
+    """A supervisor that restarts forever and tells nobody is worse than none."""
+
+    def _fixer(self, **kw):
+        from ops.autofix import AutoFixer
+        return AutoFixer(**kw)
+
+    def _remedy(self, calls, name="restart", budget=3, cooldown=0.0):
+        from ops.autofix import Remedy
+        return Remedy(name=name,
+                      applies=lambda health: True,
+                      act=lambda: (calls.append(1), True)[1],
+                      why="test", budget=budget, cooldown_s=cooldown)
+
+    def test_it_acts_on_a_fault_it_recognises(self):
+        from ops.autofix import Outcome
+        calls = []
+        fixer = self._fixer()
+        fixer.register(self._remedy(calls))
+        acted = fixer.run({"checks": []}, now=100.0)
+        self.assertEqual(acted[0].outcome, Outcome.ACTED.value)
+        self.assertEqual(len(calls), 1)
+
+    def test_it_stops_and_escalates_when_the_fault_persists(self):
+        from ops.autofix import Outcome
+        calls = []
+        fixer = self._fixer()
+        fixer.register(self._remedy(calls, budget=3))
+        for tick in range(6):
+            fixer.run({"checks": []}, now=100.0 + tick)
+        # Three attempts, then it stops rather than flapping for ever.
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(fixer.escalations)
+        self.assertIn("no longer a fix", fixer.escalations[0])
+        self.assertEqual(fixer.report(now=110.0)["status"], "CRITICAL")
+
+    def test_a_cooldown_stops_it_judging_a_starting_service(self):
+        from ops.autofix import Outcome
+        calls = []
+        fixer = self._fixer()
+        fixer.register(self._remedy(calls, cooldown=240.0))
+        fixer.run({"checks": []}, now=100.0)
+        second = fixer.run({"checks": []}, now=200.0)
+        self.assertEqual(second[0].outcome, Outcome.COOLING.value)
+        self.assertEqual(len(calls), 1)
+
+    def test_only_one_remedy_acts_per_pass(self):
+        calls = []
+        fixer = self._fixer()
+        fixer.register(self._remedy(calls, name="a"))
+        fixer.register(self._remedy(calls, name="b"))
+        fixer.run({"checks": []}, now=100.0)
+        # Two faults are usually one fault seen twice.
+        self.assertEqual(len(calls), 1)
+
+    def test_the_budget_window_expires_so_it_can_recover(self):
+        calls = []
+        fixer = self._fixer(window_s=3600.0)
+        fixer.register(self._remedy(calls, budget=2))
+        fixer.run({"checks": []}, now=100.0)
+        fixer.run({"checks": []}, now=200.0)
+        fixer.run({"checks": []}, now=300.0)
+        self.assertEqual(len(calls), 2)
+        # An hour later the window has rolled and it may act again.
+        fixer.run({"checks": []}, now=100.0 + 7200.0)
+        self.assertEqual(len(calls), 3)
+
+    def test_it_never_acts_on_a_fault_it_does_not_recognise(self):
+        from ops.autofix import standard_remedies
+        fixer = self._fixer()
+        for remedy in standard_remedies():
+            fixer.register(remedy)
+        health = {"checks": [{"name": "something_nobody_wrote_a_remedy_for",
+                              "state": "CRITICAL", "detail": ""}]}
+        self.assertEqual(fixer.run(health, now=100.0), [])
+
+    def test_a_remedy_that_throws_does_not_stop_the_pass(self):
+        from ops.autofix import Outcome, Remedy
+        fixer = self._fixer()
+        fixer.register(Remedy(
+            name="broken", applies=lambda h: True,
+            act=lambda: (_ for _ in ()).throw(RuntimeError("x")), why="test"))
+        acted = fixer.run({"checks": []}, now=100.0)
+        self.assertEqual(acted[0].outcome, Outcome.FAILED.value)
+
+    def test_the_repertoire_only_restarts_and_never_trades(self):
+        from ops import autofix
+        source = inspect.getsource(autofix)
+        for forbidden in ("execute_swap", "sign_message", "SOLANA_PRIVATE_KEY",
+                          "ALLOW_LIVE_TRADING"):
+            self.assertNotIn(forbidden, source)
+
+    def test_it_survives_a_restart_of_itself(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "autofix.json"
+            calls = []
+            first = self._fixer(state_path=path)
+            first.register(self._remedy(calls, budget=2))
+            first.run({"checks": []}, now=100.0)
+            second = self._fixer(state_path=path)
+            second.register(self._remedy(calls, budget=2, cooldown=0.0))
+            second.run({"checks": []}, now=200.0)
+            second.run({"checks": []}, now=300.0)
+            # Budget is not reset by restarting the supervisor, or the budget
+            # means nothing.
+            self.assertEqual(len(calls), 2)
+
+
+class TestDeploysAreVerifiedBeforeTheyAreTrusted(unittest.TestCase):
+
+    def _deployer(self, tmp, **kw):
+        from ops.autodeploy import AutoDeployer
+        return AutoDeployer(Path(tmp), **kw)
+
+    def test_a_dirty_tree_is_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            deployer = self._deployer(tmp)
+            deployer.dirty = lambda: [" M src/main.py"]
+            deployer.head = lambda: "abc123"
+            result = deployer.run()
+            self.assertEqual(result.status, "SKIPPED")
+            self.assertIn("operator mid-repair", result.detail)
+
+    def test_being_current_does_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            deployer = self._deployer(tmp)
+            deployer.dirty = lambda: []
+            deployer.head = lambda: "abc123"
+            deployer.behind = lambda: 0
+            self.assertEqual(deployer.run().status, "CURRENT")
+
+    def test_a_failing_suite_rolls_back_to_the_recorded_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reset_to = []
+            deployer = self._deployer(tmp)
+            heads = iter(["was_commit", "new_commit"])
+            deployer.head = lambda: next(heads)
+            deployer.dirty = lambda: []
+            deployer.behind = lambda: 3
+            deployer.verify = lambda: (False, "2 failures")
+            with mock.patch("ops.autodeploy._git",
+                            side_effect=lambda root, *a, **k: (
+                                reset_to.append(a) or (0, ""))):
+                result = deployer.run()
+            self.assertEqual(result.status, "ROLLED_BACK")
+            self.assertTrue(result.rolled_back)
+            # Back to the commit recorded BEFORE the pull, not "the previous
+            # one", which is ambiguous when a pull brings several.
+            self.assertIn(("reset", "--hard", "was_commit"), reset_to)
+
+    def test_a_passing_suite_restarts_the_service(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            deployer = self._deployer(tmp)
+            heads = iter(["was", "new"])
+            deployer.head = lambda: next(heads)
+            deployer.dirty = lambda: []
+            deployer.behind = lambda: 1
+            deployer.verify = lambda: (True, "OK")
+            with mock.patch("ops.autodeploy._git", return_value=(0, "")), \
+                 mock.patch("subprocess.run") as run:
+                run.return_value = SimpleNamespace(returncode=0)
+                result = deployer.run()
+            self.assertEqual(result.status, "DEPLOYED")
+            self.assertTrue(result.tests_ran)
+
+    def test_verification_runs_before_the_restart_never_after(self):
+        source = inspect.getsource(
+            __import__("ops.autodeploy", fromlist=["x"]).AutoDeployer.run)
+        self.assertLess(source.index("self.verify()"),
+                        source.index("systemctl"))
+
+    def test_a_non_fast_forward_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            deployer = self._deployer(tmp)
+            deployer.dirty = lambda: []
+            deployer.head = lambda: "abc"
+            deployer.behind = lambda: 2
+            with mock.patch("ops.autodeploy._git", return_value=(1, "diverged")):
+                result = deployer.run()
+            self.assertEqual(result.status, "SKIPPED")
+            self.assertIn("not a fast-forward", result.detail)
+
+    def test_a_deploy_that_did_not_restart_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            deployer = self._deployer(tmp)
+            heads = iter(["was", "new"])
+            deployer.head = lambda: next(heads)
+            deployer.dirty = lambda: []
+            deployer.behind = lambda: 1
+            deployer.verify = lambda: (True, "OK")
+            with mock.patch("ops.autodeploy._git", return_value=(0, "")), \
+                 mock.patch("subprocess.run") as run:
+                run.return_value = SimpleNamespace(returncode=1)
+                result = deployer.run()
+            self.assertEqual(result.status, "DEPLOYED_NOT_RESTARTED")
+            self.assertIn("running the old code", result.detail)
+
+
+class TestEscalationReachesAPersonOrSaysItCouldNot(unittest.TestCase):
+    """A fault that wakes nobody is indistinguishable from no fault."""
+
+    def _alerter(self, tmp, **kw):
+        from ops.alert import Alerter
+        return Alerter(log_path=Path(tmp) / "esc.jsonl",
+                       state_path=Path(tmp) / "state.json", **kw)
+
+    def test_the_same_fault_is_not_repeated_every_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            alerter = self._alerter(tmp, dedupe_s=3600.0)
+            self.assertIsNotNone(alerter.escalate("stream", "silent", now=100.0))
+            # The alert becoming the fault is how people learn to ignore it.
+            self.assertIsNone(alerter.escalate("stream", "silent", now=200.0))
+            self.assertIsNone(alerter.escalate("stream", "silent", now=3000.0))
+            self.assertIsNotNone(alerter.escalate("stream", "silent", now=4000.0))
+
+    def test_distinct_faults_are_not_deduplicated_against_each_other(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            alerter = self._alerter(tmp)
+            self.assertIsNotNone(alerter.escalate("stream", "a", now=100.0))
+            self.assertIsNotNone(alerter.escalate("census", "b", now=100.0))
+
+    def test_the_paper_trail_is_written_even_when_delivery_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            alerter = self._alerter(tmp)
+            alerter.escalate("stream", "silent", now=100.0)
+            rows = [json.loads(line) for line in
+                    (Path(tmp) / "esc.jsonl").read_text().splitlines()]
+            self.assertEqual(rows[0]["key"], "stream")
+            # Delivery failed in this environment; the log is what an audit
+            # reads and must not depend on a person having been reachable.
+            self.assertFalse(alerter.deliveries[0].sent)
+
+    def test_an_undelivered_escalation_is_reported_as_degraded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            alerter = self._alerter(tmp)
+            alerter.escalate("stream", "silent", now=100.0)
+            report = alerter.report()
+            self.assertEqual(report["status"], "DEGRADED")
+            self.assertIn("nobody has been told", report["detail"])
+
+    def test_a_missing_session_says_exactly_what_to_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            delivery = self._alerter(tmp).escalate("x", "y", now=1.0)
+            self.assertIn("telegram_authorize", delivery.detail)
+
+    def test_recovery_closes_the_loop_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            alerter = self._alerter(tmp)
+            alerter.escalate("stream", "silent", now=100.0)
+            alerter.clear("stream", now=200.0)
+            self.assertNotIn("stream", alerter.sent)
+            alerter.clear("stream", now=300.0)  # already cleared, no-op
+            keys = [json.loads(line)["message"] for line in
+                    (Path(tmp) / "esc.jsonl").read_text().splitlines()]
+            self.assertEqual(keys.count("resolved"), 1)
+
+    def test_open_faults_survive_a_supervisor_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._alerter(tmp).escalate("stream", "silent", now=100.0)
+            revived = self._alerter(tmp)
+            # Otherwise every restart re-notifies every open fault.
+            self.assertIsNone(revived.escalate("stream", "silent", now=200.0))
+
+    def test_alerting_never_blocks_the_corrective_action(self):
+        source = inspect.getsource(
+            __import__("ops.supervisor", fromlist=["x"]).main)
+        self.assertLess(source.index("fixer.run("), source.index("Alerter("))
+
+
+class TestTheSupervisorWatchesEverySubsystem(unittest.TestCase):
+
+    def _health(self, status, root=None):
+        from ops.supervisor import build_health
+        return build_health(status, None, time.time(), Path(root or "/tmp"))
+
+    def test_a_desk_that_does_not_answer_is_the_loudest_finding(self):
+        checks = self._health(None)["checks"]
+        self.assertEqual(checks[0]["state"], "CRITICAL")
+        self.assertTrue(checks[0]["escalate"])
+
+    def test_every_subsystem_that_can_degrade_silently_is_checked(self):
+        checks = self._health({
+            "stream_events": {"total": 100, "token_created": 5},
+            "yellowstone": {"status": "STREAMING", "seconds_since_response": 1},
+            "pump_decoder": {"status": "OK", "matched": {"token_created": 5}},
+            "launch_census": {"funnel": {"seen": 500}},
+            "dry_build": {"success_rate": 1.0, "built": 500},
+            "data_miners": {"producing": 9},
+            "memory": {"band": "calm", "fraction": 0.1},
+            "signer": {"mode": "isolated", "isolated": True, "halted": False},
+            "fact_ladder": {"degraded_facts": []},
+            "calibration": {"models_miscalibrated": 0},
+            "execution_conditions": {"status": "OK"},
+        })["checks"]
+        names = {check["name"] for check in checks}
+        for expected in ("pipeline_stream_events", "pipeline_stream_delivery",
+                         "pipeline_decoder", "pipeline_census",
+                         "pipeline_execution_build", "subsystem_miners",
+                         "subsystem_memory", "subsystem_signer",
+                         "persistence_evidence", "persistence_census"):
+            self.assertIn(expected, names)
+        # A fully healthy desk raises nothing critical.
+        self.assertEqual([c for c in checks if c["state"] == "CRITICAL"], [])
+
+    def test_shedding_memory_escalates_as_an_undersized_host(self):
+        checks = self._health({"memory": {"band": "shed", "fraction": 0.9}})["checks"]
+        memory = next(c for c in checks if c["name"] == "subsystem_memory")
+        self.assertEqual(memory["state"], "CRITICAL")
+        self.assertIn("undersized", memory["detail"])
+
+    def test_a_local_key_warns_without_blocking_shadow(self):
+        checks = self._health({"signer": {"mode": "local"}})["checks"]
+        signer = next(c for c in checks if c["name"] == "subsystem_signer")
+        self.assertEqual(signer["state"], "WARN")
+        self.assertIn("wrong for capital", signer["detail"])
+
+    def test_stale_persistence_escalates_because_a_restart_would_lose_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "data" / "state"
+            state.mkdir(parents=True)
+            old = state / "forward_evidence.json"
+            old.write_text("{}")
+            os.utime(old, (time.time() - 99_999, time.time() - 99_999))
+            checks = self._health({}, root=tmp)["checks"]
+            found = next(c for c in checks if c["name"] == "persistence_evidence")
+            self.assertEqual(found["state"], "CRITICAL")
+            self.assertIn("would lose everything", found["detail"])

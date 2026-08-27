@@ -1,0 +1,15 @@
+[Unit]
+Description=Run the memecoin supervisor every two minutes
+
+[Timer]
+OnBootSec=3min
+# Two minutes, because the faults this catches -- a silent stream, a frozen
+# denominator, a wedged desk -- cost evidence for every minute they persist,
+# and evidence is the only thing this desk is currently producing.
+OnUnitActiveSec=2min
+# Without this every node polls the same remote on the same second.
+RandomizedDelaySec=30
+Persistent=true
+
+[Install]
+WantedBy=timers.target
