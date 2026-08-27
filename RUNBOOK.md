@@ -385,3 +385,57 @@ with Tailscale, which runs without root in userspace mode, and browse to the
 VPS's Tailscale address. Do NOT set `HEALTH_HOST=0.0.0.0` to achieve this:
 that publishes the desk's whole interior to anything that can route to the
 box.
+
+
+## Running itself
+
+Three units, on timers, so the node needs no laptop.
+
+```bash
+cp deploy/systemd/memecoin-supervisor.* ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now memecoin-supervisor.timer
+systemctl --user list-timers | grep memecoin
+```
+
+Every two minutes the supervisor does three things in order:
+
+**Deploys.** Fetches `main`, and if there are new commits, runs the full test
+suite ON THIS NODE against the new code before restarting anything. If the
+suite fails, the checkout returns to the exact commit that was running and the
+service is untouched. It refuses to deploy over a dirty tree, and it refuses
+anything that is not a fast-forward.
+
+**Corrects.** A fixed repertoire of remedies -- restart the desk when it stops
+writing readiness, when the stream is connected and silent, when the
+denominator freezes, when the feed is dead. Each is capped at three attempts
+an hour with a four-minute cooldown; past that it stops acting and escalates,
+because a service restarting for ever while nobody is told is worse than one
+that stays down.
+
+**Escalates.** Anything critical, and any fault the fixer gave up on, goes to
+your Telegram Saved Messages using the session the collector already holds.
+One message per distinct fault per hour, one line when it recovers, and the
+full trail written to `data/state/escalations.jsonl` whether or not delivery
+worked.
+
+Check what it has been doing:
+
+```bash
+journalctl --user -u memecoin-supervisor.service -n 50 --no-pager
+```
+
+```bash
+tail -20 ~/.local/opt/memecoin-shadow/data/state/escalations.jsonl
+```
+
+To watch without acting -- useful the first day:
+
+```bash
+.venv/bin/python -m ops.supervisor --root ~/.local/opt/memecoin-shadow --no-fix --no-deploy
+```
+
+What it deliberately cannot do: trade, sign, or touch capital. The unit clears
+`ALLOW_LIVE_TRADING` and `SOLANA_PRIVATE_KEY` outright rather than merely not
+using them. It restarts processes and moves files, and that boundary is what
+makes it safe to run unattended.
