@@ -908,8 +908,14 @@ class ExecutionEngine:
             except Exception as exc:
                 build_error = f"{type(exc).__name__}: {exc}"
                 self.native_route_attempts["dry_build_failed"] += 1
-                self.dry_build_failures[build_error] = (
-                    self.dry_build_failures.get(build_error, 0) + 1)
+                # Defensive: an error handler that can itself raise turns a
+                # recoverable build failure into a crashed decision loop, and
+                # the whole reason this block exists is to survive bad builds.
+                failures = getattr(self, "dry_build_failures", None)
+                if failures is None:
+                    failures = {}
+                    self.dry_build_failures = failures
+                failures[build_error] = failures.get(build_error, 0) + 1
                 logger.warning("dry-run build failed for %s: %s",
                                native.venue, build_error)
             result = ExecutionResult(

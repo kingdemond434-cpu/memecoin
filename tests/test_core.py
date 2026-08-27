@@ -2271,6 +2271,16 @@ class FakeTelegramClient:
             yield message
 
 
+async def _stub_build_and_sign(instructions, **kwargs):
+    """Stands in for the real builder in fixtures that only assert routing.
+
+    Returns a plausible encoded transaction. It is deliberately not a valid
+    one: these tests assert which route was taken, and a fixture that produced
+    a signable transaction would be quietly testing the builder too.
+    """
+    return base64.b64encode(b"stub-signed-transaction").decode("ascii")
+
+
 class TestExecution(unittest.IsolatedAsyncioTestCase):
     def test_jito_defaults_to_parallel_nearby_regions(self):
         with patch.dict("os.environ", {"JITO_BLOCK_ENGINE_URLS": ""}, clear=False):
@@ -9486,7 +9496,12 @@ class TestNativeRouteIsTheCanonicalPath(unittest.TestCase):
         engine.pumpswap_route = None
         engine.pool_state_provider = None
         engine.pool_account_provider = None
-        engine.tx_builder = SimpleNamespace(public_key=self.OTHER)
+        engine.tx_builder = SimpleNamespace(
+            public_key=self.OTHER,
+            # Shadow now builds on every decision, so a stub builder has
+            # to be able to build. A fixture that cannot is a fixture
+            # asserting about an execution path it never reached.
+            build_and_sign=_stub_build_and_sign)
         engine.native_route_attempts = defaultdict(int)
         engine.stream_confirmations = 0
         engine.poll_confirmations = 0
@@ -9904,7 +9919,12 @@ class TestGraduationKeepsNativeExecution(unittest.IsolatedAsyncioTestCase):
         engine.curve_state_provider = (lambda token: curve) if curve else None
         engine.pool_state_provider = (lambda token: reserves) if reserves else None
         engine.pool_account_provider = (lambda token: account) if account else None
-        engine.tx_builder = SimpleNamespace(public_key=self.OTHER)
+        engine.tx_builder = SimpleNamespace(
+            public_key=self.OTHER,
+            # Shadow now builds on every decision, so a stub builder has
+            # to be able to build. A fixture that cannot is a fixture
+            # asserting about an execution path it never reached.
+            build_and_sign=_stub_build_and_sign)
         engine.native_route_attempts = defaultdict(int)
         engine.native_compute_unit_limit = 400_000
         engine.dry_run = True
@@ -11122,7 +11142,7 @@ class TestTheRunbookMatchesTheSystem(unittest.TestCase):
         engine.poll_confirmations = 0
         engine._signature_waiters = {}
         engine.reconcile_min_interval = 0.01
-        engine.tx_builder = SimpleNamespace()
+        engine.tx_builder = SimpleNamespace(build_and_sign=_stub_build_and_sign)
         report = engine.native_route_report()
         for key in ("prepared_share", "blockhash", "outcomes",
                     "pool_state_wired", "pool_account_wired"):
@@ -13517,7 +13537,12 @@ class TestNativeRouteIsActuallyTaken(unittest.IsolatedAsyncioTestCase):
         engine.pumpswap_route = None
         engine.pool_state_provider = None
         engine.pool_account_provider = None
-        engine.tx_builder = SimpleNamespace(public_key=self.OTHER)
+        engine.tx_builder = SimpleNamespace(
+            public_key=self.OTHER,
+            # Shadow now builds on every decision, so a stub builder has
+            # to be able to build. A fixture that cannot is a fixture
+            # asserting about an execution path it never reached.
+            build_and_sign=_stub_build_and_sign)
         engine.native_route_attempts = defaultdict(int)
         engine.native_compute_unit_limit = 400_000
         engine.stream_confirmations = 0
