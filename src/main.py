@@ -932,6 +932,27 @@ class MemecoinQuantDesk:
                     logger.error("Error stopping %s: %s", component.__class__.__name__, exc)
         if self.yellowstone:
             await self.yellowstone.close()
+        self._flush_ledgers()
+
+    def _flush_ledgers(self) -> None:
+        """Persist the three ledgers a restart must not lose.
+
+        They are written on a cadence during the run -- an fsync per outcome
+        is latency the decision path does not need to pay -- which means a
+        shutdown that does not flush discards up to the last interval. On a
+        planned restart that is a minute of evidence thrown away for no
+        reason, and evidence is the one thing here that cannot be regenerated.
+
+        Failures are logged and swallowed: a desk that cannot shut down
+        because a disk is full is worse than one that loses a minute.
+        """
+        for name, ledger in (("forward evidence", self.forward_evidence),
+                             ("launch census", self.launch_census),
+                             ("calibration", self.calibration)):
+            try:
+                ledger.save()
+            except Exception as exc:
+                logger.warning("could not flush %s on shutdown: %s", name, exc)
 
     def _spawn_background(self, coroutine):
         task = asyncio.create_task(coroutine)
