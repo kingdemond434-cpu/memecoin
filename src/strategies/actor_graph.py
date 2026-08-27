@@ -155,6 +155,10 @@ class SmartFlow:
     naive_evidence: float = 0.0
     measured_wallets: int = 0
     unmeasured_wallets: int = 0
+    # How many wallets funding ancestry lowered below what behaviour said.
+    # Counted, because a smart-flow number that quietly halved deserves to say
+    # what halved it.
+    ancestry_compressed: int = 0
     detail: str = ""
 
     @property
@@ -169,6 +173,7 @@ def aggregate_smart_flow(
     entries: Sequence[Entry],
     report: IndependenceReport,
     unmeasured_independence: float = 0.5,
+    ancestry: Optional[Any] = None,
 ) -> SmartFlow:
     """sum(skill * capital * independence) over one token's skilled buyers.
 
@@ -185,9 +190,18 @@ def aggregate_smart_flow(
         return SmartFlow(status="DATA_BLOCKED",
                          detail="no buyer carried both a skill score and a size")
 
+    # Funding ancestry, when it has been traced, compresses wallets that share
+    # a funder into the actor whose capital they are. This is the case
+    # behavioural independence structurally cannot see: wallets funded and
+    # deployed for ONE launch have no co-occurrence history, so every one of
+    # them reads as an unmeasured independent participant -- and a Sybil built
+    # for this launch is invisible at exactly the moment it is used.
+    compression = (getattr(ancestry, "compression", None) or {}
+                   if getattr(ancestry, "status", "") == "OK" else {})
     evidence = 0.0
     naive = 0.0
     measured = unmeasured = 0
+    compressed = 0
     for entry in scored:
         weight = float(entry.skill) * float(entry.capital_usd)
         naive += weight
@@ -197,21 +211,41 @@ def aggregate_smart_flow(
             independence = unmeasured_independence
         else:
             measured += 1
+        ancestral = compression.get(entry.wallet)
+        if ancestral is not None and ancestral < independence:
+            # Ancestry only ever lowers it. A wallet whose funding is
+            # untraceable does not earn independence it has not shown.
+            compressed += 1
+            independence = float(ancestral)
         evidence += weight * independence
+    detail = f"{len(scored)} skilled buyers, {unmeasured} unmeasured"
+    if compressed:
+        detail += f", {compressed} compressed by funding ancestry"
     return SmartFlow(status="OK", evidence=float(evidence), naive_evidence=float(naive),
                      measured_wallets=measured, unmeasured_wallets=unmeasured,
-                     detail=f"{len(scored)} skilled buyers, {unmeasured} unmeasured")
+                     ancestry_compressed=compressed, detail=detail)
 
 
 @dataclass
 class BuyerFingerprint:
-    """The first N buyers as an ordered sequence of attributes."""
+    """The first N buyers as an ordered sequence of ECONOMIC ACTORS.
+
+    Skill, independence, creator linkage and size say what each wallet was.
+    The funding fields say what each wallet was RELATIVE TO THE ONES BEFORE
+    IT -- whether it shares a funder with an earlier buyer, and how close that
+    tie is. That is the difference between "ten buyers" and "one operator
+    entering ten times", and it is not expressible as a per-wallet attribute.
+    """
 
     token: str
     skills: List[float]
     independence: List[float]
     creator_linked: List[bool]
     sizes: List[float]
+    # -1 marks unmeasured throughout, as everywhere else here.
+    shares_funder_with_prior: List[float] = field(default_factory=list)
+    common_funder_depth: List[float] = field(default_factory=list)
+    creator_funded: List[float] = field(default_factory=list)
 
     @property
     def depth(self) -> int:
@@ -230,7 +264,8 @@ class BuyerFingerprint:
         return np.asarray(
             take(self.skills) + take(self.independence)
             + take(self.creator_linked, lambda item: 1.0 if item else 0.0)
-            + take(self.sizes), dtype=float)
+            + take(self.sizes) + take(self.shares_funder_with_prior)
+            + take(self.common_funder_depth) + take(self.creator_funded), dtype=float)
 
 
 def build_fingerprint(
@@ -239,8 +274,15 @@ def build_fingerprint(
     report: IndependenceReport,
     creator_linked: Optional[Dict[str, bool]] = None,
     depth: int = 25,
+    funding_features: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> BuyerFingerprint:
-    """Order the first ``depth`` buyers and record what each one was."""
+    """Order the first ``depth`` buyers and record what each one was.
+
+    ``funding_features`` comes from FunderAncestry.buyer_features over the SAME
+    ordered wallets. Absent, the funding columns read -1 everywhere, which is
+    "unmeasured" rather than "no shared funders" -- the distinction matters,
+    because an untracked graph must not certify a cluster as clean.
+    """
     linked = creator_linked or {}
     ordered = sorted(entries, key=lambda item: item.timestamp)
     seen: set = set()
@@ -252,6 +294,17 @@ def build_fingerprint(
         unique.append(entry)
         if len(unique) >= depth:
             break
+    by_wallet = {str(row.get("wallet", "")): row for row in (funding_features or ())}
+
+    def funding(entry: Entry, key: str, missing: float = -1.0) -> float:
+        row = by_wallet.get(entry.wallet)
+        if row is None or not row.get("traced"):
+            return missing
+        value = row.get(key)
+        if value is None:
+            return missing
+        return 1.0 if value is True else 0.0 if value is False else float(value)
+
     return BuyerFingerprint(
         token=token,
         skills=[float(entry.skill) if entry.skill is not None else -1.0 for entry in unique],
@@ -259,6 +312,11 @@ def build_fingerprint(
         creator_linked=[bool(linked.get(entry.wallet, False)) for entry in unique],
         sizes=[float(entry.capital_usd) if entry.capital_usd is not None else -1.0
                for entry in unique],
+        shares_funder_with_prior=[funding(entry, "same_funder_as_prior_buyer")
+                                  for entry in unique],
+        common_funder_depth=[funding(entry, "nearest_common_funder_depth")
+                             for entry in unique],
+        creator_funded=[funding(entry, "shares_funder_with_creator") for entry in unique],
     )
 
 

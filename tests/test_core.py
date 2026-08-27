@@ -229,6 +229,9 @@ from src.strategies.rug_hazard import (
     ContinuousRugHazardModel, HAZARD_FEATURE_NAMES,
 )
 from src.strategies.genealogy_graph import GenealogyGraph, RelationshipType
+from src.strategies.funder_ancestry import (
+    AncestryReport, FunderAncestry, compress_independence,
+)
 from src.strategies.social_intelligence import SocialAccount, SocialIntelligenceEngine, SocialPlatform
 
 
@@ -7832,12 +7835,15 @@ class TestActorIntelligenceIsLiveWired(unittest.TestCase):
     passed anyway.
     """
 
-    def _desk(self, entries=None, report=None):
+    def _desk(self, entries=None, report=None, genealogy=None):
+        graph = genealogy or GenealogyGraph(solana_chain(), FakeRpc(), "")
         desk = SimpleNamespace(
             buyer_dna=BuyerDNA(depth=25, min_corpus=50),
             swarm_predictor=SwarmPredictor(),
             independence_report=report or IndependenceReport(status="DATA_BLOCKED"),
             _actor_entries={"mint": list(entries or [])},
+            genealogy=graph,
+            funder_ancestry=FunderAncestry(graph),
         )
         return desk
 
@@ -11511,6 +11517,151 @@ class TestEveryRaceBidsOnItsOwnEconomics(unittest.TestCase):
         self.assertIn("expected_edge_usd=max(0.0, gain * max(self.wallet_equity_usd, 0.0))",
                       block)
         self.assertIn("sol_price_usd=self.sol_price_usd", block)
+
+
+class TestFunderAncestryCompressesWallets(unittest.TestCase):
+    """The half of independence that behaviour structurally cannot see.
+
+    Wallets funded and deployed for ONE launch have no co-occurrence history,
+    so every one of them reads as an unmeasured independent participant -- and
+    a Sybil built for that launch is invisible at exactly the moment it is
+    used.
+    """
+
+    def _graph(self, funding):
+        """funding: {wallet: [funders]}."""
+        graph = SimpleNamespace(wallets={})
+        for wallet, funders in funding.items():
+            graph.wallets.setdefault(
+                wallet, SimpleNamespace(funding_sources=set()))
+            graph.wallets[wallet].funding_sources.update(funders)
+            for funder in funders:
+                graph.wallets.setdefault(
+                    funder, SimpleNamespace(funding_sources=set()))
+        return graph
+
+    def test_a_freshly_funded_cluster_collapses_to_roughly_one_actor(self):
+        graph = self._graph({f"b{i}": ["whale"] for i in range(5)})
+        report = FunderAncestry(graph).analyse([f"b{i}" for i in range(5)])
+        self.assertTrue(report.ok)
+        self.assertEqual(len(report.clusters), 1)
+        self.assertEqual(report.clusters[0].size, 5)
+        # Five wallets, about one actor's worth of evidence.
+        self.assertLess(report.effective_actors, 2.0)
+        self.assertLess(report.to_dict()["compression_ratio"], 0.4)
+
+    def test_genuinely_separate_funding_is_not_compressed(self):
+        graph = self._graph({f"b{i}": [f"funder{i}"] for i in range(5)})
+        report = FunderAncestry(graph).analyse([f"b{i}" for i in range(5)])
+        self.assertEqual(report.clusters, [])
+        self.assertEqual(report.effective_actors, 5.0)
+
+    def test_an_exchange_hot_wallet_confers_no_kinship(self):
+        """Everyone withdrawing from one venue is not one actor."""
+        buyers = [f"b{i}" for i in range(5)]
+        shared = {wallet: ["source"] for wallet in buyers}
+        # The same five wallets, same single funder: they ARE one actor.
+        small = FunderAncestry(self._graph(shared), hub_threshold=50).analyse(buyers)
+        self.assertTrue(small.ok)
+        self.assertEqual(len(small.clusters), 1)
+
+        # Now that funder has also funded two hundred unrelated wallets, so it
+        # is infrastructure and the five stop being kin.
+        busy = dict(shared)
+        busy.update({f"other{i}": ["source"] for i in range(200)})
+        hub = FunderAncestry(self._graph(busy), hub_threshold=50).analyse(buyers)
+        self.assertEqual(hub.clusters, [])
+        self.assertTrue(FunderAncestry(self._graph(busy), hub_threshold=50).is_hub("source"))
+
+    def test_kinship_decays_with_distance(self):
+        ancestry = FunderAncestry(self._graph({}))
+        self.assertEqual(ancestry.kinship_at(1), 1.0)
+        self.assertLess(ancestry.kinship_at(2), ancestry.kinship_at(1))
+        self.assertLess(ancestry.kinship_at(4), ancestry.kinship_at(2))
+
+    def test_a_distant_shared_ancestor_compresses_less_than_a_direct_one(self):
+        direct = FunderAncestry(self._graph({"a": ["x"], "b": ["x"]})).analyse(["a", "b"])
+        distant = FunderAncestry(self._graph({
+            "a": ["p"], "b": ["q"], "p": ["x"], "q": ["x"]})).analyse(["a", "b"])
+        self.assertLess(direct.effective_actors, distant.effective_actors)
+
+    def test_the_walk_stops_at_the_hop_limit(self):
+        chain = {"a": ["p1"], "p1": ["p2"], "p2": ["p3"], "p3": ["p4"], "p4": ["deep"],
+                 "b": ["q1"], "q1": ["q2"], "q2": ["q3"], "q3": ["q4"], "q4": ["deep"]}
+        shallow = FunderAncestry(self._graph(chain), max_hops=2).analyse(["a", "b"])
+        deep = FunderAncestry(self._graph(chain), max_hops=8).analyse(["a", "b"])
+        # Two hops reaches p2 and q2 -- traced, but no shared ancestor yet.
+        self.assertTrue(shallow.ok)
+        self.assertEqual(shallow.clusters, [])
+        self.assertEqual(shallow.effective_actors, 2.0)
+        # Eight hops reaches the common source and collapses them.
+        self.assertEqual(len(deep.clusters), 1)
+        self.assertLess(deep.effective_actors, 2.0)
+
+    def test_an_untraceable_graph_is_blocked_not_certified_independent(self):
+        """An untracked graph must not certify a Sybil as clean."""
+        report = FunderAncestry(self._graph({})).analyse(["a", "b", "c"])
+        self.assertEqual(report.status, "DATA_BLOCKED")
+        self.assertIsNone(report.effective_actors)
+
+    def test_ancestry_only_ever_lowers_independence(self):
+        graph = self._graph({"a": ["x"], "b": ["x"]})
+        report = FunderAncestry(graph).analyse(["a", "b"])
+        scores = {"a": 0.2, "b": 0.9, "c": 1.0}
+        compressed = compress_independence(scores, report)
+        self.assertLessEqual(compressed["a"], 0.2)
+        self.assertLess(compressed["b"], 0.9)
+        # Untraced wallets keep what behaviour said; ancestry cannot raise.
+        self.assertEqual(compressed["c"], 1.0)
+        for wallet, value in compressed.items():
+            self.assertLessEqual(value, scores[wallet])
+
+    def test_a_blocked_ancestry_report_changes_nothing(self):
+        scores = {"a": 0.4}
+        self.assertEqual(
+            compress_independence(scores, AncestryReport(status="DATA_BLOCKED")), scores)
+
+    def test_smart_flow_falls_when_the_buyers_share_a_funder(self):
+        entries = [Entry(token="mint", wallet=f"b{i}", timestamp=float(i),
+                         skill=0.9, capital_usd=100.0) for i in range(5)]
+        report = IndependenceReport(
+            status="OK", scores={f"b{i}": 1.0 for i in range(5)})
+        naive = aggregate_smart_flow(entries, report)
+        ancestry = FunderAncestry(
+            self._graph({f"b{i}": ["whale"] for i in range(5)})).analyse(
+                [f"b{i}" for i in range(5)])
+        compressed = aggregate_smart_flow(entries, report, ancestry=ancestry)
+        self.assertEqual(naive.evidence, naive.naive_evidence)
+        self.assertLess(compressed.evidence, naive.evidence / 2)
+        self.assertEqual(compressed.ancestry_compressed, 5)
+
+    def test_first25_carries_what_each_buyer_is_relative_to_the_ones_before_it(self):
+        """'Ten buyers' becomes an ordered sequence of economic actors."""
+        wallets = ["a", "b", "c"]
+        ancestry = FunderAncestry(self._graph({
+            "a": ["x"], "b": ["x"], "c": ["y"], "creator": ["x"]}))
+        features = ancestry.buyer_features(wallets, creator="creator")
+        self.assertFalse(features[0]["same_funder_as_prior_buyer"])
+        self.assertTrue(features[1]["same_funder_as_prior_buyer"])
+        self.assertFalse(features[2]["same_funder_as_prior_buyer"])
+        # And the creator buying his own launch under another address shows.
+        self.assertTrue(features[0]["shares_funder_with_creator"])
+        self.assertFalse(features[2]["shares_funder_with_creator"])
+
+    def test_the_fingerprint_vector_grows_by_the_funding_columns(self):
+        entries = [Entry(token="mint", wallet=w, timestamp=float(i), skill=0.5,
+                         capital_usd=10.0) for i, w in enumerate(["a", "b"])]
+        report = IndependenceReport(status="OK", scores={"a": 1.0, "b": 1.0})
+        ancestry = FunderAncestry(self._graph({"a": ["x"], "b": ["x"]}))
+        plain = build_fingerprint("mint", entries, report, depth=4)
+        funded = build_fingerprint("mint", entries, report, depth=4,
+                                   funding_features=ancestry.buyer_features(["a", "b"]))
+        self.assertEqual(len(plain.vector(4)), 7 * 4)
+        self.assertEqual(len(funded.vector(4)), 7 * 4)
+        # Unmeasured funding reads -1, not 0: an untracked graph must not
+        # look like a launch with no shared funders.
+        self.assertEqual(list(plain.vector(4))[16:20], [-1.0] * 4)
+        self.assertEqual(funded.shares_funder_with_prior[1], 1.0)
 
 class TestPumpSwapConstruction(unittest.TestCase):
     """The last DATA_BLOCKED that was never about missing information.

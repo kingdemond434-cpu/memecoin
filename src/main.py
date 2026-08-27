@@ -116,6 +116,7 @@ from src.strategies.social_intelligence import SocialIntelligenceEngine
 from src.strategies.wallet_intelligence import WalletIntelligenceEngine
 from src.strategies.wallet_value import FollowOutcome
 from src.strategies.t0_kernel import SurvivalInputs, T0Kernel
+from src.strategies.funder_ancestry import FunderAncestry, compress_independence
 
 logger = logging.getLogger(__name__)
 
@@ -584,6 +585,14 @@ class MemecoinQuantDesk:
         # decision records that it was priced by no validated model.
         self.model_feature_hash = "untrained"
         self.wallet_independence = WalletIndependence()
+        # The half of independence that behaviour cannot see. Wallets funded
+        # and deployed for one launch have no co-occurrence history, so every
+        # one reads as independent -- and a Sybil built for this launch is
+        # invisible at the moment it is used.
+        self.funder_ancestry = FunderAncestry(
+            self.genealogy,
+            max_hops=int(self.global_config.get("funder_max_hops", 4)),
+            hub_threshold=int(self.global_config.get("funder_hub_threshold", 50)))
         self.buyer_dna = BuyerDNA(
             depth=int(self.global_config.get("buyer_dna_depth", 25)),
             min_corpus=int(self.global_config.get("buyer_dna_min_corpus", 50)))
@@ -594,6 +603,7 @@ class MemecoinQuantDesk:
         # Entries per token, kept only for tokens the hot state still holds.
         self._actor_entries: Dict[str, List[Entry]] = {}
         self.independence_report = IndependenceReport(status="DATA_BLOCKED")
+        self.ancestry_report: Optional[Any] = None
         self._actor_seen: Dict[str, set] = {}
         self._independence_computed_at = 0.0
         self._independence_interval = 300.0
@@ -2601,8 +2611,23 @@ class MemecoinQuantDesk:
             intelligence["detail"] = "no scored buyer observed for this token yet"
             return intelligence
 
+        # Funding ancestry over the same ordered buyers. Traced once and used
+        # three ways -- to compress smart flow, to feed First25, and to report
+        # how many actors those wallets actually are.
+        ordered = []
+        for entry in sorted(entries, key=lambda item: item.timestamp):
+            if entry.wallet not in ordered:
+                ordered.append(entry.wallet)
+        creator = str((self.genealogy.tokens.get(token).deployer
+                       if getattr(self.genealogy, "tokens", {}).get(token) else "") or "")
+        ancestry = self.funder_ancestry.analyse(ordered[:self.buyer_dna.depth])
+        funding_features = self.funder_ancestry.buyer_features(
+            ordered[:self.buyer_dna.depth], creator)
+        intelligence["funder_ancestry"] = ancestry.to_dict()
+
         fingerprint = build_fingerprint(token, entries, report,
-                                        depth=self.buyer_dna.depth)
+                                        depth=self.buyer_dna.depth,
+                                        funding_features=funding_features)
         match = self.buyer_dna.match(fingerprint)
         intelligence["buyer_dna"] = {
             "status": match.status, "label": match.label,
@@ -2610,12 +2635,13 @@ class MemecoinQuantDesk:
             "depth": fingerprint.depth,
         }
 
-        flow = aggregate_smart_flow(entries, report)
+        flow = aggregate_smart_flow(entries, report, ancestry=ancestry)
         intelligence["smart_flow"] = {
             "status": flow.status, "evidence": flow.evidence,
             "naive_evidence": flow.naive_evidence, "discount": flow.discount,
             "measured_wallets": flow.measured_wallets,
             "unmeasured_wallets": flow.unmeasured_wallets,
+            "ancestry_compressed": flow.ancestry_compressed,
         }
 
         swarm = self.swarm_predictor.evaluate(entries, report, as_of)
@@ -2639,6 +2665,21 @@ class MemecoinQuantDesk:
             return
         self._independence_computed_at = time.time()
         self.independence_report = self.wallet_independence.compute()
+        # Ancestry over every wallet the matrix knows, applied once here so
+        # every consumer of the report sees the compressed number rather than
+        # each having to remember to compress it.
+        if self.independence_report.status == "OK" and self.independence_report.scores:
+            ancestry = self.funder_ancestry.analyse(
+                list(self.independence_report.scores))
+            if ancestry.ok:
+                before = sum(self.independence_report.scores.values())
+                self.independence_report.scores = compress_independence(
+                    self.independence_report.scores, ancestry)
+                after = sum(self.independence_report.scores.values())
+                self.ancestry_report = ancestry
+                logger.info(
+                    "FUNDER ANCESTRY %s; independence mass %.2f -> %.2f",
+                    ancestry.detail, before, after)
         logger.info("INDEPENDENCE status=%s pairs=%d wallets=%d",
                     self.independence_report.status,
                     self.independence_report.observed_pairs,
@@ -3620,7 +3661,11 @@ class MemecoinQuantDesk:
                                 getattr(self, "transport_start_failures", {}))},
             "actor_graph": {"independence_status": self.independence_report.status,
                             "measured_pairs": self.independence_report.observed_pairs,
-                            "scored_wallets": len(self.independence_report.scores)},
+                            "scored_wallets": len(self.independence_report.scores),
+                            # How many actors the tracked wallets actually are.
+                            "funder_ancestry": (self.ancestry_report.to_dict()
+                                                if self.ancestry_report is not None
+                                                else {"status": "DATA_BLOCKED"})},
             "reentry": self.reentry_book.report(),
             # Distance to the next promotion stage, as ratios. A gate that
             # says FAIL cannot distinguish a week away from a year away, and
