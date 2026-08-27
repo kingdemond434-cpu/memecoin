@@ -17,6 +17,7 @@ import math
 import os
 import time
 from dataclasses import asdict, is_dataclass, replace as dataclasses_replace
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -68,6 +69,12 @@ from src.strategies.screen_policy import (
 )
 from src.research.data_miners import DataMinerPool
 from src.research.solana_miners import register_solana_miners
+from src.research.source_catalogue import default_registry
+from src.research.regional_miners import register_regional_miners
+from src.research.telegram_miners import (
+    ChannelBook, extract_handles, register_telegram_miners,
+)
+from src.research.identity_watch import IdentityWatch, Verdict as IdentityVerdict
 from src.research.web_miners import register_web_miners
 from src.research.forward_evidence import ForwardEvidence, Outcome as ForwardOutcome
 from src.research.contribution import (
@@ -386,6 +393,20 @@ class MemecoinQuantDesk:
         self._wallet_readings: Dict[str, Any] = {}
         self.data_miners = DataMinerPool()
         self.miner_registration: Dict[str, bool] = {}
+        # Global breadth. Built in _setup_research; declared here so an
+        # offline desk and a half-constructed one both report them honestly
+        # rather than raising on a status call.
+        self.substitution = default_registry()
+        self.channel_book: Optional[ChannelBook] = None
+        self.identity_watch = IdentityWatch()
+        # Pools an outside operator saw. `_discovery_misses` counts the ones
+        # our own stream never reported, which is the only measurement of how
+        # complete the census denominator actually is.
+        self._discovered_pools: Dict[str, float] = {}
+        self._discovery_misses = 0
+        # Launches that claim a public figure, most recent last. Bounded:
+        # this is a display and training surface, not a store of record.
+        self._identity_claims: Dict[str, Any] = {}
         self.slot_value = SlotValueModel()
         self._mark_checked_at: Dict[str, float] = {}
         self._mark_checks = 0
@@ -880,6 +901,42 @@ class MemecoinQuantDesk:
             search_terms=self._name_search_terms,
             youtube_key=lambda: os.getenv("YOUTUBE_API_KEY", ""),
             github_token=lambda: os.getenv("GITHUB_TOKEN", "")))
+        # Global breadth. Every endpoint below sits behind a substitution
+        # ladder rather than being named in a miner, so a public source that
+        # refuses this address or moves a path costs the desk one pass rather
+        # than a whole domain. Regional venues are in there deliberately: a
+        # desk reading only two US aggregators is blind for the hours the
+        # Asian session is the one that leads.
+        self.substitution = default_registry()
+        self.miner_registration.update(register_regional_miners(
+            self.data_miners, http=self.http_client, rpc=self.solana_rpc,
+            registry=self.substitution,
+            watched_tokens=self._mineable_tokens,
+            tracked_wallets=self._tracked_wallets,
+            on_discovery=self._ingest_discovered_pools))
+        # Public Telegram. The channel book starts empty and fills itself from
+        # t.me links the desk already mines, verifying each handle by fetching
+        # its own public preview before anything is read from it. Nothing here
+        # holds a credential, so nothing here can open a private channel.
+        self.channel_book = ChannelBook(
+            path=str(self.global_config.get("telegram_channel_book",
+                                            "data/telegram/channels.json")))
+        self.miner_registration.update(register_telegram_miners(
+            self.data_miners, http=self.http_client, book=self.channel_book,
+            on_message=self._ingest_telegram_messages))
+        # Who a launch claims to be, and whether that name ever confirmed it.
+        # The registry ships with names and no channels, which means every
+        # claim reads UNCORROBORATED until an operator fills in handles from
+        # the figures' own verified profiles -- reported as DEGRADED rather
+        # than passed off as a clean read.
+        self.identity_watch = IdentityWatch()
+        figures = self.identity_watch.load_yaml(
+            str(self.global_config.get("figure_registry", "config/figures.yaml")))
+        seeded = self.channel_book.seed(
+            (handle for figure in self.identity_watch.figures.values()
+             for handle in figure.channels), source="figures")
+        logger.info("IDENTITY WATCH %d figure(s), %d owned channel(s) seeded",
+                    figures, seeded)
         if not self.offline:
             await self.dataset_builder.start()
             await self.global_research.start()
@@ -3635,6 +3692,8 @@ class MemecoinQuantDesk:
         source polled every fifteen seconds would put a stale number in front
         of a decision the stream had already updated.
         """
+        if getattr(self, "channel_book", None) is not None:
+            self._harvest_channels(miner_id, records)
         for record in records:
             # Chain-wide execution conditions belong to no episode: they are
             # the state of the world every decision in this moment is made in.
@@ -3687,6 +3746,205 @@ class MemecoinQuantDesk:
                     "mint_renounced": record.get("mint_renounced"),
                     "freeze_renounced": record.get("freeze_renounced"),
                     "data_status": "OK"})
+
+    def _harvest_channels(self, miner_id: str,
+                          records: List[Dict[str, Any]]) -> None:
+        """Pull public Telegram handles out of whatever any miner just returned.
+
+        This is the bootstrap for the whole Telegram side, and it is the only
+        honest one available: rather than guessing channel names, the desk
+        reads the links that tokens, repos and posts publish about themselves.
+        A Pump token's own profile links its own channel; a channel's messages
+        link the channels it forwards. Discovery therefore converges on what
+        the market is actually pointing at rather than on what was configured
+        some months ago.
+
+        Every harvested handle is only a CANDIDATE. It is verified by fetching
+        its own public preview before a single message is read from it.
+        """
+        book = getattr(self, "channel_book", None)
+        if book is None or not records:
+            return
+        for record in records[:200]:
+            for field in ("description", "text", "title", "url", "links"):
+                value = record.get(field)
+                if isinstance(value, (list, tuple)):
+                    value = " ".join(str(item.get("url", item))
+                                     if isinstance(item, dict) else str(item)
+                                     for item in value)
+                if not value:
+                    continue
+                try:
+                    book.harvest(str(value), source=miner_id)
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug("channel harvest from %s: %s", miner_id, exc)
+
+    def _ingest_telegram_messages(self, records: List[Dict[str, Any]]) -> None:
+        """Public Telegram messages: corroboration first, then attention.
+
+        The corroboration half runs before anything else and is the reason
+        this hook exists. A mint carried by a channel the figure registry
+        already knew belonged to a public figure is the only thing that can
+        turn a celebrity CLAIM into a celebrity ANNOUNCEMENT, and the registry
+        was written before this launch existed, which is what stops a launch
+        supplying its own confirmation.
+        """
+        watch = getattr(self, "identity_watch", None)
+        for record in records:
+            channel = str(record.get("channel", "") or "")
+            mints = [mint for mint in (record.get("mints") or []) if mint]
+            if watch is not None and channel and mints:
+                try:
+                    watch.note_channel_message(
+                        channel, mints, at=self._telegram_timestamp(record))
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug("telegram corroboration: %s", exc)
+            # Views are the closest thing to a MEASURED crowd reading that
+            # public Telegram exposes: a call into a channel nobody reads and
+            # one into a channel with forty thousand readers are different
+            # events, and a message count cannot tell them apart.
+            views = record.get("views")
+            for mint in mints:
+                try:
+                    self.dataset_builder.record_market_observation(
+                        mint, {"type": "telegram_public",
+                               "measurement": "telegram:public_preview",
+                               "timestamp": self._telegram_timestamp(record),
+                               "channel": channel, "views": views,
+                               "text": str(record.get("text", ""))[:500],
+                               "data_status": "OK"})
+                except Exception as exc:
+                    logger.debug("telegram observation for %s: %s", mint, exc)
+
+    @staticmethod
+    def _telegram_timestamp(record: Dict[str, Any]) -> float:
+        """The message's own posting time, falling back to when we read it.
+
+        Never silently: a message whose timestamp cannot be parsed is stamped
+        with the read time, which is later, and lateness is the safe direction
+        -- it can only make a corroboration look like a reaction, never make a
+        reaction look like an announcement.
+        """
+        raw = str(record.get("posted_at", "") or "")
+        if raw:
+            try:
+                return datetime.fromisoformat(raw).timestamp()
+            except ValueError:
+                pass
+        return float(record.get("_fetched_at", time.time()))
+
+    def _ingest_discovered_pools(self, records: List[Dict[str, Any]]) -> None:
+        """Pools an outside operator saw that our own stream may not have.
+
+        The launch census is the denominator the whole promotion ladder rests
+        on, and it is only as complete as discovery is. A pool reported here
+        that never appeared in our census is a decoder gap or a program we do
+        not decode -- and from the inside, that failure is indistinguishable
+        from a quiet market, which is exactly why it is counted separately
+        rather than merged in.
+        """
+        census = getattr(self, "launch_census", None)
+        for record in records:
+            mint = str(record.get("mint", "") or "")
+            if not mint:
+                continue
+            self._discovered_pools[mint] = float(
+                record.get("_fetched_at", time.time()))
+            if census is not None and not census.knows(mint):
+                self._discovery_misses += 1
+            try:
+                self.dataset_builder.record_market_observation(
+                    mint, {"type": "discovered_pool",
+                           "measurement": str(record.get("_source", "")),
+                           "timestamp": float(record.get("_fetched_at", time.time())),
+                           "liquidity_usd": record.get("liquidity_usd"),
+                           "fdv_usd": record.get("fdv_usd"),
+                           "venue": record.get("venue", ""),
+                           "data_status": "OK"})
+            except Exception as exc:
+                logger.debug("discovered pool %s not recorded: %s", mint, exc)
+
+    def _assess_identity(self, mint: str, event: Dict[str, Any]) -> None:
+        """Who does this launch claim to be, and did that name confirm it.
+
+        Recorded as an observation rather than acted on. The verdict classes
+        have no realised base rate yet -- `identity_watch.report()` says which
+        ones are still DATA_BLOCKED -- and sizing on a class whose payoff has
+        never been measured is exactly the guess this desk refuses elsewhere.
+        So the assessment becomes a point-in-time FEATURE now and a sizing
+        input only once the forward ledger has priced it.
+
+        The one thing it does immediately is name the launch on /status, which
+        is worth having on its own: a desk that cannot tell an operator "this
+        one claims a head of state and nothing has confirmed it" is a desk
+        whose operator finds out from the chart.
+        """
+        watch = getattr(self, "identity_watch", None)
+        if watch is None or not watch.figures:
+            return
+        try:
+            assessment = watch.assess(
+                mint,
+                symbol=str(event.get("symbol", "") or ""),
+                name=str(event.get("name", "") or ""),
+                description=str(event.get("description", "") or "")[:2000],
+                links=[str(value) for value in
+                       (event.get("telegram"), event.get("twitter"),
+                        event.get("website"), event.get("uri")) if value],
+                deployer=str(event.get("creator", "") or ""),
+                created_at=float(event.get("timestamp", time.time())))
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("identity assessment for %s: %s", mint, exc)
+            return
+        if not assessment.claimed:
+            return
+        self._identity_claims[mint] = assessment
+        while len(self._identity_claims) > 2_000:
+            self._identity_claims.pop(next(iter(self._identity_claims)))
+        logger.info("IDENTITY %s claims %s -> %s", mint,
+                    ", ".join(claim.display for claim in assessment.claims),
+                    assessment.verdict.value)
+        try:
+            self.dataset_builder.record_market_observation(
+                mint, {"type": "identity_claim", "measurement": "identity_watch",
+                       "timestamp": float(event.get("timestamp", time.time())),
+                       **assessment.to_dict(), "data_status": "OK"})
+        except Exception as exc:
+            logger.debug("identity observation for %s: %s", mint, exc)
+
+    def identity_report(self) -> Dict[str, Any]:
+        """The figure registry, plus the launches currently claiming someone."""
+        report = dict(self.identity_watch.report())
+        claims = list(self._identity_claims.items())[-25:]
+        report["recent"] = [
+            {"mint": mint, **assessment.to_dict()} for mint, assessment in claims]
+        return report
+
+    def discovery_report(self) -> Dict[str, Any]:
+        """How complete our own census denominator actually is.
+
+        `missed` counts pools an outside operator reported that our own stream
+        never did. It is the only honest measurement of decoder coverage
+        available, because every other view of it is taken from inside the
+        decoder -- and a decoder with a gap reports a quiet market, not a gap.
+        """
+        seen = len(self._discovered_pools)
+        missed = self._discovery_misses
+        if not seen:
+            return {"status": "DATA_BLOCKED", "external_pools_seen": 0,
+                    "missed_by_our_stream": 0, "coverage": None,
+                    "detail": "no external pool discovery yet this run"}
+        coverage = 1.0 - (missed / seen)
+        return {
+            "status": "OK" if coverage >= 0.9 else "DEGRADED",
+            "external_pools_seen": seen,
+            "missed_by_our_stream": missed,
+            "coverage": round(coverage, 4),
+            "detail": ("" if coverage >= 0.9 else
+                       f"{missed} of {seen} pools seen by outside operators "
+                       "never reached our census; that is a decoder or "
+                       "program-coverage gap, not a quiet market"),
+        }
 
     def _ingest_lp_supply(self, lp_mint: str, record: Dict[str, Any]) -> None:
         """Route an LP reading onto the token whose pool it belongs to.
@@ -4422,6 +4680,7 @@ class MemecoinQuantDesk:
                 at=float(event.get("timestamp", time.time())),
                 regime=str(self.current_regime or "unknown"))
             self.wallet_intel.record_token_lifecycle(token, launch_at=event.get("timestamp", time.time()))
+            self._assess_identity(token, event)
             self.dataset_builder.start_episode(
                 token, event.get("creator", ""), event.get("program", PumpFunMonitor.PUMP_FUN_PROGRAM),
                 event.get("bonding_curve", ""), WSOL_MINT, detected_at=event.get("timestamp", time.time()),
@@ -4680,6 +4939,17 @@ class MemecoinQuantDesk:
             # never returned a record reads differently from one that is
             # failing, and the two need different fixes.
             "data_miners": self.data_miners.report(),
+            # Which operator is answering each question right now, and what
+            # is dark. A domain running on its third rung is fine and is
+            # reported as such; a domain with no rung left is a question the
+            # desk asks continuously and currently cannot answer.
+            "substitution": self.substitution.report(),
+            "telegram_channels": (self.channel_book.report()
+                                  if self.channel_book is not None
+                                  else {"status": "DATA_BLOCKED",
+                                        "detail": "channel book not built yet"}),
+            "identity_watch": self.identity_report(),
+            "discovery": self.discovery_report(),
             "execution_conditions": self.execution_conditions_report(),
             "stream_events": self.stream_event_report(),
             "dry_build": (self.execution_engine.dry_build_report()
@@ -5050,6 +5320,51 @@ class MemecoinQuantDesk:
                              if path.exists() else None)
         return web.json_response({"ok": True, "age_seconds": written})
 
+    async def _release_sources_endpoint(self, _request):
+        """Lift every source quarantine now, and report what was released.
+
+        The remedy for a domain that has gone completely dark. Every rung
+        being stood down at the same moment is almost always one shared cause
+        -- this address rate limited across the board, DNS wobbling, an
+        outbound proxy blip -- and waiting out four independent penalties for
+        a cause that has already passed is unmeasured data nobody needed to
+        lose. If the cause has NOT passed, the rungs fail again on their next
+        pass and re-quarantine themselves, so this is safe to call often.
+        """
+        try:
+            released = self.substitution.release()
+        except Exception as exc:
+            return web.json_response(
+                {"ok": False, "detail": f"{type(exc).__name__}: {exc}"},
+                status=500)
+        logger.info("SOURCE RELEASE lifted %d quarantine(s)", len(released))
+        return web.json_response({"ok": True, "released": released,
+                                  "dark": self.substitution.dark_domains()})
+
+    async def _verify_channels_endpoint(self, _request):
+        """Run the Telegram verification pass now rather than at its next slot.
+
+        Verification is hourly because a handle that is public now will still
+        be public in an hour. The exception is a desk that has NO verified
+        channel yet, where waiting an hour to try again is an hour of the
+        fastest public signal there is going unread.
+        """
+        book = getattr(self, "channel_book", None)
+        if book is None:
+            return web.json_response(
+                {"ok": False, "detail": "channel book not built"}, status=503)
+        try:
+            from src.research.telegram_miners import verification_miner
+            results = await verification_miner(self.http_client, book)()
+        except Exception as exc:
+            return web.json_response(
+                {"ok": False, "detail": f"{type(exc).__name__}: {exc}"},
+                status=500)
+        verified = [row["handle"] for row in results if row.get("verified")]
+        return web.json_response({"ok": True, "checked": len(results),
+                                  "verified": verified,
+                                  "book": book.report()})
+
     async def _dashboard_endpoint(self, _request):
         """Serve the operator terminal from the desk itself.
 
@@ -5080,6 +5395,8 @@ class MemecoinQuantDesk:
         # the one action that would LOSE the very data the check is worried
         # about. Loopback only, like everything else here.
         app.router.add_post("/flush", self._flush_endpoint)
+        app.router.add_post("/release-sources", self._release_sources_endpoint)
+        app.router.add_post("/verify-channels", self._verify_channels_endpoint)
         # The desk's own terminal. Same origin as /status, so it polls the
         # live desk directly instead of asking anyone to paste JSON around.
         app.router.add_get("/", self._dashboard_endpoint)
