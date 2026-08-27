@@ -16248,3 +16248,34 @@ class TestEveryStatedProbabilityGetsScored(unittest.TestCase):
     def test_the_outcome_path_actually_calls_it(self):
         source = inspect.getsource(MemecoinQuantDesk._record_ops_event)
         self.assertIn("self._record_calibration(payload)", source)
+
+
+class TestAPlannedRestartLosesNothingItNeedNot(unittest.TestCase):
+    """Evidence is the one thing here that cannot be regenerated."""
+
+    def test_shutdown_flushes_all_three_ledgers(self):
+        saved = []
+        desk = SimpleNamespace(
+            forward_evidence=SimpleNamespace(save=lambda: saved.append("evidence")),
+            launch_census=SimpleNamespace(save=lambda: saved.append("census")),
+            calibration=SimpleNamespace(save=lambda: saved.append("calibration")))
+        MemecoinQuantDesk._flush_ledgers(desk)
+        self.assertEqual(sorted(saved), ["calibration", "census", "evidence"])
+
+    def test_a_failing_ledger_cannot_block_shutdown(self):
+        saved = []
+
+        def explode():
+            raise OSError("disk full")
+
+        desk = SimpleNamespace(
+            forward_evidence=SimpleNamespace(save=explode),
+            launch_census=SimpleNamespace(save=lambda: saved.append("census")),
+            calibration=SimpleNamespace(save=lambda: saved.append("calibration")))
+        MemecoinQuantDesk._flush_ledgers(desk)
+        # The other two still flushed; a full disk loses a minute, not the run.
+        self.assertEqual(sorted(saved), ["calibration", "census"])
+
+    def test_stop_actually_calls_it(self):
+        source = inspect.getsource(MemecoinQuantDesk.stop)
+        self.assertIn("self._flush_ledgers()", source)
