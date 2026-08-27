@@ -4682,6 +4682,10 @@ class MemecoinQuantDesk:
             "data_miners": self.data_miners.report(),
             "execution_conditions": self.execution_conditions_report(),
             "stream_events": self.stream_event_report(),
+            "dry_build": (self.execution_engine.dry_build_report()
+                          if self.execution_engine is not None
+                          else {"status": "DATA_BLOCKED",
+                                "detail": "no execution engine yet"}),
             "pump_decoder": (self.pump_monitor.decoder_report()
                              if self.pump_monitor is not None
                              else {"status": "DATA_BLOCKED",

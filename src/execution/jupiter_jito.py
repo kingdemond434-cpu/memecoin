@@ -690,6 +690,9 @@ class ExecutionEngine:
         # operator, because a landing curve fitted across Helsinki and
         # Frankfurt is a curve describing neither.
         self.region: str = os.getenv("MEMECOIN_REGION", "").strip()
+        # Why a dry-run build failed, by message. The population that would
+        # otherwise only be discovered with capital at risk.
+        self.dry_build_failures: Dict[str, int] = {}
         self.execution_history: deque = deque(maxlen=10_000)
         self.route_performance: Dict[RouteType, Dict[str, float]] = defaultdict(
             lambda: {"total": 0, "landed": 0, "filled": 0, "failed": 0, "avg_latency": 0}
@@ -887,12 +890,38 @@ class ExecutionEngine:
         route_type = (RouteType.PUMPSWAP_NATIVE if native.venue == "pumpswap"
                       else RouteType.PUMP_NATIVE)
         if self.dry_run:
+            # BUILD AND SIGN ANYWAY. This used to return here, which left the
+            # whole build path -- account derivation, compute budget, the
+            # blockhash cache, the signer -- as dead code for the entire
+            # shadow stage. Every defect in it would have surfaced on the
+            # first canary trade, with real money on the table, and that is
+            # the most expensive place to discover a missing account meta.
+            #
+            # Building costs a few milliseconds off the hot path and nothing
+            # else: no submission, no network call, no capital. What it buys
+            # is that the execution path is exercised thousands of times
+            # before it is ever trusted with a fill.
+            build_error = ""
+            try:
+                await self._build_native_signed(native, use_jito, priority_fee)
+                self.native_route_attempts["dry_built"] += 1
+            except Exception as exc:
+                build_error = f"{type(exc).__name__}: {exc}"
+                self.native_route_attempts["dry_build_failed"] += 1
+                self.dry_build_failures[build_error] = (
+                    self.dry_build_failures.get(build_error, 0) + 1)
+                logger.warning("dry-run build failed for %s: %s",
+                               native.venue, build_error)
             result = ExecutionResult(
                 success=True, status=TransactionStatus.SIMULATED,
                 input_amount=amount, actual_input_amount=amount,
                 quoted_output_amount=quote.output_amount, slippage_bps=slippage_bps,
                 latency_ms=int((time.time() - started) * 1000),
                 route_type=route_type, simulated=True,
+                # A simulated fill whose transaction could not even be built
+                # is not a fill. Recorded so the shadow ledger cannot count a
+                # trade the desk was never capable of making.
+                error=build_error,
             )
             self.native_route_attempts["simulated"] += 1
             self.native_route_attempts[f"simulated:{native.venue}"] += 1
@@ -905,20 +934,7 @@ class ExecutionEngine:
                 error="live submission is locked; ALLOW_LIVE_TRADING acknowledgement absent")
 
         try:
-            instruction = Instruction(
-                Pubkey.from_string(native.program_id),
-                bytes(native.data),
-                [SoldersAccountMeta(Pubkey.from_string(meta.pubkey),
-                                    meta.is_signer, meta.is_writable)
-                 for meta in native.accounts],
-            )
-            signed = await self.tx_builder.build_and_sign(
-                [instruction],
-                compute_unit_limit=self.native_compute_unit_limit,
-                # Jito bids through the tip account rather than the fee market,
-                # so paying both would be paying twice for one race.
-                compute_unit_price_micro_lamports=0 if use_jito else priority_fee,
-            )
+            signed = await self._build_native_signed(native, use_jito, priority_fee)
         except Exception as exc:
             self.native_route_attempts["build_failed"] += 1
             return ExecutionResult(False, TransactionStatus.REJECTED,
@@ -932,6 +948,55 @@ class ExecutionEngine:
         result.quoted_output_amount = quote.output_amount
         self._record(result, decision_id)
         return result
+
+    async def _build_native_signed(self, native: Any, use_jito: bool,
+                                   priority_fee: int) -> str:
+        """Assemble and sign the native instruction.
+
+        One implementation, used by both the dry-run and live paths. Two would
+        mean the thing exercised in shadow is not the thing that runs live,
+        which is worse than not exercising it at all.
+        """
+        instruction = Instruction(
+            Pubkey.from_string(native.program_id),
+            bytes(native.data),
+            [SoldersAccountMeta(Pubkey.from_string(meta.pubkey),
+                                meta.is_signer, meta.is_writable)
+             for meta in native.accounts],
+        )
+        return await self.tx_builder.build_and_sign(
+            [instruction],
+            compute_unit_limit=self.native_compute_unit_limit,
+            # Jito bids through the tip account rather than the fee market, so
+            # paying both would be paying twice for one race.
+            compute_unit_price_micro_lamports=0 if use_jito else priority_fee,
+        )
+
+    def dry_build_report(self) -> Dict[str, Any]:
+        """Whether the execution path actually works, measured in shadow.
+
+        The point of building in dry run is this number. A desk about to take
+        its first real trade should already know that it has assembled and
+        signed thousands of valid transactions, and exactly which ones it
+        could not.
+        """
+        built = self.native_route_attempts.get("dry_built", 0)
+        failed = self.native_route_attempts.get("dry_build_failed", 0)
+        total = built + failed
+        return {
+            "status": ("DATA_BLOCKED" if not total else
+                       "OK" if not failed else "DEGRADED"),
+            "detail": ("the execution path has not been exercised yet"
+                       if not total else
+                       "" if not failed else
+                       f"{failed} of {total} builds failed; these would be "
+                       "rejected trades with real capital"),
+            "built": built,
+            "failed": failed,
+            "success_rate": (built / total) if total else None,
+            "failures": dict(sorted(self.dry_build_failures.items(),
+                                    key=lambda item: item[1], reverse=True)[:10]),
+        }
 
     async def execute_swap(
         self,

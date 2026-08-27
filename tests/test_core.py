@@ -16815,3 +16815,67 @@ class TestCreationsArriveAsAnchorCpiEvents(unittest.IsolatedAsyncioTestCase):
         monitor = self._monitor(lambda event: None)
         monitor.matched = {"cpi_event": 9, "token_created": 4, "buy": 30}
         self.assertEqual(monitor.decoder_report()["status"], "OK")
+
+
+class TestShadowExercisesTheExecutionPath(unittest.IsolatedAsyncioTestCase):
+    """Dry run used to return before building, leaving the whole build path
+    dead until the first canary trade."""
+
+    def test_the_dry_run_branch_builds_before_it_returns(self):
+        source = inspect.getsource(ExecutionEngine._execute_native)
+        built = source.index("self._build_native_signed")
+        simulated = source.index("TransactionStatus.SIMULATED")
+        self.assertLess(built, simulated,
+                        "dry run still returns before building")
+
+    def test_both_paths_use_one_builder(self):
+        # Two implementations would mean the thing exercised in shadow is not
+        # the thing that runs live.
+        source = inspect.getsource(ExecutionEngine._execute_native)
+        self.assertEqual(source.count("await self._build_native_signed("), 2)
+        self.assertNotIn("await self.tx_builder.build_and_sign(", source)
+
+    def test_dry_run_never_submits(self):
+        source = inspect.getsource(ExecutionEngine._execute_native)
+        dry = source[source.index("if self.dry_run:"):
+                     source.index("TransactionStatus.SIMULATED")]
+        for forbidden in ("_submit_signed", "send_transaction", "self.jito."):
+            self.assertNotIn(forbidden, dry)
+
+    def test_an_unexercised_path_reports_blocked(self):
+        engine = ExecutionEngine.__new__(ExecutionEngine)
+        engine.native_route_attempts = defaultdict(int)
+        engine.dry_build_failures = {}
+        report = engine.dry_build_report()
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertIn("has not been exercised", report["detail"])
+
+    def test_clean_builds_read_ok_with_a_count(self):
+        engine = ExecutionEngine.__new__(ExecutionEngine)
+        engine.native_route_attempts = defaultdict(int, {"dry_built": 4_000})
+        engine.dry_build_failures = {}
+        report = engine.dry_build_report()
+        self.assertEqual(report["status"], "OK")
+        self.assertEqual(report["built"], 4_000)
+        self.assertEqual(report["success_rate"], 1.0)
+
+    def test_failed_builds_are_named_as_rejected_trades(self):
+        engine = ExecutionEngine.__new__(ExecutionEngine)
+        engine.native_route_attempts = defaultdict(
+            int, {"dry_built": 90, "dry_build_failed": 10})
+        engine.dry_build_failures = {"ValueError: missing creator vault": 10}
+        report = engine.dry_build_report()
+        self.assertEqual(report["status"], "DEGRADED")
+        self.assertIn("rejected trades with real capital", report["detail"])
+        self.assertEqual(report["success_rate"], 0.9)
+        self.assertIn("ValueError: missing creator vault", report["failures"])
+
+    def test_a_simulated_fill_that_could_not_be_built_carries_the_error(self):
+        # Otherwise the shadow ledger counts a trade the desk could never have
+        # made, and the forward evidence is inflated by its own bugs.
+        source = inspect.getsource(ExecutionEngine._execute_native)
+        self.assertIn("error=build_error", source)
+
+    def test_status_exposes_it(self):
+        self.assertIn("dry_build_report()",
+                      inspect.getsource(MemecoinQuantDesk.readiness))
