@@ -16536,3 +16536,50 @@ class TestTheLandingCorpusSurvivesARestart(unittest.TestCase):
         source = inspect.getsource(MemecoinQuantDesk._setup_execution)
         self.assertIn("landing_attempts.jsonl", source)
         self.assertIn("landing_model.load()", source)
+
+
+class TestStreamDeliveryIsVisible(unittest.IsolatedAsyncioTestCase):
+    """A connected stream carrying no creations looks exactly like a quiet
+    market from every other panel."""
+
+    def _desk(self):
+        desk = SimpleNamespace(_stream_events={})
+        desk.stream_event_report = types.MethodType(
+            MemecoinQuantDesk.stream_event_report, desk)
+        return desk
+
+    def test_no_events_at_all_is_blocked(self):
+        report = self._desk().stream_event_report()
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertIn("no chain event has been delivered", report["detail"])
+
+    def test_trades_without_creations_is_degraded_not_healthy(self):
+        desk = self._desk()
+        desk._stream_events = {"token_trade": 5_000, "pool_swap": 900}
+        report = desk.stream_event_report()
+        self.assertEqual(report["status"], "DEGRADED")
+        self.assertEqual(report["token_created"], 0)
+        self.assertEqual(report["total"], 5_900)
+        self.assertIn("not one token_created", report["detail"])
+
+    def test_creations_arriving_reads_ok(self):
+        desk = self._desk()
+        desk._stream_events = {"token_created": 42, "token_trade": 5_000}
+        report = desk.stream_event_report()
+        self.assertEqual(report["status"], "OK")
+        self.assertEqual(report["token_created"], 42)
+
+    def test_events_are_counted_before_any_guard_rejects_them(self):
+        source = inspect.getsource(MemecoinQuantDesk._on_pump_event)
+        counted = source.index("self._stream_events[kind]")
+        guarded = source.index('if not token:')
+        self.assertLess(counted, guarded,
+                        "events are counted after a guard can drop them")
+
+    def test_a_dropped_event_is_attributed_rather_than_vanishing(self):
+        desk = self._desk()
+        desk._stream_events = {"token_created": 3, "token_created:no_token": 3}
+        report = desk.stream_event_report()
+        # The suffixed key is diagnostic, not a second event.
+        self.assertEqual(report["total"], 3)
+        self.assertIn("token_created:no_token", report["by_type"])
