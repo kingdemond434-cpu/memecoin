@@ -3387,6 +3387,40 @@ class MemecoinQuantDesk:
                     ordered.append(token)
         return ordered
 
+    def signer_report(self) -> Dict[str, Any]:
+        """Where the private key actually lives, and what the signer has done.
+
+        Reported unconditionally, because "no signer configured" and "signer
+        holding the key in this process" are different states an operator must
+        be able to tell apart at a glance -- and the second one is the default,
+        which is exactly why it has to be visible rather than inferred from
+        the absence of the first.
+        """
+        engine = self.execution_engine
+        signer = getattr(getattr(engine, "tx_builder", None), "signer", None)
+        if signer is None:
+            return {
+                "status": "DATA_BLOCKED",
+                "mode": "none",
+                "isolated": False,
+                "detail": ("no execution engine is built yet; nothing can "
+                           "sign, which is correct before setup completes"),
+                "signed": 0, "refused": 0,
+            }
+        try:
+            report = dict(signer.report())
+        except Exception as exc:
+            return {"status": "DATA_BLOCKED", "mode": "unknown",
+                    "isolated": False, "signed": 0, "refused": 0,
+                    "detail": f"signer report failed: {exc}"}
+        report.setdefault("status", "OK" if report.get("isolated") else "DEGRADED")
+        # A local signer is not an error, and it is not fine either. It is a
+        # deliberate configuration the operator should see stated.
+        report.setdefault("live_submission_locked",
+                          os.getenv("ALLOW_LIVE_TRADING", "").lower()
+                          != "yes-i-understand")
+        return report
+
     def execution_conditions_report(self) -> Dict[str, Any]:
         """What the chain costs and whether it is keeping up.
 
@@ -4592,6 +4626,7 @@ class MemecoinQuantDesk:
             "launch_census": self.launch_census.report(),
             "screen_policy": self.screen_policy.report(),
             "memory": self.memory.report(),
+            "signer": self.signer_report(),
             "fact_ladder": self.facts.report(),
             "calibration": self.calibration.report(),
             "entity_registry": self.entity_registry.report(),
