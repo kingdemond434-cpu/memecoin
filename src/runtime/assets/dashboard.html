@@ -1,0 +1,725 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Aurum Desk Terminal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap">
+
+<style>
+:root{
+  --ground:#0A0A0F; --panel:#12121A; --panel-2:#171722; --rule:#232334; --rule-soft:#1B1B27;
+  --ink:#E6E6F0; --ink-dim:#8A8AA3; --ink-faint:#5A5A73;
+  --sol-violet:#9945FF; --sol-green:#14F195;
+  --ok:#00D18F; --warn:#FFB020; --crit:#FF4D6A; --blocked:#5A5A73;
+  --grad:linear-gradient(90deg,var(--sol-violet) 0%,#7B5BFF 45%,var(--sol-green) 100%);
+  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  --display:"Chakra Petch","IBM Plex Sans",system-ui,sans-serif;
+  --body:"IBM Plex Sans",system-ui,-apple-system,sans-serif;
+}
+*{box-sizing:border-box}
+body{
+  margin:0;background:var(--ground);color:var(--ink);
+  font-family:var(--body);font-size:14px;line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+}
+h1,h2,h3{font-family:var(--display);margin:0;text-wrap:balance;letter-spacing:.01em}
+a{color:var(--sol-green)}
+
+/* ---------- shell ---------- */
+.wrap{max-width:1520px;margin:0 auto;padding:0 20px 64px}
+
+/* ---------- masthead ---------- */
+.mast{
+  display:flex;align-items:baseline;gap:18px;flex-wrap:wrap;
+  padding:22px 0 14px;border-bottom:1px solid var(--rule);
+}
+.mark{
+  font-family:var(--display);font-weight:700;font-size:22px;letter-spacing:.08em;
+  background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.mast .sub{font-family:var(--mono);font-size:11px;color:var(--ink-faint);letter-spacing:.06em;text-transform:uppercase}
+.mast .spacer{flex:1}
+.clock{font-family:var(--mono);font-size:12px;color:var(--ink-dim);font-variant-numeric:tabular-nums}
+
+/* gradient hairline under masthead — the one place the brand gradient runs */
+.railline{height:2px;background:var(--grad);opacity:.85}
+
+/* ---------- status strip ---------- */
+.strip{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));
+  border:1px solid var(--rule);border-top:none;background:var(--panel);
+}
+.cell{padding:12px 14px;border-right:1px solid var(--rule-soft)}
+.cell:last-child{border-right:none}
+.cell .k{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-faint)}
+.cell .v{font-family:var(--mono);font-size:20px;font-weight:700;margin-top:5px;font-variant-numeric:tabular-nums}
+.cell .n{font-family:var(--mono);font-size:11px;color:var(--ink-dim);margin-top:2px}
+
+/* ---------- status pills ---------- */
+.pill{
+  display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);
+  font-size:10px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;
+  padding:3px 8px;border:1px solid currentColor;border-radius:2px;
+}
+.pill::before{content:"";width:6px;height:6px;background:currentColor;border-radius:50%}
+.s-ok{color:var(--ok)} .s-warn{color:var(--warn)} .s-crit{color:var(--crit)} .s-blocked{color:var(--blocked)}
+
+/* ---------- grid ---------- */
+.grid{display:grid;gap:14px;margin-top:14px;grid-template-columns:repeat(12,1fr)}
+.span4{grid-column:span 4} .span5{grid-column:span 5} .span6{grid-column:span 6}
+.span7{grid-column:span 7} .span8{grid-column:span 8} .span12{grid-column:span 12}
+@media(max-width:1180px){.span4,.span5,.span6,.span7,.span8{grid-column:span 12}}
+
+.panel{background:var(--panel);border:1px solid var(--rule);display:flex;flex-direction:column;min-width:0}
+.phead{
+  display:flex;align-items:center;gap:10px;padding:10px 14px;
+  border-bottom:1px solid var(--rule);background:var(--panel-2);
+}
+.phead h2{font-size:12px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--ink)}
+.phead .spacer{flex:1}
+.pbody{padding:14px;min-width:0}
+.note{font-size:12px;color:var(--ink-dim);line-height:1.55}
+.note strong{color:var(--ink);font-weight:600}
+
+/* ---------- funnel ---------- */
+.funnel{display:flex;flex-direction:column;gap:9px}
+.frow{display:grid;grid-template-columns:132px 1fr 92px;align-items:center;gap:12px}
+.flabel{font-family:var(--mono);font-size:11px;color:var(--ink-dim);letter-spacing:.04em}
+.ftrack{height:22px;background:#0D0D14;border:1px solid var(--rule-soft);position:relative;overflow:hidden}
+.fbar{height:100%;background:var(--grad);opacity:.9}
+.fbar.dim{background:#2C2C40;opacity:1}
+.fval{font-family:var(--mono);font-size:13px;font-weight:700;text-align:right;font-variant-numeric:tabular-nums}
+
+/* ---------- tables ---------- */
+.tablewrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px}
+th{
+  text-align:left;font-size:10px;letter-spacing:.09em;text-transform:uppercase;
+  color:var(--ink-faint);font-weight:500;padding:0 10px 7px 0;border-bottom:1px solid var(--rule);
+}
+td{padding:7px 10px 7px 0;border-bottom:1px solid var(--rule-soft);font-variant-numeric:tabular-nums}
+tr:last-child td{border-bottom:none}
+td.num,th.num{text-align:right;padding-right:0}
+.bad{color:var(--crit)} .good{color:var(--ok)} .mid{color:var(--warn)} .off{color:var(--blocked)}
+
+/* ---------- coverage heat grid ---------- */
+.heat{display:grid;grid-template-columns:auto repeat(6,1fr);gap:3px;font-family:var(--mono);font-size:10px}
+.heat .hh{color:var(--ink-faint);text-align:center;padding-bottom:4px;letter-spacing:.04em}
+.heat .rh{color:var(--ink-dim);padding-right:8px;display:flex;align-items:center;justify-content:flex-end}
+.hc{
+  aspect-ratio:1.9/1;display:flex;align-items:center;justify-content:center;
+  border:1px solid var(--rule-soft);color:var(--ink-faint);font-variant-numeric:tabular-nums;
+}
+
+/* ---------- reliability plot ---------- */
+.rel{display:grid;grid-template-columns:repeat(10,1fr);gap:3px;align-items:end;height:96px;margin-bottom:6px}
+.relbar{position:relative;background:#0D0D14;border:1px solid var(--rule-soft);height:100%;display:flex;align-items:flex-end}
+.relfill{width:100%;background:var(--sol-violet);opacity:.55}
+.relmark{position:absolute;left:0;right:0;height:2px;background:var(--sol-green)}
+.relaxis{display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;color:var(--ink-faint)}
+
+/* ---------- feed ---------- */
+.feed{font-family:var(--mono);font-size:11.5px;display:flex;flex-direction:column;gap:0}
+.fitem{display:grid;grid-template-columns:62px 96px 1fr;gap:10px;padding:6px 0;border-bottom:1px solid var(--rule-soft)}
+.fitem:last-child{border-bottom:none}
+.ftime{color:var(--ink-faint);font-variant-numeric:tabular-nums}
+.ftag{font-size:10px;letter-spacing:.07em;text-transform:uppercase;font-weight:700}
+.ftext{color:var(--ink-dim)}
+
+/* ---------- loader ---------- */
+.loader{border:1px solid var(--rule);background:var(--panel);margin-top:14px}
+.loader .pbody{display:flex;flex-direction:column;gap:10px}
+textarea{
+  width:100%;min-height:104px;background:#0B0B11;color:var(--ink);border:1px solid var(--rule);
+  font-family:var(--mono);font-size:12px;padding:10px;resize:vertical;border-radius:2px;
+}
+textarea:focus-visible,button:focus-visible{outline:2px solid var(--sol-green);outline-offset:2px}
+.btnrow{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+button{
+  font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;
+  padding:8px 14px;background:transparent;color:var(--ink);border:1px solid var(--rule);
+  border-radius:2px;cursor:pointer;
+}
+button:hover{border-color:var(--sol-violet);color:#fff}
+button.primary{border-color:transparent;background:var(--grad);color:#0A0A0F}
+button.primary:hover{filter:brightness(1.12)}
+.msg{font-family:var(--mono);font-size:11px;color:var(--ink-dim)}
+code{font-family:var(--mono);font-size:11.5px;background:#0B0B11;border:1px solid var(--rule-soft);padding:1px 5px;border-radius:2px;color:var(--sol-green)}
+
+.banner{
+  display:flex;gap:12px;align-items:flex-start;padding:11px 14px;margin-top:14px;
+  border:1px solid var(--rule);border-left:2px solid var(--warn);background:var(--panel);
+}
+.banner .t{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--warn);font-weight:700;white-space:nowrap;padding-top:2px}
+.banner .d{font-size:12.5px;color:var(--ink-dim);line-height:1.55}
+.foot{margin-top:26px;padding-top:14px;border-top:1px solid var(--rule);font-family:var(--mono);font-size:11px;color:var(--ink-faint);display:flex;gap:18px;flex-wrap:wrap}
+@media(prefers-reduced-motion:no-preference){.fbar,.relfill{transition:width .5s ease,height .5s ease}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="mast">
+    <div class="mark">AURUM</div>
+    <div class="sub">Solana Shadow Desk &middot; Dry Run</div>
+    <div class="spacer"></div>
+    <div class="clock" id="clock">—</div>
+    <span class="pill s-warn" id="mode">DRY RUN &middot; NO LIVE CAPITAL</span>
+  </header>
+  <div class="railline"></div>
+
+  <div class="strip" id="strip"></div>
+
+  <div class="banner">
+    <div class="t">Reading this</div>
+    <div class="d">
+      Every panel distinguishes <strong>measured</strong> from <strong>not yet measured</strong>. A
+      <span class="pill s-blocked" style="font-size:9px;padding:1px 6px">blocked</span> reading means nothing has been
+      observed — it is never a passing grade. The desk is early: most of these are blocked by design, and that is the
+      honest state rather than a fault.
+    </div>
+  </div>
+
+  <div class="grid">
+
+    <section class="panel span5">
+      <div class="phead"><h2>Launch funnel</h2><div class="spacer"></div><span class="pill" id="census-pill">—</span></div>
+      <div class="pbody">
+        <div class="funnel" id="funnel"></div>
+        <p class="note" style="margin:14px 0 0">
+          The denominator is every <code>token_created</code> on the stream — not only the launches that reached a
+          decision. A screen that discards monsters looks like a clean record from inside the ledger.
+        </p>
+      </div>
+    </section>
+
+    <section class="panel span7">
+      <div class="phead"><h2>What the screens cost</h2><div class="spacer"></div><span class="pill" id="miss-pill">—</span></div>
+      <div class="pbody">
+        <div class="tablewrap">
+          <table>
+            <thead><tr>
+              <th>Screen reason</th><th class="num">Rejected</th>
+              <th class="num">Monsters lost</th><th class="num">Monster rate</th>
+            </tr></thead>
+            <tbody id="screens"></tbody>
+          </table>
+        </div>
+        <p class="note" style="margin:12px 0 0" id="capture-note"></p>
+      </div>
+    </section>
+
+    <section class="panel span4">
+      <div class="phead"><h2>Chain conditions</h2><div class="spacer"></div><span class="pill" id="cond-pill">—</span></div>
+      <div class="pbody"><div class="tablewrap"><table><tbody id="conditions"></tbody></table></div></div>
+    </section>
+
+    <section class="panel span8">
+      <div class="phead"><h2>Probability calibration</h2><div class="spacer"></div><span class="pill" id="cal-pill">—</span></div>
+      <div class="pbody">
+        <div class="tablewrap">
+          <table>
+            <thead><tr>
+              <th>Model</th><th>Evidence</th><th class="num">Obs</th><th class="num">Weight</th>
+              <th class="num">ECE</th><th class="num">Understates</th><th>State</th>
+            </tr></thead>
+            <tbody id="calibration"></tbody>
+          </table>
+        </div>
+        <p class="note" style="margin:12px 0 0">
+          <strong>Evidence</strong> is where the observations came from. Replayed history is real evidence about the
+          market and none at all about our own execution, so it counts at a quarter weight; synthetic counts at zero.
+          A model reading OK on replay is a hypothesis, not a result.
+          Accuracy is not calibration. A rug model that says 5% for everything and is right 95% of the time is accurate
+          and useless. <strong>Understating risk</strong> holds positions through rugs; overstating it exits monsters
+          early — only the first can end the account, so it is shown on its own.
+        </p>
+      </div>
+    </section>
+
+    <section class="panel span6">
+      <div class="phead"><h2>Landing grid coverage</h2><div class="spacer"></div><span class="pill" id="grid-pill">—</span></div>
+      <div class="pbody">
+        <div class="heat" id="heat"></div>
+        <p class="note" style="margin:14px 0 0">
+          Bid multiple against measured congestion. Cells the desk has never bid in are estimates wearing the clothes of
+          measurements — exploration fills the emptiest one, never on exits and never on a high-edge trade.
+        </p>
+      </div>
+    </section>
+
+    <section class="panel span12">
+      <div class="phead"><h2>Screen policy &mdash; size, not survival</h2><div class="spacer"></div><span class="pill" id="screen-pill">—</span></div>
+      <div class="pbody">
+        <div class="tablewrap">
+          <table>
+            <thead><tr>
+              <th>Screen</th><th class="num">Launches touched</th><th class="num">Size forgone</th>
+              <th class="num">Mean cut</th><th>Shape</th>
+            </tr></thead>
+            <tbody id="screens2"></tbody>
+          </table>
+        </div>
+        <p class="note" style="margin:12px 0 0" id="screen-note"></p>
+      </div>
+    </section>
+
+    <section class="panel span6">
+      <div class="phead"><h2>Rug mechanisms</h2><div class="spacer"></div><span class="pill" id="rug-pill">—</span></div>
+      <div class="pbody">
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Mechanism</th><th class="num">Count</th><th>Escapable</th></tr></thead>
+            <tbody id="rugs"></tbody>
+          </table>
+        </div>
+        <p class="note" style="margin:12px 0 0">
+          An unexplained death is recorded <strong>unclassified</strong>, never folded into slow bleed. A residual that
+          absorbs everything hides how much the observation stream is missing.
+        </p>
+      </div>
+    </section>
+
+    <section class="panel span7">
+      <div class="phead"><h2>Data miners</h2><div class="spacer"></div><span class="pill" id="mine-pill">—</span></div>
+      <div class="pbody">
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Miner</th><th>Enriches</th><th class="num">Cadence</th><th class="num">Records</th><th>State</th></tr></thead>
+            <tbody id="miners"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel span5">
+      <div class="phead"><h2>Promotion distance</h2><div class="spacer"></div><span class="pill" id="promo-pill">—</span></div>
+      <div class="pbody">
+        <div class="funnel" id="promo"></div>
+        <p class="note" style="margin:14px 0 0">
+          Distance to the next stage, as ratios. A gate that says pass or fail cannot tell you whether you are a week
+          away or a year away — and that difference decides whether to keep running or change something.
+        </p>
+      </div>
+    </section>
+
+    <section class="panel span12">
+      <div class="phead"><h2>Fact ladder &mdash; measured or inferred</h2><div class="spacer"></div><span class="pill" id="ladder-pill">—</span></div>
+      <div class="pbody">
+        <div class="tablewrap">
+          <table>
+            <thead><tr>
+              <th>Fact</th><th class="num">Resolutions</th><th class="num">Measured</th>
+              <th>Rung distribution</th>
+            </tr></thead>
+            <tbody id="ladder"></tbody>
+          </table>
+        </div>
+        <p class="note" style="margin:12px 0 0">
+          Nothing blocks if any rung can answer, and no rung is mistaken for another. A fact resolving mostly at
+          <strong>prior</strong> while a measured rung is declared for it is a broken source wearing the appearance of a
+          quiet market.
+        </p>
+      </div>
+    </section>
+
+    <section class="panel span12">
+      <div class="phead"><h2>Signer</h2><div class="spacer"></div><span class="pill" id="sign-pill">—</span></div>
+      <div class="pbody"><div class="feed" id="signer"></div></div>
+    </section>
+
+  </div>
+
+  <section class="loader">
+    <div class="phead"><h2>Load live status</h2></div>
+    <div class="pbody">
+      <p class="note" style="margin:0">
+        Served by the desk itself, so it reads <code>/status</code> directly and refreshes every 10 seconds. The paste
+        box below is a fallback for rendering a snapshot taken on another host.
+      </p>
+      <textarea id="input" spellcheck="false" placeholder='{"launch_census": {...}, "calibration": {...}, "data_miners": {...}}'></textarea>
+      <div class="btnrow">
+        <button class="primary" id="load">Render status</button>
+        <button id="reset">Back to sample</button>
+        <span class="msg" id="msg"></span>
+      </div>
+    </div>
+  </section>
+
+  <footer class="foot">
+    <span id="src">SOURCE — sample snapshot</span>
+    <span>SCHEMA v1</span>
+    <span>E[log W] &middot; risk-constrained</span>
+  </footer>
+</div>
+
+<script>
+"use strict";
+
+/* A deliberately EARLY snapshot. Showing healthy fabricated numbers on a desk
+   that has measured nothing would be the exact dishonesty the desk is built
+   to avoid. */
+const SAMPLE = {
+  launch_census:{status:"OK",
+    funnel:{seen:18432,screened_out:17994,reached_a_decision:438,entered:61,unaccounted:0},
+    outcomes:{resolved:12207,monsters:57,rugs:8811,migrated:412,
+      rug_share_of_resolved:0.7218,monster_share_of_resolved:0.00467},
+    screens:{holder_concentration:6120,rug_hazard:4402,no_source_touch:3380,
+      first25_not_independent:2211,capacity:1102,reentry_bar:779},
+    rug_mechanisms:{unclassified:4402,slow_bleed:2610,migration_stall:1180,
+      creator_dump:361,sniper_cascade:180,lp_pull:62,mint_dilution:14,honeypot:2},
+    missed_monsters:{monsters_resolved:57,monsters_entered:9,
+      monsters_decided_not_entered:6,monsters_screened_out:42,
+      monster_capture_rate:0.2632,
+      costliest_screens:[
+        {reason:"holder_concentration",monsters_discarded:19,total_screened:6120,monster_share_of_rejections:0.0031},
+        {reason:"no_source_touch",monsters_discarded:11,total_screened:3380,monster_share_of_rejections:0.0033},
+        {reason:"first25_not_independent",monsters_discarded:7,total_screened:2211,monster_share_of_rejections:0.0032},
+        {reason:"rug_hazard",monsters_discarded:4,total_screened:4402,monster_share_of_rejections:0.0009},
+        {reason:"capacity",monsters_discarded:1,total_screened:1102,monster_share_of_rejections:0.0009}]},
+    memory:{in_memory:20000,cap:20000,spilled_to_disk:41209}},
+
+  calibration:{status:"MISCALIBRATED",models_tracked:5,models_measured:2,models_miscalibrated:1,
+    models:[
+      {model:"rug_30s",status:"MISCALIBRATED",observations:1244,brier:0.1832,
+        expected_calibration_error:0.1140,understates_risk_by:0.1102,overstates_risk_by:0.0038,
+        dominant_provenance:"shadow",evidence_weight:622.0,proven_on_real_fills:false},
+      {model:"landing_p",status:"OK",observations:906,brier:0.0921,
+        expected_calibration_error:0.0288,understates_risk_by:0.0121,overstates_risk_by:0.0167,
+        dominant_provenance:"reconstructed",evidence_weight:226.5,proven_on_real_fills:false},
+      {model:"rug_5m",status:"DATA_BLOCKED",observations:112,brier:null,
+        expected_calibration_error:null,understates_risk_by:null,overstates_risk_by:null,
+        dominant_provenance:"shadow",evidence_weight:56.0,proven_on_real_fills:false},
+      {model:"monster_p",status:"DATA_BLOCKED",observations:38,brier:null,
+        expected_calibration_error:null,understates_risk_by:null,overstates_risk_by:null,
+        dominant_provenance:"shadow",evidence_weight:19.0,proven_on_real_fills:false},
+      {model:"escape_p",status:"DATA_BLOCKED",observations:0,brier:null,
+        expected_calibration_error:null,understates_risk_by:null,overstates_risk_by:null,
+        dominant_provenance:"none",evidence_weight:0.0,proven_on_real_fills:false}]},
+
+  screen_policy:{status:"OK",evaluated:18432,full_size:344,reduced:17650,
+    declined_uneconomic:397,declined_veto:41,kept_but_reduced_share:0.9576,size_floor:0.05,
+    costliest_screens:[
+      {screen:"holder_concentration",size_forgone:5218.4,launches_touched:18432,mean_cut:0.2831},
+      {screen:"no_source_touch",size_forgone:3102.9,launches_touched:18432,mean_cut:0.1683},
+      {screen:"first25_not_independent",size_forgone:1944.1,launches_touched:18432,mean_cut:0.1055},
+      {screen:"rug_hazard",size_forgone:1610.7,launches_touched:18432,mean_cut:0.0874},
+      {screen:"capacity",size_forgone:402.2,launches_touched:18432,mean_cut:0.0218}]},
+
+  fact_ladder:{status:"DEGRADED",facts_declared:7,
+    degraded_facts:["escape_feasibility","creator_prior_rug_rate"],
+    facts:[
+      {fact:"holder_concentration",resolutions:18432,measured_share:0.881,
+        rungs:{measured:16241,proxy:1904,prior:287}},
+      {fact:"lp_control",resolutions:412,measured_share:0.972,
+        rungs:{measured:400,absent:12}},
+      {fact:"mint_authority",resolutions:18432,measured_share:0.994,
+        rungs:{measured:18321,prior:111}},
+      {fact:"funder_ancestry",resolutions:18432,measured_share:0.643,
+        rungs:{measured:11852,reconstructed:4901,proxy:1402,prior:277}},
+      {fact:"first25_independence",resolutions:18432,measured_share:0.712,
+        rungs:{measured:13123,reconstructed:3810,proxy:1499}},
+      {fact:"creator_prior_rug_rate",resolutions:18432,measured_share:0.212,
+        rungs:{reconstructed:3908,proxy:5220,prior:9304}},
+      {fact:"escape_feasibility",resolutions:61,measured_share:0.0,
+        rungs:{proxy:44,prior:17}}]},
+
+  execution_conditions:{status:"OK",congestion:0.31,slot_time_ratio:1.31,tps:3182.4,
+    fee_p50_lamports:41000,fee_p90_lamports:214000,contested_share:0.62,accounts_sampled:9,
+    unattributed_wallet_readings:73},
+
+  bid_explorer:{status:"OK",explorations:118,cells_covered:5,cells_total:24,coverage_target_per_cell:25,
+    cells:[
+      {cell:"calm@0.35",attempts:25,landed:4},{cell:"calm@0.50",attempts:25,landed:11},
+      {cell:"calm@0.70",attempts:25,landed:19},{cell:"calm@0.85",attempts:22,landed:20},
+      {cell:"calm@1.25",attempts:14,landed:14},{cell:"calm@1.60",attempts:6,landed:6},
+      {cell:"busy@0.35",attempts:9,landed:0},{cell:"busy@0.50",attempts:12,landed:2},
+      {cell:"busy@0.70",attempts:25,landed:9},{cell:"busy@0.85",attempts:18,landed:11},
+      {cell:"busy@1.25",attempts:7,landed:6},{cell:"busy@1.60",attempts:2,landed:2},
+      {cell:"contested@0.35",attempts:1,landed:0},{cell:"contested@0.50",attempts:3,landed:0},
+      {cell:"contested@0.70",attempts:4,landed:1},{cell:"contested@0.85",attempts:5,landed:2},
+      {cell:"contested@1.25",attempts:2,landed:1},{cell:"contested@1.60",attempts:0,landed:0},
+      {cell:"unknown@0.35",attempts:0,landed:0},{cell:"unknown@0.50",attempts:0,landed:0},
+      {cell:"unknown@0.70",attempts:0,landed:0},{cell:"unknown@0.85",attempts:0,landed:0},
+      {cell:"unknown@1.25",attempts:0,landed:0},{cell:"unknown@1.60",attempts:0,landed:0}]},
+
+  data_miners:{status:"OK",registered:18,runnable:16,producing:11,failing:2,
+    awaiting_credentials:["web:program_repos"],silent:["web:reddit_new"],total_records:284117,
+    miners:[
+      {miner_id:"chain:holder_structure",enriches:"holder_structure",cadence:15,records:41220,state:"OK"},
+      {miner_id:"chain:priority_fees",enriches:"execution_conditions",cadence:15,records:38104,state:"OK"},
+      {miner_id:"chain:network_health",enriches:"execution_conditions",cadence:60,records:9620,state:"OK"},
+      {miner_id:"chain:lp_supply",enriches:"supply_control",cadence:60,records:7710,state:"OK"},
+      {miner_id:"chain:deployer_history",enriches:"wallet_history",cadence:900,records:2044,state:"OK"},
+      {miner_id:"chain:mint_authority",enriches:"token_metadata",cadence:60,records:18866,state:"OK"},
+      {miner_id:"market:dexscreener_pairs",enriches:"venue_liquidity",cadence:15,records:52011,state:"OK"},
+      {miner_id:"market:jupiter_tokens",enriches:"token_metadata",cadence:3600,records:96400,state:"OK"},
+      {miner_id:"web:youtube_recent",enriches:"narrative",cadence:60,records:1188,state:"OK"},
+      {miner_id:"web:name_corpus",enriches:"token_metadata",cadence:60,records:14002,state:"OK"},
+      {miner_id:"web:wikipedia_attention",enriches:"market_context",cadence:86400,records:56,state:"OK"},
+      {miner_id:"web:reddit_new",enriches:"social_attention",cadence:60,records:0,state:"SILENT"},
+      {miner_id:"web:hackernews",enriches:"social_attention",cadence:900,records:288,state:"RATE_LIMITED"},
+      {miner_id:"web:program_repos",enriches:"narrative",cadence:3600,records:0,state:"NO_KEY"}]},
+
+  forward_evidence:{stage:"FORWARD_SHADOW",
+    distance:{decisions:{have:438,need:5000},real_fills:{have:0,need:250},
+      launch_cohorts:{have:11,need:40},regimes:{have:2,need:4},
+      net_log_growth:{have:0.0,need:0.0},catastrophic:{have:0,need:0}}},
+
+  signer:{public_key:"—  not configured  —",signed:0,refused:0,halted:true,
+    halt_reason:"ALLOW_LIVE_TRADING is not set to the acknowledgement",
+    recent_refusals:[]}
+};
+
+/* ---------- helpers ---------- */
+const $=id=>document.getElementById(id);
+const num=n=>(n===null||n===undefined||Number.isNaN(n))?"—":Number(n).toLocaleString("en-US");
+const pct=(n,d=1)=>(n===null||n===undefined)?"—":(Number(n)*100).toFixed(d)+"%";
+const fix=(n,d=3)=>(n===null||n===undefined)?"—":Number(n).toFixed(d);
+function pill(el,text,cls){el.textContent=text;el.className="pill "+cls;}
+function statusClass(s){
+  return s==="OK"?"s-ok":s==="MISCALIBRATED"||s==="RATE_LIMITED"?"s-warn":
+         s==="FAILING"||s==="CRITICAL"?"s-crit":"s-blocked";
+}
+function cadence(sec){
+  if(sec===null||sec===undefined)return "—";
+  if(sec>=86400)return (sec/86400)+"d"; if(sec>=3600)return (sec/3600)+"h";
+  if(sec>=60)return (sec/60)+"m"; return sec+"s";
+}
+
+/* Which mechanisms leave time to act. Encoded once, shown as form. */
+const ESCAPABLE={lp_pull:["No","bad"],mint_dilution:["Before","good"],freeze:["No","bad"],
+  creator_dump:["Partly","mid"],sniper_cascade:["Partly","mid"],honeypot:["Never","bad"],
+  migration_stall:["Yes","good"],slow_bleed:["Yes","good"],unclassified:["Unknown","off"]};
+
+/* ---------- render ---------- */
+function render(d){
+  /* strip */
+  const c=d.launch_census||{},f=c.funnel||{},o=c.outcomes||{},mm=c.missed_monsters||{};
+  const cond=d.execution_conditions||{},cal=d.calibration||{},mine=d.data_miners||{};
+  const cells=[
+    ["Launches seen",num(f.seen),"denominator, unfiltered"],
+    ["Entered",num(f.entered),(f.seen?pct(f.entered/f.seen,2):"—")+" of launches"],
+    ["Reached decision",pct(mm.monster_capture_rate,1),
+      num((mm.monsters_decided_not_entered||0)+(mm.monsters_entered||0))+" of "+num(mm.monsters_resolved)+" monsters survived screens"],
+    ["Monsters entered",
+      mm.monsters_resolved?pct((mm.monsters_entered||0)/mm.monsters_resolved,1):"—",
+      num(mm.monsters_entered)+" of "+num(mm.monsters_resolved)+" actually taken"],
+    ["Rug share",pct(o.rug_share_of_resolved,1),num(o.rugs)+" of "+num(o.resolved)+" resolved"],
+    ["Congestion",cond.congestion===null||cond.congestion===undefined?"—":fix(cond.congestion,2),
+      "slot ratio "+fix(cond.slot_time_ratio,2)+"×"],
+    ["Fee p90",num(cond.fee_p90_lamports),"p50 "+num(cond.fee_p50_lamports)+" lamports"],
+    ["Miners live",num(mine.producing)+"/"+num(mine.registered),num(mine.total_records)+" records"]
+  ];
+  $("strip").innerHTML=cells.map(([k,v,n])=>
+    `<div class="cell"><div class="k">${k}</div><div class="v">${v}</div><div class="n">${n}</div></div>`).join("");
+
+  /* funnel */
+  const stages=[["Seen",f.seen,false],["Screened out",f.screened_out,true],
+    ["Reached decision",f.reached_a_decision,false],["Entered",f.entered,false]];
+  const top=Math.max(1,f.seen||1);
+  $("funnel").innerHTML=stages.map(([l,v,dim])=>{
+    const w=Math.max(0.6,((v||0)/top)*100);
+    return `<div class="frow"><div class="flabel">${l}</div>
+      <div class="ftrack"><div class="fbar${dim?" dim":""}" style="width:${w}%"></div></div>
+      <div class="fval">${num(v)}</div></div>`;
+  }).join("");
+  pill($("census-pill"),c.status||"—",statusClass(c.status));
+
+  /* screens */
+  const rows=(mm.costliest_screens||[]);
+  $("screens").innerHTML=rows.length?rows.map(r=>{
+    const rate=r.monster_share_of_rejections;
+    const cls=rate===null||rate===undefined?"off":rate>=0.003?"bad":rate>=0.001?"mid":"good";
+    return `<tr><td>${r.reason}</td><td class="num">${num(r.total_screened)}</td>
+      <td class="num ${cls}">${num(r.monsters_discarded)}</td>
+      <td class="num ${cls}">${rate===null||rate===undefined?"—":(rate*100).toFixed(2)+"%"}</td></tr>`;
+  }).join(""):`<tr><td colspan="4" class="off">No resolved monster yet — capture rate is unmeasurable, not perfect.</td></tr>`;
+  pill($("miss-pill"),mm.monsters_resolved?"MEASURED":"BLOCKED",mm.monsters_resolved?"s-ok":"s-blocked");
+  $("capture-note").innerHTML=mm.monsters_resolved
+    ? `Of <strong>${num(mm.monsters_resolved)}</strong> resolved monsters, <strong>${num(mm.monsters_screened_out)}</strong> were discarded before anything could decide on them. The top row is the most expensive filter the desk owns.`
+    : `No monster has resolved yet. Every screen currently looks free, which is a property of the sample size and not of the screens.`;
+
+  /* conditions */
+  const cl=[["Congestion",fix(cond.congestion,2)],["Slot time vs nominal",fix(cond.slot_time_ratio,2)+"×"],
+    ["Transactions / sec",num(Math.round(cond.tps||0))],["Fee p50 (lamports)",num(cond.fee_p50_lamports)],
+    ["Fee p90 (lamports)",num(cond.fee_p90_lamports)],["Slots with any fee",pct(cond.contested_share,0)],
+    ["Accounts sampled",num(cond.accounts_sampled)]];
+  $("conditions").innerHTML=cl.map(([k,v])=>
+    `<tr><td style="color:var(--ink-dim)">${k}</td><td class="num">${v}</td></tr>`).join("");
+  pill($("cond-pill"),cond.status||"—",statusClass(cond.status));
+
+  /* calibration */
+  $("calibration").innerHTML=(cal.models||[]).map(m=>{
+    const cls=statusClass(m.status);
+    const under=m.understates_risk_by;
+    const uCls=under===null||under===undefined?"off":under>0.05?"bad":under>0.02?"mid":"good";
+    const prov=m.dominant_provenance||"—";
+    const pCls=prov==="forward_real"?"good":prov==="shadow"?"mid":prov==="synthetic"?"bad":"off";
+    return `<tr><td>${m.model}</td>
+      <td class="${pCls}">${prov.replace("_"," ")}</td>
+      <td class="num">${num(m.observations)}</td>
+      <td class="num">${m.evidence_weight===undefined?"—":num(m.evidence_weight)}</td>
+      <td class="num">${fix(m.expected_calibration_error,4)}</td>
+      <td class="num ${uCls}">${under===null||under===undefined?"—":fix(under,4)}</td>
+      <td><span class="pill ${cls}">${m.status}</span></td></tr>`;
+  }).join("");
+  pill($("cal-pill"),cal.status||"—",statusClass(cal.status));
+
+  /* heat grid */
+  const be=d.bid_explorer||{cells:[]};
+  const mults=["0.35","0.50","0.70","0.85","1.25","1.60"];
+  const buckets=["calm","busy","contested","unknown"];
+  const byCell={}; (be.cells||[]).forEach(c2=>byCell[c2.cell]=c2);
+  const target=be.coverage_target_per_cell||25;
+  let html=`<div class="hh"></div>`+mults.map(m=>`<div class="hh">${m}×</div>`).join("");
+  buckets.forEach(b=>{
+    html+=`<div class="rh">${b}</div>`;
+    mults.forEach(m=>{
+      const c2=byCell[b+"@"+m]||{attempts:0,landed:0};
+      const fill=Math.min(1,c2.attempts/target);
+      const bg=fill===0?"#0D0D14":`color-mix(in srgb, var(--sol-violet) ${Math.round(fill*72)}%, #0D0D14)`;
+      const ink=fill>0.55?"#F2ECFF":"var(--ink-faint)";
+      const rate=c2.attempts?Math.round((c2.landed/c2.attempts)*100)+"%":"·";
+      html+=`<div class="hc" style="background:${bg};color:${ink}" title="${b} @ ${m}× — ${c2.attempts} attempts, ${c2.landed} landed">${rate}</div>`;
+    });
+  });
+  $("heat").innerHTML=html;
+  pill($("grid-pill"),(be.cells_covered||0)+"/"+(be.cells_total||0)+" COVERED",
+    (be.cells_covered||0)>=(be.cells_total||1)*0.6?"s-ok":"s-warn");
+
+  /* screen policy */
+  const sp=d.screen_policy||{costliest_screens:[]};
+  const maxCut=Math.max(0.0001,...(sp.costliest_screens||[]).map(r=>r.mean_cut||0));
+  $("screens2").innerHTML=(sp.costliest_screens||[]).map(r=>{
+    const w=Math.round(((r.mean_cut||0)/maxCut)*100);
+    const cls=(r.mean_cut||0)>0.25?"bad":(r.mean_cut||0)>0.12?"mid":"good";
+    return `<tr><td>${r.screen}</td><td class="num">${num(r.launches_touched)}</td>
+      <td class="num">${fix(r.size_forgone,1)}</td>
+      <td class="num ${cls}">${pct(r.mean_cut,1)}</td>
+      <td><div class="ftrack" style="height:14px"><div class="fbar" style="width:${w}%"></div></div></td></tr>`;
+  }).join("");
+  pill($("screen-pill"),sp.status||"—",statusClass(sp.status));
+  $("screen-note").innerHTML=sp.evaluated
+    ? `<strong>${pct(sp.kept_but_reduced_share,1)}</strong> of launches are now kept at reduced size rather than discarded. Only <strong>${num(sp.declined_uneconomic)}</strong> were declined on economics (no size clears its own cost) and <strong>${num(sp.declined_veto)}</strong> on a genuine veto — untradeable at any size.`
+    : `No launch screened yet.`;
+
+  /* fact ladder */
+  const fl=d.fact_ladder||{facts:[]};
+  const RUNGC={measured:"var(--sol-green)",corroborated:"#5BE8B5",reconstructed:"var(--sol-violet)",
+    proxy:"#FFB020",prior:"#FF4D6A",absent:"#3A3A4E"};
+  $("ladder").innerHTML=(fl.facts||[]).map(f=>{
+    const total=Object.values(f.rungs||{}).reduce((a,b)=>a+b,0)||1;
+    const bar=Object.entries(f.rungs||{}).map(([k,v])=>
+      `<span title="${k}: ${num(v)}" style="display:block;height:100%;width:${(v/total)*100}%;background:${RUNGC[k]||"#3A3A4E"}"></span>`).join("");
+    const ms=f.measured_share;
+    const cls=ms===null||ms===undefined?"off":ms>=0.7?"good":ms>=0.4?"mid":"bad";
+    return `<tr><td>${f.fact}</td><td class="num">${num(f.resolutions)}</td>
+      <td class="num ${cls}">${pct(ms,1)}</td>
+      <td><div style="display:flex;height:14px;border:1px solid var(--rule-soft)">${bar}</div></td></tr>`;
+  }).join("");
+  pill($("ladder-pill"),fl.status||"—",statusClass(fl.status));
+
+  /* rugs */
+  const rm=c.rug_mechanisms||{};
+  const total=Object.values(rm).reduce((a,b)=>a+b,0)||1;
+  $("rugs").innerHTML=Object.entries(rm).map(([k,v])=>{
+    const [label,cls]=ESCAPABLE[k]||["—","off"];
+    return `<tr><td>${k}</td><td class="num">${num(v)} <span class="off">(${pct(v/total,0)})</span></td>
+      <td class="${cls}">${label}</td></tr>`;
+  }).join("");
+  const unc=(rm.unclassified||0)/total;
+  pill($("rug-pill"),unc>0.4?"MOSTLY UNNAMED":"NAMED",unc>0.4?"s-warn":"s-ok");
+
+  /* miners */
+  $("miners").innerHTML=(mine.miners||[]).map(m=>{
+    const cls=m.state==="OK"?"s-ok":m.state==="RATE_LIMITED"?"s-warn":
+              m.state==="NO_KEY"?"s-blocked":"s-crit";
+    return `<tr><td>${m.miner_id}</td><td class="off">${m.enriches}</td>
+      <td class="num">${cadence(m.cadence)}</td><td class="num">${num(m.records)}</td>
+      <td><span class="pill ${cls}">${m.state}</span></td></tr>`;
+  }).join("");
+  pill($("mine-pill"),num(mine.producing)+" PRODUCING",mine.producing?"s-ok":"s-blocked");
+
+  /* promotion */
+  const dist=(d.forward_evidence||{}).distance||{};
+  $("promo").innerHTML=Object.entries(dist).map(([k,v])=>{
+    const need=v.need||0,have=v.have||0;
+    const ratio=need>0?Math.min(1,have/need):(have<=need?1:0);
+    const w=Math.max(0.6,ratio*100);
+    return `<div class="frow"><div class="flabel">${k.replace(/_/g," ")}</div>
+      <div class="ftrack"><div class="fbar${ratio>=1?"":" dim"}" style="width:${w}%"></div></div>
+      <div class="fval">${num(have)}<span class="off">/${num(need)}</span></div></div>`;
+  }).join("");
+  const ready=Object.values(dist).every(v=>(v.need||0)===0?true:(v.have||0)>=(v.need||0));
+  pill($("promo-pill"),ready?"READY":"ACCUMULATING",ready?"s-ok":"s-warn");
+
+  /* signer */
+  const s=d.signer||{};
+  const items=[
+    ["state",s.halted?"HALTED":"ARMED",s.halted?"s-crit":"s-ok",s.halt_reason||"policy satisfied"],
+    ["key",s.public_key||"—","s-blocked","held in a separate process; never in the trading desk"],
+    ["signed",num(s.signed),"s-ok","transactions put a name to"],
+    ["refused",num(s.refused),(s.refused?"s-warn":"s-blocked"),"policy said no"]
+  ];
+  $("signer").innerHTML=items.map(([t,v,cls,note])=>
+    `<div class="fitem"><div class="ftime">${t}</div>
+     <div class="ftag ${cls.replace("s-","")}" style="color:var(--${cls==="s-ok"?"ok":cls==="s-crit"?"crit":cls==="s-warn"?"warn":"blocked"})">${v}</div>
+     <div class="ftext">${note}</div></div>`).join("");
+  pill($("sign-pill"),s.halted?"HALTED":"ARMED",s.halted?"s-crit":"s-ok");
+}
+
+/* ---------- clock ---------- */
+function tick(){
+  const n=new Date();
+  $("clock").textContent=n.toISOString().replace("T"," ").slice(0,19)+" UTC";
+}
+tick(); setInterval(tick,1000);
+
+/* ---------- load ---------- */
+$("load").addEventListener("click",()=>{
+  const raw=$("input").value.trim();
+  if(!raw){$("msg").textContent="Paste the /status JSON first.";return;}
+  let parsed;
+  try{parsed=JSON.parse(raw);}
+  catch(e){$("msg").textContent="That is not valid JSON — "+e.message;return;}
+  try{
+    render(parsed);
+    $("msg").textContent="Rendered. Any panel your build does not emit shows as blocked.";
+    $("src").textContent="SOURCE — pasted /status";
+    try{localStorage.setItem("aurum.status",raw);}catch(_){}
+  }catch(e){$("msg").textContent="Rendered partially — "+e.message;}
+});
+$("reset").addEventListener("click",()=>{
+  render(SAMPLE);$("input").value="";$("msg").textContent="";
+  $("src").textContent="SOURCE — sample snapshot";
+  try{localStorage.removeItem("aurum.status");}catch(_){}
+});
+
+/* Served from the desk, so /status is same-origin and needs no paste. */
+async function poll(){
+  try{
+    const r=await fetch("/status",{cache:"no-store"});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    render(await r.json());
+    $("src").textContent="SOURCE — live /status @ "+new Date().toISOString().slice(11,19)+"Z";
+    $("msg").textContent="";
+  }catch(e){
+    $("msg").textContent="live poll failed ("+e.message+"); showing last good render";
+  }
+}
+if(location.protocol.startsWith("http")){ poll(); setInterval(poll,10000); }
+
+let boot=SAMPLE, label="SOURCE — sample snapshot";
+try{
+  const saved=localStorage.getItem("aurum.status");
+  if(saved){boot=JSON.parse(saved);label="SOURCE — pasted /status";$("input").value=saved;}
+}catch(_){boot=SAMPLE;}
+try{render(boot);$("src").textContent=label;}
+catch(e){render(SAMPLE);$("src").textContent="SOURCE — sample snapshot";}
+</script>
+</body>
+</html>
