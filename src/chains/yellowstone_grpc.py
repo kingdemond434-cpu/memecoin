@@ -738,6 +738,13 @@ class PumpFunMonitor:
         hashlib.sha256(f"global:{name}".encode()).digest()[:8]: name
         for name in ("create", "create_v2", "buy", "buy_v2", "sell", "sell_v2", "migrate")
     }
+    #: Anchor's self-CPI event tag. A program using `emit_cpi!` publishes its
+    #: events as inner instructions prefixed with this, and Pump.fun does --
+    #: so CreateEvent never arrives as a top-level `create` instruction and a
+    #: decoder that only reads top-level instructions names every buy and sell
+    #: and not one launch. The payload after this tag is an ordinary program
+    #: event, which _decode_program_event already knows how to read.
+    ANCHOR_CPI_EVENT = bytes.fromhex("e445a52e51cb9a1d")
     CREATE_EVENT = bytes((27, 114, 169, 77, 222, 235, 99, 118))
     TRADE_EVENT = bytes((189, 219, 127, 211, 78, 230, 97, 238))
     COMPLETE_EVENT = bytes((95, 114, 97, 156, 212, 46, 152, 8))
@@ -768,10 +775,12 @@ class PumpFunMonitor:
         unmatched = dict(sorted(self.unmatched.items(),
                                 key=lambda item: item[1], reverse=True)[:12])
         return {
-            "status": ("OK" if self.matched.get("create") or
+            "status": ("OK" if self.matched.get("token_created") or
+                       self.matched.get("create") or
                        self.matched.get("create_v2") else
                        "DEGRADED" if self.matched else "DATA_BLOCKED"),
-            "detail": ("" if self.matched.get("create") or
+            "detail": ("" if self.matched.get("token_created") or
+                       self.matched.get("create") or
                        self.matched.get("create_v2") else
                        "instructions decode but no creation has been named; "
                        "if unmatched prefixes appear below, one of them is "
@@ -878,6 +887,30 @@ class PumpFunMonitor:
                     continue
                 program = keys[program_index]
                 if program != self.PUMP_FUN_PROGRAM:
+                    continue
+                if data[:8] == self.ANCHOR_CPI_EVENT:
+                    self.matched["cpi_event"] = self.matched.get("cpi_event", 0) + 1
+                    event = self._decode_program_event(data[8:], signature, slot)
+                    if event:
+                        kind = str(event.get("type", "") or "cpi_event")
+                        self.matched[kind] = self.matched.get(kind, 0) + 1
+                        if kind == "token_created" and event.get("creator"):
+                            transfers = extract_system_transfers(keys, instructions)
+                            event["funding_transfers"] = transfers
+                            event["funding_wallets"] = sorted({
+                                item["from"] for item in transfers
+                                if item["to"] == event["creator"]
+                                and item["from"] != event["creator"]
+                            })
+                        apply_event_timing(event, tx_data, received_ns)
+                        enrich_trade_balances(event, tx_data, keys)
+                        result = self.callback(event)
+                        if asyncio.iscoroutine(result):
+                            await result
+                    else:
+                        prefix = data[8:16].hex()
+                        self.unmatched[f"cpi:{prefix}"] = (
+                            self.unmatched.get(f"cpi:{prefix}", 0) + 1)
                     continue
                 name = self.DISCRIMINATORS.get(data[:8])
                 if not name:

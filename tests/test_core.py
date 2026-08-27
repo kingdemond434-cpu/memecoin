@@ -16757,3 +16757,61 @@ class TestTheDecoderSaysWhatItCannotName(unittest.TestCase):
     def test_status_exposes_it(self):
         source = inspect.getsource(MemecoinQuantDesk.readiness)
         self.assertIn("decoder_report()", source)
+
+
+class TestCreationsArriveAsAnchorCpiEvents(unittest.IsolatedAsyncioTestCase):
+    """Pump.fun emits via `emit_cpi!`, so CreateEvent is an inner instruction
+    behind Anchor's event tag -- never a top-level `create`."""
+
+    def _create_payload(self, mint=b"M" * 32, curve=b"C" * 32,
+                        user=b"U" * 32, creator=b"D" * 32):
+        from src.chains.yellowstone_grpc import PumpFunMonitor
+        body = b""
+        for text in (b"Doge", b"DOGE", b"ipfs://x"):
+            body += struct.pack("<I", len(text)) + text
+        body += mint + curve + user + creator + struct.pack("<q", 1_700_000_000)
+        return PumpFunMonitor.CREATE_EVENT + body
+
+    def _monitor(self, sink):
+        from src.chains.yellowstone_grpc import PumpFunMonitor, YellowstoneClient
+        return PumpFunMonitor(YellowstoneClient("https://x"), sink)
+
+    def test_the_anchor_tag_is_the_one_seen_on_chain(self):
+        from src.chains.yellowstone_grpc import PumpFunMonitor
+        self.assertEqual(PumpFunMonitor.ANCHOR_CPI_EVENT.hex(), "e445a52e51cb9a1d")
+
+    def test_a_wrapped_create_event_decodes_into_token_created(self):
+        from src.chains.yellowstone_grpc import PumpFunMonitor
+        seen = []
+        monitor = self._monitor(lambda event: seen.append(event))
+        wrapped = PumpFunMonitor.ANCHOR_CPI_EVENT + self._create_payload()
+        event = monitor._decode_program_event(wrapped[8:], "sig", 42)
+        self.assertIsNotNone(event)
+        self.assertEqual(event["type"], "token_created")
+        self.assertEqual(event["name"], "Doge")
+        self.assertEqual(event["symbol"], "DOGE")
+        self.assertTrue(event["creator"])
+
+    def test_the_transaction_path_routes_the_wrapper_to_the_event_decoder(self):
+        source = inspect.getsource(
+            __import__("src.chains.yellowstone_grpc",
+                       fromlist=["x"]).PumpFunMonitor._on_transaction)
+        self.assertIn("self.ANCHOR_CPI_EVENT", source)
+        self.assertIn("self._decode_program_event(data[8:]", source)
+        # And it must be checked BEFORE the top-level discriminator lookup,
+        # or the wrapper is filed as an unknown prefix and dropped.
+        self.assertLess(source.index("ANCHOR_CPI_EVENT"),
+                        source.index("self.DISCRIMINATORS.get"))
+
+    def test_an_unknown_wrapped_event_is_counted_by_its_inner_prefix(self):
+        from src.chains.yellowstone_grpc import PumpFunMonitor
+        monitor = self._monitor(lambda event: None)
+        # Wrapper we understand, inner event we do not.
+        monitor.unmatched[f"cpi:{'ab' * 8}"] = 1
+        report = monitor.decoder_report()
+        self.assertIn(f"cpi:{'ab' * 8}", report["unmatched_prefixes"])
+
+    def test_the_report_reads_ok_once_creations_are_named_via_cpi(self):
+        monitor = self._monitor(lambda event: None)
+        monitor.matched = {"cpi_event": 9, "token_created": 4, "buy": 30}
+        self.assertEqual(monitor.decoder_report()["status"], "OK")
