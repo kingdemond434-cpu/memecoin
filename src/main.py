@@ -119,6 +119,7 @@ from src.strategies.wallet_value import FollowOutcome
 from src.strategies.t0_kernel import SurvivalInputs, T0Kernel
 from src.strategies.funder_ancestry import FunderAncestry, compress_independence
 from src.execution.staged_exits import StagedExits
+from src.strategies.disagreement import DisagreementModel, views_from_intelligence
 
 logger = logging.getLogger(__name__)
 
@@ -282,6 +283,12 @@ class MemecoinQuantDesk:
         # execute an exit but has not run setup is a shape the tests build and
         # the runtime can reach during teardown.
         self.state_sequencer = StateSequencer()
+        # Disagreement across the desk's independent views, as a sizing
+        # multiplier rather than a veto.
+        self.disagreement = DisagreementModel(
+            min_views=int(self.global_config.get("disagreement_min_views", 3)),
+            floor=float(self.global_config.get("disagreement_floor", 0.25)),
+            sensitivity=float(self.global_config.get("disagreement_sensitivity", 3.0)))
         # Exit instructions built before they are needed. Everything expensive
         # about a sell is independent of the amount, so the escape path should
         # never pay for account derivation at the moment it fires.
@@ -1065,8 +1072,15 @@ class MemecoinQuantDesk:
             trade_info = admission
             should_trade = False
         else:
+            # How much the desk's independent views of this launch scatter.
+            # A contested launch is a smaller position, not a rejected one --
+            # and a launch every view calls good gets full size, which is the
+            # ordering a majority vote gets exactly backwards.
+            disagreement = self._read_disagreement(token, candidate, prediction,
+                                                   liquidity)
             trade_info = self.elogw_engine.size_candidate(
-                prediction, self.sol_price_usd, liquidity)
+                prediction, self.sol_price_usd, liquidity,
+                disagreement=disagreement)
             has_room, room = self.elogw_engine.portfolio_room(trade_info)
             if not has_room:
                 trade_info = {**trade_info, **room}
@@ -3069,6 +3083,46 @@ class MemecoinQuantDesk:
             "recent_divergences": list(self._mark_divergences),
             "status": "OK" if self._marks_local else "DATA_BLOCKED",
         }
+
+    def _read_disagreement(self, token: str, candidate: Any, prediction: Any,
+                           liquidity: float):
+        """Dispersion across the desk's own readings of this launch.
+
+        Assembled from the reports the desk already produces rather than by
+        re-running the models: a second set of calls would be a second set of
+        answers, and two views of one model disagreeing with itself is not
+        disagreement.
+        """
+        intelligence: Dict[str, Any] = {}
+        try:
+            intelligence["actor"] = self.actor_intelligence(token, liquidity)
+        except Exception as exc:
+            logger.debug("actor view unavailable for %s: %s", token, exc)
+        hazard = self.rug_hazard.get_hazard(token)
+        if hazard is not None:
+            intelligence["hazard"] = {"status": hazard.data_status,
+                                      "hazard_30s": hazard.hazard_30s}
+        monster = getattr(prediction, "monster_probability", None)
+        if monster is not None:
+            intelligence["monster"] = {"status": "OK", "probability": monster}
+        events = self._source_events.get(token) or []
+        if events:
+            credibility = [float(getattr(item, "credibility", 0.0) or 0.0)
+                           for item in events
+                           if getattr(item, "credibility", None) is not None]
+            if credibility:
+                intelligence["source"] = {"status": "OK",
+                                          "credibility": max(credibility)}
+        probe = {"size_tokens": 0}
+        status, ratio = self._exit_capacity(token, probe)
+        intelligence["capacity"] = {
+            "status": "OK" if str(status).startswith("OK") else "DATA_BLOCKED",
+            "ratio": ratio}
+        reading = self.disagreement.read(views_from_intelligence(intelligence))
+        if reading.ok and reading.sigma > 0:
+            logger.debug("DISAGREEMENT %s sigma=%.3f shrink=%.2f (%s)",
+                         token, reading.sigma, reading.shrink, reading.detail)
+        return reading
 
     def _stage_exits(self, token: str, position: Dict[str, Any]) -> Optional[Any]:
         """Build the exit ladder for a position the moment it opens.

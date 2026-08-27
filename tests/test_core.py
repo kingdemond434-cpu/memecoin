@@ -68,6 +68,9 @@ from src.collectors.adapters import (
 from src.collectors.event_source import (
     Event, EventSource, SourceClass, SourceMesh, SourceState,
 )
+from src.strategies.disagreement import (
+    DisagreementModel, DisagreementReading, View, views_from_intelligence,
+)
 from src.execution.staged_exits import (
     StagedExits, StagedLadder, StagedRung,
 )
@@ -11849,6 +11852,149 @@ class TestExitsArePreparedBeforeTheyAreNeeded(unittest.TestCase):
         self.assertIn("self.staged_exits.release(token)", source)
         # And the exit path reaches for the rung before submitting.
         self.assertIn("rung, staged_status = self.staged_exits.take(", source)
+
+
+class TestDisagreementShrinksRatherThanVetoes(unittest.TestCase):
+    """A vote discards the information in the disagreement.
+
+    It also produces the same size whether the views were unanimous or barely
+    carried -- so the position is largest precisely where the evidence is most
+    contested, because the bullish views are loudest there.
+    """
+
+    def _views(self, *values, weight=1.0):
+        return [View(name=f"v{index}", value=value, weight=weight)
+                for index, value in enumerate(values)]
+
+    def test_unanimity_costs_nothing(self):
+        reading = DisagreementModel().read(self._views(0.8, 0.8, 0.8, 0.8))
+        self.assertTrue(reading.ok)
+        self.assertEqual(reading.sigma, 0.0)
+        self.assertEqual(reading.shrink, 1.0)
+
+    def test_scattered_views_shrink_the_bet(self):
+        model = DisagreementModel()
+        tight = model.read(self._views(0.6, 0.65, 0.6, 0.62))
+        loose = model.read(self._views(0.05, 0.95, 0.1, 0.9))
+        self.assertGreater(loose.sigma, tight.sigma)
+        self.assertLess(loose.shrink, tight.shrink)
+        self.assertLess(loose.shrink, 0.5)
+
+    def test_nothing_is_rejected_for_disagreeing(self):
+        """A contested launch is a smaller position, not an abandoned one."""
+        reading = DisagreementModel().read(self._views(0.0, 1.0, 0.0, 1.0))
+        self.assertTrue(reading.ok)
+        self.assertGreaterEqual(reading.shrink, DisagreementModel().floor)
+        self.assertGreater(reading.shrink, 0.0)
+
+    def test_unanimous_pessimism_is_agreement_not_disagreement(self):
+        """Level belongs to Q. This measures dispersion."""
+        reading = DisagreementModel().read(self._views(0.05, 0.05, 0.05, 0.05))
+        self.assertEqual(reading.shrink, 1.0)
+        self.assertLess(reading.mean, 0.1)
+
+    def test_silence_is_not_consent(self):
+        """A desk with five broken models must not trade on six confirmations."""
+        views = [View(name="a", value=0.9),
+                 View(name="b", value=None, status="DATA_BLOCKED"),
+                 View(name="c", value=None, status="DATA_BLOCKED"),
+                 View(name="d", value=None, status="DATA_BLOCKED")]
+        reading = DisagreementModel(min_views=3).read(views)
+        self.assertEqual(reading.status, "DATA_BLOCKED")
+        self.assertEqual(reading.participating, 1)
+        self.assertEqual(reading.absent, 3)
+        # And a blocked reading changes nothing about size.
+        self.assertEqual(reading.shrink, 1.0)
+
+    def test_a_weightier_view_moves_the_mean_more(self):
+        model = DisagreementModel(min_views=2)
+        light = model.read([View("a", 0.0, weight=1.0), View("b", 1.0, weight=1.0),
+                            View("c", 0.5, weight=1.0)])
+        heavy = model.read([View("a", 0.0, weight=5.0), View("b", 1.0, weight=1.0),
+                            View("c", 0.5, weight=1.0)])
+        self.assertGreater(light.mean, heavy.mean)
+
+    def test_the_widest_pair_is_named(self):
+        """'The models disagree' is not actionable."""
+        reading = DisagreementModel().read([
+            View("monster", 0.95), View("actor", 0.6), View("distribution", 0.05)])
+        self.assertIn(reading.widest[0], {"monster", "distribution"})
+        self.assertIn(reading.widest[1], {"monster", "distribution"})
+        self.assertAlmostEqual(reading.widest[2], 0.9)
+
+    def test_the_shrink_is_floored_rather_than_reaching_zero(self):
+        """A shrink that could reach zero would be a second veto competing
+        with the objective."""
+        model = DisagreementModel(floor=0.3, sensitivity=50.0)
+        self.assertAlmostEqual(model.shrink_for(10.0), 0.3, places=6)
+        self.assertEqual(model.shrink_for(0.0), 1.0)
+
+    def test_shrink_falls_monotonically_in_dispersion(self):
+        model = DisagreementModel()
+        previous = 1.0
+        for sigma in (0.0, 0.05, 0.1, 0.2, 0.4, 0.5):
+            current = model.shrink_for(sigma)
+            self.assertLessEqual(current, previous)
+            previous = current
+
+    def test_danger_readings_are_flipped_to_the_bullish_scale(self):
+        """Two models saying the same thing in opposite units would otherwise
+        look like the widest disagreement in the set."""
+        views = {view.name: view for view in views_from_intelligence({
+            "monster": {"status": "OK", "probability": 0.1},
+            "hazard": {"status": "OK", "hazard_30s": 0.9},
+            "distribution": {"status": "OK", "probability": 0.9},
+        })}
+        # All three are saying "bad"; on the common scale they agree.
+        self.assertAlmostEqual(views["monster"].value, 0.1)
+        self.assertAlmostEqual(views["rug"].value, 0.1)
+        self.assertAlmostEqual(views["distribution"].value, 0.1)
+        reading = DisagreementModel().read(list(views.values()))
+        self.assertEqual(reading.shrink, 1.0)
+
+    def test_an_absent_report_becomes_an_absent_view_not_a_zero(self):
+        views = {view.name: view for view in views_from_intelligence({})}
+        self.assertTrue(all(not view.participates for view in views.values()))
+        self.assertTrue(all(view.value is None for view in views.values()))
+
+    def _engine(self):
+        engine = ElogwEngine(MultiHeadPredictor())
+        # Sizing is a fraction OF something; with no book every size is zero
+        # and the test would pass on two zeros.
+        engine.portfolio_value = 10_000.0
+        return engine
+
+    def test_sizing_shrinks_and_says_what_shrank_it(self):
+        engine = self._engine()
+        prediction = MultiHeadPrediction(token="t", chain="solana", timestamp=0.0)
+        for target, _multiple in SURVIVAL_LEVELS:
+            setattr(prediction, target.value, 0.4)
+        prediction.p_rug_30s = prediction.p_rug_5m = 0.05
+        prediction.expected_feasible_multiple = 5.0
+        plain = engine.size_candidate(prediction, 150.0, 100_000.0)
+        contested = engine.size_candidate(
+            prediction, 150.0, 100_000.0,
+            disagreement=DisagreementModel().read(
+                [View("a", 0.0), View("b", 1.0), View("c", 0.5)]))
+        self.assertEqual(plain["disagreement_shrink"], 1.0)
+        self.assertLess(contested["disagreement_shrink"], 1.0)
+        self.assertLess(contested["position_size_sol"], plain["position_size_sol"])
+        self.assertLess(contested["kelly_fraction"], plain["kelly_fraction"])
+        # And the reading travels with the sizing for the forward ledger.
+        self.assertIsNotNone(contested["disagreement"])
+
+    def test_a_blocked_reading_leaves_sizing_untouched(self):
+        engine = self._engine()
+        prediction = MultiHeadPrediction(token="t", chain="solana", timestamp=0.0)
+        for target, _multiple in SURVIVAL_LEVELS:
+            setattr(prediction, target.value, 0.4)
+        prediction.p_rug_30s = prediction.p_rug_5m = 0.05
+        prediction.expected_feasible_multiple = 5.0
+        blocked = DisagreementModel(min_views=5).read([View("a", 0.5)])
+        self.assertEqual(
+            engine.size_candidate(prediction, 150.0, 100_000.0,
+                                  disagreement=blocked)["position_size_sol"],
+            engine.size_candidate(prediction, 150.0, 100_000.0)["position_size_sol"])
 
 class TestPumpSwapConstruction(unittest.TestCase):
     """The last DATA_BLOCKED that was never about missing information.

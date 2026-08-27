@@ -1010,15 +1010,29 @@ class ElogwEngine:
         prediction: MultiHeadPrediction,
         sol_price_usd: float,
         liquidity_usd: float,
+        disagreement: Optional[Any] = None,
     ) -> Dict:
         """The size a candidate would take, and what that size is worth.
 
         Separate from admissibility and from Q. Sizing owns how much; Q owns
         whether. Fusing them is what let a Kelly hurdle quietly become the
         entry policy.
+
+        ``disagreement`` shrinks the size when the desk's independent views of
+        this launch scatter. The growth-optimal fraction falls in PARAMETER
+        uncertainty as well as in outcome uncertainty, and a contested launch
+        is exactly a case where the mean is uncertain. Nothing is rejected for
+        being contested -- it is sized smaller, which is the ordering a vote
+        gets backwards: a vote produces full size whether the views were
+        unanimous or barely carried.
         """
         elogw, fraction, size_sol = self.calculate_expected_log_growth(
             prediction, sol_price_usd, liquidity_usd)
+        shrink = 1.0
+        if disagreement is not None and getattr(disagreement, "ok", False):
+            shrink = float(getattr(disagreement, "shrink", 1.0))
+            fraction *= shrink
+            size_sol *= shrink
         position_value = size_sol * sol_price_usd
         p_rug = max(prediction.p_rug_30s, prediction.p_rug_5m)
         return {
@@ -1032,6 +1046,13 @@ class ElogwEngine:
             "p_rug": p_rug,
             "probability_bins": self.probability_bins(prediction),
             "drawdown_aversion_lambda": self.drawdown_aversion_lambda,
+            # Recorded on the sizing, not only in the log: a position that was
+            # halved deserves to say what halved it, and the forward ledger
+            # needs it to ask whether shrinking was right.
+            "disagreement_shrink": shrink,
+            "disagreement": (disagreement.to_dict()
+                             if disagreement is not None
+                             and hasattr(disagreement, "to_dict") else None),
         }
 
     def portfolio_room(self, sized: Dict) -> Tuple[bool, Dict]:
