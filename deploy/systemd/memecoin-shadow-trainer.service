@@ -1,5 +1,5 @@
 [Unit]
-Description=Chronological memecoin shadow and rug-hazard training
+Description=Chronological memecoin shadow, rug-hazard, and exit-policy training
 After=memecoin-shadow.service
 
 [Service]
@@ -10,9 +10,10 @@ Environment=ALLOW_LIVE_TRADING=
 Environment=SOLANA_PRIVATE_KEY=
 ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.research.shadow_trainer --storage data/launch_episodes --model-dir models --min-samples 250
 ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.research.hazard_trainer --storage data/launch_episodes --model-dir models --min-rows 250
+ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.research.exit_policy_trainer
 NoNewPrivileges=true
 PrivateTmp=true
 UMask=0077
-MemoryMax=1024M
+MemoryMax=1536M
 CPUQuota=100%
 Nice=10

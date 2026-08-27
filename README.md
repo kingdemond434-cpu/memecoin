@@ -292,9 +292,9 @@ mainnet slot `441417557` exercises the same Pump.fun inner-instruction decoder
 used live.
 
 On a Dockerless VPS, `memecoin-shadow-user.service` runs the collector as an
-isolated user service. `memecoin-shadow-train.timer` invokes the strict
-chronological multi-head trainer and the rug-hazard calibration trainer every
-six hours. Insufficient samples, class coverage, or OOS E[log W] remain
+isolated user service. `memecoin-shadow-trainer.timer` invokes the strict
+chronological multi-head, rug-hazard calibration, and learned exit-policy
+trainers hourly. Insufficient samples, class coverage, or OOS E[log W] remain
 `DATA_BLOCKED`/`REJECTED`; only passed artifacts are loaded into forward
 dry-run shadow evaluation. The hazard calibration trainer only fits on the
 leakage-free half of the hazard signal set (trade flow, liquidity, route,
