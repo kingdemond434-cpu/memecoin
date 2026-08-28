@@ -43,11 +43,15 @@ systemctl --user stop memecoin-shadow.service 2>/dev/null || true
 # reinstall. Losing them silently un-configures the source mesh and empties
 # the entity registry, and the desk would keep running and report less
 # coverage without anything saying why.
-rsync -a --delete \
-  --exclude 'data/' --exclude '.git/' --exclude '.venv/' \
-  --exclude 'config/*.verified.yaml' \
-  --exclude 'native/solana_fastpath/target/' \
-  "$SOURCE/" "$ROOT/"
+if [ "$(readlink -f "$SOURCE")" != "$(readlink -f "$ROOT")" ]; then
+  rsync -a --delete \
+    --exclude 'data/' --exclude '.git/' --exclude '.venv/' \
+    --exclude 'config/*.verified.yaml' \
+    --exclude 'native/solana_fastpath/target/' \
+    "$SOURCE/" "$ROOT/"
+else
+  echo "source is the installed checkout; preserving it in place"
+fi
 mkdir -p "$ROOT/data/state" "$ROOT/models"
 
 if [ ! -x "$ROOT/.venv/bin/python" ]; then
