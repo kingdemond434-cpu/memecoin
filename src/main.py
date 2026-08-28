@@ -480,12 +480,15 @@ class MemecoinQuantDesk:
         self.dry_run = configured_dry_run if self.dry_run_override is None else bool(self.dry_run_override)
         await self._setup_keys()
         await self._setup_chains()
-        await self._setup_yellowstone()
         await self._setup_intelligence()
         await self._setup_prediction()
         await self._setup_execution()
         await self._setup_detection_and_risk()
         await self._setup_research()
+        # Connect event producers last. Yellowstone can deliver immediately
+        # after subscribe; connecting it before the portfolio, actor graph and
+        # PIT lake existed sent real transactions into a half-built desk.
+        await self._setup_yellowstone()
         await self._refresh_portfolio_state()
         logger.info("Desk initialized: mode=%s live_submission_locked=%s", "DRY_RUN" if self.dry_run else "LIVE",
                     os.getenv("ALLOW_LIVE_TRADING", "").lower() != "yes-i-understand")
@@ -541,10 +544,12 @@ class MemecoinQuantDesk:
             self.yellowstone.status = "DATA_BLOCKED"
             self.yellowstone.status_detail = "YELLOWSTONE_GRPC_URL is missing; RPC fallback enabled"
         if connected:
-            await self.yellowstone.subscribe(create_combined_subscription())
             self.pump_monitor = PumpFunMonitor(self.yellowstone, self._on_pump_event)
             self.pump_swap_monitor = PumpSwapMonitor(self.yellowstone, self._on_pump_event)
             self.raydium_monitor = RaydiumMonitor(self.yellowstone, self._on_raydium_event)
+            # Register every decoder before the stream task can dispatch its
+            # first response. Subscription starts the receive task.
+            await self.yellowstone.subscribe(create_combined_subscription())
         elif not self.offline:
             self.rpc_program_stream = SolanaRpcProgramStream(
                 self.solana_rpc, [PumpFunMonitor.PUMP_FUN_PROGRAM, PumpSwapMonitor.PUMP_AMM_PROGRAM,
@@ -555,6 +560,7 @@ class MemecoinQuantDesk:
             self.pump_monitor = PumpFunMonitor(self.rpc_program_stream, self._on_pump_event)
             self.pump_swap_monitor = PumpSwapMonitor(self.rpc_program_stream, self._on_pump_event)
             self.raydium_monitor = RaydiumMonitor(self.rpc_program_stream, self._on_raydium_event)
+            await self.rpc_program_stream.start()
 
     async def _setup_intelligence(self):
         helius = os.getenv("HELIUS_API_KEY", "")
@@ -957,10 +963,6 @@ class MemecoinQuantDesk:
             started = await self.data_miners.start()
             logger.info("DATA MINERS %d runnable of %d declared",
                         started, len(self.miner_registration))
-            # Event callbacks write to the PIT builder, hazard tracker, and
-            # research graphs. Start the stream only after all consumers exist.
-            if self.rpc_program_stream:
-                await self.rpc_program_stream.start()
 
     async def start(self):
         if self.offline:

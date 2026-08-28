@@ -2089,6 +2089,34 @@ class TestHazardTrainer(unittest.IsolatedAsyncioTestCase):
 
 
 class TestApplicationStartup(unittest.IsolatedAsyncioTestCase):
+    async def test_chain_event_producers_connect_after_every_consumer(self):
+        desk = MemecoinQuantDesk(dry_run_override=True, offline=True)
+        calls = []
+
+        def step(name):
+            async def run():
+                calls.append(name)
+            return run
+
+        ordered = (
+            "_setup_keys", "_setup_chains", "_setup_intelligence",
+            "_setup_prediction", "_setup_execution",
+            "_setup_detection_and_risk", "_setup_research",
+            "_setup_yellowstone", "_refresh_portfolio_state",
+        )
+        patches = [patch.object(desk, name, new=step(name)) for name in ordered]
+        for replacement in patches:
+            replacement.start()
+        try:
+            await desk.initialize()
+        finally:
+            for replacement in reversed(patches):
+                replacement.stop()
+
+        self.assertEqual(calls, list(ordered))
+        self.assertLess(calls.index("_setup_research"),
+                        calls.index("_setup_yellowstone"))
+
     def test_market_observation_cohort_is_bounded_and_stable(self):
         desk = MemecoinQuantDesk()
         desk.global_config = {"market_observation_cohort_size": 2}
