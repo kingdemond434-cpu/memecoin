@@ -33,6 +33,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -42,6 +43,24 @@ from src.collectors import adapters
 logger = logging.getLogger(__name__)
 
 REGISTRY_SCHEMA_VERSION = "v1"
+
+# Successful-poll cadence by transport. Push/stream adapters merely drain a
+# local queue and stay sub-second; remote HTTP/RSS endpoints are not hammered
+# once per second. Per-source YAML can override these measurements.
+DEFAULT_POLL_INTERVALS: Dict[str, float] = {
+    "telegram": 0.10,
+    "bluesky": 0.05,
+    "nostr": 0.05,
+    "discord": 0.10,
+    "youtube": 0.25,
+    "twitch": 0.25,
+    "farcaster": 10.0,
+    "mastodon": 15.0,
+    "rss": 60.0,
+    "official_site": 60.0,
+    "metadata": 30.0,
+    "code_repo": 300.0,
+}
 
 #: Declaration kind -> adapter factory. Every factory takes (source_id, fetch)
 #: plus its own keywords, so a new kind is one entry here.
@@ -59,6 +78,31 @@ ADAPTER_KINDS: Dict[str, Callable[..., EventSource]] = {
     "code_repo": adapters.code_repository_source,
     "metadata": adapters.metadata_artifact_source,
 }
+
+
+def _adapter_options(declaration: "SourceDeclaration") -> Dict[str, Any]:
+    """Translate declaration metadata to normaliser options.
+
+    A declaration's ``options`` primarily configure its network transport
+    (URL, relay, repository, instance).  Adapter factories normalise records
+    already fetched by that transport and intentionally do not accept those
+    connection parameters.  Passing the whole mapping made every real RSS,
+    Mastodon, Nostr and repository transport look like ``NO_FETCHER`` even
+    while it was running.  Keep the two interfaces explicit.
+    """
+    options = declaration.options
+    if declaration.kind == "rss":
+        return {"language": declaration.language}
+    if declaration.kind == "telegram":
+        return {"channel": str(options.get("channel", ""))}
+    if declaration.kind == "discord":
+        return {"guild": str(options.get("guild", ""))}
+    if declaration.kind == "official_site":
+        domain = str(options.get("domain", "")).strip()
+        if not domain:
+            domain = (urlsplit(str(options.get("url", ""))).hostname or "").lower()
+        return {"domain": domain}
+    return {}
 
 
 class DeclarationState(Enum):
@@ -337,9 +381,11 @@ def build_sources(
                 source.degraded_after_seconds = declaration.degraded_after_seconds
             if declaration.dead_after_seconds is not None:
                 source.dead_after_seconds = declaration.dead_after_seconds
-            if declaration.poll_interval_seconds is not None:
-                source.poll_interval_seconds = max(
-                    0.01, float(declaration.poll_interval_seconds))
+            source.poll_interval_seconds = max(
+                0.01, float(
+                    declaration.poll_interval_seconds
+                    if declaration.poll_interval_seconds is not None
+                    else DEFAULT_POLL_INTERVALS.get(declaration.kind, 30.0)))
             sources.append(source)
         except TypeError as exc:
             mark(DeclarationState.NO_FETCHER, f"adapter rejected its options: {exc}")

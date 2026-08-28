@@ -185,8 +185,14 @@ class EventSource(ABC):
             events = await self.poll()
         except Exception as exc:
             self._consecutive_failures += 1
-            logger.warning("source %s poll failed (%d consecutive): %s",
-                           self.source_id, self._consecutive_failures, exc)
+            # Keep the first failures loud, then log powers of two. A broken
+            # endpoint polled forever must not turn the research log into a
+            # denial of service or hide failures from healthy sources.
+            failures = self._consecutive_failures
+            emit_warning = failures <= 3 or failures & (failures - 1) == 0
+            log = logger.warning if emit_warning else logger.debug
+            log("source %s poll failed (%d consecutive): %s",
+                self.source_id, failures, exc)
             return []
         self._consecutive_failures = 0
         self._last_poll_ok_at = now
@@ -220,6 +226,20 @@ class EventSource(ABC):
                     f"(degraded at {self.degraded_after_seconds:.0f}s, "
                     f"dead at {self.dead_after_seconds:.0f}s, "
                     f"{self._timeouts} timeouts)"))
+
+    def retry_delay(self, elapsed_seconds: float = 0.0,
+                    max_backoff_seconds: float = 300.0) -> float:
+        """Next cadence, with bounded exponential backoff after failures."""
+        base = max(0.01, float(self.poll_interval_seconds))
+        if self._consecutive_failures:
+            # A 1s feed backs off 1,2,4,... seconds. A 5m repository
+            # remains at its declared cadence and never retries faster merely
+            # because the previous request failed.
+            exponent = min(max(0, self._consecutive_failures - 1), 12)
+            interval = min(max_backoff_seconds, max(base, 1.0) * (2 ** exponent))
+        else:
+            interval = base
+        return max(0.0, interval - max(0.0, float(elapsed_seconds)))
 
 
 class SourceMesh:
@@ -304,14 +324,13 @@ class SourceMesh:
         first -- and the barrier applied on every cycle, not just slow ones.
         A producer per source means a slow source is slow by itself.
         """
-        interval = max(0.01, float(getattr(source, "poll_interval_seconds", 1.0)))
         while self._running:
             started = time.time()
             events = await self._collect_one(source, started)
             for event in events:
                 self._publish(event, time.time())
             elapsed = time.time() - started
-            await asyncio.sleep(max(0.0, interval - elapsed))
+            await asyncio.sleep(source.retry_delay(elapsed))
 
     def _publish(self, event: Event, now: float) -> None:
         """Put one event on the fan-in queue, dropping the oldest when full.

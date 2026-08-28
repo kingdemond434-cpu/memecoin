@@ -7,8 +7,8 @@
 pub mod curve;
 pub mod decide;
 pub mod filter;
-pub mod helpers;
 pub mod generated_flags;
+pub mod helpers;
 pub mod instruction;
 pub mod policy;
 pub mod pumpswap;

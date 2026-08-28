@@ -273,7 +273,10 @@ mod tests {
         let mut done = curve();
         done.complete = true;
         assert!(!done.tradeable());
-        assert_eq!(done.quote_buy(1_000_000, LEGACY_FEE_BPS), Err(QuoteError::CurveCompleteOrEmpty));
+        assert_eq!(
+            done.quote_buy(1_000_000, LEGACY_FEE_BPS),
+            Err(QuoteError::CurveCompleteOrEmpty)
+        );
     }
 
     #[test]
@@ -301,7 +304,9 @@ mod tests {
 
     #[test]
     fn a_sell_cannot_exceed_real_sol_reserves() {
-        let quote = curve().quote_sell(900_000_000_000_000, LEGACY_FEE_BPS).unwrap();
+        let quote = curve()
+            .quote_sell(900_000_000_000_000, LEGACY_FEE_BPS)
+            .unwrap();
         assert!(quote.output_amount + quote.fee_amount <= curve().real_sol_reserves);
     }
 
@@ -324,7 +329,12 @@ mod tests {
         let size = c.sell_capacity(500, LEGACY_FEE_BPS);
         assert!(c.quote_sell(size, LEGACY_FEE_BPS).unwrap().price_impact_bps <= 500);
         // And one unit past it does not.
-        assert!(c.quote_sell(size + 1, LEGACY_FEE_BPS).unwrap().price_impact_bps > 500);
+        assert!(
+            c.quote_sell(size + 1, LEGACY_FEE_BPS)
+                .unwrap()
+                .price_impact_bps
+                > 500
+        );
     }
 
     #[test]
@@ -332,19 +342,30 @@ mod tests {
         let c = curve();
         // A tiny sell reports outsized impact purely from quantisation; the
         // frontier must not conclude from it that nothing is executable.
-        assert!(c.quote_sell(1, LEGACY_FEE_BPS).is_err()
-            || c.quote_sell(1, LEGACY_FEE_BPS).unwrap().price_impact_bps > 100);
+        assert!(
+            c.quote_sell(1, LEGACY_FEE_BPS).is_err()
+                || c.quote_sell(1, LEGACY_FEE_BPS).unwrap().price_impact_bps > 100
+        );
         assert!(c.sell_capacity(100, LEGACY_FEE_BPS) > 1_000_000);
     }
 
     #[test]
     fn zero_input_is_rejected_on_both_sides() {
-        assert_eq!(curve().quote_buy(0, LEGACY_FEE_BPS), Err(QuoteError::NonPositiveInput));
-        assert_eq!(curve().quote_sell(0, LEGACY_FEE_BPS), Err(QuoteError::NonPositiveInput));
+        assert_eq!(
+            curve().quote_buy(0, LEGACY_FEE_BPS),
+            Err(QuoteError::NonPositiveInput)
+        );
+        assert_eq!(
+            curve().quote_sell(0, LEGACY_FEE_BPS),
+            Err(QuoteError::NonPositiveInput)
+        );
     }
 
     #[test]
     fn a_fee_that_consumes_the_input_is_rejected() {
-        assert_eq!(curve().quote_buy(10, 10_000), Err(QuoteError::ConsumedByFee));
+        assert_eq!(
+            curve().quote_buy(10, 10_000),
+            Err(QuoteError::ConsumedByFee)
+        );
     }
 }

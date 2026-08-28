@@ -8,6 +8,7 @@ below decides whether it would be justified.
 
 ```bash
 systemctl --user is-active memecoin-shadow.service
+systemctl --user is-active memecoin-watchdog.timer
 curl -s localhost:18080/health
 ```
 
@@ -35,6 +36,13 @@ a live one by accident.
 The status endpoint binds loopback. It serves the desk's whole interior --
 open positions, watched wallets, model reports -- so putting it on a public
 interface publishes all of that to anything that can reach the box.
+
+The watchdog persists its current state in
+`data/state/watchdog_state.json` and its action history in
+`data/state/watchdog_events.jsonl`. For intentional maintenance, create
+`data/state/maintenance.lock` before stopping the desk; the installer does
+this automatically. A five-minute cooldown and three-restarts-per-hour hard
+budget prevent provider failures from becoming restart storms.
 
 ## 2. Credentials and coverage
 

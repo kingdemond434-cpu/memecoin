@@ -3,6 +3,7 @@ Description=Memecoin shadow desk (DRY RUN, no live capital)
 Documentation=file:%h/.local/opt/memecoin-shadow/RUNBOOK.md
 After=network-online.target
 Wants=network-online.target
+OnFailure=memecoin-health-escalate.service
 # Not a crash loop. Five failures inside a minute means something restarting
 # will not fix, and hammering it buries the reason. These are [Unit]
 # directives -- under [Service] systemd silently ignores them, which is the
@@ -11,7 +12,10 @@ StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+WatchdogSec=90s
+TimeoutStartSec=120s
 WorkingDirectory=%h/.local/opt/memecoin-shadow
 EnvironmentFile=-%h/.config/memecoin-shadow/env
 
@@ -47,8 +51,11 @@ UMask=0077
 MemoryMax=4G
 CPUQuota=200%
 
-StandardOutput=append:%h/.local/opt/memecoin-shadow/data/state/shadow.log
-StandardError=append:%h/.local/opt/memecoin-shadow/data/state/shadow.log
+# Journald provides bounded rotation.  An append-only shadow.log grows without
+# limit and eventually stops the very evidence writes this service exists for.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=memecoin-shadow
 
 [Install]
 WantedBy=default.target

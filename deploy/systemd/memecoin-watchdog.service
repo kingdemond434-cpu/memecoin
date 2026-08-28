@@ -1,0 +1,23 @@
+[Unit]
+Description=Bounded self-healing for the memecoin shadow desk
+After=network-online.target
+Wants=network-online.target
+OnFailure=memecoin-health-escalate.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/opt/memecoin-shadow
+EnvironmentFile=-%h/.config/memecoin-shadow/env
+Environment=ALLOW_LIVE_TRADING=
+Environment=SOLANA_PRIVATE_KEY=
+ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m ops.watchdog --root %h/.local/opt/memecoin-shadow
+SuccessExitStatus=0 1
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=%h/.local/opt/memecoin-shadow/data
+UMask=0077
+MemoryMax=128M
+CPUQuota=20%
+Nice=15
+

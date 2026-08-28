@@ -185,6 +185,20 @@ global:
   shadow_max_total_exposure_pct: 0.50
   shadow_max_portfolio_risk: 0.10
   max_liquidity_fraction: 0.01
+  # Known veto facts always stop a trade. Owner-enriched concentration is
+  # still reported as unmeasured until the token-account owners are resolved;
+  # setting this true makes that optional enrichment itself mandatory.
+  require_complete_veto_inputs: false
+  max_veto_exit_impact_pct: 0.20
+  # A reporting definition, not an alpha threshold. Owner shares are summed
+  # from native SPL token accounts and kept as observed lower bounds.
+  holder_whale_supply_pct: 1.0
+  mutable_safety_refresh_seconds: 15
+  # Planning only. No module is allowed to sign a sweep transaction; a cold
+  # address and separate explicit authorization are still required.
+  profit_isolation_working_capital_usd: 10000
+  profit_isolation_trigger_usd: 1000
+  profit_isolation_fraction: 1.0
   min_liquidity_usd: 5000
   reject_data_blocked_safety_checks: true
   max_candidate_concurrency: 24

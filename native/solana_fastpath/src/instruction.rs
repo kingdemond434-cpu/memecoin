@@ -44,13 +44,25 @@ pub struct AccountMeta {
 
 impl AccountMeta {
     fn ro(pubkey: Pubkey) -> Self {
-        Self { pubkey, is_signer: false, is_writable: false }
+        Self {
+            pubkey,
+            is_signer: false,
+            is_writable: false,
+        }
     }
     fn rw(pubkey: Pubkey) -> Self {
-        Self { pubkey, is_signer: false, is_writable: true }
+        Self {
+            pubkey,
+            is_signer: false,
+            is_writable: true,
+        }
     }
     fn signer(pubkey: Pubkey, is_writable: bool) -> Self {
-        Self { pubkey, is_signer: true, is_writable }
+        Self {
+            pubkey,
+            is_signer: true,
+            is_writable,
+        }
     }
 }
 
@@ -187,7 +199,11 @@ pub fn build_buy_v2(accounts: &BuyAccounts, amount: u64, max_sol_cost: u64) -> I
     Instruction {
         program_id: accounts.program,
         accounts: metas,
-        data: encode_args(anchor_instruction_discriminator("buy_v2"), amount, max_sol_cost),
+        data: encode_args(
+            anchor_instruction_discriminator("buy_v2"),
+            amount,
+            max_sol_cost,
+        ),
     }
 }
 
@@ -228,7 +244,11 @@ pub fn build_sell_v2(accounts: &SellAccounts, amount: u64, min_sol_output: u64) 
     Instruction {
         program_id: accounts.program,
         accounts: metas,
-        data: encode_args(anchor_instruction_discriminator("sell_v2"), amount, min_sol_output),
+        data: encode_args(
+            anchor_instruction_discriminator("sell_v2"),
+            amount,
+            min_sol_output,
+        ),
     }
 }
 
@@ -242,34 +262,64 @@ mod tests {
 
     fn buy_accounts() -> BuyAccounts {
         BuyAccounts {
-            global: pk(1), base_mint: pk(2), quote_mint: pk(3),
-            base_token_program: pk(4), quote_token_program: pk(5),
-            associated_token_program: pk(6), fee_recipient: pk(7),
-            associated_quote_fee_recipient: pk(8), buyback_fee_recipient: pk(9),
-            associated_quote_buyback_fee_recipient: pk(10), bonding_curve: pk(11),
-            associated_base_bonding_curve: pk(12), associated_quote_bonding_curve: pk(13),
-            user: pk(14), associated_base_user: pk(15), associated_quote_user: pk(16),
-            creator_vault: pk(17), associated_creator_vault: pk(18), sharing_config: pk(19),
-            global_volume_accumulator: pk(20), user_volume_accumulator: pk(21),
-            associated_user_volume_accumulator: pk(22), fee_config: pk(23),
-            fee_program: pk(24), system_program: pk(25), event_authority: pk(26),
+            global: pk(1),
+            base_mint: pk(2),
+            quote_mint: pk(3),
+            base_token_program: pk(4),
+            quote_token_program: pk(5),
+            associated_token_program: pk(6),
+            fee_recipient: pk(7),
+            associated_quote_fee_recipient: pk(8),
+            buyback_fee_recipient: pk(9),
+            associated_quote_buyback_fee_recipient: pk(10),
+            bonding_curve: pk(11),
+            associated_base_bonding_curve: pk(12),
+            associated_quote_bonding_curve: pk(13),
+            user: pk(14),
+            associated_base_user: pk(15),
+            associated_quote_user: pk(16),
+            creator_vault: pk(17),
+            associated_creator_vault: pk(18),
+            sharing_config: pk(19),
+            global_volume_accumulator: pk(20),
+            user_volume_accumulator: pk(21),
+            associated_user_volume_accumulator: pk(22),
+            fee_config: pk(23),
+            fee_program: pk(24),
+            system_program: pk(25),
+            event_authority: pk(26),
             program: pk(27),
         }
     }
 
     fn sell_accounts() -> SellAccounts {
         SellAccounts {
-            global: pk(1), base_mint: pk(2), quote_mint: pk(3),
-            base_token_program: pk(4), quote_token_program: pk(5),
-            associated_token_program: pk(6), fee_recipient: pk(7),
-            associated_quote_fee_recipient: pk(8), buyback_fee_recipient: pk(9),
-            associated_quote_buyback_fee_recipient: pk(10), bonding_curve: pk(11),
-            associated_base_bonding_curve: pk(12), associated_quote_bonding_curve: pk(13),
-            user: pk(14), associated_base_user: pk(15), associated_quote_user: pk(16),
-            creator_vault: pk(17), associated_creator_vault: pk(18), sharing_config: pk(19),
-            user_volume_accumulator: pk(20), associated_user_volume_accumulator: pk(21),
-            fee_config: pk(22), fee_program: pk(23), system_program: pk(24),
-            event_authority: pk(25), program: pk(26),
+            global: pk(1),
+            base_mint: pk(2),
+            quote_mint: pk(3),
+            base_token_program: pk(4),
+            quote_token_program: pk(5),
+            associated_token_program: pk(6),
+            fee_recipient: pk(7),
+            associated_quote_fee_recipient: pk(8),
+            buyback_fee_recipient: pk(9),
+            associated_quote_buyback_fee_recipient: pk(10),
+            bonding_curve: pk(11),
+            associated_base_bonding_curve: pk(12),
+            associated_quote_bonding_curve: pk(13),
+            user: pk(14),
+            associated_base_user: pk(15),
+            associated_quote_user: pk(16),
+            creator_vault: pk(17),
+            associated_creator_vault: pk(18),
+            sharing_config: pk(19),
+            user_volume_accumulator: pk(20),
+            associated_user_volume_accumulator: pk(21),
+            fee_config: pk(22),
+            fee_program: pk(23),
+            system_program: pk(24),
+            event_authority: pk(25),
+            program: pk(26),
         }
     }
 
@@ -324,7 +374,10 @@ mod tests {
         // Generated from idl/pump.json, so a hand edit here cannot drift from
         // what the program actually expects.
         assert_eq!(writable, crate::generated_flags::BUY_V2_WRITABLE.to_vec());
-        assert_eq!(ix.accounts.len(), crate::generated_flags::BUY_V2_ACCOUNT_COUNT);
+        assert_eq!(
+            ix.accounts.len(),
+            crate::generated_flags::BUY_V2_ACCOUNT_COUNT
+        );
     }
 
     #[test]
@@ -338,7 +391,10 @@ mod tests {
             .map(|(index, _)| index + 1)
             .collect();
         assert_eq!(writable, crate::generated_flags::SELL_V2_WRITABLE.to_vec());
-        assert_eq!(ix.accounts.len(), crate::generated_flags::SELL_V2_ACCOUNT_COUNT);
+        assert_eq!(
+            ix.accounts.len(),
+            crate::generated_flags::SELL_V2_ACCOUNT_COUNT
+        );
     }
 
     #[test]

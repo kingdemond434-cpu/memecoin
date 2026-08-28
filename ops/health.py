@@ -162,28 +162,127 @@ def check_feeds(readiness: Dict[str, Any], thresholds: HealthThresholds) -> List
     checks: List[Check] = []
     yellowstone = readiness.get("yellowstone") or {}
     status = str(yellowstone.get("status", "UNKNOWN"))
+    program_stream = readiness.get("rpc_program_stream") or {}
+    fallback_status = str(program_stream.get("status", "UNKNOWN"))
+    fallback_ok = fallback_status in {"STREAMING", "OK", "RPC_WS", "RPC_FALLBACK"}
     if status == "STREAMING":
         checks.append(Check("feed_yellowstone", State.OK, "streaming",
                             {"status": status}))
     elif status in {"NOT_STARTED", "UNKNOWN"}:
         checks.append(Check("feed_yellowstone", State.DATA_BLOCKED,
                             f"yellowstone status is {status}", {"status": status}))
+    elif fallback_ok:
+        checks.append(Check("feed_yellowstone", State.WARN,
+                            f"yellowstone {status}; RPC stream is carrying events",
+                            {"status": status, "fallback": fallback_status}))
     else:
         checks.append(Check("feed_yellowstone", State.CRITICAL,
                             f"yellowstone is not streaming: {status}",
                             {"status": status, "detail": yellowstone.get("detail")},
                             escalate=True))
 
-    program_stream = readiness.get("rpc_program_stream")
-    if program_stream is None:
+    if not program_stream:
         checks.append(Check("feed_rpc_program_stream", State.DATA_BLOCKED,
                             "no RPC program stream configured"))
     else:
-        stream_status = str(program_stream.get("status", "UNKNOWN"))
+        stream_status = fallback_status
         checks.append(Check(
             "feed_rpc_program_stream",
-            State.OK if stream_status in {"STREAMING", "OK"} else State.WARN,
+            State.OK if fallback_ok else State.WARN,
             f"rpc program stream {stream_status}", {"status": stream_status}))
+    return checks
+
+
+def check_runtime_surfaces(readiness: Dict[str, Any]) -> List[Check]:
+    """Liveness of the components a healthy PID can still lose internally."""
+    checks: List[Check] = []
+    tasks = readiness.get("runtime_tasks") or {}
+    failed = list(tasks.get("failed") or ())
+    task_status = str(tasks.get("status", "DATA_BLOCKED"))
+    checks.append(Check(
+        "runtime_tasks",
+        State.CRITICAL if task_status == "CRITICAL" or failed
+        else State.OK if task_status == "OK" else State.DATA_BLOCKED,
+        f"runtime task graph {task_status}",
+        {"failed": failed, "background_failures": tasks.get("background_failures")},
+        escalate=bool(failed)))
+
+    watchdog = readiness.get("watchdog") or {}
+    watchdog_status = str(watchdog.get("status", "DATA_BLOCKED"))
+    checks.append(Check(
+        "watchdog", State.OK if watchdog_status == "OK" else State.WARN
+        if watchdog_status == "DEGRADED" else State.DATA_BLOCKED,
+        f"watchdog {watchdog_status}", watchdog))
+
+    mesh = readiness.get("source_mesh") or {}
+    sources = int(mesh.get("sources", 0) or 0)
+    producers = int(mesh.get("producers", 0) or 0)
+    coverage = mesh.get("coverage")
+    mesh_broken = bool(sources and (not mesh.get("streaming") or producers < sources))
+    mesh_state = (State.CRITICAL if mesh_broken else State.WARN
+                  if coverage is not None and float(coverage) < 0.80
+                  else State.OK if sources else State.DATA_BLOCKED)
+    checks.append(Check(
+        "source_mesh", mesh_state,
+        f"{producers}/{sources} producers; coverage {coverage}",
+        {"sources": sources, "producers": producers, "coverage": coverage,
+         "by_state": mesh.get("by_state"), "dropped": mesh.get("dropped_events")},
+        escalate=mesh_broken))
+
+    miners = readiness.get("data_miners") or {}
+    miner_status = str(miners.get("status", "DATA_BLOCKED"))
+    checks.append(Check(
+        "data_miners",
+        State.OK if miner_status == "OK" else State.WARN
+        if int(miners.get("producing", 0) or 0) > 0 else State.DATA_BLOCKED,
+        f"{miners.get('producing', 0)}/{miners.get('runnable', 0)} miners producing",
+        {"status": miner_status, "failing": miners.get("failing"),
+         "rate_limited": miners.get("rate_limited"),
+         "awaiting_credentials": miners.get("awaiting_credentials")}))
+
+    events = readiness.get("stream_events") or {}
+    total = int(events.get("total", 0) or 0)
+    creations = int(events.get("token_created", 0) or 0)
+    missing_creations = total >= 100 and creations == 0
+    checks.append(Check(
+        "creation_event_delivery",
+        State.CRITICAL if missing_creations else State.OK if creations
+        else State.DATA_BLOCKED,
+        f"{creations} creation events of {total} total chain events",
+        {"by_type": events.get("by_type")}, escalate=missing_creations))
+
+    decoder = readiness.get("pump_decoder") or {}
+    decoder_status = str(decoder.get("status", "DATA_BLOCKED"))
+    checks.append(Check(
+        "pump_decoder",
+        State.CRITICAL if decoder_status == "CRITICAL" else State.WARN
+        if decoder_status == "DEGRADED" else State.OK
+        if decoder_status == "OK" else State.DATA_BLOCKED,
+        f"pump decoder {decoder_status}", decoder,
+        escalate=decoder_status == "CRITICAL"))
+
+    memory = readiness.get("memory") or {}
+    band = str(memory.get("band", "unmeasured"))
+    checks.append(Check(
+        "memory_governor",
+        State.CRITICAL if band == "shed" else State.WARN if band == "trim"
+        else State.OK if band == "calm" else State.DATA_BLOCKED,
+        f"memory governor {band}",
+        {"fraction": memory.get("fraction"), "peak_fraction": memory.get("peak_fraction")},
+        escalate=band == "shed"))
+
+    loop = readiness.get("event_loop") or {}
+    drops = int(loop.get("candidate_drops", 0) or 0) + int(
+        loop.get("redecision_drops", 0) or 0)
+    checks.append(Check(
+        "decision_queue", State.WARN if drops else State.OK,
+        f"{drops} cumulative decision queue drops", loop))
+
+    evidence = readiness.get("trade_evidence") or {}
+    evidence_status = str(evidence.get("status", "DATA_BLOCKED"))
+    checks.append(Check(
+        "trade_evidence", State.OK if evidence_status == "OK" else State.DATA_BLOCKED,
+        f"trade evidence {evidence_status}", evidence))
     return checks
 
 
@@ -512,6 +611,7 @@ def run_health_checks(
         checks.append(check_data_freshness(readiness, now, thresholds))
         checks.extend(check_models(readiness, model_dir, now, thresholds))
         checks.extend(check_sources(readiness))
+        checks.extend(check_runtime_surfaces(readiness))
         checks.extend(check_intelligence_coverage(readiness))
         checks.append(check_champions(readiness))
     else:

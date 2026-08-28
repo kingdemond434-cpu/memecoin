@@ -1,0 +1,88 @@
+# Official domains to verify with tools/verify_entities.py.
+#
+# The verifier fetches each organisation's own pages and stamps the resulting
+# overlay with page hashes and the verification date. It never invents a
+# wallet or treats a display handle as a stable platform account id.
+candidates:
+  - entity_id: solana-foundation
+    display_name: Solana Foundation
+    domain: solana.org
+    aliases: [Solana]
+  - entity_id: pump-fun
+    display_name: Pump.fun
+    domain: pump.fun
+    aliases: [Pumpfun, Pump Fun]
+  - entity_id: jupiter-exchange
+    display_name: Jupiter Exchange
+    domain: jup.ag
+    aliases: [Jupiter, Jupiter Aggregator]
+  - entity_id: raydium
+    display_name: Raydium
+    domain: raydium.io
+  - entity_id: phantom
+    display_name: Phantom
+    domain: phantom.com
+    aliases: [Phantom Wallet]
+  - entity_id: coinbase
+    display_name: Coinbase
+    domain: coinbase.com
+  - entity_id: binance
+    display_name: Binance
+    domain: binance.com
+  - entity_id: circle
+    display_name: Circle
+    domain: circle.com
+    aliases: [USDC]
+  - entity_id: tether
+    display_name: Tether
+    domain: tether.to
+    aliases: [USDT]
+  - entity_id: jito
+    display_name: Jito
+    domain: jito.network
+    aliases: [Jito Labs, Jito Foundation]
+  - entity_id: meteora
+    display_name: Meteora
+    domain: meteora.ag
+    aliases: [Meteora DLMM]
+  - entity_id: orca
+    display_name: Orca
+    domain: orca.so
+    aliases: [Orca Whirlpools]
+  - entity_id: helius
+    display_name: Helius
+    domain: helius.dev
+  - entity_id: anza
+    display_name: Anza
+    domain: anza.xyz
+    aliases: [Agave]
+  - entity_id: magic-eden
+    display_name: Magic Eden
+    domain: magiceden.io
+  - entity_id: backpack
+    display_name: Backpack
+    domain: backpack.app
+  - entity_id: solflare
+    display_name: Solflare
+    domain: solflare.com
+    aliases: [Solflare Wallet]
+  - entity_id: bonk
+    display_name: BONK
+    domain: bonkcoin.com
+    aliases: [Bonk Inu]
+  - entity_id: kraken
+    display_name: Kraken
+    domain: kraken.com
+  - entity_id: okx
+    display_name: OKX
+    domain: okx.com
+  - entity_id: bybit
+    display_name: Bybit
+    domain: bybit.com
+  - entity_id: coingecko
+    display_name: CoinGecko
+    domain: coingecko.com
+  - entity_id: dex-screener
+    display_name: DEX Screener
+    domain: dexscreener.com
+    aliases: [DexScreener]

@@ -24,9 +24,7 @@ pub fn looks_like_pool_creation(logs: &[String]) -> bool {
         let Some((_, instruction)) = line.rsplit_once("Instruction:") else {
             return false;
         };
-        let normalized = instruction
-            .trim()
-            .to_ascii_lowercase();
+        let normalized = instruction.trim().to_ascii_lowercase();
         let normalized: String = normalized
             .chars()
             .filter(|c| *c != '_' && *c != ' ')
@@ -67,7 +65,10 @@ mod tests {
 
     #[test]
     fn the_discriminator_matches_the_deployed_program() {
-        assert_eq!(anchor_discriminator("buy"), vec![102, 6, 61, 18, 1, 218, 235, 234]);
+        assert_eq!(
+            anchor_discriminator("buy"),
+            vec![102, 6, 61, 18, 1, 218, 235, 234]
+        );
     }
 
     #[test]
@@ -78,6 +79,8 @@ mod tests {
         assert!(!looks_like_pool_creation(&[
             "Program log: Instruction: CreatePosition".to_string()
         ]));
-        assert!(!looks_like_pool_creation(&["no instruction here".to_string()]));
+        assert!(!looks_like_pool_creation(&[
+            "no instruction here".to_string()
+        ]));
     }
 }

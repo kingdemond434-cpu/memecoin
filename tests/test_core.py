@@ -153,7 +153,7 @@ from src.strategies.authenticity import (
     EntityRegistry, ProofLevel, SourceSignal, WatchedEntity, extract_mints,
     host_matches, load_entities, looks_like_mint, rank_copycats,
 )
-from tools import verify_entities
+from tools import resolve_entity_ids, verify_entities
 from src.strategies.escape import (
     HAZARD_HORIZONS, TRIGGER_MECHANISMS, UNESCAPABLE_MECHANISMS, HazardCurve,
     HazardMechanism, LandingLatency, escape_probability,
@@ -247,9 +247,12 @@ from src.chains.pump_curve import (
 )
 from ops.audit_pack import build_audit_pack
 from ops.health import (
-    Check, HealthReport, State, check_intelligence_coverage, run_health_checks,
+    Check, HealthReport, State, check_intelligence_coverage,
+    check_runtime_surfaces, run_health_checks,
 )
 from ops.monitor import main as monitor_main
+from ops.watchdog import Policy as WatchdogPolicy
+from ops.watchdog import decide as watchdog_decide, observed_faults
 from src.runtime.hot_state import (
     AsyncArchiveWriter, CompactWalletDNA, EconomicCache, HotState, HotStateBudget,
 )
@@ -710,13 +713,33 @@ class TestOfficialSocialCollectors(unittest.IsolatedAsyncioTestCase):
             "telegram_channels": "@alpha, https://t.me/beta ,gamma",
         })
         fake_client = FakeTelegramClient("path", 123, "hash")
+        fake_client.entities_by_handle = {
+            "alpha": SimpleNamespace(id=101, title="Alpha"),
+            "beta": SimpleNamespace(id=102, title="Beta"),
+            "gamma": SimpleNamespace(id=103, title="Gamma"),
+        }
         with patch("src.strategies.social_intelligence.TelegramClient", return_value=fake_client):
             await engine._setup_telegram()
         self.assertIn(engine.data_status["telegram"], {"OK_PUSH", "OK_POLLING"})
         self.assertTrue(fake_client.connected)
         self.assertEqual(set(engine.accounts), {"telegram:alpha", "telegram:beta", "telegram:gamma"})
-        for handle in ("alpha", "beta", "gamma"):
+        for expected_id, handle in enumerate(("alpha", "beta", "gamma"), 101):
             self.assertEqual(engine.accounts[f"telegram:{handle}"].handle, handle)
+            self.assertEqual(engine.accounts[f"telegram:{handle}"].account_id,
+                             str(expected_id))
+
+    async def test_a_resolved_stable_id_upgrades_a_handle_placeholder(self):
+        engine = self.make_engine()
+        await engine._add_account({
+            "platform": "telegram", "handle": "alpha", "account_id": "alpha",
+        })
+        await engine._add_account({
+            "platform": "telegram", "handle": "alpha", "account_id": "101",
+            "display_name": "Alpha",
+        })
+        account = engine.accounts["telegram:alpha"]
+        self.assertEqual(account.account_id, "101")
+        self.assertEqual(account.display_name, "Alpha")
 
     async def test_fetch_telegram_posts_extracts_contract_and_dedupes_read_only(self):
         engine = self.make_engine()
@@ -788,7 +811,7 @@ class TestOfficialSocialCollectors(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine._telegram_client.target, -10012345)
 
 
-class TestNativeMintChecks(unittest.TestCase):
+class TestNativeMintChecks(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def mint_bytes(mint_tag=0, freeze_tag=0, supply=1_000_000, decimals=6):
         raw = bytearray(82)
@@ -815,6 +838,81 @@ class TestNativeMintChecks(unittest.TestCase):
     def test_invalid_authority_coption_is_rejected(self):
         with self.assertRaises(ValueError):
             RugDetector.parse_spl_mint(bytes(self.mint_bytes(2, 0)), TOKEN_PROGRAM)
+
+    def test_spl_token_account_owner_and_amount_decode_from_raw_layout(self):
+        owner_raw = bytes(range(1, 33))
+        raw = bytearray(165)
+        raw[32:64] = owner_raw
+        struct.pack_into("<Q", raw, 64, 123_456)
+        account = {"data": [base64.b64encode(bytes(raw)).decode(), "base64"]}
+        self.assertEqual(
+            RugDetector.parse_spl_token_account_owner(account), b58encode(owner_raw))
+        self.assertEqual(RugDetector.parse_spl_token_account_amount(account), 123_456)
+
+    async def test_native_holder_owner_and_developer_balance_enrichment(self):
+        class HolderRPC:
+            async def request(self, method, params):
+                if method == "getTokenLargestAccounts":
+                    return {"value": [
+                        {"address": "token-account-a", "amount": "400"},
+                        {"address": "token-account-b", "amount": "100"},
+                    ]}
+                if method == "getMultipleAccounts":
+                    return {"value": [
+                        {"data": {"parsed": {"info": {"owner": "developer"}}}},
+                        {"data": {"parsed": {"info": {"owner": "other"}}}},
+                    ]}
+                if method == "getTokenAccountsByOwner":
+                    return {"value": [
+                        {"account": {"data": {"parsed": {"info": {
+                            "tokenAmount": {"amount": "425"},
+                        }}}}},
+                    ]}
+                raise AssertionError(method)
+
+        detector = RugDetector(solana_chain(), HolderRPC())
+        holders = await detector._solana_holder_concentration("mint", 1_000)
+        developer = await detector._solana_owner_token_share(
+            "mint", "developer", 1_000)
+        self.assertEqual(holders["owner_enrichment_status"], "OK")
+        self.assertEqual(holders["accounts"][0]["owner"], "developer")
+        self.assertAlmostEqual(holders["owner_resolved_supply_pct"], 50.0)
+        self.assertEqual(developer["status"], "OK")
+        self.assertAlmostEqual(developer["supply_pct"], 42.5)
+
+    def test_holder_actor_join_uses_positive_public_evidence_as_lower_bounds(self):
+        desk = object.__new__(MemecoinQuantDesk)
+        desk.global_config = {"holder_whale_supply_pct": 5.0}
+        desk.public_coordination = SimpleNamespace(token_evidence={"mint": [
+            SimpleNamespace(kind="same_slot_buy_cluster", wallets=["bundle"]),
+        ]})
+
+        class Genealogy:
+            @staticmethod
+            def find_cluster(address):
+                return SimpleNamespace(cluster_id="dev-cluster",
+                                       wallets={"developer", "linked"})
+
+            @staticmethod
+            def get_wallet_profile(address):
+                return SimpleNamespace(is_insider=True) if address == "insider" else None
+
+        desk.genealogy = Genealogy()
+        risk = SimpleNamespace(checks={"holders": {"accounts": [
+            {"owner": "developer", "supply_pct": 8.0},
+            {"owner": "linked", "supply_pct": 6.0},
+            {"owner": "bundle", "supply_pct": 5.0},
+            {"owner": "insider", "supply_pct": 2.0},
+        ]}}, whale_pct=None, bundler_pct=None, connected_cluster_pct=None,
+                               insider_pct=None, fresh_wallet_pct=None)
+        result = desk._enrich_holder_actor_concentration(
+            "mint", risk, "developer")
+        self.assertEqual(result["semantics"], "observed_lower_bounds")
+        self.assertAlmostEqual(risk.whale_pct, 19.0)
+        self.assertAlmostEqual(risk.bundler_pct, 5.0)
+        self.assertAlmostEqual(risk.connected_cluster_pct, 14.0)
+        self.assertAlmostEqual(risk.insider_pct, 2.0)
+        self.assertIsNone(risk.fresh_wallet_pct)
 
 
 class TestProbabilityAndAccounting(unittest.TestCase):
@@ -1751,6 +1849,9 @@ class TestScaleInWiring(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(position["remaining_cost_usd"], 100.0)
         self.assertEqual(len(position["scale_ins"]), 1)
         self.assertEqual(position["scale_ins"][0]["elogw_gain"], 0.5)
+        kwargs = desk.execution_engine.buys[0][3]
+        self.assertEqual(kwargs["expected_edge_usd"], 5_000.0)
+        self.assertEqual(kwargs["sol_price_usd"], 150.0)
 
     async def test_no_add_when_marginal_growth_is_not_positive(self):
         result = ExecutionResult(success=True, status=TransactionStatus.SIMULATED, simulated=True,
@@ -1845,6 +1946,35 @@ class TestShadowTrainer(unittest.TestCase):
         unknown = snapshot_labels(at_launch, episode, {"rugged": True, "rug_time": None})
         self.assertEqual(unknown[PredictionTarget.P_RUG_30S], 0.0)
         self.assertEqual(unknown[PredictionTarget.P_RUG_5M], 0.0)
+
+    def test_legacy_tail_labels_are_rebuilt_from_the_recorded_maximum(self):
+        """Missing old rungs must never become false observations.
+
+        The tail schema grew over time.  A legacy snapshot can therefore
+        contain ``label_50x`` but no ``label_20x`` while still carrying the
+        final ``max_multiple``.  Treating the absent value as false creates a
+        non-nested survival curve and can starve an otherwise valid head of
+        its positive class.
+        """
+        from src.research.shadow_trainer import snapshot_labels
+        from src.strategies.multihead_predictor import PredictionTarget
+
+        snapshot = {
+            "timestamp": 1_000.0,
+            "labels": {"label_2x": True, "label_50x": True,
+                       "label_20x": None, "max_multiple": 75.0},
+            "liquidity_features": {},
+        }
+        labels = snapshot_labels(
+            snapshot, {"created_at": 1_000.0},
+            {"max_multiple": 75.0, "rugged": False, "migrated": False},
+        )
+        self.assertEqual(labels[PredictionTarget.P_2X], 1.0)
+        self.assertEqual(labels[PredictionTarget.P_20X], 1.0)
+        self.assertEqual(labels[PredictionTarget.P_50X], 1.0)
+        self.assertEqual(labels[PredictionTarget.P_100X], 0.0)
+        ordered = [labels[target] for target, _ in SURVIVAL_LEVELS]
+        self.assertEqual(ordered, sorted(ordered, reverse=True))
 
     def test_insufficient_history_remains_explicitly_data_blocked(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2249,6 +2379,7 @@ class FakeTelegramClient:
         self.disconnected = False
         self.authorized = True
         self.messages_by_entity = {}
+        self.entities_by_handle = {}
         self.event_handlers = []
 
     def add_event_handler(self, callback, event):
@@ -2262,6 +2393,11 @@ class FakeTelegramClient:
 
     async def is_user_authorized(self):
         return self.authorized
+
+    async def get_entity(self, entity):
+        if entity in self.entities_by_handle:
+            return self.entities_by_handle[entity]
+        raise ValueError(f"unknown public Telegram entity {entity}")
 
     async def disconnect(self):
         self.disconnected = True
@@ -2712,6 +2848,83 @@ class TestRpcFallback(unittest.IsolatedAsyncioTestCase):
 
 
 class TestShadowMarketObservation(unittest.IsolatedAsyncioTestCase):
+    async def test_live_position_mark_uses_local_executable_curve_without_jupiter(self):
+        class Recorder:
+            def __init__(self):
+                self.items = []
+
+            def record_market_observation(self, token, observation):
+                self.items.append(observation)
+
+            def record_observation(self, token, observation):
+                self.items.append(observation)
+
+        desk = MemecoinQuantDesk()
+        desk.dry_run = False
+        desk.sol_price_usd = 150.0
+        desk.global_config = {"router_mark_crosscheck_seconds": 60.0}
+        desk._router_mark_checked_at = {"mint": time.time()}
+        desk._latest_stream_mark = {"mint": {"multiple": 1.0, "timestamp": time.time()}}
+        desk._latest_curve_state = {"mint": BondingCurveState(
+            virtual_token_reserves=1_000_000_000_000,
+            virtual_sol_reserves=30_000_000_000,
+            real_token_reserves=500_000_000_000,
+            real_sol_reserves=10_000_000_000,
+            token_total_supply=1_000_000_000_000,
+            complete=False,
+        )}
+        desk._latest_pool_state = {}
+        desk._router_mark_cache = {}
+        desk._router_mark_inflight = set()
+        desk.rug_hazard = Recorder()
+        desk.dataset_builder = Recorder()
+        desk.counterfactual_lab = CounterfactualExecutionLab()
+        desk.jupiter = SimpleNamespace(get_quote=lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("live hot path must not await Jupiter")))
+
+        marked = await desk._mark_position(
+            "mint", {"size_tokens": 1_000_000_000, "remaining_cost_usd": 4.0})
+        self.assertIsNotNone(marked)
+        self.assertGreater(marked[1], 0.0)
+        self.assertEqual(desk.dataset_builder.items[-1]["measurement"],
+                         "local_pump_executable_sell")
+
+    async def test_live_position_mark_uses_local_pumpswap_after_graduation(self):
+        class Recorder:
+            def __init__(self):
+                self.items = []
+
+            def record_market_observation(self, token, observation):
+                self.items.append(observation)
+
+            def record_observation(self, token, observation):
+                self.items.append(observation)
+
+        desk = MemecoinQuantDesk()
+        desk.dry_run = False
+        desk.sol_price_usd = 150.0
+        desk.global_config = {"router_mark_crosscheck_seconds": 60.0}
+        desk._router_mark_checked_at = {"mint": time.time()}
+        desk._latest_stream_mark = {}
+        desk._latest_curve_state = {}
+        desk._latest_pool_state = {"mint": PumpSwapPoolState(
+            pool="pool", base_mint="mint", quote_mint=WSOL_MINT,
+            base_reserves=1_000_000_000_000,
+            quote_reserves=30_000_000_000,
+            total_fee_bps=100, updated_at=time.time(),
+        )}
+        desk._router_mark_cache = {}
+        desk._router_mark_inflight = set()
+        desk.rug_hazard = Recorder()
+        desk.dataset_builder = Recorder()
+        desk.counterfactual_lab = CounterfactualExecutionLab()
+
+        marked = await desk._mark_position(
+            "mint", {"size_tokens": 1_000_000_000, "remaining_cost_usd": 4.0})
+        self.assertIsNotNone(marked)
+        self.assertEqual(desk.dataset_builder.items[-1]["measurement"],
+                         "local_pumpswap_executable_sell")
+
     async def test_social_candidate_requires_verified_spl_mint(self):
         class Rpc:
             async def request(self, method, params):
@@ -7262,6 +7475,30 @@ class TestSourceRegistry(unittest.TestCase):
         self.assertEqual(len(sources), 1)
         self.assertEqual(report.ready, 1)
         self.assertEqual(report.by_state["READY"], 1)
+        self.assertEqual(sources[0].poll_interval_seconds,
+                         DEFAULT_POLL_INTERVALS["rss"])
+
+    def test_a_source_can_override_its_kind_cadence(self):
+        declaration = self._declaration(poll_interval_seconds=7.5)
+        sources, _ = build_sources([declaration], self._fetchers("rss:kr"))
+        self.assertEqual(sources[0].poll_interval_seconds, 7.5)
+
+    def test_transport_options_do_not_leak_into_record_adapters(self):
+        declarations = [
+            self._declaration(source_id="feed", options={"url": "https://feed.test/rss"}),
+            self._declaration(source_id="social", kind="mastodon",
+                              options={"instance": "https://social.test"}),
+            self._declaration(source_id="relay", kind="nostr",
+                              options={"relay": "wss://relay.test"}),
+            self._declaration(source_id="repo", kind="code_repo",
+                              options={"repo": "owner/name"}),
+        ]
+        sources, report = build_sources(
+            declarations, self._fetchers("feed", "social", "relay", "repo"))
+        self.assertEqual(len(sources), 4)
+        self.assertEqual(report.ready, 4)
+        self.assertNotIn("NO_FETCHER", report.by_state)
+        self.assertEqual(sources[0].language, "ko")
 
     def test_a_missing_credential_is_named_not_silently_skipped(self):
         declaration = self._declaration(source_id="tg:a", kind="telegram",
@@ -7903,6 +8140,17 @@ class TestPerSourceCadence(unittest.IsolatedAsyncioTestCase):
         detail = source.health(self.NOW + 5).detail
         self.assertIn("degraded at 30s", detail)
         self.assertIn("dead at 90s", detail)
+
+    def test_failures_back_off_but_success_uses_declared_cadence(self):
+        source = self._Fake("rss", SourceClass.FEED,
+                            poll_interval_seconds=60)
+        self.assertEqual(source.retry_delay(), 60)
+        source._consecutive_failures = 1
+        self.assertEqual(source.retry_delay(), 60)
+        source._consecutive_failures = 4
+        self.assertEqual(source.retry_delay(), 300)
+        source._consecutive_failures = 20
+        self.assertEqual(source.retry_delay(), 300)
 
 
 class TestActorIntelligenceIsLiveWired(unittest.TestCase):
@@ -8579,6 +8827,12 @@ class TestOrphanIntelligence(unittest.IsolatedAsyncioTestCase):
     async def test_an_empty_entity_registry_blocks_rather_than_clears(self):
         """No watched entities means 'we cannot tell', not 'nothing is a copycat'."""
         desk = await self._desk()
+        # Make the premise explicit. Production nodes legitimately generate a
+        # gitignored verified overlay, so this test must not depend on whether
+        # that operator-owned file happens to exist in the working tree.
+        desk._watched_entities = []
+        desk.entity_registry = EntityRegistry()
+        desk.authenticity = AuthenticityResolver(desk.entity_registry)
         verdict = desk._authenticity(self.MINT, self._candidate(self.MINT))
         self.assertEqual(verdict["status"], "DATA_BLOCKED")
         self.assertEqual(verdict["registry_size"], 0)
@@ -10423,6 +10677,13 @@ class TestEntityProvenanceIsRequired(unittest.TestCase):
         self.assertEqual(entities[0].verified_from, "https://figure.com/press")
         self.assertGreater(entities[0].verified_at, 0)
 
+    def test_centralised_at_handle_urls_are_not_misread_as_mastodon(self):
+        found = verify_entities.handles_in(
+            '<a href="https://www.youtube.com/@official">video</a>'
+            '<a href="https://social.example/@real">fediverse</a>')
+        self.assertEqual(found.get("mastodon"), ["real@social.example"])
+        self.assertEqual(found.get("youtube"), ["official"])
+
     def test_an_entity_without_a_source_is_refused_not_flagged(self):
         """A flag on a record that still confers proof is not a control."""
         entry = self._entry()
@@ -10544,6 +10805,9 @@ class TestEntityVerifierReadsPublishedPages(unittest.TestCase):
     """Filling the registry from memory is the failure the empty file prevents."""
 
     PAGE = """<html><body>
+      <a href="https://x.com/exampleofficial">X</a>
+      <a href="https://x.com/home">X home, not a profile</a>
+      <a href="https://x.com/exampleofficial/status/123">an X post, not a profile</a>
       <a href="https://t.me/example_official">Telegram</a>
       <a href="https://www.youtube.com/channel/UCabcdefghijklmnopqrstuv">YouTube</a>
       <a href="https://bsky.app/profile/example.org">Bluesky</a>
@@ -10553,6 +10817,7 @@ class TestEntityVerifierReadsPublishedPages(unittest.TestCase):
 
     def test_only_profile_links_become_handles(self):
         found = verify_entities.handles_in(self.PAGE)
+        self.assertEqual(found["x"], ["exampleofficial"])
         self.assertEqual(found["telegram"], ["example_official"])
         self.assertEqual(found["youtube"], ["UCabcdefghijklmnopqrstuv"])
         self.assertEqual(found["bluesky"], ["example.org"])
@@ -10570,6 +10835,7 @@ class TestEntityVerifierReadsPublishedPages(unittest.TestCase):
         lines = verify_entities.declaration("example-org", "Example Org", result)
         rendered = "\n".join(lines)
         self.assertIn("# telegram: example_official", rendered)
+        self.assertIn('published_handles: {"telegram": ["example_official"]}', rendered)
         self.assertIn("verified_from: \"https://example.org/\"", rendered)
         self.assertIn("verified_at:", rendered)
         # The emitted accounts block must not carry the handle uncommented.
@@ -10595,6 +10861,86 @@ class TestEntityVerifierReadsPublishedPages(unittest.TestCase):
         self.assertEqual(entities[0].accounts, {})
         self.assertEqual(entities[0].known_wallets, set())
         self.assertEqual(entities[0].official_domains, {"example.org"})
+
+
+class TestEntityStableIdResolver(unittest.IsolatedAsyncioTestCase):
+    def test_expired_github_token_falls_back_to_the_public_endpoint(self):
+        failure = urllib.error.HTTPError("url", 401, "expired", {}, None)
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "expired"}), \
+             patch.object(resolve_entity_ids, "_json",
+                          side_effect=[failure, {"id": 202}]) as fetch:
+            value, status = resolve_entity_ids.resolve_public("github", "example")
+        self.assertEqual((value, status), ("202", "OK"))
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(fetch.call_args_list[-1].args, (
+            "https://api.github.com/users/example",))
+
+    async def test_only_platform_resolved_ids_enter_the_authoritative_accounts(self):
+        document = {"entities": [{
+            "entity_id": "example", "display_name": "Example",
+            "accounts": {},
+            "metadata": {"published_handles": {
+                "telegram": ["exampletg"], "github": ["examplegh"],
+                "x": ["examplex"],
+            }},
+        }]}
+
+        async def telegram(handles, session):
+            return {"exampletg": ("101", "OK")}
+
+        def public(platform, handle):
+            if platform == "github":
+                return "202", "OK"
+            return None, "credential unavailable"
+
+        with patch.object(resolve_entity_ids, "resolve_telegram", telegram), \
+             patch.object(resolve_entity_ids, "resolve_public", public):
+            report = await resolve_entity_ids.resolve_document(
+                document, Path("unused"))
+
+        self.assertEqual(document["entities"][0]["accounts"], {
+            "telegram": ["101"], "github": ["202"],
+        })
+        self.assertEqual(report["resolved"], 2)
+        self.assertEqual(report["unresolved"][0]["platform"], "x")
+
+    async def test_yaml_null_accounts_is_an_empty_registry_not_a_crash(self):
+        document = {"entities": [{
+            "entity_id": "example", "accounts": None,
+            "metadata": {"published_handles": {"github": ["example"]}},
+        }]}
+        with patch.object(resolve_entity_ids, "resolve_public",
+                          return_value=("202", "OK")):
+            report = await resolve_entity_ids.resolve_document(
+                document, Path("unused"))
+        self.assertEqual(report["resolved"], 1)
+        self.assertEqual(document["entities"][0]["accounts"], {"github": ["202"]})
+
+    async def test_a_cross_entity_id_collision_is_never_assigned(self):
+        document = {"entities": [
+            {"entity_id": name, "accounts": {},
+             "metadata": {"published_handles": {"github": [name]}}}
+            for name in ("first", "second")
+        ]}
+        with patch.object(resolve_entity_ids, "resolve_public",
+                          return_value=("same-id", "OK")):
+            report = await resolve_entity_ids.resolve_document(
+                document, Path("unused"))
+        self.assertTrue(report["conflicts"])
+        self.assertEqual(document["entities"][0]["accounts"], {})
+        self.assertEqual(document["entities"][1]["accounts"], {})
+
+    async def test_multiple_profiles_on_one_official_page_are_ambiguous(self):
+        document = {"entities": [{
+            "entity_id": "marketplace", "accounts": {},
+            "metadata": {"published_handles": {"x": ["partner", "marketplace"]}},
+        }]}
+        with patch.object(resolve_entity_ids, "resolve_public") as resolver:
+            report = await resolve_entity_ids.resolve_document(
+                document, Path("unused"))
+        resolver.assert_not_called()
+        self.assertEqual(document["entities"][0]["accounts"], {})
+        self.assertIn("ambiguous", report["unresolved"][0]["detail"])
 
 
 class TestBlockhashIsNotFetchedOnTheHotPath(unittest.IsolatedAsyncioTestCase):
@@ -14305,6 +14651,36 @@ class TestForwardEvidence(unittest.TestCase):
             "meme_launch_rate_1h": 10, "sol_change_24h": -5.0})
         self.assertEqual(MemecoinQuantDesk.current_regime.fget(desk), "bear")
 
+    def test_production_regime_uses_the_market_cache_not_the_research_miner(self):
+        desk = SimpleNamespace(
+            global_config={"regime_hot_launch_rate": 300},
+            dataset_builder=SimpleNamespace(current_market_state=lambda: {
+                "status": "OK", "meme_launch_rate_1h": 500,
+                "sol_change_24h": -2.0,
+            }),
+            global_research=SimpleNamespace(get_stats=lambda: {
+                "meme_launch_rate_1h": 1, "sol_change_24h": 10.0,
+            }),
+        )
+        self.assertEqual(MemecoinQuantDesk.current_regime.fget(desk), "churn")
+
+    def test_market_state_refuses_a_stale_price_cache(self):
+        builder = PointInTimeDatasetBuilder.__new__(PointInTimeDatasetBuilder)
+        builder._market_cache = {
+            "observed_at": 900.0, "sol_change_24h": 3.0,
+            "priority_fee_median": 10.0, "priority_fee_p90": 20.0,
+        }
+        builder.active_episodes = {
+            "recent": SimpleNamespace(created_at=950.0),
+            "old": SimpleNamespace(created_at=1.0),
+        }
+        builder.completed_episodes = {}
+        fresh = builder.current_market_state(as_of=1_000.0)
+        stale = builder.current_market_state(as_of=2_000.0)
+        self.assertEqual(fresh["meme_launch_rate_1h"], 2)
+        self.assertEqual(fresh["status"], "OK")
+        self.assertIsNone(stale["sol_change_24h"])
+
 
 def _fastpath():
     """The compiled extension, or None when it has not been built here.
@@ -14380,6 +14756,7 @@ class TestRustPythonPolicyParity(unittest.TestCase):
                                     self._prediction(levels, rug, rug))),
                             exit_cost=0.02, entry_cost=0.02,
                             exit_capacity_ratio=capacity, escape_probability=escape,
+                            add_capacity_fraction=None,
                             probe_fraction=probe)
                         python = ActionValuePolicy(min_edge=1e-4,
                                                    max_add_fraction=0.05).score(python_state)
@@ -14387,7 +14764,7 @@ class TestRustPythonPolicyParity(unittest.TestCase):
                             0.1, 30_000_000_000, 1_000_000_000_000,
                             list(levels), rug, rug, 0.0,
                             held, multiple, 0.02, 0.02, capacity, escape,
-                            None, None, None, probe,
+                            None, None, None, None, probe,
                             1e-4, 0.05, False, 0.25, 0.05, 0.0005, 0.10, False)
                         self.assertEqual(python.status, "OK")
                         self.assertEqual(
@@ -14408,10 +14785,32 @@ class TestRustPythonPolicyParity(unittest.TestCase):
                 0.1, 30_000_000_000, 1_000_000_000_000,
                 [0.5, 0.3, 0.2, 0.1, 0.05, 0.0, 0.0, 0.0], 0.0, 0.0, 0.0,
                 0.3, 2.0, 0.02, 0.02, capacity, escape,
-                None, None, None, None,
+                None, None, None, None, None,
                 1e-4, 0.05, False, 0.25, 0.05, 0.0005, 0.10, False)
             self.assertEqual(python.status, "DATA_BLOCKED")
             self.assertIsNotNone(native[4])
+
+    def test_add_capacity_is_identical_in_python_and_rust(self):
+        levels = self.LEVELS[1]
+        state = ActionState(
+            held_fraction=0.10, current_multiple=1.5,
+            forward_bins=tuple((probability, gross) for _, probability, gross
+                               in ElogwEngine.probability_bins(self._prediction(levels))),
+            exit_cost=0.02, entry_cost=0.02, exit_capacity_ratio=0.9,
+            escape_probability=0.9, add_fraction=0.04,
+            add_capacity_fraction=0.02,
+        )
+        python = ActionValuePolicy(max_add_fraction=0.05).score(state)
+        native = self.rust.t0_decide(
+            0.1, 30_000_000_000, 1_000_000_000_000,
+            list(levels), 0.0, 0.0, 0.0,
+            0.10, 1.5, 0.02, 0.02, 0.9, 0.9,
+            None, None, 0.04, 0.02, None,
+            1e-4, 0.05, False, 0.25, 0.05, 0.0005, 0.10, False)
+        python_add = next(score for score in python.scores if score.action is Action.ADD)
+        rust_add = next(score for score in native[7] if score[0] == "add")
+        self.assertFalse(python_add.feasible)
+        self.assertFalse(rust_add[2])
 
     def test_the_age_bands_agree(self):
         for age in (0.0, 0.05, 0.49, 0.5, 4.9, 5.0, 59.9, 60.0, 3_600.0):
@@ -14446,7 +14845,7 @@ class TestRustT0Safety(unittest.TestCase):
             held_fraction=0.0, current_multiple=1.0, exit_cost=0.02,
             entry_cost=0.02, exit_capacity_ratio=0.9, escape_probability=0.9,
             alternative_growth_per_second=None, expected_remaining_seconds=None,
-            add_fraction=None, probe_fraction=0.02, min_edge=1e-4,
+            add_fraction=None, add_capacity_fraction=None, probe_fraction=0.02, min_edge=1e-4,
             max_add_fraction=0.05, live=False, max_position_fraction=0.25,
             max_single_commit_fraction=0.05, min_commit_fraction=0.0005,
             min_exit_capacity=0.10, live_unlocked=False)
@@ -14456,7 +14855,7 @@ class TestRustT0Safety(unittest.TestCase):
             "p_rug_5m", "expected_feasible_multiple", "held_fraction",
             "current_multiple", "exit_cost", "entry_cost", "exit_capacity_ratio",
             "escape_probability", "alternative_growth_per_second",
-            "expected_remaining_seconds", "add_fraction", "probe_fraction",
+            "expected_remaining_seconds", "add_fraction", "add_capacity_fraction", "probe_fraction",
             "min_edge", "max_add_fraction", "live", "max_position_fraction",
             "max_single_commit_fraction", "min_commit_fraction",
             "min_exit_capacity", "live_unlocked")])
@@ -16815,3 +17214,96 @@ class TestCreationsArriveAsAnchorCpiEvents(unittest.IsolatedAsyncioTestCase):
         monitor = self._monitor(lambda event: None)
         monitor.matched = {"cpi_event": 9, "token_created": 4, "buy": 30}
         self.assertEqual(monitor.decoder_report()["status"], "OK")
+
+
+class TestBoundedOperationalWatchdog(unittest.TestCase):
+    NOW = 10_000.0
+
+    @staticmethod
+    def _healthy():
+        return {
+            "runtime_tasks": {"status": "OK", "failed": []},
+            "source_mesh": {"sources": 4, "producers": 4,
+                            "streaming": True, "coverage": 1.0},
+            "yellowstone": {"status": "STREAMING"},
+            "rpc_program_stream": {"status": "RPC_WS"},
+            "memory": {"band": "calm"},
+            "stream_events": {"total": 10, "token_created": 2},
+            "pump_decoder": {"status": "OK"},
+            "event_loop": {"candidate_drops": 0, "redecision_drops": 0},
+            "data_miners": {"status": "OK", "runnable": 3, "producing": 2},
+            "prediction": "OK",
+            "rug_hazard": {"model_trained": True},
+            "credentials": {"absent": []},
+        }
+
+    def _decide(self, readiness=None, state=None, **overrides):
+        inputs = dict(
+            service_active=True, service_enabled=True,
+            readiness=readiness or self._healthy(), readiness_age=10.0,
+            state=state if state is not None else {}, now=self.NOW,
+            policy=WatchdogPolicy(), trainer_active=False, training_age=10.0)
+        inputs.update(overrides)
+        return watchdog_decide(**inputs)
+
+    def test_a_stopped_desk_is_restarted_immediately(self):
+        plan = self._decide(service_active=False)
+        self.assertTrue(plan.restart_desk)
+        self.assertIn("desk_service_inactive", plan.repair_reasons)
+
+    def test_a_disabled_desk_is_enabled(self):
+        self.assertTrue(self._decide(service_enabled=False).enable_desk)
+
+    def test_an_internal_feed_fault_must_persist_before_restart(self):
+        readiness = self._healthy()
+        readiness["yellowstone"] = {"status": "DEGRADED"}
+        readiness["rpc_program_stream"] = {"status": "DEAD"}
+        state = {}
+        first = self._decide(readiness=readiness, state=state)
+        second = self._decide(readiness=readiness, state=state, now=self.NOW + 61)
+        self.assertFalse(first.restart_desk)
+        self.assertTrue(second.restart_desk)
+
+    def test_restart_cooldown_suppresses_a_storm(self):
+        state = {"last_restart_at": self.NOW - 30, "restart_times": [self.NOW - 30]}
+        plan = self._decide(service_active=False, state=state)
+        self.assertFalse(plan.restart_desk)
+        self.assertIn("restart_suppressed_by_cooldown", plan.alerts)
+
+    def test_restart_budget_is_hard(self):
+        state = {"restart_times": [self.NOW - 900, self.NOW - 600, self.NOW - 300]}
+        plan = self._decide(service_active=False, state=state)
+        self.assertFalse(plan.restart_desk)
+        self.assertIn("restart_budget_exhausted", plan.alerts)
+
+    def test_missing_credentials_are_named_but_never_faked_or_restarted(self):
+        readiness = self._healthy()
+        readiness["credentials"] = {"absent": [{"name": "X_BEARER_TOKEN"}]}
+        repairable, alerts = observed_faults(readiness)
+        self.assertFalse(repairable)
+        self.assertIn("optional_credentials_absent", alerts)
+
+    def test_a_dead_critical_coroutine_is_repairable(self):
+        readiness = self._healthy()
+        readiness["runtime_tasks"] = {
+            "status": "CRITICAL", "failed": ["source_consumer"]}
+        repairable, _ = observed_faults(readiness)
+        self.assertIn("critical_runtime_task_failed", repairable)
+
+    def test_systemd_and_the_external_watchdog_are_both_installed(self):
+        root = Path(__file__).resolve().parents[1]
+        desk = (root / "deploy/systemd/memecoin-shadow.service").read_text()
+        timer = (root / "deploy/systemd/memecoin-watchdog.timer").read_text()
+        installer = (root / "deploy/install_shadow.sh").read_text()
+        self.assertIn("Type=notify", desk)
+        self.assertIn("WatchdogSec=90s", desk)
+        self.assertIn("OnUnitActiveSec=60s", timer)
+        self.assertIn("enable --now memecoin-watchdog.timer", installer)
+
+    def test_health_surface_marks_a_partial_task_graph_critical(self):
+        readiness = self._healthy()
+        readiness["runtime_tasks"] = {
+            "status": "CRITICAL", "failed": ["market_observer"]}
+        checks = {item.name: item for item in check_runtime_surfaces(readiness)}
+        self.assertEqual(checks["runtime_tasks"].state, State.CRITICAL)
+        self.assertTrue(checks["runtime_tasks"].escalate)

@@ -45,6 +45,15 @@ from src.chains.pump_route import (
 
 logger = logging.getLogger(__name__)
 
+try:  # Optional locally; mandatory status is surfaced by report().
+    from solana_fastpath import (
+        pumpswap_build_buy as native_pumpswap_build_buy,
+        pumpswap_build_sell as native_pumpswap_build_sell,
+    )
+except (ImportError, AttributeError):  # pragma: no cover - environment dependent
+    native_pumpswap_build_buy = None
+    native_pumpswap_build_sell = None
+
 PUMPSWAP_ROUTE_SCHEMA_VERSION = "v1"
 PUMPSWAP_PROGRAM = program_id(PUMP_AMM_IDL) if IDL_STATUS == "OK" else ""
 
@@ -197,17 +206,12 @@ class PumpSwapRoute:
                   max_quote_amount_in: int) -> PreparedInstruction:
         """`buy(base_amount_out, max_quote_amount_in, track_volume)`.
 
-        The third argument is an `OptionBool`, not a u64, so the data is
-        assembled here rather than through the u64 helper -- and it is encoded
-        explicitly as absent, because opting a trade into volume tracking is a
-        choice about what we tell the protocol, not a default to inherit.
+        The third argument is the IDL's one-field `OptionBool` wrapper, not a
+        u64, so its Borsh bool byte is appended explicitly. It is false because
+        opting into volume tracking is a policy choice, not a default to
+        inherit.
         """
-        prepared = self._build("buy", pool, user, base_amount_out, max_quote_amount_in)
-        if prepared.ok:
-            # Anchor encodes `Option<bool>` as a single presence byte followed
-            # by the value when present. Absent is one zero byte.
-            prepared.data = prepared.data + b"\x00"
-        return prepared
+        return self._build("buy", pool, user, base_amount_out, max_quote_amount_in)
 
     def build_sell(self, pool: PoolState, user: str, base_amount_in: int,
                    min_quote_amount_out: int) -> PreparedInstruction:
@@ -267,9 +271,41 @@ class PumpSwapRoute:
         try:
             accounts = build_accounts(PUMP_AMM_IDL, name, supplied)
             data = encode_u64_args(PUMP_AMM_IDL, name, (first, second))
+            if name == "buy":
+                # The IDL's OptionBool wrapper is one Borsh bool byte. False
+                # preserves the existing policy of not opting into tracking.
+                data += b"\x00"
         except (IdlError, ValueError, TypeError) as exc:
             return PreparedInstruction(status="REJECTED", detail=f"unbuildable: {exc}")
         expected = len(account_names(PUMP_AMM_IDL, name))
+        native_builder = (native_pumpswap_build_buy if name == "buy"
+                          else native_pumpswap_build_sell)
+        if native_builder is not None:
+            try:
+                raw_keys = [bytes(Pubkey.from_string(meta.pubkey)) for meta in accounts]
+                raw = (native_builder(raw_keys, first, second, False)
+                       if name == "buy" else native_builder(raw_keys, first, second))
+                native_program = str(Pubkey.from_bytes(bytes(raw[0])))
+                native_accounts = [AccountMeta(
+                    pubkey=str(Pubkey.from_bytes(bytes(key))),
+                    is_signer=bool(is_signer), is_writable=bool(is_writable))
+                    for key, is_signer, is_writable in raw[1]]
+                native_data = bytes(raw[2])
+            except Exception as exc:
+                return PreparedInstruction(
+                    status="DATA_BLOCKED", venue="pumpswap",
+                    detail=f"native PumpSwap construction failed closed: {exc}")
+            python_shape = [(item.pubkey, item.is_signer, item.is_writable)
+                            for item in accounts]
+            native_shape = [(item.pubkey, item.is_signer, item.is_writable)
+                            for item in native_accounts]
+            if (native_program != self.program or native_shape != python_shape
+                    or native_data != data):
+                return PreparedInstruction(
+                    status="DATA_BLOCKED", venue="pumpswap",
+                    detail="native/Python PumpSwap instruction parity mismatch")
+            # Rust is authoritative once the exact bytes and metas agree.
+            accounts, data = native_accounts, native_data
         return PreparedInstruction(status="OK", program_id=self.program,
                                    accounts=accounts, data=data,
                                    expected_accounts=expected, venue="pumpswap")
@@ -284,4 +320,8 @@ class PumpSwapRoute:
             "buy_accounts": len(account_names(PUMP_AMM_IDL, "buy")) if not blocked else 0,
             "sell_accounts": len(account_names(PUMP_AMM_IDL, "sell")) if not blocked else 0,
             "pool_size": POOL_SIZE,
+            "native_builder": ("OK_WITH_CONTINUOUS_PARITY"
+                               if native_pumpswap_build_buy is not None
+                               and native_pumpswap_build_sell is not None
+                               else "DATA_BLOCKED: native extension unavailable"),
         }

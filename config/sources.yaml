@@ -36,49 +36,18 @@ sources:
     tier: 1
     region: global
   - id: code:pump-public-docs
-    kind: code_repo
+    kind: rss
     tier: 2
-    region: global
-    options: {repo: pump-fun/pump-public-docs}
-
-  # ---- Telegram: crypto-native, where a CA usually appears first -----------
-  # These declare which LANGUAGES are worth covering, not which channels. A
-  # placeholder channel name would read as a chosen channel and report
-  # UNCONFIGURED, which an operator reads as "needs a key" rather than as
-  # "nobody has picked one". Add `options: {channel: <public channel>}` per
-  # entry; until then each is reported as pending an endpoint, by name.
-  - id: telegram:calls-en-1
-    kind: telegram
-    tier: 1
-    degraded_after_seconds: 60
-    dead_after_seconds: 300
     language: en
     region: global
-    requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
-  - id: telegram:calls-zh-1
-    kind: telegram
-    tier: 1
-    language: zh
-    region: cn
-    requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
-  - id: telegram:calls-ru-1
-    kind: telegram
-    tier: 1
-    language: ru
-    region: cis
-    requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
-  - id: telegram:calls-tr-1
-    kind: telegram
-    tier: 1
-    language: tr
-    region: tr
-    requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
-  - id: telegram:calls-ko-1
-    kind: telegram
-    tier: 1
-    language: ko
-    region: kr
-    requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
+    poll_interval_seconds: 300
+    # Public Atom carries the commit chronology without consuming the broken
+    # or expired GitHub token quota.
+    options: {url: "https://github.com/pump-fun/pump-public-docs/commits/main.atom"}
+
+  # Telegram declarations are expanded directly from TELEGRAM_CHANNELS at
+  # runtime.  This keeps the joined watchlist in one place and avoids fake
+  # placeholder usernames that can only report NO_FETCHER.
 
   # ---- open social firehoses: free, filtered locally -----------------------
   - id: bluesky:jetstream
@@ -96,12 +65,6 @@ sources:
     tier: 2
     region: global
     requires_env: [NEYNAR_API_KEY]
-  - id: mastodon:mastodon-social
-    kind: mastodon
-    tier: 3
-    region: global
-    options: {instance: "https://mastodon.social"}
-
   # ---- live video and audio: spoken before written ------------------------
   - id: youtube:websub-watchlist
     kind: youtube

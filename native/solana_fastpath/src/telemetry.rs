@@ -50,7 +50,12 @@ pub struct Samples {
 
 impl Samples {
     pub fn new(capacity: usize) -> Self {
-        Self { values: Vec::with_capacity(capacity), capacity: capacity.max(1), next: 0, observed: 0 }
+        Self {
+            values: Vec::with_capacity(capacity),
+            capacity: capacity.max(1),
+            next: 0,
+            observed: 0,
+        }
     }
 
     pub fn record(&mut self, nanos: u64) {
@@ -95,7 +100,10 @@ pub struct Telemetry {
 
 impl Telemetry {
     pub fn new(capacity: usize) -> Self {
-        Self { stages: HashMap::new(), capacity }
+        Self {
+            stages: HashMap::new(),
+            capacity,
+        }
     }
 
     pub fn record(&mut self, stage: Stage, nanos: u64) {
@@ -113,7 +121,9 @@ impl Telemetry {
     }
 
     pub fn percentile(&self, stage: Stage, p: f64) -> Option<u64> {
-        self.stages.get(&stage).and_then(|samples| samples.percentile(p))
+        self.stages
+            .get(&stage)
+            .and_then(|samples| samples.percentile(p))
     }
 
     /// (stage, p50, p90, p99, count) for every stage that has run.
@@ -203,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn the_report_lists_every_stage_that_ran(){
+    fn the_report_lists_every_stage_that_ran() {
         let mut telemetry = Telemetry::new(8);
         telemetry.record(Stage::Receive, 10);
         telemetry.record(Stage::Decode, 20);

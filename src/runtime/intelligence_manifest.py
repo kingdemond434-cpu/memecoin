@@ -80,6 +80,12 @@ ENTRY_CONTRIBUTORS: Tuple[Contributor, ...] = (
     Contributor("strategies.rug_hazard", "hazard",
                 "The competing-risk hazard at entry is the denominator every "
                 "forward return is discounted by."),
+    Contributor("strategies.risk_veto", "risk_veto",
+                "A non-negotiable safety fact is a veto, not a negative alpha vote."),
+    Contributor("strategies.memecoin_state", "holder_trajectory",
+                "Supply distribution changes can matter more than one static holder count."),
+    Contributor("strategies.memecoin_state", "dev_wallet",
+                "Creator selling, transfers and authority mutations invalidate the entry thesis."),
     Contributor("strategies.multihead_predictor", "prediction",
                 "The forward distribution itself. Absent, nothing downstream "
                 "has anything to price."),
@@ -104,6 +110,10 @@ ENTRY_CONTRIBUTORS: Tuple[Contributor, ...] = (
                 "Whether a public group is being used to organise the buy side."),
     Contributor("strategies.social_intelligence", "social",
                 "Public attention, and how much of it arrived before we did."),
+    Contributor("strategies.memecoin_state", "capital_rotation",
+                "Quality- and independence-weighted flow across tokens reveals measured rotation."),
+    Contributor("strategies.memecoin_state", "social_price_disagreement",
+                "Attention only leads when the token has not already repriced by the same amount."),
     Contributor("strategies.information_graph", "information",
                 "Which wallets lead which, so a follower's buy is not counted "
                 "as independent confirmation of a leader's."),
@@ -154,6 +164,10 @@ POSITION_CONTRIBUTORS: Tuple[Contributor, ...] = (
     Contributor("strategies.rug_hazard", "hazard",
                 "The hazard, refreshed -- an exit decided on entry-time hazard "
                 "is decided on evidence since contradicted."),
+    Contributor("strategies.memecoin_state", "holder_trajectory",
+                "A sudden concentration change can invalidate a held position."),
+    Contributor("strategies.memecoin_state", "dev_wallet",
+                "Creator behaviour is re-read after entry rather than treated as sacred."),
 )
 
 _STAGES: Mapping[str, Tuple[Contributor, ...]] = {

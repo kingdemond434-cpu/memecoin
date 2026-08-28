@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import os
+import socket
 import time
 from dataclasses import asdict, is_dataclass, replace as dataclasses_replace
 from enum import Enum
@@ -29,7 +30,7 @@ from src.chains.provider_credentials import normalize_provider_environment
 from src.chains.rpc_manager import ChainRegistry, RPCManager
 from src.chains.yellowstone_grpc import (
     NATIVE_FASTPATH_STATUS, PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
-    create_combined_subscription,
+    create_combined_subscription, native_t0_decide,
 )
 from src.detection.rug_detector import RugDetector
 from src.detection.token_detector import DetectionSource, TokenCandidate, TokenDetectionEngine
@@ -74,9 +75,10 @@ from src.research.contribution import (
     ContributionLedger, GateFlip, action_value_contributions,
 )
 from src.research.attribution import EdgeDecayMonitor
+from src.research.trade_evidence import TradeEvidenceLedger, evidence_packet
 from src.runtime.hot_state import HotState, HotStateBudget
 from src.strategies.action_value import (
-    Action as ActionValue, ActionValuePolicy, Decision as ActionDecision,
+    Action as ActionValue, ActionScore, ActionValuePolicy, Decision as ActionDecision,
     PositionState as ActionState,
 )
 from src.collectors.event_source import Event, SourceMesh
@@ -119,6 +121,12 @@ from src.execution.pump_fees import (
 )
 from src.execution.tradeability import curve_tradeability, exit_capacity_ratio, pool_tradeability
 from src.strategies.distribution import DistributionDetector
+from src.strategies.memecoin_state import (
+    DevEvent, DevWalletMonitor, HolderTrajectoryMonitor, RotationTrade,
+    SmartWalletRotationTracker, social_price_disagreement,
+)
+from src.strategies.profit_sweeper import ProfitIsolationPolicy
+from src.strategies.risk_veto import RiskVeto
 from src.strategies.mega_event import MegaEventReserve
 from src.strategies.escape import (
     EscapeEstimate, HazardMechanism, LandingLatency, escape_probability,
@@ -176,6 +184,26 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _systemd_notify(message: str) -> bool:
+    """Send readiness/watchdog state without adding a runtime dependency.
+
+    The user service sets ``NOTIFY_SOCKET``.  When the desk is launched by a
+    developer or a test there is no socket and this is deliberately a no-op.
+    """
+    address = os.getenv("NOTIFY_SOCKET", "")
+    if not address:
+        return False
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as client:
+            client.sendto(message.encode(), address)
+        return True
+    except OSError as exc:
+        logger.warning("systemd notification failed: %s", exc)
+        return False
+
+
 class MemecoinQuantDesk:
     def __init__(self, config_path: str = "config/chains.yaml", *, dry_run_override: Optional[bool] = None,
                  offline: bool = False):
@@ -221,6 +249,10 @@ class MemecoinQuantDesk:
         self._main_task: Optional[asyncio.Task] = None
         self._health_task: Optional[asyncio.Task] = None
         self._market_task: Optional[asyncio.Task] = None
+        self._fatal_task_event = asyncio.Event()
+        self._fatal_task_detail = ""
+        self._task_health: Dict[str, Dict[str, Any]] = {}
+        self._background_failures = 0
         self._background_tasks: set[asyncio.Task] = set()
         self._candidate_pipelines: Dict[str, asyncio.Task] = {}
         self._candidate_semaphore: Optional[asyncio.Semaphore] = None
@@ -317,6 +349,13 @@ class MemecoinQuantDesk:
         self._market_entry_price: Dict[str, float] = {}
         self._curve_entry_price: Dict[str, float] = {}
         self._latest_stream_mark: Dict[str, Dict[str, float]] = {}
+        self._router_mark_cache: Dict[str, Dict[str, float]] = {}
+        self._router_mark_inflight: Set[str] = set()
+        self._router_mark_checked_at: Dict[str, float] = {}
+        self._native_decisions = 0
+        self._native_parity_matches = 0
+        self._native_parity_mismatches = 0
+        self._native_decision_fallbacks = 0
         # Latest bonding-curve reserves decoded straight off the trade
         # stream, so exit capacity is answerable locally in the window a
         # decision actually has, with no RPC round trip.
@@ -398,12 +437,42 @@ class MemecoinQuantDesk:
         self._closed_pnl: Dict[str, float] = {}
         self._market_cursor = 0
         self._model_artifact_mtime = 0.0
+        # Explicit memecoin mechanics which were previously spread across
+        # risk, actor and social reports. They are kept as measurements rather
+        # than parallel trading authorities.
+        self.holder_trajectory = HolderTrajectoryMonitor()
+        self.dev_wallet_monitor = DevWalletMonitor()
+        self.rotation_tracker = SmartWalletRotationTracker()
+        self.risk_veto: RiskVeto = RiskVeto()
+        self.trade_evidence: Optional[TradeEvidenceLedger] = None
+        self.profit_isolation: Optional[ProfitIsolationPolicy] = None
+        self._safety_refreshed_at: Dict[str, float] = {}
 
     async def initialize(self):
         normalize_provider_environment(os.environ)
         with open(self.config_path, encoding="utf-8") as handle:
             self.config = yaml.safe_load(handle)
         self.global_config = self.config.get("global", {})
+        self.risk_veto = RiskVeto(
+            require_complete_safety=bool(
+                self.global_config.get("require_complete_veto_inputs", False)),
+            max_exit_impact_pct=float(
+                self.global_config.get("max_veto_exit_impact_pct", 0.20)),
+            max_liquidity_fraction=float(
+                self.global_config.get("max_liquidity_fraction", 0.01)),
+        )
+        state_root = Path(self.global_config.get("ops_state_dir", "data/state"))
+        self.trade_evidence = TradeEvidenceLedger(
+            state_root / "trade_evidence.jsonl")
+        self.profit_isolation = ProfitIsolationPolicy(
+            working_capital_usd=float(self.global_config.get(
+                "profit_isolation_working_capital_usd",
+                self.global_config.get("paper_equity_usd", 10_000))),
+            sweep_trigger_usd=float(self.global_config.get(
+                "profit_isolation_trigger_usd", 1_000)),
+            isolation_fraction=float(self.global_config.get(
+                "profit_isolation_fraction", 1.0)),
+        )
         self._candidate_semaphore = asyncio.Semaphore(
             int(self.global_config.get("max_candidate_concurrency", 8))
         )
@@ -848,6 +917,8 @@ class MemecoinQuantDesk:
         self.dataset_builder = PointInTimeDatasetBuilder(
             self.solana_config, self.solana_rpc, self.genealogy, self.wallet_intel, self.social_intel,
             self.prelaunch, self.info_graph, self.rug_hazard, self.champion_challenger,
+            actor_provider=self.actor_intelligence,
+            memecoin_state_provider=self._memecoin_state_features,
         )
         self.info_graph.set_outcome_provider(self.dataset_builder.get_outcome)
         if hasattr(self.genealogy, "set_outcome_provider"):
@@ -900,19 +971,27 @@ class MemecoinQuantDesk:
         # decide -- candidates and redecisions -- are driven by events and
         # never sleep; the two that maintain are driven by the clock and never
         # sit in front of a decision.
-        self._main_task = asyncio.create_task(self._candidate_dispatch_loop())
+        self._main_task = self._start_runtime_task(
+            "candidate_dispatch", self._candidate_dispatch_loop())
         self._redecision_tasks = [
-            asyncio.create_task(self._redecision_loop())
-            for _ in range(int(self.global_config.get("redecision_workers", 4)))]
-        self._safety_task = asyncio.create_task(self._safety_sweep_loop())
-        self._intelligence_task = asyncio.create_task(self._intelligence_loop())
+            self._start_runtime_task(f"redecision_{index}", self._redecision_loop())
+            for index in range(int(self.global_config.get("redecision_workers", 4)))]
+        self._safety_task = self._start_runtime_task(
+            "safety_sweep", self._safety_sweep_loop())
+        self._intelligence_task = self._start_runtime_task(
+            "intelligence", self._intelligence_loop())
         self._register_memory_reliefs()
-        self._health_task = asyncio.create_task(self._health_loop())
-        self._market_task = asyncio.create_task(self._market_observer_loop())
-        self._source_task = asyncio.create_task(self._source_consumer_loop())
+        self._health_task = self._start_runtime_task("health", self._health_loop())
+        self._market_task = self._start_runtime_task(
+            "market_observer", self._market_observer_loop())
+        self._source_task = self._start_runtime_task(
+            "source_consumer", self._source_consumer_loop())
+        self._persist_readiness(_jsonable(self.readiness()))
+        _systemd_notify("READY=1\nSTATUS=DRY_RUN collectors active")
 
     async def stop(self):
         self._running = False
+        _systemd_notify("STOPPING=1\nSTATUS=flushing evidence and closing streams")
         # Producers first: they hold sockets, and cancelling the consumer
         # while producers keep publishing fills a queue nobody drains.
         try:
@@ -982,7 +1061,83 @@ class MemecoinQuantDesk:
     def _spawn_background(self, coroutine):
         task = asyncio.create_task(coroutine)
         self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+
+        def completed(done: asyncio.Task) -> None:
+            self._background_tasks.discard(done)
+            if done.cancelled():
+                return
+            try:
+                exc = done.exception()
+            except asyncio.CancelledError:
+                return
+            if exc is not None:
+                self._background_failures += 1
+                logger.error("background task failed", exc_info=(
+                    type(exc), exc, exc.__traceback__))
+
+        task.add_done_callback(completed)
+
+    def _start_runtime_task(self, name: str, coroutine) -> asyncio.Task:
+        """Start one indispensable loop and make an unexpected exit fatal.
+
+        A process with a living health loop and a dead source consumer looks
+        healthy to systemd while collecting nothing.  Failing the process is
+        the correct recovery boundary because systemd can restart the complete
+        graph from a consistent snapshot.
+        """
+        task = asyncio.create_task(coroutine, name=f"memecoin:{name}")
+        self._task_health[name] = {
+            "status": "RUNNING", "started_at": time.time(), "failures": 0}
+
+        def completed(done: asyncio.Task) -> None:
+            state = self._task_health.setdefault(name, {})
+            if done.cancelled() or not self._running:
+                state.update({"status": "STOPPED", "stopped_at": time.time()})
+                return
+            try:
+                exc = done.exception()
+            except asyncio.CancelledError:
+                exc = None
+            detail = (f"{type(exc).__name__}: {exc}" if exc is not None
+                      else "loop returned while the desk was running")
+            state.update({"status": "FAILED", "failed_at": time.time(),
+                          "detail": detail,
+                          "failures": int(state.get("failures", 0)) + 1})
+            self._fatal_task_detail = f"{name}: {detail}"
+            logger.critical("critical runtime task failed: %s", self._fatal_task_detail)
+            self._fatal_task_event.set()
+
+        task.add_done_callback(completed)
+        return task
+
+    def runtime_task_report(self) -> Dict[str, Any]:
+        states = {name: dict(value) for name, value in self._task_health.items()}
+        failed = [name for name, value in states.items()
+                  if value.get("status") == "FAILED"]
+        return {
+            "status": "CRITICAL" if failed else "OK" if states else "DATA_BLOCKED",
+            "failed": failed,
+            "fatal_detail": self._fatal_task_detail,
+            "background_failures": self._background_failures,
+            "tasks": states,
+        }
+
+    def watchdog_report(self) -> Dict[str, Any]:
+        path = Path(self.global_config.get("ops_state_dir", "data/state")) \
+            / "watchdog_state.json"
+        try:
+            payload = json.loads(path.read_text())
+            age = max(0.0, time.time() - float(payload.get("last_run_at", 0.0)))
+        except (OSError, ValueError, TypeError):
+            return {"status": "DATA_BLOCKED",
+                    "detail": "watchdog has not completed a run"}
+        return {
+            "status": "OK" if age <= 180.0 else "DEGRADED",
+            "seconds_since_run": round(age, 1),
+            "restart_count_window": len(payload.get("restart_times") or ()),
+            "last_plan": payload.get("last_plan") or {},
+            "last_failures": payload.get("last_failures") or [],
+        }
 
     async def _candidate_dispatch_loop(self):
         """Dispatch every candidate the instant it is detected.
@@ -1177,6 +1332,14 @@ class MemecoinQuantDesk:
         if candidate.chain != "solana" or not candidate.address:
             return
         token = candidate.address
+        if self.trade_evidence:
+            self.trade_evidence.record("candidate_observed", {
+                "mint": token, "chain": candidate.chain,
+                "source": getattr(candidate.source, "value", str(candidate.source)),
+                "detected_at": candidate.timestamp, "factory": candidate.factory,
+                "deployer": candidate.deployer, "pair": candidate.pair,
+                "transaction": candidate.tx_hash,
+            }, timestamp=candidate.timestamp)
         if token in self.elogw_engine.open_positions:
             return
         # A token we have already exited is not an ordinary candidate. The
@@ -1197,22 +1360,62 @@ class MemecoinQuantDesk:
             candidate.base_token or WSOL_MINT, detected_at=candidate.timestamp,
             prelaunch_context=self._prelaunch_context(candidate.deployer or "", candidate.timestamp),
         )
-        risk = await self.rug_detector.analyze(token, candidate.pair, candidate.base_token)
-        risk_data = _jsonable(risk)
-        self.dataset_builder.record_risk_report(token, risk_data)
         self.rug_hazard.register_token(token, {"deployer": candidate.deployer or "", "pair": candidate.pair or ""})
         self.public_coordination.record_creator(token, candidate.deployer or "")
+        # Shared launch funding is coordination evidence, not proof that the
+        # creator controls every recipient. Only the identified creator is
+        # placed in the developer set until the entity graph proves a link.
+        self.dev_wallet_monitor.register(token, candidate.deployer or "")
         # Wallets funded within the same atomic launch transaction as the pool
-        # creation -- the only funding evidence available without an extra
-        # RPC call. record_funding keys on the *funded* wallet so that N
-        # different wallets sharing one funder inside this transaction (a
-        # common bundled-sniper-bot pattern) is what actually trips the
-        # shared_funder coordination signal.
+        # creation. This is public coordination evidence, not proof that the
+        # creator controls every recipient.
         for item in candidate.metadata.get("funding_transfers", []):
             self.public_coordination.record_funding(
                 token, item.get("to", ""), item.get("from", ""),
                 float(item.get("lamports", 0) or 0) / 1e9, candidate.timestamp,
             )
+        risk = await self.rug_detector.analyze(
+            token, candidate.pair, candidate.base_token,
+            candidate.deployer or None)
+        self._enrich_holder_actor_concentration(
+            token, risk, candidate.deployer or "")
+        risk_data = _jsonable(risk)
+        self.dataset_builder.record_risk_report(token, risk_data)
+        self.holder_trajectory.record_mapping(
+            token, {
+                "top_10_pct": getattr(risk, "top_10_pct", None),
+                "top_20_pct": getattr(risk, "top_20_pct", None),
+                "dev_pct": getattr(risk, "deployer_balance_pct", None),
+                "insider_pct": getattr(risk, "insider_pct", None),
+                "bundler_pct": getattr(risk, "bundler_pct", None),
+                "fresh_wallet_pct": getattr(risk, "fresh_wallet_pct", None),
+                "whale_pct": getattr(risk, "whale_pct", None),
+                "cluster_pct": getattr(risk, "connected_cluster_pct", None),
+                "holder_count": getattr(risk, "holder_count", None),
+            },
+            timestamp=getattr(risk, "timestamp", time.time()),
+            source="native_spl_largest_accounts")
+        if getattr(risk, "deployer_balance_pct", None) is not None:
+            self.dev_wallet_monitor.record_balance(
+                token, risk.deployer_balance_pct,
+                timestamp=getattr(risk, "timestamp", time.time()),
+                source="native_spl")
+        hard_veto = self.risk_veto.evaluate(
+            risk, dev_state=self.dev_wallet_monitor.state(token),
+            connected_holder_pct=getattr(risk, "connected_cluster_pct", None))
+        if hard_veto.status == "VETO":
+            self._record_blocked_decision(
+                token, "safety_veto",
+                {"risk": risk_data, "veto": hard_veto.to_dict()})
+            return
+        if ((risk.data_status == "DATA_BLOCKED"
+             or hard_veto.status == "DATA_BLOCKED")
+                and self.global_config.get(
+                    "reject_data_blocked_safety_checks", True)):
+            self._record_blocked_decision(
+                token, "DATA_BLOCKED_safety_checks",
+                {"risk": risk_data, "veto": hard_veto.to_dict()})
+            return
         # Safety is graded, not binary. HONEYPOT, RUGGED and CRITICAL are
         # untradeable at any size and stay vetoes; HIGH is a worse token, not
         # an impossible one, and a hard reject on it discards the launches
@@ -1269,8 +1472,21 @@ class MemecoinQuantDesk:
                 trade_info = {**trade_info, **room}
                 should_trade = False
             else:
-                # Q owns the economic question from here.
-                should_trade = True
+                economic_veto = self.risk_veto.evaluate(
+                    risk, dev_state=self.dev_wallet_monitor.state(token),
+                    position_value_usd=float(
+                        trade_info.get("position_value_usd", 0) or 0),
+                    liquidity_usd=liquidity,
+                    connected_holder_pct=getattr(
+                        risk, "connected_cluster_pct", None))
+                if economic_veto.status == "VETO":
+                    trade_info = {
+                        **trade_info, "reason": "risk_veto",
+                        "risk_veto": economic_veto.to_dict()}
+                    should_trade = False
+                else:
+                    # Q owns the economic question from here.
+                    should_trade = True
         intelligence = self._entry_intelligence(
             token, candidate, risk, prediction, trade_info, liquidity)
         coverage = self.entry_coverage.record(intelligence)
@@ -1337,6 +1553,10 @@ class MemecoinQuantDesk:
             decision.update({"should_trade": should_trade, "trade_info": trade_info,
                              "contested_for_capital": True})
         decision_id = self.counterfactual_lab.record_decision(token, _jsonable(prediction), decision)
+        self._record_trade_evidence_packet(
+            token, candidate, risk, liquidity, trade_info, intelligence,
+            decision="ENTER" if should_trade else str(trade_info.get("reason", "REJECT")),
+            veto=veto.to_dict())
         if not should_trade:
             return
         result = await self.execution_engine.execute_swap(
@@ -1479,7 +1699,70 @@ class MemecoinQuantDesk:
             "token": token, "entered": False, "attempted": False,
             "rejection_reason": reason,
         })
+        if self.trade_evidence:
+            self.trade_evidence.record("candidate_rejected", {
+                "mint": token, "reason": reason, "evidence": evidence})
         self.counterfactual_lab.record_decision(token, evidence, {"should_trade": False, "reason": reason})
+
+    def _record_trade_evidence_packet(
+        self, token: str, candidate: Any, risk: Any, liquidity: float,
+        trade_info: Dict[str, Any], intelligence: Dict[str, Any], *,
+        decision: str, veto: Dict[str, Any],
+    ) -> None:
+        """Freeze the complete measured entry thesis before execution."""
+        if not self.trade_evidence:
+            return
+        curve = self._latest_curve_state.get(token)
+        pool = self._latest_pool_state.get(token)
+        if curve is not None:
+            bonding = {
+                "status": "OK", "venue": "pump_fun",
+                "virtual_token_reserves": curve.virtual_token_reserves,
+                "virtual_sol_reserves": curve.virtual_sol_reserves,
+                "real_token_reserves": curve.real_token_reserves,
+                "real_sol_reserves": curve.real_sol_reserves,
+                "complete": curve.complete,
+            }
+        elif pool is not None:
+            bonding = {"status": "OK", "venue": "pump_swap", "pool": pool.pool,
+                       "base_reserves": pool.base_reserves,
+                       "quote_reserves": pool.quote_reserves}
+        else:
+            bonding = {"status": "DATA_BLOCKED", "detail": "no native venue state"}
+        checks = getattr(risk, "checks", {}) or {}
+        actors = intelligence.get("actors") or {
+            "status": "DATA_BLOCKED", "detail": "actor graph unavailable"}
+        packet = evidence_packet(
+            mint=token, timestamp=time.time(), bonding_curve=bonding,
+            liquidity={"status": "OK" if liquidity > 0 else "DATA_BLOCKED",
+                       "liquidity_usd": liquidity},
+            sellability=checks.get("sell_route") or {
+                "status": "DATA_BLOCKED", "detail": "sell route not measured"},
+            authorities={"status": getattr(risk, "data_status", "DATA_BLOCKED"),
+                         "mint_active": getattr(risk, "can_mint", None),
+                         "freeze_active": getattr(risk, "can_freeze", None),
+                         "extensions": getattr(risk, "token_extensions", ())},
+            holder_distribution=self.holder_trajectory.state(token),
+            wallet_clusters=actors,
+            dev_wallet=self.dev_wallet_monitor.state(token),
+            smart_wallet_flow=actors.get("smart_flow") or {
+                "status": "DATA_BLOCKED", "detail": "quality flow unavailable"},
+            social_velocity=intelligence.get("social") or {
+                "status": "DATA_BLOCKED", "detail": "social velocity unavailable"},
+            entry_cost=self._cost_model(token),
+            exit_liquidity={"status": "OK" if liquidity > 0 else "DATA_BLOCKED",
+                            "liquidity_usd": liquidity,
+                            "capacity_limit_fraction": self.risk_veto.max_liquidity_fraction},
+            risk_vetoes=veto.get("reasons", ()),
+            expected_edge=(float(trade_info["elogw"])
+                           if trade_info.get("elogw") is not None else None),
+            position_size=(float(trade_info["position_value_usd"])
+                           if trade_info.get("position_value_usd") is not None else None),
+            exit_plan={"status": self.exit_policy_status,
+                       "policy": _jsonable(self.exit_policy)},
+            decision=decision,
+        )
+        self.trade_evidence.record("candidate_decision", packet)
 
     def _prelaunch_context(self, deployer: str, detected_at: float) -> Optional[Dict[str, Any]]:
         profile = self.prelaunch.get_entity_profile(deployer) if deployer else None
@@ -1603,6 +1886,13 @@ class MemecoinQuantDesk:
             "can_mint": bool(risk.can_mint),
             "can_freeze": bool(risk.can_freeze),
             "top_10_pct": float(risk.top_10_pct),
+            "top_20_pct": getattr(risk, "top_20_pct", None),
+            "dev_pct": getattr(risk, "deployer_balance_pct", None),
+            "insider_pct": getattr(risk, "insider_pct", None),
+            "bundler_pct": getattr(risk, "bundler_pct", None),
+            "fresh_wallet_pct": getattr(risk, "fresh_wallet_pct", None),
+            "whale_pct": getattr(risk, "whale_pct", None),
+            "connected_cluster_pct": getattr(risk, "connected_cluster_pct", None),
             "extension_risk": float(getattr(risk, "extension_risk", 0) or 0),
             "sell_route_feasible": risk.sell_route_feasible,
         }
@@ -1633,6 +1923,9 @@ class MemecoinQuantDesk:
             # reached yet -- which is the same false alarm as reporting a live
             # module missing, and would have trained an operator to ignore it.
             try:
+                refresh = getattr(self, "_refresh_open_safety", None)
+                if refresh is not None:
+                    await refresh(token, position)
                 await self._manage_one_position(token, position)
             finally:
                 try:
@@ -1646,8 +1939,89 @@ class MemecoinQuantDesk:
                     # far worse failure than a missing coverage row.
                     logger.warning("position coverage failed for %s: %s", token, exc)
 
+    async def _refresh_open_safety(self, token: str, position: Dict[str, Any]) -> None:
+        """Re-read mutable mint, route and holder facts off the event hot path."""
+        now = time.time()
+        interval = float(self.global_config.get("mutable_safety_refresh_seconds", 15.0))
+        if now - self._safety_refreshed_at.get(token, 0.0) < interval:
+            return
+        self._safety_refreshed_at[token] = now
+        candidate = position.get("candidate")
+        if candidate is None:
+            return
+        previous = position.get("risk_object")
+        current = await self.rug_detector.analyze(
+            token, getattr(candidate, "pair", None), getattr(candidate, "base_token", None),
+            getattr(candidate, "deployer", None))
+        self._enrich_holder_actor_concentration(
+            token, current, str(getattr(candidate, "deployer", "") or ""))
+        position["risk_object"] = current
+        position["risk_report"] = _jsonable(current)
+        self.dataset_builder.record_risk_report(token, _jsonable(current))
+        self.holder_trajectory.record_mapping(token, {
+            "top_10_pct": getattr(current, "top_10_pct", None),
+            "top_20_pct": getattr(current, "top_20_pct", None),
+            "dev_pct": getattr(current, "deployer_balance_pct", None),
+            "insider_pct": getattr(current, "insider_pct", None),
+            "bundler_pct": getattr(current, "bundler_pct", None),
+            "fresh_wallet_pct": getattr(current, "fresh_wallet_pct", None),
+            "whale_pct": getattr(current, "whale_pct", None),
+            "cluster_pct": getattr(current, "connected_cluster_pct", None),
+            "holder_count": getattr(current, "holder_count", None),
+        }, timestamp=getattr(current, "timestamp", now), source="native_spl_refresh")
+        trajectory = self.holder_trajectory.state(token)
+        position["holder_trajectory"] = trajectory
+        top10_change = trajectory.get("changes", {}).get("top_10_pct")
+        if top10_change is not None:
+            self.rug_hazard.record_observation(token, {
+                "type": "concentration", "top10_change_pct": float(top10_change) / 100.0,
+                "timestamp": now, "source": "native_spl_refresh"})
+
+        if previous is not None:
+            gained_authority = (
+                (not bool(getattr(previous, "can_mint", False))
+                 and bool(getattr(current, "can_mint", False)))
+                or (not bool(getattr(previous, "can_freeze", False))
+                    and bool(getattr(current, "can_freeze", False))))
+            if gained_authority:
+                self.dev_wallet_monitor.record(token, DevEvent(
+                    now, "authority_mutation",
+                    wallet=str(getattr(candidate, "deployer", "") or ""),
+                    severity="critical", evidence=_jsonable(current)))
+                self.rug_hazard.record_observation(token, {
+                    "type": "dev_wallet_activation", "strength": 1.0,
+                    "confidence": 1.0, "timestamp": now,
+                    "reason": "authority_mutation"})
+            if (getattr(previous, "sell_route_feasible", None) is not False
+                    and getattr(current, "sell_route_feasible", None) is False):
+                self.dev_wallet_monitor.record(token, DevEvent(
+                    now, "sell_route_failed", severity="critical",
+                    evidence=(getattr(current, "checks", {}) or {}).get("sell_route", {})))
+                self.rug_hazard.record_observation(token, {
+                    "type": "route", "feasible": False, "timestamp": now,
+                    "source": "native_safety_refresh"})
+
     async def _manage_one_position(self, token: str, position: Dict[str, Any]) -> None:
         """One position, one cycle. Returns early where the cycle is resolved."""
+        dev_monitor = getattr(self, "dev_wallet_monitor", None)
+        holder_monitor = getattr(self, "holder_trajectory", None)
+        dev_state = (dev_monitor.state(token) if dev_monitor else {
+            "status": "DATA_BLOCKED", "detail": "developer monitor unavailable"})
+        position["dev_wallet"] = dev_state
+        position["holder_trajectory"] = (holder_monitor.state(token) if holder_monitor else {
+            "status": "DATA_BLOCKED", "detail": "holder monitor unavailable"})
+        risk = position.get("risk_object")
+        veto_engine = getattr(self, "risk_veto", None)
+        if risk is not None and veto_engine is not None:
+            veto = veto_engine.evaluate(
+                risk, dev_state=dev_state,
+                connected_holder_pct=getattr(risk, "connected_cluster_pct", None))
+            position["risk_veto"] = veto.to_dict()
+            if veto.status == "VETO":
+                await self._execute_exit(
+                    token, position, 1.0,
+                    "hard_safety_veto:" + ",".join(veto.reasons))
+                return
         should_hazard_exit, urgency, pct = self.rug_hazard.should_exit(token, position)
         if should_hazard_exit:
             await self._execute_exit(token, position, pct, f"rug_hazard_{urgency}")
@@ -1901,10 +2275,22 @@ class MemecoinQuantDesk:
         """
         hazard = self.rug_hazard.get_hazard(token)
         reentry = self.reentry_book.get(token)
+        observations = list(self.rug_hazard.observations.get(token, ()))
+        social_disagreement = social_price_disagreement(
+            [item for item in observations if item.get("type") == "social"],
+            [item for item in observations if item.get("type") in {"trade", "market"}],
+        )
+        dev_state = self.dev_wallet_monitor.state(token)
+        veto = self.risk_veto.evaluate(
+            risk, dev_state=dev_state,
+            position_value_usd=(float(trade_info["position_value_usd"])
+                                if trade_info.get("position_value_usd") is not None else None),
+            liquidity_usd=liquidity if liquidity > 0 else None,
+            connected_holder_pct=getattr(risk, "connected_cluster_pct", None))
         return {
             "safety": {"status": getattr(risk, "data_status", "DATA_BLOCKED"),
                        "ownership_renounced": bool(getattr(risk, "ownership_renounced", False)),
-                       "risk_score": getattr(risk, "risk_score", None)},
+                       "risk_score": getattr(risk, "score", None)},
             "hazard": ({"status": hazard.data_status, "hazard_30s": hazard.hazard_30s,
                         "hazard_5m": hazard.hazard_5m, "urgency": hazard.exit_urgency,
                         "reason": hazard.blocked_reason}
@@ -1924,6 +2310,11 @@ class MemecoinQuantDesk:
                           or {"status": "DATA_BLOCKED", "reason": "no deployer profile"}),
             "coordination": self.public_coordination.get_features(token),
             "social": self.social_intel.get_token_social_signal(token),
+            "risk_veto": veto.to_dict(),
+            "holder_trajectory": self.holder_trajectory.state(token),
+            "dev_wallet": dev_state,
+            "capital_rotation": self.rotation_tracker.report(),
+            "social_price_disagreement": social_disagreement,
             "information": {"status": "OK", "lead_sequence": len(
                 self.info_graph.get_lead_sequence(token))} if self.info_graph else {
                 "status": "DATA_BLOCKED", "reason": "information graph not constructed"},
@@ -1947,9 +2338,134 @@ class MemecoinQuantDesk:
                                      "risk_contribution", "reason")}},
         }
 
+    def _memecoin_state_features(self, token: str,
+                                 as_of: Optional[float] = None) -> Dict[str, Any]:
+        """The same PIT memecoin state used by snapshots and live inference."""
+        holder = getattr(self, "holder_trajectory", None)
+        developer = getattr(self, "dev_wallet_monitor", None)
+        rotation = getattr(self, "rotation_tracker", None)
+        return {
+            "holder_trajectory": (holder.state(token, as_of) if holder else {
+                "status": "DATA_BLOCKED", "detail": "holder monitor unavailable"}),
+            "dev_wallet": (developer.state(token, as_of) if developer else {
+                "status": "DATA_BLOCKED", "detail": "developer monitor unavailable"}),
+            "capital_rotation": (rotation.report(as_of) if rotation else {
+                "status": "DATA_BLOCKED", "detail": "rotation tracker unavailable"}),
+        }
+
+    def _enrich_holder_actor_concentration(self, token: str, risk: Any,
+                                           deployer: str) -> Dict[str, Any]:
+        """Attach evidence-backed actor lower bounds to native holder data.
+
+        The RPC layer resolves token accounts to wallet owners.  This method
+        joins those public owners to the already-observed genealogy and
+        coordination graphs.  A graph that has not linked a wallet does not
+        prove independence, so unobserved labels remain ``None``; positive
+        matches are safe lower bounds and can still trigger a hard veto.
+        """
+        checks = getattr(risk, "checks", None)
+        holders = checks.get("holders") if isinstance(checks, dict) else None
+        accounts = holders.get("accounts", []) if isinstance(holders, dict) else []
+        by_owner: Dict[str, float] = {}
+        for account in accounts:
+            owner = str(account.get("owner", "") or "")
+            if not owner:
+                continue
+            try:
+                share = float(account.get("supply_pct"))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(share) and share >= 0:
+                by_owner[owner] = by_owner.get(owner, 0.0) + share
+        if not by_owner:
+            result = {"status": "DATA_BLOCKED",
+                      "reason": "largest token-account owners unresolved"}
+            if isinstance(holders, dict):
+                holders["entity_enrichment"] = result
+            return result
+
+        evidence: Dict[str, Any] = {
+            "status": "PARTIAL", "semantics": "observed_lower_bounds",
+            "resolved_owners": len(by_owner),
+        }
+        whale_threshold = float(self.global_config.get(
+            "holder_whale_supply_pct", 1.0))
+        whale_owners = {owner for owner, pct in by_owner.items()
+                        if pct >= whale_threshold}
+        risk.whale_pct = sum(by_owner[owner] for owner in whale_owners)
+        evidence.update({
+            "whale_supply_threshold_pct": whale_threshold,
+            "whale_pct_lower_bound": risk.whale_pct,
+            "whale_owners": len(whale_owners),
+        })
+
+        coordination = getattr(self, "public_coordination", None)
+        coordinated_wallets = set()
+        kinds = set()
+        if coordination is not None:
+            for item in coordination.token_evidence.get(token, []):
+                if item.kind in {
+                    "same_slot_buy_cluster", "shared_funder",
+                    "near_identical_buy_sizes",
+                }:
+                    coordinated_wallets.update(item.wallets)
+                    kinds.add(item.kind)
+        if kinds:
+            risk.bundler_pct = sum(
+                pct for owner, pct in by_owner.items()
+                if owner in coordinated_wallets)
+            evidence.update({
+                "bundler_pct_lower_bound": risk.bundler_pct,
+                "bundler_evidence": sorted(kinds),
+                "coordinated_holders": len(set(by_owner) & coordinated_wallets),
+            })
+        else:
+            evidence["bundler_status"] = "DATA_BLOCKED: no qualifying public coordination evidence"
+
+        genealogy = getattr(self, "genealogy", None)
+        developer_cluster = (genealogy.find_cluster(deployer)
+                             if genealogy is not None and deployer else None)
+        if developer_cluster is not None:
+            cluster_wallets = set(developer_cluster.wallets)
+            risk.connected_cluster_pct = sum(
+                pct for owner, pct in by_owner.items()
+                if owner in cluster_wallets)
+            evidence.update({
+                "connected_cluster_pct_lower_bound": risk.connected_cluster_pct,
+                "connected_cluster_id": developer_cluster.cluster_id,
+                "connected_holders": len(set(by_owner) & cluster_wallets),
+            })
+        else:
+            evidence["connected_cluster_status"] = "DATA_BLOCKED: developer cluster unproven"
+
+        insider_wallets = set()
+        if genealogy is not None:
+            for owner in by_owner:
+                profile = genealogy.get_wallet_profile(owner)
+                if profile is not None and getattr(profile, "is_insider", False):
+                    insider_wallets.add(owner)
+        if insider_wallets:
+            risk.insider_pct = sum(by_owner[owner] for owner in insider_wallets)
+            evidence.update({
+                "insider_pct_lower_bound": risk.insider_pct,
+                "insider_holders": len(insider_wallets),
+            })
+        else:
+            evidence["insider_status"] = "DATA_BLOCKED: no evidence-labeled insider holder"
+
+        # Chain age is not derivable from a wallet's first local observation.
+        # Keep fresh-wallet concentration unavailable until an actual
+        # transaction-history timestamp is measured.
+        evidence["fresh_wallet_status"] = "DATA_BLOCKED: chain-age enrichment unavailable"
+        if isinstance(holders, dict):
+            holders["entity_enrichment"] = evidence
+        return evidence
+
     def _position_intelligence(self, token: str, position: Dict[str, Any]) -> Dict[str, Any]:
         """One slot per module that must be visible in an open-position decision."""
         hazard = self.rug_hazard.get_hazard(token)
+        holder = getattr(self, "holder_trajectory", None)
+        developer = getattr(self, "dev_wallet_monitor", None)
         return {
             "distribution": position.get("distribution")
             or {"status": "DATA_BLOCKED", "reason": "not read this cycle"},
@@ -1973,6 +2489,10 @@ class MemecoinQuantDesk:
                         "urgency": hazard.exit_urgency}
                        if hazard is not None
                        else {"status": "DATA_BLOCKED", "reason": "token not registered"}),
+            "holder_trajectory": (holder.state(token) if holder else {
+                "status": "DATA_BLOCKED", "reason": "holder monitor unavailable"}),
+            "dev_wallet": (developer.state(token) if developer else {
+                "status": "DATA_BLOCKED", "reason": "developer monitor unavailable"}),
         }
 
     def ingest_curve_account(self, token: str, data: bytes) -> bool:
@@ -2157,7 +2677,8 @@ class MemecoinQuantDesk:
             quote = quote_buy(curve, lamports)
             return quote if quote.data_status == "OK" else None
         pool = self._latest_pool_state.get(token)
-        if pool is not None and pool.blocked_reason() is None:
+        if (pool is not None and pool.quote_mint == WSOL_MINT
+                and pool.blocked_reason() is None):
             quote = pool_quote_buy(pool, lamports)
             return quote if quote.data_status == "OK" else None
         return None
@@ -2633,6 +3154,101 @@ class MemecoinQuantDesk:
                 token, position, decision, state, add_fraction)
         return decision
 
+    @staticmethod
+    def _survival_levels(prediction: Any) -> List[float]:
+        return [float(getattr(prediction, name, 0.0) or 0.0) for name in (
+            "p_2x", "p_5x", "p_10x", "p_20x", "p_50x", "p_100x", "p_250x", "p_500x")]
+
+    def _native_reserves(self, token: str) -> Optional[Tuple[int, int]]:
+        curve = getattr(self, "_latest_curve_state", {}).get(token)
+        if curve is not None and getattr(curve, "tradeable", False):
+            return int(curve.virtual_sol_reserves), int(curve.virtual_token_reserves)
+        pool = getattr(self, "_latest_pool_state", {}).get(token)
+        if pool is not None and pool.blocked_reason() is None:
+            return int(pool.effective_quote_reserves), int(pool.base_reserves)
+        return None
+
+    def _token_age_seconds(self, token: str, position: Optional[Dict[str, Any]]) -> float:
+        if position is not None and position.get("entry_time") is not None:
+            return max(0.0, time.time() - float(position["entry_time"]))
+        episode = getattr(getattr(self, "dataset_builder", None), "active_episodes", {}).get(token)
+        created_at = getattr(episode, "created_at", None)
+        return max(0.0, time.time() - float(created_at)) if created_at is not None else 0.0
+
+    def _increment_native_stat(self, name: str) -> None:
+        setattr(self, name, int(getattr(self, name, 0)) + 1)
+
+    def _canonical_action_score(self, token: str, prediction: Any, state: ActionState,
+                                position: Optional[Dict[str, Any]] = None) -> ActionDecision:
+        """Rust owns the decision; Python runs continuously as a parity oracle.
+
+        A disagreement blocks entry/ordinary position action and is surfaced,
+        rather than quietly selecting whichever implementation is more
+        permissive. Catastrophic hazard exits run before this method and are
+        therefore never blocked by a parity fault.
+        """
+        shadow = self.action_policy.score(state)
+        reserves = self._native_reserves(token)
+        if native_t0_decide is None or reserves is None or self.action_policy.is_trained:
+            self._increment_native_stat("_native_decision_fallbacks")
+            return shadow
+        try:
+            raw = native_t0_decide(
+                self._token_age_seconds(token, position), reserves[0], reserves[1],
+                self._survival_levels(prediction),
+                float(getattr(prediction, "p_rug_30s", 0.0) or 0.0),
+                float(getattr(prediction, "p_rug_5m", 0.0) or 0.0),
+                float(getattr(prediction, "expected_feasible_multiple", 0.0) or 0.0),
+                float(state.held_fraction), float(state.current_multiple),
+                float(state.exit_cost), float(state.entry_cost),
+                state.exit_capacity_ratio, state.escape_probability,
+                state.alternative_growth_per_second, state.expected_remaining_seconds,
+                state.add_fraction, state.add_capacity_fraction, state.probe_fraction,
+                float(self.action_policy.min_edge), float(self.action_policy.max_add_fraction),
+                not self.dry_run, float(self.elogw_engine.max_position_pct),
+                float(getattr(self, "global_config", {}).get("max_single_commit_fraction",
+                                             self.elogw_engine.max_position_pct)),
+                float(getattr(self, "global_config", {}).get("min_commit_fraction", 0.0005)),
+                float(getattr(self, "global_config", {}).get("min_exit_capacity", 0.10)),
+                os.getenv("ALLOW_LIVE_TRADING", "").lower() == "yes-i-understand",
+            )
+        except Exception as exc:
+            self._increment_native_stat("_native_decision_fallbacks")
+            logger.error("native decision failed closed for %s: %s", token, exc)
+            return ActionDecision(status="DATA_BLOCKED", detail=f"native decision failed: {exc}")
+
+        self._increment_native_stat("_native_decisions")
+        action = ActionValue(raw[0])
+        scores = [ActionScore(ActionValue(name), float(q),
+                              status="OK" if feasible else "DATA_BLOCKED")
+                  for name, q, feasible in raw[7]]
+        status = "DATA_BLOCKED" if raw[4] else "OK"
+        native = ActionDecision(status=status, action=action, q=float(raw[1]),
+                                scores=scores, detail=str(raw[4] or raw[5] or "rust_t0"))
+        shadow_scores = {score.action: score for score in shadow.scores}
+        native_scores = {score.action: score for score in native.scores}
+        scores_match = shadow_scores.keys() == native_scores.keys() and all(
+            shadow_scores[key].feasible == native_scores[key].feasible
+            and (not shadow_scores[key].feasible
+                 or math.isclose(shadow_scores[key].q, native_scores[key].q,
+                                 rel_tol=1e-9, abs_tol=1e-9))
+            for key in shadow_scores)
+        same = (shadow.status == native.status
+                and (shadow.status != "OK" or (shadow.action is native.action
+                                                and math.isclose(shadow.q, native.q,
+                                                                 rel_tol=1e-9, abs_tol=1e-9)
+                                                and scores_match)))
+        if not same:
+            self._increment_native_stat("_native_parity_mismatches")
+            logger.error("RUST/PYTHON ACTION PARITY mismatch %s rust=%s/%.12f python=%s/%.12f",
+                         token, native.action.value, native.q, shadow.action.value, shadow.q)
+            return ActionDecision(status="DATA_BLOCKED", detail="rust_python_action_parity_mismatch")
+        self._increment_native_stat("_native_parity_matches")
+        if not raw[3]:
+            return ActionDecision(status="REFUSED", action=action, q=float(raw[1]), scores=scores,
+                                  detail=str(raw[5] or raw[4] or "native safety refused action"))
+        return native
+
     def _freeze_decision(self, token: str, position: Dict[str, Any], decision: Any,
                          state: Any, add_fraction: Optional[float]):
         """Turn a chosen action into an immutable, executable object.
@@ -2881,7 +3497,8 @@ class MemecoinQuantDesk:
         must not read as a launch whose buyers scored zero.
         """
         as_of = time.time() if as_of is None else as_of
-        entries = self._actor_entries.get(token) or []
+        entries = [entry for entry in (self._actor_entries.get(token) or [])
+                   if entry.timestamp <= as_of]
         report = self.independence_report
         intelligence: Dict[str, Any] = {
             "observed_buyers": len(entries),
@@ -4080,12 +4697,32 @@ class MemecoinQuantDesk:
         current_value = quote.output_amount / 1_000_000
         remaining_cost = max(float(position["remaining_cost_usd"]), 1e-9)
         multiple = current_value / remaining_cost
-        observation = {"type": "route", "feasible": True, "price_impact_pct": quote.price_impact_pct,
-                       "value_usd": current_value, "price_multiple": multiple, "timestamp": time.time()}
+        observation = {"type": "route", "feasible": True, "price_impact_pct": impact,
+                       "value_usd": current_value, "price_multiple": multiple, "timestamp": now,
+                       "measurement": measurement, "data_status": "OK"}
         self.rug_hazard.record_observation(token, observation)
         self.dataset_builder.record_market_observation(token, observation)
         self.counterfactual_lab.record_market_observation(token, multiple, observation["timestamp"])
         return multiple, current_value
+
+    async def _crosscheck_router_mark(self, token: str, size_tokens: int) -> None:
+        try:
+            quote = await self.jupiter.get_quote(
+                token, USDC_MINT, size_tokens, slippage_bps=500)
+            if quote and quote.output_amount > 0:
+                self._router_mark_cache[token] = {
+                    "value_usd": quote.output_amount / 1_000_000,
+                    "price_impact_pct": float(quote.price_impact_pct),
+                    "timestamp": time.time(),
+                }
+            else:
+                self.rug_hazard.record_observation(
+                    token, {"type": "route", "feasible": False, "timestamp": time.time(),
+                            "measurement": "async_jupiter_crosscheck"})
+        except Exception as exc:
+            logger.debug("async Jupiter mark crosscheck failed for %s: %s", token, exc)
+        finally:
+            self._router_mark_inflight.discard(token)
 
     async def _observe_active_markets(self):
         """Collect outcome paths independently of prediction/trade authority.
@@ -4422,6 +5059,7 @@ class MemecoinQuantDesk:
                 at=float(event.get("timestamp", time.time())),
                 regime=str(self.current_regime or "unknown"))
             self.wallet_intel.record_token_lifecycle(token, launch_at=event.get("timestamp", time.time()))
+            self.dev_wallet_monitor.register(token, event.get("creator", ""))
             self.dataset_builder.start_episode(
                 token, event.get("creator", ""), event.get("program", PumpFunMonitor.PUMP_FUN_PROGRAM),
                 event.get("bonding_curve", ""), WSOL_MINT, detected_at=event.get("timestamp", time.time()),
@@ -4540,6 +5178,22 @@ class MemecoinQuantDesk:
                 self.wallet_intel.record_live_trade(token, observation)
             self._open_follow_candidate(token, event)
             score = self.wallet_intel.get_wallet_score(event.get("wallet", ""))
+            wallet = str(event.get("wallet", "") or "")
+            timestamp = float(event.get("timestamp", time.time()))
+            self.dev_wallet_monitor.record_trade(
+                token, wallet=wallet, side=str(event.get("side", "")),
+                timestamp=timestamp,
+                token_amount=event.get("actual_token_amount_ui"), evidence=observation)
+            notional_sol = event.get("notional_sol")
+            self.rotation_tracker.record(RotationTrade(
+                token=token, wallet=wallet, side=str(event.get("side", "")),
+                timestamp=timestamp,
+                wallet_quality=(float(score.overall_score) if score is not None else None),
+                independence_weight=self.independence_report.scores.get(wallet),
+                notional_usd=((float(notional_sol) * self.sol_price_usd)
+                              if notional_sol is not None and self.sol_price_usd > 0 else None),
+                narrative=str(event.get("narrative", "") or ""),
+            ))
             if score and score.overall_score >= 0.7:
                 event_type = LeadEventType.ELITE_WALLET_BUY if event.get("side") == "buy" else LeadEventType.SMART_WALLET_EXIT
                 self.info_graph.record_event(token, event_type, event.get("wallet", ""), "wallet",
@@ -4551,6 +5205,7 @@ class MemecoinQuantDesk:
             self.dataset_builder.record_market_observation(token, {"type": "migration", **event})
         elif event.get("type") == "pool_created":
             self._seed_pool_state(token, event)
+            self.dev_wallet_monitor.register(token, event.get("creator", ""))
             self.wallet_intel.record_token_lifecycle(token, migration_at=event.get("timestamp", time.time()))
             self.dataset_builder.start_episode(
                 token, event.get("creator", ""), event.get("program", PumpSwapMonitor.PUMP_AMM_PROGRAM),
@@ -4740,6 +5395,12 @@ class MemecoinQuantDesk:
                 "candidate_pipelines": len(self._candidate_pipelines),
                 "redecision_workers": len(self._redecision_tasks),
             },
+            # A process is not healthy merely because its HTTP loop is alive.
+            # Every indispensable coroutine is supervised and reported here;
+            # an unexpected return terminates the process so systemd can
+            # rebuild the whole graph rather than leaving a partial desk.
+            "runtime_tasks": self.runtime_task_report(),
+            "watchdog": self.watchdog_report(),
             # Whether the objective actually owns the decisions. A fallback
             # that quietly becomes the main path is the failure this catches.
             "action_authority": {
@@ -4749,6 +5410,24 @@ class MemecoinQuantDesk:
             },
             "exit_latency": self.landing_latency.estimate().report(),
             "decision_contribution": self.contribution_ledger.report(),
+            "trade_evidence": (self.trade_evidence.report()
+                               if self.trade_evidence else {"status": "DATA_BLOCKED"}),
+            "holder_trajectory": {"tracked_tokens": len(
+                getattr(getattr(self, "holder_trajectory", None), "_history", {}))},
+            "developer_monitor": {
+                "tracked_tokens": len(getattr(
+                    getattr(self, "dev_wallet_monitor", None), "_developers", {})),
+                "tokens_with_events": len(getattr(
+                    getattr(self, "dev_wallet_monitor", None), "_events", {}))},
+            "capital_rotation": (self.rotation_tracker.report()
+                                 if getattr(self, "rotation_tracker", None) else {
+                                     "status": "DATA_BLOCKED"}),
+            "profit_isolation": (self.profit_isolation.plan(
+                equity_usd=(self.wallet_equity_usd
+                            if self.equity_status == "OK" else None),
+                cold_destination=os.getenv("PROFIT_COLD_WALLET", ""),
+                dry_run=self.dry_run) if self.profit_isolation else {
+                    "status": "DATA_BLOCKED"}),
             "wallet_coverage": (self.wallet_intel.coverage_report()
                                 if self.wallet_intel else {"status": "DATA_BLOCKED"}),
             # Which declared modules actually reached a decision. A rate that
@@ -4779,6 +5458,7 @@ class MemecoinQuantDesk:
                     self.memory.observe()
                 except Exception as exc:  # pragma: no cover - defensive
                     logger.debug("memory governor read failed: %s", exc)
+                _systemd_notify("WATCHDOG=1\nSTATUS=DRY_RUN collectors active")
                 await asyncio.sleep(10)
             snapshot = _jsonable(self.readiness())
             logger.info("HEALTH %s", json.dumps(snapshot, separators=(",", ":")))
@@ -4850,7 +5530,19 @@ class MemecoinQuantDesk:
         count toward the promotion gate's diversity requirement -- a desk that
         never measured the market must not satisfy it with one bucket.
         """
-        stats = (self.global_research.get_stats() if self.global_research else {}) or {}
+        builder = getattr(self, "dataset_builder", None)
+        stats = (builder.current_market_state()
+                 if builder is not None and hasattr(builder, "current_market_state")
+                 else {}) or {}
+        # Compatibility for isolated callers which provide the measurements
+        # directly through a research stub. The production miner is not used:
+        # it discovers mechanisms and does not collect market state.
+        if (stats.get("meme_launch_rate_1h") is None
+                or stats.get("sol_change_24h") is None):
+            research = getattr(self, "global_research", None)
+            fallback = (research.get_stats() if research else {}) or {}
+            if fallback.get("meme_launch_rate_1h") is not None:
+                stats = fallback
         launch_rate = stats.get("meme_launch_rate_1h")
         sol_change = stats.get("sol_change_24h")
         if launch_rate is None or sol_change is None:
@@ -5093,10 +5785,18 @@ async def _run(args: argparse.Namespace):
             return
         await desk.start()
         if args.run_seconds:
-            await asyncio.sleep(args.run_seconds)
+            try:
+                await asyncio.wait_for(
+                    desk._fatal_task_event.wait(), timeout=args.run_seconds)
+            except asyncio.TimeoutError:
+                pass
+            else:
+                raise RuntimeError(
+                    f"critical runtime task stopped: {desk._fatal_task_detail}")
         else:
-            while True:
-                await asyncio.sleep(3_600)
+            await desk._fatal_task_event.wait()
+            raise RuntimeError(
+                f"critical runtime task stopped: {desk._fatal_task_detail}")
     finally:
         await desk.stop()
 

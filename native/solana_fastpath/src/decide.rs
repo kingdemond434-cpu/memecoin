@@ -70,12 +70,7 @@ pub struct Inputs {
 }
 
 /// One decision for one token, from state and a forward view.
-pub fn decide(
-    state: &TokenState,
-    now: f64,
-    inputs: &Inputs,
-    limits: &Limits,
-) -> T0Decision {
+pub fn decide(state: &TokenState, now: f64, inputs: &Inputs, limits: &Limits) -> T0Decision {
     let age_seconds = state.age_seconds(now);
     let band = policy::age_band(age_seconds);
 
@@ -187,6 +182,7 @@ mod tests {
                 alternative_growth_per_second: None,
                 expected_remaining_seconds: None,
                 add_fraction: None,
+                add_capacity_fraction: None,
                 probe_fraction: Some(0.02),
             },
             survival: Survival {
@@ -269,10 +265,22 @@ mod tests {
     #[test]
     fn the_age_band_travels_with_the_decision() {
         let state = tradeable_state();
-        assert_eq!(decide(&state, 0.2, &inputs(), &Limits::default()).age_band, "flash");
-        assert_eq!(decide(&state, 2.0, &inputs(), &Limits::default()).age_band, "early");
-        assert_eq!(decide(&state, 30.0, &inputs(), &Limits::default()).age_band, "forming");
-        assert_eq!(decide(&state, 600.0, &inputs(), &Limits::default()).age_band, "mature");
+        assert_eq!(
+            decide(&state, 0.2, &inputs(), &Limits::default()).age_band,
+            "flash"
+        );
+        assert_eq!(
+            decide(&state, 2.0, &inputs(), &Limits::default()).age_band,
+            "early"
+        );
+        assert_eq!(
+            decide(&state, 30.0, &inputs(), &Limits::default()).age_band,
+            "forming"
+        );
+        assert_eq!(
+            decide(&state, 600.0, &inputs(), &Limits::default()).age_band,
+            "mature"
+        );
     }
 
     #[test]
@@ -290,6 +298,10 @@ mod tests {
         exiting.live = true;
         let decision = decide(&tradeable_state(), 5.0, &exiting, &Limits::default());
         assert!(decision.action.bank_fraction() > 0.0);
-        assert!(decision.allowed, "safety refused an exit: {:?}", decision.refused);
+        assert!(
+            decision.allowed,
+            "safety refused an exit: {:?}",
+            decision.refused
+        );
     }
 }
