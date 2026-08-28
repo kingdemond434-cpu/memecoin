@@ -255,6 +255,11 @@ class MemecoinQuantDesk:
         self._task_health: Dict[str, Dict[str, Any]] = {}
         self._background_failures = 0
         self._background_tasks: set[asyncio.Task] = set()
+        # Telegram can replay its configured channels as soon as the client
+        # connects, before the PIT dataset finishes constructing. Preserve
+        # those signals and drain them once every downstream consumer exists.
+        self._pending_social_signals: deque = deque(maxlen=10_000)
+        self._pending_social_dropped = 0
         self._candidate_pipelines: Dict[str, asyncio.Task] = {}
         self._candidate_semaphore: Optional[asyncio.Semaphore] = None
         self._web_runner: Optional[web.AppRunner] = None
@@ -488,6 +493,7 @@ class MemecoinQuantDesk:
         await self._setup_execution()
         await self._setup_detection_and_risk()
         await self._setup_research()
+        await self._flush_pending_social_signals()
         # Connect event producers last. Yellowstone can deliver immediately
         # after subscribe; connecting it before the portfolio, actor graph and
         # PIT lake existed sent real transactions into a half-built desk.
@@ -5291,6 +5297,11 @@ class MemecoinQuantDesk:
         token = signal.get("token", "")
         if not token:
             return
+        if self.dataset_builder is None:
+            if len(self._pending_social_signals) == self._pending_social_signals.maxlen:
+                self._pending_social_dropped += 1
+            self._pending_social_signals.append(dict(signal))
+            return
         if signal.get("type") == "new_mention":
             self.info_graph.record_event(token, LeadEventType.OBSCURE_X_MENTION, signal.get("account", ""),
                                          "social", signal.get("timestamp", time.time()), signal)
@@ -5298,6 +5309,15 @@ class MemecoinQuantDesk:
         self.dataset_builder.record_market_observation(token, {"type": "social", **signal})
         if signal.get("type") == "new_mention" and signal.get("first_mention"):
             self._spawn_background(self._triage_social_candidate(signal))
+
+    async def _flush_pending_social_signals(self) -> None:
+        while self._pending_social_signals:
+            await self._on_social_mention(self._pending_social_signals.popleft())
+        if self._pending_social_dropped:
+            logger.error(
+                "social startup buffer overflowed; %d earliest signals were dropped",
+                self._pending_social_dropped,
+            )
 
     async def _triage_social_candidate(self, signal: Dict[str, Any]):
         """Evaluate social addresses only after verifying that the account is an SPL mint."""

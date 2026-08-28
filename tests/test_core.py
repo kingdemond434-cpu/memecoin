@@ -652,6 +652,24 @@ class TestOfficialSocialCollectors(unittest.IsolatedAsyncioTestCase):
             return {"value": []}
         raise AssertionError(f"unexpected RPC method: {method}")
 
+    async def test_social_startup_signal_waits_for_pit_builder_then_drains(self):
+        desk = MemecoinQuantDesk(offline=True)
+        signal = {
+            "type": "new_mention", "token": "mint", "account": "scanner",
+            "timestamp": time.time(), "first_mention": False,
+        }
+        await desk._on_social_mention(signal)
+        self.assertEqual(len(desk._pending_social_signals), 1)
+
+        recorded = []
+        desk.info_graph = SimpleNamespace(record_event=lambda *args: recorded.append("graph"))
+        desk.rug_hazard = SimpleNamespace(record_observation=lambda *args: recorded.append("hazard"))
+        desk.dataset_builder = SimpleNamespace(
+            record_market_observation=lambda *args: recorded.append("dataset"))
+        await desk._flush_pending_social_signals()
+        self.assertEqual(len(desk._pending_social_signals), 0)
+        self.assertEqual(recorded, ["graph", "hazard", "dataset"])
+
     async def test_youtube_video_extracts_real_contract_and_engagement(self):
         engine = self.make_engine()
         account = SocialAccount(SocialPlatform.YOUTUBE, "channel", "channel", "Channel")
