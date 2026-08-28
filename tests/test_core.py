@@ -19078,3 +19078,101 @@ class TestTheDeskIsSplitIntoModules(unittest.TestCase):
             self.assertNotIn(name, defined, f"{name} is still defined in main.py")
             self.assertTrue(hasattr(__import__(
                 "src.main", fromlist=["MemecoinQuantDesk"]).MemecoinQuantDesk, name))
+
+
+class TestTheDashboardShowsWhatTheDeskReports(unittest.TestCase):
+    """A panel reading a key the desk does not serve renders an em-dash for
+    ever and looks like a quiet subsystem rather than a broken page."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def _html(self):
+        return (self.ROOT / "src" / "runtime" / "assets"
+                / "dashboard.html").read_text(encoding="utf-8")
+
+    def test_every_new_subsystem_has_a_panel(self):
+        html = self._html()
+        for section in ("latency", "t0_kernel", "tx_kernel", "landing_router",
+                        "substitution"):
+            self.assertIn(f"d.{section}", html, f"no panel reads {section}")
+
+    def test_every_declared_element_is_actually_rendered(self):
+        import re
+        html = self._html()
+        declared = set(re.findall(r'id="([a-z0-9-]+)"', html))
+        # The loader's own controls are wired by addEventListener, not by the
+        # render pass, so they are excluded rather than asserted.
+        wired = {"input", "load", "reset", "msg", "clock", "src", "samplewarn"}
+        for element in declared - wired:
+            self.assertIn(f'$("{element}")', html,
+                          f'#{element} is declared and never rendered')
+
+    def test_the_latency_stage_names_match_the_ledger(self):
+        from src.runtime.latency import STAGES
+        html = self._html()
+        for stage in STAGES:
+            self.assertIn(stage, html, f"the dashboard cannot show {stage}")
+
+    def test_substitution_is_not_coloured_as_a_fault(self):
+        """A domain on its third operator is the ladder working. Colouring it
+        as a warning trains the reader to ignore the colour that matters."""
+        html = self._html()
+        self.assertIn('s==="OK"||s==="SUBSTITUTED"?"s-ok"', html)
+
+    def test_the_empty_state_still_invents_no_numbers(self):
+        html = self._html()
+        start = html.index("const EMPTY")
+        empty = html[start:html.index("};", start)]
+        for section in ("latency", "t0_kernel", "tx_kernel", "landing_router",
+                        "substitution"):
+            self.assertIn(section, empty, f"{section} has no honest empty state")
+        # Every new section must start blocked rather than showing a plausible
+        # figure nobody measured.
+        self.assertGreaterEqual(empty.count('status:"DATA_BLOCKED"'), 9)
+
+    def test_the_mode_pill_is_read_from_the_desk_not_asserted(self):
+        """It was static markup reading DRY RUN whether or not that was true.
+        A dashboard that cannot tell you capital is live is worse than one
+        that says nothing."""
+        html = self._html()
+        self.assertIn('pill($("mode")', html)
+        self.assertIn("LIVE \u00b7 CAPITAL AT RISK", html)
+        self.assertIn("MODE UNREPORTED", html)
+
+    def test_the_panels_read_fields_the_desk_actually_serves(self):
+        """The keys below are read by the render pass; each must exist on the
+        report its subsystem produces."""
+        from src.execution.landing_router import LandingRouter, Route
+        from src.execution.tx_kernel import TxKernel
+        from src.research.source_catalogue import default_registry
+        from src.runtime.latency import LatencyLedger
+
+        latency = LatencyLedger().report()
+        for field in ("status", "detail", "dominant_controllable_stage",
+                      "unmeasured_stages", "stages"):
+            self.assertIn(field, latency)
+        for row in latency["stages"].values():
+            for field in ("p50_us", "p90_us", "p99_us", "samples", "data_status"):
+                self.assertIn(field, row)
+
+        router = LandingRouter()
+        router.register(Route(name="rpc", kind="rpc", submit=lambda tx: None))
+        report = router.report()
+        for field in ("status", "detail", "mechanisms", "by_route"):
+            self.assertIn(field, report)
+        for row in report["by_route"].values():
+            for field in ("first_receipts", "landed", "land_rate", "data_status"):
+                self.assertIn(field, row)
+
+        substitution = default_registry().report()
+        for field in ("status", "detail", "coverage", "ladders"):
+            self.assertIn(field, substitution)
+        for row in substitution["ladders"]:
+            for field in ("domain", "active", "on_primary", "eligible_rungs",
+                          "declared_rungs"):
+                self.assertIn(field, row)
+
+        transactions = TxKernel(mode="off").report()
+        for field in ("rust_authoritative", "consecutive_agreements",
+                      "promote_after", "divergences", "demoted_reason"):
+            self.assertIn(field, transactions)

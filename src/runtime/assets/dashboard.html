@@ -335,6 +335,57 @@ code{font-family:var(--mono);font-size:11.5px;background:#0B0B11;border:1px soli
       </div>
     </section>
 
+    <section class="panel span7">
+      <div class="phead"><h2>Where the milliseconds go</h2><div class="spacer"></div><span class="pill" id="lat-pill">—</span></div>
+      <div class="pbody">
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Stage</th><th class="num">p50</th><th class="num">p90</th><th class="num">p99</th><th class="num">Samples</th></tr></thead>
+            <tbody id="latency"></tbody>
+          </table>
+        </div>
+        <p class="note" style="margin:12px 0 0" id="lat-note"></p>
+      </div>
+    </section>
+
+    <section class="panel span5">
+      <div class="phead"><h2>Hot path implementation</h2><div class="spacer"></div><span class="pill" id="impl-pill">—</span></div>
+      <div class="pbody">
+        <div class="feed" id="impl"></div>
+        <p class="note" style="margin:14px 0 0">
+          Rust decides only after a run of exact agreement, and one disagreement demotes it for the session. While it is
+          authoritative Python is not on the trade at all &mdash; it re-checks afterwards, and a check that was dropped
+          is counted as <strong>unverified</strong> rather than as agreement.
+        </p>
+      </div>
+    </section>
+
+    <section class="panel span7">
+      <div class="phead"><h2>Landing routes</h2><div class="spacer"></div><span class="pill" id="route-pill">—</span></div>
+      <div class="pbody">
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Route</th><th>Mechanism</th><th class="num">First receipts</th><th class="num">Landed</th><th>Land rate</th></tr></thead>
+            <tbody id="routes"></tbody>
+          </table>
+        </div>
+        <p class="note" style="margin:12px 0 0" id="route-note"></p>
+      </div>
+    </section>
+
+    <section class="panel span5">
+      <div class="phead"><h2>Source substitution</h2><div class="spacer"></div><span class="pill" id="sub-pill">—</span></div>
+      <div class="pbody">
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Domain</th><th>Answering</th><th class="num">Rungs</th></tr></thead>
+            <tbody id="subs"></tbody>
+          </table>
+        </div>
+        <p class="note" style="margin:12px 0 0" id="sub-note"></p>
+      </div>
+    </section>
+
     <section class="panel span12">
       <div class="phead"><h2>Signer</h2><div class="spacer"></div><span class="pill" id="sign-pill">—</span></div>
       <div class="pbody"><div class="feed" id="signer"></div></div>
@@ -400,7 +451,21 @@ const EMPTY = {
   fact_ladder:{status:"DATA_BLOCKED",facts_declared:0,degraded_facts:[],facts:[]},
   forward_evidence:{stage:"FORWARD_SHADOW",distance:{}},
   signer:{mode:null,isolated:null,public_key:"—",signed:0,refused:0,
-    halted:null,halt_reason:"",recent_refusals:[]}
+    halted:null,halt_reason:"",recent_refusals:[]},
+  latency:{status:"DATA_BLOCKED",
+    detail:"nothing has been traced yet; every speed claim is unverified",
+    dominant_controllable_stage:null,unmeasured_stages:[],stages:{},
+    total:{samples:0,data_status:"DATA_BLOCKED"}},
+  t0_kernel:{status:"DATA_BLOCKED",native:"—",rust_authoritative:false,
+    python_on_hot_path:true,consecutive_agreements:0,promote_after:null,
+    divergences:0,parity_pending:0,parity_unverified:0,demoted_reason:""},
+  tx_kernel:{status:"DATA_BLOCKED",native:"—",rust_authoritative:false,
+    consecutive_agreements:0,promote_after:null,divergences:0,
+    invariant_failures:0,demoted_reason:""},
+  landing_router:{status:"DATA_BLOCKED",detail:"the landing router has not reported",
+    mechanisms:[],races:0,races_with_no_acceptance:0,by_route:{}},
+  substitution:{status:"DATA_BLOCKED",detail:"",domains:0,dark:[],substituted:[],
+    coverage:{regions_declared:0,regions_proven:0,unproven_regions:[]},ladders:[]}
 };
 
 /* ---------- helpers ---------- */
@@ -410,7 +475,11 @@ const pct=(n,d=1)=>(n===null||n===undefined)?"—":(Number(n)*100).toFixed(d)+"%
 const fix=(n,d=3)=>(n===null||n===undefined)?"—":Number(n).toFixed(d);
 function pill(el,text,cls){el.textContent=text;el.className="pill "+cls;}
 function statusClass(s){
-  return s==="OK"?"s-ok":s==="MISCALIBRATED"||s==="RATE_LIMITED"?"s-warn":
+  /* SUBSTITUTED is the ladder doing its job, not a fault: a domain running on
+     its third operator is healthy, and colouring it as a warning would train
+     the reader to ignore the one colour that matters. */
+  return s==="OK"||s==="SUBSTITUTED"?"s-ok":
+         s==="MISCALIBRATED"||s==="RATE_LIMITED"||s==="DEGRADED"?"s-warn":
          s==="FAILING"||s==="CRITICAL"?"s-crit":"s-blocked";
 }
 function cadence(sec){
@@ -585,6 +654,94 @@ function render(d){
   }).join("");
   const ready=Object.values(dist).every(v=>(v.need||0)===0?true:(v.have||0)>=(v.need||0));
   pill($("promo-pill"),ready?"READY":"ACCUMULATING",ready?"s-ok":"s-warn");
+
+  /* mode -- read from the desk, never asserted by the page.
+     This was static markup that said DRY RUN whether or not it was true,
+     which is the one label on the page that must never be decoration: a
+     dashboard that cannot tell you capital is live is worse than one that
+     says nothing. Unlocked live submission is CRITICAL colouring, because
+     seeing it when you did not expect it is the whole point. */
+  const live=d.mode&&d.mode!=="DRY_RUN";
+  const unlocked=d.live_submission_locked===false;
+  pill($("mode"),
+    d.mode?(live?"LIVE · CAPITAL AT RISK":"DRY RUN · NO LIVE CAPITAL")
+          :"MODE UNREPORTED",
+    !d.mode?"s-blocked":live||unlocked?"s-crit":"s-warn");
+
+  /* latency -- the only panel that says whether the next hour belongs to
+     code or to money. Milliseconds, because microseconds on a 400ms slot is
+     a precision nobody can act on. */
+  const lat=d.latency||{},stages=lat.stages||{};
+  const ORDER=["chain_to_receive","receive_to_decode","decode_to_dispatch",
+    "dispatch_to_decide","decide_to_build","build_to_sign","sign_to_submit",
+    "submit_to_land"];
+  const ms=v=>(v===null||v===undefined)?"—":(v/1000).toFixed(v<1000?2:1)+"ms";
+  $("latency").innerHTML=ORDER.filter(k=>k in stages).map(k=>{
+    const row=stages[k]||{};
+    const blocked=row.data_status!=="OK";
+    const hot=k===lat.dominant_controllable_stage;
+    return `<tr><td>${hot?"<strong>"+k+"</strong>":k}</td>
+      <td class="num ${blocked?"off":""}">${ms(row.p50_us)}</td>
+      <td class="num ${blocked?"off":""}">${ms(row.p90_us)}</td>
+      <td class="num ${blocked?"off":hot?"mid":""}">${ms(row.p99_us)}</td>
+      <td class="num ${blocked?"off":""}">${blocked?"blocked":num(row.samples)}</td></tr>`;
+  }).join("")||`<tr><td colspan="5" class="off">No stage has been traced.</td></tr>`;
+  $("lat-note").textContent=lat.detail||
+    "chain-to-receive crosses two clocks and carries this box's NTP skew; every other stage is one monotonic clock and is exact.";
+  pill($("lat-pill"),lat.status||"—",statusClass(lat.status));
+
+  /* which implementation is on the money path */
+  const t0=d.t0_kernel||{},tx=d.tx_kernel||{};
+  const impl=[
+    ["decision",t0.rust_authoritative?"RUST":"PYTHON",
+      t0.demoted_reason?"s-crit":t0.rust_authoritative?"s-ok":"s-warn",
+      t0.demoted_reason||(t0.rust_authoritative
+        ? "python is off the trade; it re-checks afterwards"
+        : num(t0.consecutive_agreements)+" of "+num(t0.promote_after)+" agreements to promotion")],
+    ["transaction",tx.rust_authoritative?"RUST":"SOLDERS",
+      tx.demoted_reason?"s-crit":tx.rust_authoritative?"s-ok":"s-warn",
+      tx.demoted_reason||num(tx.consecutive_agreements)+" of "+num(tx.promote_after)+" byte-identical builds"],
+    ["divergences",num((t0.divergences||0)+(tx.divergences||0)),
+      ((t0.divergences||0)+(tx.divergences||0))?"s-crit":"s-ok",
+      "one is enough to demote for the session"],
+    ["unverified",num(t0.parity_unverified),
+      (t0.parity_unverified?"s-warn":"s-blocked"),
+      "promoted decisions whose python check was dropped"]
+  ];
+  $("impl").innerHTML=impl.map(([t,v,cls,note])=>
+    `<div class="fitem"><div class="ftime">${t}</div>
+     <div class="ftag" style="color:var(--${cls==="s-ok"?"ok":cls==="s-crit"?"crit":cls==="s-warn"?"warn":"blocked"})">${v}</div>
+     <div class="ftext">${note}</div></div>`).join("");
+  pill($("impl-pill"),t0.rust_authoritative?"NATIVE":"SHADOW",
+       t0.demoted_reason||tx.demoted_reason?"s-crit":t0.rust_authoritative?"s-ok":"s-warn");
+
+  /* landing routes -- mechanisms, not regions */
+  const lr=d.landing_router||{},byroute=lr.by_route||{};
+  const rkeys=Object.keys(byroute);
+  $("routes").innerHTML=rkeys.length?rkeys.map(k=>{
+    const r=byroute[k]||{},blocked=r.data_status!=="OK";
+    const rate=blocked?"unmeasured":pct(r.land_rate,1);
+    return `<tr><td>${k}</td><td class="off">${(lr.mechanisms||[]).includes(k)?k:""}</td>
+      <td class="num">${num(r.first_receipts)}</td>
+      <td class="num">${num(r.landed)}</td>
+      <td class="${blocked?"off":r.land_rate>=0.5?"good":"mid"}">${rate}</td></tr>`;
+  }).join(""):`<tr><td colspan="5" class="off">No route has been declared.</td></tr>`;
+  $("route-note").textContent=lr.detail||
+    ((lr.mechanisms||[]).length+" independent mechanism(s); a rate stays unmeasured until thirty resolved attempts, because three landings out of three is three attempts.");
+  pill($("route-pill"),lr.status||"—",statusClass(lr.status));
+
+  /* substitution -- who is answering each question */
+  const sub=d.substitution||{},cov=sub.coverage||{};
+  const ladders=sub.ladders||[];
+  $("subs").innerHTML=ladders.length?ladders.map(l=>{
+    const dark=!l.active;
+    return `<tr><td>${l.domain}</td>
+      <td class="${dark?"bad":l.on_primary?"good":"mid"}">${l.active||"nothing"}</td>
+      <td class="num ${dark?"bad":""}">${num(l.eligible_rungs)}/${num(l.declared_rungs)}</td></tr>`;
+  }).join(""):`<tr><td colspan="3" class="off">No domain has been declared.</td></tr>`;
+  $("sub-note").textContent=sub.detail||
+    (num(cov.regions_proven)+" of "+num(cov.regions_declared)+" regions have actually returned a record; a declared region that never answers is configuration, not coverage.");
+  pill($("sub-pill"),sub.status||"—",statusClass(sub.status));
 
   /* signer */
   const s=d.signer||{};
