@@ -306,6 +306,23 @@ def solana_chain():
     )
 
 
+
+def _desk_source() -> str:
+    """The desk's source across every module its class is assembled from.
+
+    A number of tests below grep source text as a proxy for "the desk serves
+    this key" or "this call site exists". That proxy was written when the desk
+    was one file. It is now a class assembled from several, so reading only
+    `main.py` would silently stop checking whatever moved -- which is the
+    worst possible failure mode for an assertion of this shape, because it
+    keeps passing.
+    """
+    root = Path(__file__).resolve().parents[1] / "src"
+    return "\n".join((root / name).read_text(encoding="utf-8")
+                     for name in ("main.py", "runtime/reporting.py",
+                                  "runtime/ingestion.py", "runtime/wiring.py"))
+
+
 class TestProviderCredentials(unittest.TestCase):
     def test_extracts_helius_key_from_rpc_url(self):
         self.assertEqual(
@@ -6544,7 +6561,7 @@ class TestDeskWiringIsComplete(unittest.TestCase):
 
     def test_every_wired_component_is_constructed_on_the_real_desk(self):
         """The fakes prove the logic; this proves the desk actually has them."""
-        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        source = _desk_source()
         # Each of these was reported as wired at some point; each is only
         # reachable if it is both imported and assigned in __init__.
         for attribute in (
@@ -6557,7 +6574,7 @@ class TestDeskWiringIsComplete(unittest.TestCase):
 
     def test_the_readiness_surface_exposes_the_new_components(self):
         """A component absent from readiness is invisible to the monitor."""
-        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        source = _desk_source()
         for key in ("action_policy", "actor_graph", "hot_state", "mega_event_reserve"):
             self.assertIn(f'"{key}":', source,
                           f"{key} is not reported in readiness, so nothing can monitor it")
@@ -7941,7 +7958,7 @@ class TestActorIntelligenceIsLiveWired(unittest.TestCase):
                      skill=skill, capital_usd=capital)
 
     def test_main_imports_the_full_actor_surface(self):
-        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        source = _desk_source()
         for name in ("BuyerDNA", "SwarmPredictor", "aggregate_smart_flow",
                      "build_fingerprint"):
             self.assertIn(name, source, f"{name} is built but never reaches main")
@@ -8018,7 +8035,7 @@ class TestSourceIntelligenceIsLiveWired(unittest.IsolatedAsyncioTestCase):
         return desk
 
     def test_main_imports_the_collectors(self):
-        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        source = _desk_source()
         self.assertIn("src.collectors.event_source", source)
         self.assertIn("src.collectors.registry", source)
 
@@ -8287,7 +8304,7 @@ class TestReentryIsLiveWired(unittest.TestCase):
         self.assertIn("still open", reenter.detail)
 
     def test_desk_constructs_a_reentry_book_and_reports_it(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         assigned = {
             node.targets[0].attr
@@ -8299,7 +8316,7 @@ class TestReentryIsLiveWired(unittest.TestCase):
         self.assertIn('"reentry": self.reentry_book.report()', source)
 
     def test_full_exits_are_recorded_and_partial_ones_are_not(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         exit_fn = next(node for node in ast.walk(tree)
                        if isinstance(node, ast.AsyncFunctionDef)
@@ -8326,7 +8343,7 @@ class TestReentryIsLiveWired(unittest.TestCase):
         self.assertTrue(any(call in ast.walk(closed_branch) for call in calls))
 
     def test_the_entry_path_gates_and_prices_reentries(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         evaluate = next(node for node in ast.walk(tree)
                         if isinstance(node, ast.AsyncFunctionDef)
@@ -9312,7 +9329,7 @@ class TestDecisionContribution(unittest.TestCase):
             ledger.report()["components"]["escape_probability"]["observations"], 10)
 
     def test_it_is_wired_into_the_position_decision(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         scorer = next(node for node in ast.walk(tree)
                       if isinstance(node, ast.FunctionDef) and node.name == "_score_actions")
@@ -11113,7 +11130,7 @@ class TestTheRunbookMatchesTheSystem(unittest.TestCase):
         for key in ("source_mesh", "entity_registry", "forward_evidence",
                     "native_route"):
             self.assertIn(f"['{key}']", text, key)
-        source = (self.ROOT / "src" / "main.py").read_text(encoding="utf-8")
+        source = _desk_source()
         for key in ("source_mesh", "entity_registry", "forward_evidence",
                     "native_route"):
             self.assertIn(f'"{key}":', source, key)
@@ -11158,7 +11175,7 @@ class TestTheRunbookMatchesTheSystem(unittest.TestCase):
 
     def test_the_status_endpoint_binds_loopback_by_default(self):
         """/status serves the desk's interior; 0.0.0.0 publishes all of it."""
-        source = (self.ROOT / "src" / "main.py").read_text(encoding="utf-8")
+        source = _desk_source()
         self.assertIn('os.getenv("HEALTH_HOST", "127.0.0.1")', source)
         self.assertNotIn('web.TCPSite(self._web_runner, "0.0.0.0"', source)
         unit = (self.ROOT / "deploy" / "systemd" / "memecoin-shadow.service").read_text()
@@ -11624,7 +11641,7 @@ class TestEveryRaceBidsOnItsOwnEconomics(unittest.TestCase):
 
     def test_the_scale_in_passes_its_marginal_elogw_to_the_bid(self):
         """An ADD fell back to the fixed ladder while the entry beside it bid."""
-        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        source = _desk_source()
         block = source[source.index("attempt = {**_jsonable(result), \"scale_in\": True")
                        - 2_000:source.index("attempt = {**_jsonable(result), \"scale_in\": True")]
         self.assertIn("expected_edge_usd=max(0.0, gain * max(self.wallet_equity_usd, 0.0))",
@@ -11945,7 +11962,7 @@ class TestExitsArePreparedBeforeTheyAreNeeded(unittest.TestCase):
         self.assertEqual(staged.report()["staged_positions"], 3)
 
     def test_the_desk_stages_on_open_reprices_on_events_and_releases_on_close(self):
-        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        source = _desk_source()
         self.assertIn("staged = self._stage_exits(token, position)", source)
         self.assertIn("self._reprice_staged_exits(token)", source)
         self.assertIn("self.staged_exits.release(token)", source)
@@ -12247,7 +12264,7 @@ class TestKolRolesDecideTheAction(unittest.TestCase):
         self.assertEqual(touches[0].timestamp, 0.0)
 
     def test_the_desk_reports_the_lifecycle_census(self):
-        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        source = _desk_source()
         self.assertIn('"ignition": self.ignition_census()', source)
         self.assertIn("self._read_ignition(token)", source)
 
@@ -12389,7 +12406,7 @@ class TestOneSlotOfDelayIsPricedPerOpportunity(unittest.TestCase):
         self.assertIsNone(plain["slot_value"])
 
     def test_every_race_on_the_desk_prices_its_own_slot(self):
-        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        source = _desk_source()
         self.assertEqual(source.count("slot_value=self._entry_slot_value("), 2)
         self.assertIn("slot_value=self._exit_slot_value(", source)
 
@@ -13281,7 +13298,7 @@ class TestEventDrivenRuntime(unittest.IsolatedAsyncioTestCase):
         return desk
 
     def test_the_dispatcher_never_sleeps_between_candidates(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         loop = next(node for node in ast.walk(tree)
                     if isinstance(node, ast.AsyncFunctionDef)
@@ -13295,7 +13312,7 @@ class TestEventDrivenRuntime(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("wait_for", ast.dump(loop))
 
     def test_the_old_clocked_loop_is_gone(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         self.assertNotIn("await self._process_new_tokens()\n                await self._manage_positions()",
                          source)
         tree = ast.parse(source)
@@ -13307,7 +13324,7 @@ class TestEventDrivenRuntime(unittest.IsolatedAsyncioTestCase):
         self.assertIn("_safety_sweep_loop", names)
 
     def test_a_trade_on_an_open_position_requests_an_immediate_redecision(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         handler = next(node for node in ast.walk(tree)
                        if isinstance(node, ast.AsyncFunctionDef)
@@ -13384,7 +13401,7 @@ class TestEventDrivenRuntime(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(desk.managed, [])
 
     def test_dispatch_is_synchronous_so_it_cannot_block_the_queue(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         dispatch = next(node for node in ast.walk(tree)
                         if isinstance(node, ast.FunctionDef)
@@ -13463,7 +13480,7 @@ class TestActionValueIsAuthoritative(unittest.TestCase):
 
     def test_a_priced_hold_ends_the_cycle(self):
         """The ratchet and scale-in used to run after a chosen HOLD."""
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         body = next(node for node in ast.walk(tree)
                     if isinstance(node, ast.AsyncFunctionDef)
@@ -13476,7 +13493,7 @@ class TestActionValueIsAuthoritative(unittest.TestCase):
         self.assertLess(hold_index, ratchet_index)
 
     def test_only_a_catastrophic_reading_bypasses_the_objective(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         body = next(node for node in ast.walk(tree)
                     if isinstance(node, ast.AsyncFunctionDef)
@@ -13491,7 +13508,7 @@ class TestActionValueIsAuthoritative(unittest.TestCase):
         self.assertNotIn("_execute_exit", after_bank)
 
     def test_the_entry_path_prices_ignore_against_probe(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         evaluate = next(node for node in ast.walk(tree)
                         if isinstance(node, ast.AsyncFunctionDef)
@@ -13512,7 +13529,7 @@ class TestActionValueIsAuthoritative(unittest.TestCase):
         self.assertEqual(policy.score(blocked).status, "DATA_BLOCKED")
 
     def test_authority_counters_reach_readiness(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         for key in ("priced_holds", "unpriced_cycles", "suppressed_monster_banks"):
             self.assertIn(f'"{key}"', source)
         self.assertIn('"action_authority"', source)
@@ -13627,7 +13644,7 @@ class TestStreamedCurveStateIsBuildable(unittest.TestCase):
     """
 
     def test_the_creation_event_records_what_trade_events_lack(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         self.assertIn("_curve_static[token]", source)
         tree = ast.parse(source)
         handler = next(node for node in ast.walk(tree)
@@ -13641,7 +13658,7 @@ class TestStreamedCurveStateIsBuildable(unittest.TestCase):
     def test_an_account_update_replaces_rather_than_merges(self):
         """Mixing a measured field into a reconstructed record produces a row
         that is neither, and nothing downstream can tell which parts to trust."""
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         ingest = next(node for node in ast.walk(tree)
                       if isinstance(node, ast.FunctionDef)
@@ -13762,7 +13779,7 @@ class TestSourceMeshStreams(unittest.IsolatedAsyncioTestCase):
 
     def test_the_runtime_consumes_the_mesh(self):
         """The architecture existed and the runtime never called it."""
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         names = {node.name for node in ast.walk(tree)
                  if isinstance(node, ast.AsyncFunctionDef)}
@@ -13844,7 +13861,7 @@ class TestStreamFillReconciliation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.stream_confirmations, 0)
 
     def test_the_decode_path_reports_our_signatures(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         handler = next(node for node in ast.walk(tree)
                        if isinstance(node, ast.AsyncFunctionDef)
@@ -14052,7 +14069,7 @@ class TestLocalLiquidity(unittest.TestCase):
             MemecoinQuantDesk._local_liquidity(self._desk(done), "mint"), 0.0)
 
     def test_the_local_read_is_tried_before_any_network_call(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         resolve = next(node for node in ast.walk(tree)
                        if isinstance(node, ast.AsyncFunctionDef)
@@ -14160,7 +14177,7 @@ class TestAccountPrewarming(unittest.TestCase):
         self.assertEqual(route.report()["prewarm"]["hit_rate"], 1.0)
 
     def test_detection_warms_the_accounts(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         handler = next(node for node in ast.walk(tree)
                        if isinstance(node, ast.AsyncFunctionDef)
@@ -14321,7 +14338,7 @@ class TestForwardEvidence(unittest.TestCase):
         self.assertIn("NamedTemporaryFile", source)
 
     def test_the_desk_feeds_it_from_trade_outcomes(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         recorder = next(node for node in ast.walk(tree)
                         if isinstance(node, ast.FunctionDef)
@@ -18968,3 +18985,96 @@ class TestLatencyRegressionBenchmarks(unittest.TestCase):
         workflow = (Path(__file__).resolve().parents[1]
                     / ".github" / "workflows" / "ci.yml").read_text()
         self.assertIn("tools/bench_hotpath.py", workflow)
+
+
+class TestTheDeskIsSplitIntoModules(unittest.TestCase):
+    """main.py was 5,570 lines. One file holding the trading path, the
+    reporting surface and the HTTP server means a change to any of them risks
+    all of them, and a merge conflict in one is a merge conflict in every one.
+    """
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    #: A ceiling, not a target. It exists so the file cannot quietly grow back
+    #: to where it was: the next thing that belongs in a service module gets
+    #: put in one, because the alternative is a failing test.
+    MAX_MAIN_LINES = 4_200
+
+    def test_main_stays_under_its_line_budget(self):
+        lines = (self.ROOT / "src" / "main.py").read_text(encoding="utf-8").count("\n")
+        self.assertLess(lines, self.MAX_MAIN_LINES,
+                        f"src/main.py is {lines} lines; extract a service rather "
+                        "than raising this ceiling")
+
+    def test_the_desk_is_assembled_from_the_service_modules(self):
+        from src.main import MemecoinQuantDesk
+        from src.runtime.ingestion import MinedRecordIngestion
+        from src.runtime.reporting import ReportingSurface
+        from src.runtime.wiring import SubsystemWiring
+        for base in (ReportingSurface, MinedRecordIngestion, SubsystemWiring):
+            self.assertTrue(issubclass(MemecoinQuantDesk, base), base.__name__)
+
+    def test_no_service_module_imports_the_desk_back(self):
+        """A mixin that imported its own host would be a circular import, and
+        the reason `_jsonable` moved to its own module."""
+        for name in ("reporting", "ingestion", "wiring"):
+            source = (self.ROOT / "src" / "runtime" / f"{name}.py").read_text(
+                encoding="utf-8")
+            self.assertNotIn("from src.main import", source, name)
+            self.assertNotIn("import src.main", source, name)
+
+    def test_the_dashboard_asset_path_survived_the_move(self):
+        """`__file__` now resolves inside src/runtime/, so a naive move would
+        look for the asset one directory too deep and 404."""
+        from src.runtime import reporting
+        path = (Path(reporting.__file__).resolve().parents[1]
+                / "runtime" / "assets" / "dashboard.html")
+        self.assertTrue(path.exists(), path)
+
+    def test_the_dashboard_cache_belongs_to_the_module_that_uses_it(self):
+        from src.runtime.reporting import ReportingSurface
+        # A mixin assigning to SomeOtherClass.attr reaches across the boundary
+        # the split exists to draw.
+        self.assertIn("_dashboard_cache", vars(ReportingSurface))
+
+    def test_serialisation_behaviour_is_unchanged_by_the_move(self):
+        """A refactor that quietly improves a helper is a behaviour change
+        wearing a tidy commit message."""
+        from dataclasses import dataclass
+        from enum import Enum
+        from src.runtime.serialisation import jsonable
+
+        class Colour(Enum):
+            RED = "red"
+
+        @dataclass
+        class Row:
+            name: str
+            colour: Colour
+
+        self.assertEqual(jsonable(Colour.RED), "red")
+        self.assertEqual(jsonable(Row("a", Colour.RED)),
+                         {"name": "a", "colour": "red"})
+        self.assertEqual(jsonable([Colour.RED, {"k": Colour.RED}]),
+                         ["red", {"k": "red"}])
+        # Unrecognised values pass through rather than raising: a status page
+        # that fails on one unexpected field reports nothing about the rest.
+        sentinel = object()
+        self.assertIs(jsonable(sentinel), sentinel)
+
+    def test_the_extracted_methods_are_gone_from_main(self):
+        import ast
+        source = (self.ROOT / "src" / "main.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        desk = next(node for node in tree.body
+                    if isinstance(node, ast.ClassDef)
+                    and node.name == "MemecoinQuantDesk")
+        defined = {node.name for node in desk.body
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        # Still resolvable on the class, and no longer defined in this file --
+        # which is what "moved" means as opposed to "copied".
+        for name in ("readiness", "_status_endpoint", "_ingest_mined_records",
+                     "_setup_execution"):
+            self.assertNotIn(name, defined, f"{name} is still defined in main.py")
+            self.assertTrue(hasattr(__import__(
+                "src.main", fromlist=["MemecoinQuantDesk"]).MemecoinQuantDesk, name))
