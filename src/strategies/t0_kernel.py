@@ -353,8 +353,12 @@ class T0Kernel:
 
     def _not_expressible(self, state: PositionState, survival: Optional[SurvivalInputs],
                          virtual_sol: int, virtual_token: int) -> str:
-        if state.reentry_bins or state.replacement_bins:
-            return "state carries re-entry or replacement distributions"
+        # Re-entry and replacement used to bail out here. They no longer do:
+        # the kernel takes both distributions and prices them itself, so a
+        # post-exit re-entry decision is as much a Rust decision as any other.
+        # That mattered more than it sounds -- re-entry is decided in exactly
+        # the same seconds-old window as the original entry, so routing it to
+        # Python meant the fast path covered the easy half of the problem.
         if survival is None:
             return _NO_SURVIVAL
         if virtual_sol <= 0 or virtual_token <= 0:
@@ -387,13 +391,33 @@ class T0Kernel:
                 float(self.policy.min_edge if min_edge is None else min_edge),
                 float(getattr(self.policy, "max_add_fraction", 0.5)
                       if max_add_fraction is None else max_add_fraction),
-                False, 1.0, 1.0, 0.0, 0.0, True))
+                False, 1.0, 1.0, 0.0, 0.0, True,
+                self._bins(state.reentry_bins),
+                self._bins(state.replacement_bins),
+                (float(state.replacement_fraction)
+                 if getattr(state, "replacement_fraction", None) is not None
+                 else None)))
         return Decision(
             status="OK", action=Action(action), q=float(q),
             scores=[ActionScore(action=Action(name), q=float(value),
                                 status="OK" if feasible else "INFEASIBLE")
                     for name, value, feasible in scores],
             detail="rust t0 kernel")
+
+    @staticmethod
+    def _bins(bins: Optional[Sequence[Tuple[float, float]]]
+              ) -> Optional[List[Tuple[float, float]]]:
+        """Distribution bins as plain float pairs, or None.
+
+        None and an empty list mean different things to the kernel: None is
+        "no candidate was supplied", which makes the action infeasible, and an
+        empty list would be "a candidate with no outcomes", which is a
+        distribution that sums to zero probability. Collapsing them would let
+        a missing candidate price as a certain loss.
+        """
+        if bins is None:
+            return None
+        return [(float(probability), float(gross)) for probability, gross in bins]
 
     def _compare(self, python_decision: Decision, rust_decision: Decision) -> KernelOutcome:
         outcome = KernelOutcome(

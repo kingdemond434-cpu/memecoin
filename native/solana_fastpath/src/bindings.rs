@@ -262,7 +262,8 @@ fn pumpswap_account_list_status() -> &'static str {
     alternative_growth_per_second, expected_remaining_seconds, add_fraction,
     probe_fraction, min_edge, max_add_fraction, live, max_position_fraction,
     max_single_commit_fraction, min_commit_fraction, min_exit_capacity,
-    live_unlocked
+    live_unlocked, reentry_bins = None, replacement_bins = None,
+    replacement_fraction = None
 ))]
 fn t0_decide(
     age_seconds: f64,
@@ -290,6 +291,11 @@ fn t0_decide(
     min_commit_fraction: f64,
     min_exit_capacity: f64,
     live_unlocked: bool,
+    // (probability, gross) pairs for the two actions whose distribution
+    // the position itself does not carry. Absent for most decisions.
+    reentry_bins: Option<Vec<(f64, f64)>>,
+    replacement_bins: Option<Vec<(f64, f64)>>,
+    replacement_fraction: Option<f64>,
 ) -> PyResult<(String, f64, String, bool, Option<String>, Option<String>, f64, Vec<(String, f64, bool)>)>
 {
     if levels.len() != crate::policy::SURVIVAL_MULTIPLES.len() {
@@ -314,6 +320,21 @@ fn t0_decide(
         0.0,
     );
 
+    // Converted to the policy's own Bin here rather than passed as tuples,
+    // so the kernel never sees a shape chosen on the Python side.
+    let to_bins = |rows: &Option<Vec<(f64, f64)>>| -> Option<Vec<crate::policy::Bin>> {
+        rows.as_ref().map(|rows| {
+            rows.iter()
+                .map(|(probability, gross)| crate::policy::Bin {
+                    probability: *probability,
+                    gross: *gross,
+                })
+                .collect()
+        })
+    };
+    let reentry = to_bins(&reentry_bins);
+    let replacement = to_bins(&replacement_bins);
+
     let inputs = crate::decide::Inputs {
         position: crate::policy::Position {
             held_fraction,
@@ -336,6 +357,11 @@ fn t0_decide(
         min_edge,
         max_add_fraction,
         live,
+        alternatives: crate::policy::Alternatives {
+            reentry: reentry.as_deref(),
+            replacement: replacement.as_deref(),
+            replacement_fraction,
+        },
     };
     let limits = crate::safety::Limits {
         max_position_fraction,
@@ -521,6 +547,20 @@ fn public_key_of(secret_key: &[u8]) -> PyResult<Vec<u8>> {
         .map_err(|err| PyValueError::new_err(format!("{err:?}")))
 }
 
+/// Assemble a transaction from a message the ISOLATED SIGNER signed.
+///
+/// The call the canonical path uses. `build_signed_transaction` needs the
+/// secret key and is therefore unusable by a desk whose signer lives in
+/// another process; this takes only signatures, so the compile and assemble
+/// steps move to Rust while the key stays exactly where it was.
+#[pyfunction]
+fn assemble_transaction(serialized_message: &[u8], signatures: Vec<Vec<u8>>)
+    -> PyResult<String>
+{
+    crate::transaction::assemble(serialized_message, &signatures)
+        .map_err(|err| PyValueError::new_err(format!("{err:?}")))
+}
+
 /// Compile, sign and encode in one call: the whole tail of the entry path.
 ///
 /// One call rather than three because the FFI round trip is a meaningful
@@ -573,6 +613,7 @@ fn solana_fastpath(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(associated_token_addresses, module)?)?;
     module.add_function(wrap_pyfunction!(associated_token_address, module)?)?;
     module.add_function(wrap_pyfunction!(compile_v0_message, module)?)?;
+    module.add_function(wrap_pyfunction!(assemble_transaction, module)?)?;
     module.add_function(wrap_pyfunction!(sign_message, module)?)?;
     module.add_function(wrap_pyfunction!(public_key_of, module)?)?;
     module.add_function(wrap_pyfunction!(build_signed_transaction, module)?)?;

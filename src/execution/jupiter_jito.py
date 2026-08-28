@@ -27,6 +27,7 @@ from solders.transaction import VersionedTransaction
 
 from src.chains.pump_curve import quote_buy, quote_sell
 from src.execution.landing_router import LandingRouter, Route
+from src.execution.tx_kernel import TxKernel
 from src.execution.landing_model import Attempt, LandingModel
 from src.chains.blockhash import BlockhashCache
 from src.execution.slot_value import urgency_adjusted_edge
@@ -511,6 +512,12 @@ class SolanaTransactionBuilder:
         # put an RPC round trip inside the window the system exists to win,
         # and did it after the decision while the opportunity aged.
         self.blockhash_cache = blockhash_cache or BlockhashCache(rpc)
+        # Which implementation compiles and assembles. Defaults to the
+        # evidence ladder rather than to Rust: the extension is proven against
+        # solders in tests, and a test is not two hundred consecutive
+        # agreements on this node against this node's own account lists.
+        self.tx_kernel = TxKernel(
+            mode=os.getenv("TX_KERNEL_MODE", "auto"))
         # How often the cache could not vouch for its hash and the synchronous
         # fetch was paid anyway. Counted rather than hidden: a cache that
         # refuses on every trade has removed nothing.
@@ -546,14 +553,37 @@ class SolanaTransactionBuilder:
             program_instructions.append(
                 set_compute_unit_price(int(compute_unit_price_micro_lamports)))
         program_instructions.extend(instructions)
-        message = MessageV0.try_compile(payer, program_instructions, [], blockhash)
+
+        # Compiled through the kernel, which is solders until Rust has
+        # produced two hundred consecutive byte-identical messages and is
+        # solders again permanently the first time it does not. The signing
+        # step below is untouched by any of this: the key stays in the signer,
+        # which may be another process, and both implementations produce the
+        # same bytes for it to sign.
+        def compile_with_solders() -> bytes:
+            return bytes(to_bytes_versioned(
+                MessageV0.try_compile(payer, program_instructions, [], blockhash)))
+
+        message_bytes = self.tx_kernel.compile_message(
+            bytes(payer), program_instructions, bytes(blockhash),
+            compile_with_solders)
+
         # Signed by the signer, which may refuse. A refusal propagates: an
         # unsigned transaction continuing as though it were signed is the
         # failure the whole isolation exists to prevent, and a local fallback
         # here would quietly undo it.
-        signature = await self.signer.sign_message(bytes(to_bytes_versioned(message)))
-        signed = VersionedTransaction.populate(message, [Signature.from_bytes(signature)])
-        return base64.b64encode(bytes(signed)).decode("ascii")
+        signature = await self.signer.sign_message(message_bytes)
+
+        def assemble_with_solders() -> str:
+            message = MessageV0.from_bytes(message_bytes[1:]
+                                           if message_bytes[:1] == b"\x80"
+                                           else message_bytes)
+            signed = VersionedTransaction.populate(
+                message, [Signature.from_bytes(signature)])
+            return base64.b64encode(bytes(signed)).decode("ascii")
+
+        return self.tx_kernel.assemble(message_bytes, [signature],
+                                       assemble_with_solders)
 
     async def _recent_blockhash(self) -> Hash:
         """A blockhash fresh enough to land, from cache when it can be vouched for.

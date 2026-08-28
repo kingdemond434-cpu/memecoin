@@ -1,0 +1,12 @@
+{
+  "microseconds": {
+    "assemble_tx": 2.2074,
+    "compile_message": 18.405,
+    "native_decode": 0.2218,
+    "native_quote": 0.2826,
+    "python_policy": 492.7729,
+    "t0_decide": 2.9677
+  },
+  "note": "minimum microseconds per call; see tools/bench_hotpath.py for why the minimum",
+  "tolerance": 4.0
+}
