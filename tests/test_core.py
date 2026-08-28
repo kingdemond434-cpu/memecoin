@@ -19176,3 +19176,148 @@ class TestTheDashboardShowsWhatTheDeskReports(unittest.TestCase):
         for field in ("rust_authoritative", "consecutive_agreements",
                       "promote_after", "divergences", "demoted_reason"):
             self.assertIn(field, transactions)
+
+
+class TestCounterfactualCorpus(unittest.TestCase):
+    """A corpus of trades taken can answer 'did we make money'. It cannot
+    answer 'should we have been there', and that is where the returns are."""
+
+    def _corpus(self, **kwargs):
+        from src.research.counterfactual_corpus import CounterfactualCorpus
+        return CounterfactualCorpus(**kwargs)
+
+    def test_an_ignored_launch_is_a_row(self):
+        from src.research.counterfactual_corpus import ActionOption
+        corpus = self._corpus()
+        corpus.record("d1", "MINT", chosen_action="ignore",
+                      screen_reason="holder_concentration",
+                      options=[ActionOption("ignore", q=0.0),
+                               ActionOption("enter", q=-0.02)])
+        report = corpus.report()
+        self.assertEqual(report["recorded"], 1)
+        self.assertEqual(report["by_chosen_action"], {"ignore": 1})
+
+    def test_the_corpus_says_when_it_is_still_only_recording_trades(self):
+        corpus = self._corpus()
+        for index in range(10):
+            corpus.record(f"d{index}", f"M{index}", chosen_action="enter")
+        report = corpus.report()
+        self.assertEqual(report["status"], "DEGRADED")
+        self.assertIn("still recording trades", report["detail"])
+
+    def test_an_unresolved_decision_is_not_a_loss(self):
+        corpus = self._corpus()
+        corpus.record("d1", "MINT", chosen_action="enter")
+        report = corpus.report()
+        self.assertEqual(report["resolved"], 0)
+        self.assertEqual(report["unresolved_in_flight"], 1)
+        # A launch still in flight has no payoff, and treating that as a loss
+        # manufactures one out of impatience.
+        self.assertEqual(report["outcomes_by_action"], {})
+
+    def test_the_foregone_return_is_none_when_the_peak_is_unknown(self):
+        corpus = self._corpus()
+        corpus.record("d1", "MINT", chosen_action="enter")
+        row = corpus.resolve("d1", realised_multiple=1.4)
+        self.assertIsNone(row.resolution["foregone_multiple"])
+        corpus.record("d2", "MINT2", chosen_action="enter")
+        row = corpus.resolve("d2", realised_multiple=1.4, peak_multiple=9.0)
+        self.assertAlmostEqual(row.resolution["foregone_multiple"], 7.6)
+
+    def test_every_decision_about_one_launch_shares_its_outcome(self):
+        corpus = self._corpus()
+        corpus.record("entry", "MINT", chosen_action="enter")
+        corpus.record("hold", "MINT", chosen_action="hold")
+        corpus.record("bank", "MINT", chosen_action="bank_25")
+        corpus.record("other", "OTHER", chosen_action="ignore")
+        rows = corpus.resolve_by_mint("MINT", peak_multiple=12.0)
+        # Resolving only the entry would throw away every hold the desk got
+        # right or wrong.
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(corpus.report()["unresolved_in_flight"], 1)
+
+    def test_a_frozen_row_is_not_amended_by_its_resolution(self):
+        corpus = self._corpus()
+        corpus.record("d1", "MINT", chosen_action="enter",
+                      state={"holder_top1": 0.11})
+        row = corpus.resolve("d1", realised_multiple=2.0, peak_multiple=5.0)
+        # The state is what the decision saw. A row updated with anything
+        # learned afterwards leaks the future into its own features.
+        self.assertEqual(row.state, {"holder_top1": 0.11})
+        self.assertIn("realised_multiple", row.resolution)
+        self.assertNotIn("realised_multiple", row.state)
+
+    def test_infeasible_actions_keep_their_status_rather_than_a_sentinel(self):
+        from src.research.counterfactual_corpus import ActionOption
+        corpus = self._corpus()
+        row = corpus.record("d1", "MINT", chosen_action="hold", options=[
+            ActionOption("hold", q=0.0),
+            ActionOption("reenter", q=None, status="INFEASIBLE")])
+        payload = row.to_dict()
+        reenter = next(o for o in payload["options"] if o["action"] == "reenter")
+        # Infeasible is not terrible. A large negative Q would teach the model
+        # the difference backwards.
+        self.assertEqual(reenter["status"], "INFEASIBLE")
+        self.assertIsNone(reenter["q"])
+
+    def test_rows_survive_a_round_trip_to_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "corpus.jsonl")
+            corpus = self._corpus(path=path, flush_every=1)
+            corpus.record("d1", "MINT", chosen_action="ignore",
+                          screen_reason="too_concentrated")
+            corpus.resolve("d1", peak_multiple=30.0)
+            rows = self._corpus(path=path).load()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["chosen_action"], "ignore")
+        self.assertEqual(rows[0]["resolution"]["peak_multiple"], 30.0)
+        self.assertEqual(rows[0]["screen_reason"], "too_concentrated")
+
+    def test_close_writes_decisions_still_in_flight(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "corpus.jsonl")
+            corpus = self._corpus(path=path)
+            corpus.record("d1", "MINT", chosen_action="enter")
+            corpus.close()
+            rows = self._corpus(path=path).load()
+        # Written with a null resolution rather than discarded: the desk
+        # decided, and what happened next was never observed.
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["resolution"])
+
+    def test_a_full_pending_set_writes_the_oldest_rather_than_dropping_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "corpus.jsonl")
+            corpus = self._corpus(path=path, max_pending=3, flush_every=1)
+            for index in range(6):
+                corpus.record(f"d{index}", f"M{index}", chosen_action="ignore")
+            rows = self._corpus(path=path).load()
+        self.assertEqual(corpus.dropped_unresolved, 3)
+        # Dropping silently would bias the corpus toward launches that
+        # resolved quickly.
+        self.assertEqual(len(rows), 3)
+
+    def test_a_write_failure_is_counted_rather_than_raised(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # A FILE where a directory has to be. Root can create almost any
+            # path, so an unwritable location has to be one that cannot exist
+            # rather than one that merely does not.
+            blocker = Path(tmp) / "blocker"
+            blocker.write_text("not a directory")
+            corpus = self._corpus(path=str(blocker / "corpus.jsonl"),
+                                  flush_every=1)
+            corpus.record("d1", "MINT", chosen_action="ignore")
+            corpus.resolve("d1", peak_multiple=2.0)
+        report = corpus.report()
+        self.assertGreaterEqual(report["write_failures"], 1)
+        self.assertTrue(report["last_error"])
+
+    def test_the_desk_records_a_row_for_a_screened_launch(self):
+        source = _desk_source()
+        # The whole corpus rests on this call site existing.
+        self.assertIn("counterfactual_corpus.record(", source)
+        self.assertIn('chosen_action="ignore"', source)
+        self.assertIn("_resolve_corpus(", source)
+
+    def test_the_desk_reports_the_corpus(self):
+        self.assertIn('"decision_corpus"', _desk_source())
