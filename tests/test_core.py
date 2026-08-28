@@ -3082,6 +3082,20 @@ class TestPointInTimeResearch(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(outcome["rugged"])
         self.assertEqual(outcome["rug_time"], 12)
 
+    async def test_mixed_price_shapes_choose_one_coherent_path(self):
+        builder = self.builder()
+        episode = LaunchEpisode("token", "solana", 0, "dev", "pump", "curve", "wsol")
+        episode.market_observations.extend([
+            {"timestamp": 0, "price_multiple": 1.0, "signature": "a", "program": "p"},
+            {"timestamp": 2, "price_multiple": 4.0, "signature": "b", "program": "p"},
+            {"timestamp": 4, "price_multiple": 0.2, "signature": "c", "program": "p"},
+            {"timestamp": 3, "price_usd": 99.0},
+        ])
+        outcome = await builder._determine_final_outcome(episode)
+        self.assertEqual(outcome["status"], "OK")
+        self.assertEqual(outcome["max_multiple"], 4.0)
+        self.assertEqual(outcome["observations"], 3)
+
     async def test_pit_outcome_recognizes_native_migration_event(self):
         episode = LaunchEpisode("token", "solana", 100, "dev", "pump", "curve", "wsol")
         episode.market_observations.extend([
@@ -10627,6 +10641,9 @@ class TestSourceTransports(unittest.IsolatedAsyncioTestCase):
 
             async def is_user_authorized(self):
                 return True
+
+            async def get_input_entity(self, channel):
+                return channel
 
             def add_event_handler(self, handler, event):
                 self.handlers.append((handler, event))

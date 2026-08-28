@@ -2654,7 +2654,8 @@ class MemecoinQuantDesk:
             if state is not None and not state.coin_creator:
                 state.coin_creator = decoded.coin_creator
             return True
-        except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError) as exc:
+        except (ConnectionError, TimeoutError, RuntimeError,
+                ValueError, KeyError, TypeError) as exc:
             logger.warning("pool account fetch failed for %s: %s", pool, exc)
             return False
         finally:

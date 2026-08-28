@@ -753,11 +753,20 @@ class PointInTimeDatasetBuilder:
                     )
 
     async def _determine_final_outcome(self, episode: LaunchEpisode) -> Dict[str, Any]:
-        prices = sorted(
+        # Never mix an absolute USD price series with a relative-multiple
+        # series. The old fallback admitted both shapes into one list, then
+        # selected the USD branch when even one row lacked a multiple;
+        # indexing the other rows at ``price_usd`` killed finalisation with a
+        # KeyError and retried the same episode every second forever.
+        multiple_prices = sorted(
             [item for item in episode.market_observations
-             if float(item.get("price_usd", item.get("price_multiple", 0)) or 0) > 0],
-            key=lambda item: item.get("timestamp", 0),
-        )
+             if float(item.get("price_multiple", 0) or 0) > 0],
+            key=lambda item: item.get("timestamp", 0))
+        usd_prices = sorted(
+            [item for item in episode.market_observations
+             if float(item.get("price_usd", 0) or 0) > 0],
+            key=lambda item: item.get("timestamp", 0))
+        prices = multiple_prices if len(multiple_prices) >= 3 else usd_prices
         if not prices:
             return {"status": "DATA_BLOCKED", "reason": "no_point_in_time_price_observations"}
         distinct_times = sorted({float(item.get("timestamp", 0) or 0) for item in prices})
@@ -771,7 +780,7 @@ class PointInTimeDatasetBuilder:
             for item in prices
         })
         provenance_verified = any(source != "unknown" for source in provenance_sources)
-        if all(float(item.get("price_multiple", 0) or 0) > 0 for item in prices):
+        if prices is multiple_prices:
             multiples = [float(item["price_multiple"]) for item in prices]
         else:
             entry = float(prices[0]["price_usd"])

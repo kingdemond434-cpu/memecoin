@@ -797,9 +797,22 @@ class TelegramChannelTransport(Transport):
                 "date": message.date.timestamp() if message.date else time.time(),
                 "sender_id": str(getattr(message, "sender_id", "") or self.channel)})
 
+        # Resolve now, while startup failures are captured and named. Passing
+        # an unresolved string defers this lookup into Telethon's update
+        # dispatcher; an invalid channel then becomes an unhandled task
+        # exception on every incoming update instead of one failed source.
+        lookup: Any = self.channel
+        if str(lookup).lstrip("-").isdigit():
+            lookup = int(lookup)
+        try:
+            target = await self.client.get_input_entity(lookup)
+        except Exception as exc:
+            raise TransportError(
+                f"Telegram channel {self.channel!r} is unavailable: "
+                f"{type(exc).__name__}: {exc}") from exc
         self._event_handler = _handler
         self.client.add_event_handler(
-            self._event_handler, events.NewMessage(chats=self.channel))
+            self._event_handler, events.NewMessage(chats=target))
 
         # connect(), not start(): start() is the one that prompts. A session
         # that exists but is no longer authorised is refused here rather than
