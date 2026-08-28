@@ -100,15 +100,25 @@ def observed_faults(readiness: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     if str(memory.get("band", "")).lower() == "shed":
         repairable.append("memory_governor_persistently_shedding")
 
+    # Repairable, not alert-only: a stream that delivers trades but no
+    # creation events is a broken subscription on a healthy socket, and a
+    # miner pool that is entirely dark while runnable is a wedged scheduler.
+    # Both are exactly what a process restart re-establishes. They still pass
+    # through the two-observation persistence rule, the cooldown and the
+    # restart budget -- an immediate fixer without those is a flapping desk.
     stream_events = readiness.get("stream_events") or {}
     if (int(stream_events.get("total", 0) or 0) >= 100
             and int(stream_events.get("token_created", 0) or 0) == 0):
-        alerts.append("chain_stream_delivers_no_creation_events")
+        repairable.append("chain_stream_delivers_no_creation_events")
 
+    # Alert-only, and the reason is structural: restarting re-decodes the
+    # same unknown bytes the same way. Only new decoder code fixes this.
     decoder = readiness.get("pump_decoder") or {}
     if str(decoder.get("status", "")).upper() in {"DEGRADED", "CRITICAL"}:
         alerts.append("pump_decoder_degraded")
 
+    # Alert-only: the drops already happened. A restart destroys the queue
+    # that is now keeping up and un-drops nothing.
     event_loop = readiness.get("event_loop") or {}
     if (int(event_loop.get("candidate_drops", 0) or 0)
             or int(event_loop.get("redecision_drops", 0) or 0)):
@@ -117,7 +127,7 @@ def observed_faults(readiness: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     miners = readiness.get("data_miners") or {}
     if (int(miners.get("runnable", 0) or 0) > 0
             and str(miners.get("status", "")).upper() == "DATA_BLOCKED"):
-        alerts.append("all_runnable_data_miners_are_dark")
+        repairable.append("all_runnable_data_miners_are_dark")
 
     # Telegram is the desk's fastest human-signal path and the one whose
     # failure is quietest: the session stays "connected", the handler stays
@@ -132,6 +142,9 @@ def observed_faults(readiness: Dict[str, Any]) -> Tuple[List[str], List[str]]:
             # blind to every channel while looking healthy.
             alerts.append("telegram_session_unauthorised")
         elif str(social_status.get("telegram", "")).upper().startswith("DATA_BLOCKED"):
+            # Alert-only on purpose: the common cause is a flood-wait, and
+            # reconnecting during one extends the penalty. The repair would
+            # be the injury.
             alerts.append("telegram_signal_path_blocked")
         elif not int(telegram.get("channels_listed", 0) or 0):
             alerts.append("telegram_no_channels_configured")
@@ -167,6 +180,23 @@ def decide(*, service_active: bool, service_enabled: bool,
         repairable, alerts = observed_faults(readiness)
         persistent.extend(repairable)
         plan.alerts.extend(alerts)
+        # A stalled Telegram feed reports OK on every field it has, so the
+        # only evidence it has stopped is that the mention count is not
+        # moving -- which needs memory across runs, and observed_faults
+        # deliberately has none. Repairable, not alert-only: a restart
+        # reconnects the Telethon client, which is the fix. It joins the
+        # persistent list so it obeys the same two-observation rule,
+        # cooldown and restart budget as every other repair.
+        telegram = ((readiness.get("credentials") or {}).get("telegram") or {})
+        if telegram.get("keys_present") and telegram.get("session_authorised"):
+            mentions = int(((readiness.get("social") or {}).get("total_mentions", 0)) or 0)
+            previous = state.get("telegram_mentions")
+            since = float(state.get("telegram_mentions_at", 0.0) or 0.0)
+            if previous is None or mentions != int(previous):
+                state["telegram_mentions"] = mentions
+                state["telegram_mentions_at"] = now
+            elif since and now - since > policy.telegram_stall_seconds:
+                persistent.append("telegram_signals_stalled")
 
     consecutive = dict(state.get("consecutive_faults") or {})
     seen = set(immediate + persistent)
@@ -191,21 +221,6 @@ def decide(*, service_active: bool, service_enabled: bool,
         plan.alerts.append(
             "restart_suppressed_by_cooldown" if not cooldown_ok
             else "restart_budget_exhausted")
-
-    # A stalled Telegram feed reports OK on every field it has, so the only
-    # evidence it has stopped is that the mention count is not moving. That
-    # needs memory across runs, which observed_faults deliberately has none
-    # of, so it is measured here against the persisted count.
-    telegram = ((readiness.get("credentials") or {}).get("telegram") or {})
-    if telegram.get("keys_present") and telegram.get("session_authorised"):
-        mentions = int(((readiness.get("social") or {}).get("total_mentions", 0)) or 0)
-        previous = state.get("telegram_mentions")
-        since = float(state.get("telegram_mentions_at", 0.0) or 0.0)
-        if previous is None or mentions != int(previous):
-            state["telegram_mentions"] = mentions
-            state["telegram_mentions_at"] = now
-        elif since and now - since > policy.telegram_stall_seconds:
-            plan.alerts.append("telegram_signals_stalled")
 
     if (training_age is not None
             and training_age > policy.training_stale_seconds

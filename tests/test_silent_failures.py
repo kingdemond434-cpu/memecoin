@@ -204,22 +204,28 @@ class TelegramSilenceIsAFault(unittest.TestCase):
         self.assertIn("telegram_signal_path_blocked",
                       observed_faults(readiness)[1])
 
-    def test_a_frozen_mention_count_eventually_alerts(self):
+    def test_a_frozen_mention_count_earns_a_restart_not_just_an_alert(self):
+        """The fix for a wedged Telethon client is a reconnect, so the stall
+        is repairable -- through the same persistence rule as every repair:
+        one observation is a coincidence, two is a fault."""
         readiness, state = self.healthy(), {}
-        self.assertNotIn("telegram_signals_stalled",
-                         self.call(readiness, state, now=10_000.0).alerts)
+        self.assertFalse(self.call(readiness, state, now=10_000.0).restart_desk)
         # Still inside a plausible quiet stretch.
-        self.assertNotIn("telegram_signals_stalled",
-                         self.call(readiness, state, now=11_000.0).alerts)
-        self.assertIn("telegram_signals_stalled",
-                      self.call(readiness, state, now=12_000.0).alerts)
+        self.assertFalse(self.call(readiness, state, now=11_000.0).restart_desk)
+        # Past the stall window: first observation arms, second repairs.
+        first = self.call(readiness, state, now=12_000.0)
+        self.assertFalse(first.restart_desk)
+        second = self.call(readiness, state, now=12_060.0)
+        self.assertTrue(second.restart_desk)
+        self.assertIn("telegram_signals_stalled", second.repair_reasons)
 
     def test_a_moving_count_resets_the_clock(self):
         readiness, state = self.healthy(), {}
         self.call(readiness, state, now=10_000.0)
         readiness["social"]["total_mentions"] = 4468
-        self.assertNotIn("telegram_signals_stalled",
-                         self.call(readiness, state, now=12_000.0).alerts)
+        plan = self.call(readiness, state, now=12_000.0)
+        self.assertFalse(plan.restart_desk)
+        self.assertNotIn("telegram_signals_stalled", plan.alerts)
 
     def test_an_unconfigured_alert_channel_says_so(self):
         """The alert about alerts. Returning a quiet False is how every
@@ -273,3 +279,56 @@ class BatchRepliesAlignByIdNotByOrder(unittest.TestCase):
             source = handle.read()
         self.assertIn("by_id.get(request.get(\"id\"))", source)
         self.assertNotIn("return [r.get(\"result\") for r in data]", source)
+
+
+class RestartFixableFaultsAreRepairedNotAnnounced(unittest.TestCase):
+    """Where a restart IS the fix, the watchdog acts; alerts are for the rest.
+
+    A broken creation-event subscription on a healthy socket and a wedged
+    miner pool are both re-established by a process restart. Leaving them as
+    alerts meant a human reading a journal was the repair path for faults the
+    machine could fix in under two minutes. The promotion keeps the guard
+    rails: two consecutive observations, the cooldown, and the budget.
+    """
+
+    def healthy(self):
+        return {
+            "runtime_tasks": {"status": "OK", "failed": []},
+            "source_mesh": {"sources": 2, "producers": 2, "streaming": True},
+            "yellowstone": {"status": "STREAMING"},
+            "rpc_program_stream": {"status": "RPC_WS"},
+            "memory": {"band": "calm"},
+            "stream_events": {"total": 10, "token_created": 1},
+            "pump_decoder": {"status": "OK"},
+            "event_loop": {}, "data_miners": {"status": "OK", "runnable": 3},
+            "prediction": "OK", "rug_hazard": {"model_trained": True},
+            "credentials": {"absent": []},
+        }
+
+    def test_a_creationless_stream_is_repairable(self):
+        readiness = self.healthy()
+        readiness["stream_events"] = {"total": 500, "token_created": 0}
+        repairs, alerts = observed_faults(readiness)
+        self.assertIn("chain_stream_delivers_no_creation_events", repairs)
+        self.assertNotIn("chain_stream_delivers_no_creation_events", alerts)
+
+    def test_dark_miners_are_repairable(self):
+        readiness = self.healthy()
+        readiness["data_miners"] = {"status": "DATA_BLOCKED", "runnable": 5}
+        repairs, alerts = observed_faults(readiness)
+        self.assertIn("all_runnable_data_miners_are_dark", repairs)
+
+    def test_what_a_restart_cannot_fix_stays_an_alert(self):
+        """The boundary is the point: promoting these would flap the desk
+        against faults only new code, credentials or evidence can clear."""
+        readiness = self.healthy()
+        readiness["pump_decoder"] = {"status": "DEGRADED"}
+        readiness["event_loop"] = {"candidate_drops": 4}
+        readiness["prediction"] = "DATA_BLOCKED"
+        readiness["credentials"] = {"absent": [{"name": "X_BEARER_TOKEN"}]}
+        repairs, alerts = observed_faults(readiness)
+        for fault in ("pump_decoder_degraded", "decision_queue_dropped_work",
+                      "prediction_model_data_blocked",
+                      "optional_credentials_absent"):
+            self.assertIn(fault, alerts)
+            self.assertNotIn(fault, repairs)
