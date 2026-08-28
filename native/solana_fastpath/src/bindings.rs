@@ -262,7 +262,8 @@ fn pumpswap_account_list_status() -> &'static str {
     alternative_growth_per_second, expected_remaining_seconds, add_fraction,
     probe_fraction, min_edge, max_add_fraction, live, max_position_fraction,
     max_single_commit_fraction, min_commit_fraction, min_exit_capacity,
-    live_unlocked
+    live_unlocked, reentry_bins = None, replacement_bins = None,
+    replacement_fraction = None
 ))]
 fn t0_decide(
     age_seconds: f64,
@@ -290,6 +291,11 @@ fn t0_decide(
     min_commit_fraction: f64,
     min_exit_capacity: f64,
     live_unlocked: bool,
+    // (probability, gross) pairs for the two actions whose distribution
+    // the position itself does not carry. Absent for most decisions.
+    reentry_bins: Option<Vec<(f64, f64)>>,
+    replacement_bins: Option<Vec<(f64, f64)>>,
+    replacement_fraction: Option<f64>,
 ) -> PyResult<(String, f64, String, bool, Option<String>, Option<String>, f64, Vec<(String, f64, bool)>)>
 {
     if levels.len() != crate::policy::SURVIVAL_MULTIPLES.len() {
@@ -314,6 +320,21 @@ fn t0_decide(
         0.0,
     );
 
+    // Converted to the policy's own Bin here rather than passed as tuples,
+    // so the kernel never sees a shape chosen on the Python side.
+    let to_bins = |rows: &Option<Vec<(f64, f64)>>| -> Option<Vec<crate::policy::Bin>> {
+        rows.as_ref().map(|rows| {
+            rows.iter()
+                .map(|(probability, gross)| crate::policy::Bin {
+                    probability: *probability,
+                    gross: *gross,
+                })
+                .collect()
+        })
+    };
+    let reentry = to_bins(&reentry_bins);
+    let replacement = to_bins(&replacement_bins);
+
     let inputs = crate::decide::Inputs {
         position: crate::policy::Position {
             held_fraction,
@@ -336,6 +357,11 @@ fn t0_decide(
         min_edge,
         max_add_fraction,
         live,
+        alternatives: crate::policy::Alternatives {
+            reentry: reentry.as_deref(),
+            replacement: replacement.as_deref(),
+            replacement_fraction,
+        },
     };
     let limits = crate::safety::Limits {
         max_position_fraction,

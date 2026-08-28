@@ -18746,3 +18746,225 @@ class TestTxKernelPromotion(unittest.TestCase):
         # undo the signer isolation to save a few microseconds.
         self.assertNotIn("build_signed_transaction(", source)
         self.assertIn("assemble_transaction", source)
+
+
+class TestReentryAndReplacementAreRustExpressible(unittest.TestCase):
+    """No latency-sensitive state falls back to Python any more.
+
+    Re-entry is decided in the same seconds-old window as the original entry,
+    so routing it to Python meant the fast path covered the easy half of the
+    problem and handed the hard half back.
+    """
+
+    RESERVES = {"virtual_sol": 30_000_000_000, "virtual_token": 1_073_000_000_000_000}
+
+    def setUp(self):
+        try:
+            import solana_fastpath  # noqa: F401
+        except ImportError:
+            self.skipTest("solana_fastpath is not built on this host")
+
+    @staticmethod
+    def _survival():
+        from src.strategies.t0_kernel import SurvivalInputs
+        return SurvivalInputs(levels=[0.62, 0.41, 0.24, 0.13, 0.06, 0.03, 0.012, 0.004],
+                              p_rug_30s=0.09, p_rug_5m=0.31,
+                              expected_feasible_multiple=2.4)
+
+    @classmethod
+    def _forward(cls):
+        import solana_fastpath as fp
+        survival = cls._survival()
+        # Both sides must price HOLD off the same bins or every comparison is
+        # about the bins rather than about the policy.
+        return tuple(fp.survival_bins(list(survival.levels), survival.p_rug_30s,
+                                      survival.p_rug_5m,
+                                      survival.expected_feasible_multiple))
+
+    def _kernel(self, **kwargs):
+        from src.strategies.action_value import ActionValuePolicy
+        from src.strategies.t0_kernel import T0Kernel
+        return T0Kernel(ActionValuePolicy(min_edge=1e-4, max_add_fraction=0.5),
+                        **kwargs)
+
+    def test_a_reentry_state_is_no_longer_refused_by_the_kernel(self):
+        from src.strategies.action_value import PositionState
+        kernel = self._kernel(mode="shadow")
+        state = PositionState(
+            held_fraction=0.0, current_multiple=1.0, forward_bins=self._forward(),
+            exit_cost=0.01, entry_cost=0.01, exit_capacity_ratio=0.9,
+            escape_probability=0.85, expected_remaining_seconds=60.0,
+            alternative_growth_per_second=0.0, add_fraction=0.1,
+            probe_fraction=0.02,
+            reentry_bins=((0.5, 0.8), (0.3, 1.9), (0.2, 3.5)))
+        decision = kernel.score(state, survival=self._survival(), **self.RESERVES)
+        self.assertTrue(decision.kernel["compared"])
+        self.assertEqual(kernel.report()["not_expressible_in_kernel"], 0)
+
+    def test_a_replacement_state_is_no_longer_refused_by_the_kernel(self):
+        from src.strategies.action_value import PositionState
+        kernel = self._kernel(mode="shadow")
+        state = PositionState(
+            held_fraction=0.4, current_multiple=2.2, forward_bins=self._forward(),
+            exit_cost=0.01, entry_cost=0.01, exit_capacity_ratio=0.8,
+            escape_probability=0.8, expected_remaining_seconds=60.0,
+            alternative_growth_per_second=0.0, add_fraction=0.1,
+            probe_fraction=0.02,
+            replacement_bins=((0.4, 0.7), (0.4, 2.1), (0.2, 5.0)),
+            replacement_fraction=0.2)
+        decision = kernel.score(state, survival=self._survival(), **self.RESERVES)
+        self.assertTrue(decision.kernel["compared"])
+        self.assertEqual(kernel.report()["not_expressible_in_kernel"], 0)
+
+    def test_the_two_implementations_agree_across_randomised_states(self):
+        import collections
+        import random
+        from src.strategies.action_value import PositionState
+        random.seed(21)
+        kernel = self._kernel(mode="shadow")
+        survival, forward = self._survival(), self._forward()
+
+        def bins(count=4):
+            weights = [random.uniform(0.05, 0.4) for _ in range(count)]
+            total = sum(weights)
+            return tuple((weight / total, random.uniform(0.2, 4.0))
+                         for weight in weights)
+
+        chosen = collections.Counter()
+        for _ in range(300):
+            flat = random.random() < 0.5
+            state = PositionState(
+                held_fraction=0.0 if flat else random.uniform(0.05, 0.9),
+                current_multiple=random.uniform(0.4, 8.0),
+                forward_bins=forward,
+                exit_cost=random.uniform(0.005, 0.03),
+                entry_cost=random.uniform(0.005, 0.03),
+                exit_capacity_ratio=random.uniform(0.2, 1.0),
+                escape_probability=random.uniform(0.2, 1.0),
+                expected_remaining_seconds=random.uniform(10, 300),
+                alternative_growth_per_second=random.uniform(0, 0.002),
+                add_fraction=random.uniform(0.01, 0.3),
+                probe_fraction=random.uniform(0.005, 0.05),
+                reentry_bins=bins() if flat else None,
+                replacement_bins=bins() if not flat else None,
+                replacement_fraction=(random.uniform(0.01, 0.3)
+                                      if not flat else None))
+            decision = kernel.score(state, survival=survival, **self.RESERVES)
+            self.assertTrue(decision.kernel["compared"])
+            chosen[decision.action.value] += 1
+        report = kernel.report()
+        self.assertEqual(report["divergences"], 0)
+        self.assertEqual(report["compared"], 300)
+        # Both new actions must actually be CHOSEN somewhere in the sweep,
+        # or this only proves they never fire.
+        self.assertGreater(chosen["reenter"], 0)
+        self.assertGreater(chosen["replace"], 0)
+
+    def test_a_missing_candidate_is_infeasible_rather_than_a_certain_loss(self):
+        from src.strategies.action_value import PositionState
+        kernel = self._kernel(mode="rust")
+        state = PositionState(
+            held_fraction=0.0, current_multiple=1.0, forward_bins=self._forward(),
+            exit_cost=0.01, entry_cost=0.01, exit_capacity_ratio=0.9,
+            escape_probability=0.85, expected_remaining_seconds=60.0,
+            alternative_growth_per_second=0.0, add_fraction=0.1,
+            probe_fraction=0.02)
+        decision = kernel.score(state, survival=self._survival(), **self.RESERVES)
+        by_action = {score.action.value: score for score in decision.scores}
+        for name in ("reenter", "replace"):
+            self.assertIn(name, by_action)
+            # None supplied, so infeasible. Not a bad score -- an absent one.
+            self.assertEqual(by_action[name].status, "INFEASIBLE")
+
+    def test_reentry_is_refused_while_the_position_is_still_open(self):
+        from src.strategies.action_value import PositionState
+        kernel = self._kernel(mode="rust")
+        state = PositionState(
+            held_fraction=0.5, current_multiple=2.0, forward_bins=self._forward(),
+            exit_cost=0.01, entry_cost=0.01, exit_capacity_ratio=0.9,
+            escape_probability=0.85, expected_remaining_seconds=60.0,
+            alternative_growth_per_second=0.0, add_fraction=0.1,
+            probe_fraction=0.02,
+            reentry_bins=((0.5, 0.8), (0.5, 4.0)))
+        decision = kernel.score(state, survival=self._survival(), **self.RESERVES)
+        by_action = {score.action.value: score for score in decision.scores}
+        # Re-entry is not the question being asked of an open position.
+        self.assertEqual(by_action["reenter"].status, "INFEASIBLE")
+
+
+class TestLatencyRegressionBenchmarks(unittest.TestCase):
+    """A latency regression should fail a build the way a wrong answer does."""
+
+    def setUp(self):
+        try:
+            import solana_fastpath  # noqa: F401
+        except ImportError:
+            self.skipTest("solana_fastpath is not built on this host")
+
+    def test_every_baseline_case_can_actually_be_built(self):
+        from tools.bench_hotpath import build_cases
+        cases = build_cases()
+        problems = {name: case for name, case in cases.items()
+                    if name.startswith("_")}
+        self.assertEqual(problems, {}, f"benchmark cases failed to build: {problems}")
+        for name in ("native_decode", "native_quote", "t0_decide",
+                     "compile_message", "assemble_tx", "python_policy"):
+            self.assertIn(name, cases)
+
+    def test_the_committed_baseline_covers_every_case(self):
+        from tools.bench_hotpath import build_cases, load_baseline
+        baseline = load_baseline()
+        missing = [name for name in build_cases() if not name.startswith("_")
+                   and name not in baseline]
+        # A case with no baseline is a case CI cannot fail on, which is the
+        # same as not having it.
+        self.assertEqual(missing, [], f"no committed baseline for: {missing}")
+
+    def test_the_rust_kernel_is_dramatically_faster_than_the_python_policy(self):
+        """The measurement that justifies the whole promotion ladder."""
+        from tools.bench_hotpath import load_baseline
+        baseline = load_baseline()
+        # Two orders of magnitude, not two percent. If this ever stops being
+        # true the ladder is carrying risk for nothing.
+        self.assertGreater(baseline["python_policy"] / baseline["t0_decide"], 20.0)
+
+    def test_a_slowdown_beyond_tolerance_is_reported_as_a_regression(self):
+        import io
+        import json
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest import mock
+        from tools import bench_hotpath
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "baseline.json"
+            # A baseline a hundred times faster than anything real.
+            path.write_text(json.dumps({"microseconds": {
+                "native_decode": 0.001, "native_quote": 0.001,
+                "t0_decide": 0.001, "compile_message": 0.001,
+                "assemble_tx": 0.001, "python_policy": 0.001}}))
+            with mock.patch.object(bench_hotpath, "BASELINE_PATH", str(path)), \
+                 mock.patch.object(sys, "argv", ["bench"]), \
+                 redirect_stdout(io.StringIO()) as output:
+                code = bench_hotpath.main()
+        self.assertEqual(code, 1)
+        self.assertIn("LATENCY REGRESSION", output.getvalue())
+
+    def test_measuring_nothing_is_a_failure_not_a_pass(self):
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+        from tools import bench_hotpath
+
+        with mock.patch.object(bench_hotpath, "build_cases", return_value={}), \
+             mock.patch.object(sys, "argv", ["bench"]), \
+             redirect_stdout(io.StringIO()):
+            code = bench_hotpath.main()
+        # A suite that measured nothing has not shown anything is fast, and
+        # reporting success would be a lie CI repeats on every build.
+        self.assertEqual(code, 2)
+
+    def test_ci_runs_the_benchmark(self):
+        workflow = (Path(__file__).resolve().parents[1]
+                    / ".github" / "workflows" / "ci.yml").read_text()
+        self.assertIn("tools/bench_hotpath.py", workflow)

@@ -60,6 +60,19 @@ jobs:
           SOLANA_PRIVATE_KEY: ""
         run: python -m unittest discover -s tests -q
 
+      - name: Latency regression check
+        # A correctness regression fails the build and a latency regression
+        # did not, which left the one property this system is supposed to have
+        # as the one nothing defended.
+        #
+        # The tolerance is four times baseline, which sounds absurd until you
+        # remember these are shared runners that vary by a factor of two on
+        # identical code. It catches the class worth failing a build over: an
+        # accidental quadratic, a lost cache, or the Rust path silently
+        # falling back to Python. Anything subtler is measured on the node,
+        # where the number means something.
+        run: python tools/bench_hotpath.py
+
       - name: Assert the vendored IDL tables are current
         # The Rust account-flag tables are generated from the IDLs. A hand
         # edit that drifts from them builds transactions the program rejects,
