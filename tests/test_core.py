@@ -135,7 +135,8 @@ from src.collectors.transports import (
     BlueskyJetstreamTransport, GithubRepoTransport, JsonPollTransport,
     MastodonTimelineTransport, NostrRelayTransport, OfficialSiteTransport,
     QueueTransport, RssTransport, TelegramChannelTransport, TransportError,
-    build_transport, build_transports, parse_timestamp, transport_report,
+    build_transport, build_transports, parse_timestamp, start_transports,
+    stop_transports, transport_report,
 )
 from src.strategies.decision_snapshot import (
     DecisionSnapshot, DecisionStatus, StateSequencer, guard as decision_guard,
@@ -10615,6 +10616,66 @@ class TestSourceTransports(unittest.IsolatedAsyncioTestCase):
         self.assertIn("NOT_SET_API_ID", message)
         self.assertIn("NOT_SET_API_HASH", message)
 
+    async def test_telegram_channels_share_one_authorised_client(self):
+        class SharedClient:
+            def __init__(self):
+                self.handlers = []
+                self.disconnects = 0
+
+            def is_connected(self):
+                return True
+
+            async def is_user_authorized(self):
+                return True
+
+            def add_event_handler(self, handler, event):
+                self.handlers.append((handler, event))
+
+            def remove_event_handler(self, handler):
+                self.handlers = [row for row in self.handlers if row[0] is not handler]
+
+            async def disconnect(self):
+                self.disconnects += 1
+
+        telethon = types.ModuleType("telethon")
+        telethon.events = SimpleNamespace(NewMessage=lambda **kwargs: kwargs)
+        shared = SharedClient()
+        first = TelegramChannelTransport("t1", "alpha")
+        second = TelegramChannelTransport("t2", "beta")
+        first.attach_client(shared)
+        second.attach_client(shared)
+        with mock.patch.dict(sys.modules, {"telethon": telethon}):
+            self.assertEqual(await start_transports({"t1": first, "t2": second}), {})
+            self.assertEqual(len(shared.handlers), 2)
+            await stop_transports({"t1": first, "t2": second})
+        self.assertEqual(shared.disconnects, 0)
+        self.assertEqual(shared.handlers, [])
+
+    async def test_transport_startup_is_concurrent_and_bounded(self):
+        class Slow:
+            def __init__(self, delay):
+                self.delay = delay
+
+            async def start(self):
+                await asyncio.sleep(self.delay)
+
+        started = time.perf_counter()
+        failures = await start_transports(
+            {"one": Slow(0.05), "two": Slow(0.05)},
+            timeout_s=0.2, concurrency=2)
+        elapsed = time.perf_counter() - started
+        self.assertEqual(failures, {})
+        self.assertLess(elapsed, 0.09)
+
+    async def test_one_hung_transport_does_not_stall_startup(self):
+        class Slow:
+            async def start(self):
+                await asyncio.sleep(1)
+
+        failures = await start_transports({"hung": Slow()}, timeout_s=0.01)
+        self.assertIn("hung", failures)
+        self.assertIn("TimeoutError", failures["hung"])
+
 
 class TestTransportsAreBuiltFromDeclarations(unittest.TestCase):
     """A declaration with no transport is a coverage hole with a name."""
@@ -13277,6 +13338,13 @@ class TestEachSourceMinesOnItsOwnClock(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["producing"], 1)
         self.assertEqual(report["failing"], 1)
         self.assertEqual(report["total_records"], 1)
+        fine = next(row for row in report["miners"] if row["miner_id"] == "fine")
+        broken = next(row for row in report["miners"] if row["miner_id"] == "broken")
+        self.assertEqual(fine["state"], "PRODUCING")
+        self.assertEqual(fine["enriches"], "market_context")
+        self.assertEqual(fine["cadence_seconds"], 10.0)
+        self.assertEqual(fine["records_total"], 1)
+        self.assertEqual(broken["state"], "ERROR")
 
     async def test_an_empty_pool_says_the_lake_is_fed_by_the_chain_alone(self):
         report = DataMinerPool().report()
@@ -15425,7 +15493,7 @@ class TestTheMinerSelectorsAskAboutWhatWeActuallyTrade(unittest.TestCase):
 
     def test_tracked_wallets_are_bounded_and_deduplicated(self):
         desk = self._desk()
-        desk.wallet_intelligence = SimpleNamespace(
+        desk.wallet_intel = SimpleNamespace(
             elite_wallets={f"W{i}": {} for i in range(200)})
         desk._recent_funders = {"W0": {}}
         wallets = MemecoinQuantDesk._tracked_wallets(desk)
@@ -15533,6 +15601,41 @@ class TestTheCensusCountsEveryLaunchNotOnlyOurs(unittest.TestCase):
         funnel = census.report()["funnel"]
         self.assertEqual(funnel["screened_out"], 0)
         self.assertEqual(funnel["reached_a_decision"], 1)
+        self.assertEqual(funnel["unaccounted"], 0)
+
+    def test_every_launch_has_one_explicit_disposition(self):
+        census = LaunchCensus()
+        for mint in ("waiting", "blocked", "screened", "ignored", "probe", "entry"):
+            census.see(mint)
+        census.data_blocked("blocked", "DATA_BLOCKED_liquidity")
+        census.screen("screened", "veto_honeypot")
+        census.decision_ready("ignored")
+        census.decide("ignored", "negative_elogw")
+        census.decide("probe", "PROBE")
+        census.decide("entry", "ENTER")
+        census.enter("entry")
+        funnel = census.report()["funnel"]
+        self.assertEqual(funnel["unaccounted"], 0)
+        self.assertEqual(sum(funnel["dispositions"].values()), funnel["seen"])
+        self.assertEqual(funnel["data_blocked"], 1)
+        self.assertEqual(funnel["awaiting_state"], 1)
+        self.assertEqual(funnel["entered"], 1)
+
+    def test_legacy_unaccounted_launches_become_explicit_data_gaps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "census.json"
+            path.write_text(json.dumps({
+                "schema": "v1",
+                "totals": {"seen": 2, "screened": 0, "decided": 0},
+                "records": [
+                    {"mint": "a", "stage": "seen", "detected_at": 1},
+                    {"mint": "b", "stage": "seen", "detected_at": 2},
+                ],
+            }))
+            census = LaunchCensus(path)
+            self.assertTrue(census.load())
+            funnel = census.report()["funnel"]
+        self.assertEqual(funnel["data_blocked"], 2)
         self.assertEqual(funnel["unaccounted"], 0)
 
     def test_totals_survive_eviction_of_the_detail_they_came_from(self):

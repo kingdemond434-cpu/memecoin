@@ -518,8 +518,11 @@ function render(d){
     `<div class="cell"><div class="k">${k}</div><div class="v">${v}</div><div class="n">${n}</div></div>`).join("");
 
   /* funnel */
-  const stages=[["Seen",f.seen,false],["Screened out",f.screened_out,true],
-    ["Reached decision",f.reached_a_decision,false],["Entered",f.entered,false]];
+  const stages=[["Seen",f.seen,false],["Awaiting state",f.awaiting_state,false],
+    ["Data blocked",f.data_blocked,true],["Screened out",f.screened_out,true],
+    ["Decision ready",f.decision_ready,false],["Decided ignore",f.decided_ignore,true],
+    ["Decided probe",f.decided_probe,false],["Decided enter",f.decided_enter,false],
+    ["Entered",f.entered,false]];
   const top=Math.max(1,f.seen||1);
   $("funnel").innerHTML=stages.map(([l,v,dim])=>{
     const w=Math.max(0.6,((v||0)/top)*100);
@@ -605,7 +608,7 @@ function render(d){
   pill($("screen-pill"),sp.status||"—",statusClass(sp.status));
   $("screen-note").innerHTML=sp.evaluated
     ? `<strong>${pct(sp.kept_but_reduced_share,1)}</strong> of launches are now kept at reduced size rather than discarded. Only <strong>${num(sp.declined_uneconomic)}</strong> were declined on economics (no size clears its own cost) and <strong>${num(sp.declined_veto)}</strong> on a genuine veto — untradeable at any size.`
-    : `No launch screened yet.`;
+    : `The soft sizing policy has not been reached yet. Upstream there are <strong>${num(f.data_blocked)}</strong> data-blocked launches and <strong>${num(f.screened_out)}</strong> hard screens; those are separate funnel populations, not zero activity.`;
 
   /* fact ladder */
   const fl=d.fact_ladder||{facts:[]};
@@ -636,11 +639,12 @@ function render(d){
 
   /* miners */
   $("miners").innerHTML=(mine.miners||[]).map(m=>{
-    const cls=m.state==="OK"?"s-ok":m.state==="RATE_LIMITED"?"s-warn":
-              m.state==="NO_KEY"?"s-blocked":"s-crit";
-    return `<tr><td>${m.miner_id}</td><td class="off">${m.enriches}</td>
-      <td class="num">${cadence(m.cadence)}</td><td class="num">${num(m.records)}</td>
-      <td><span class="pill ${cls}">${m.state}</span></td></tr>`;
+    const state=m.state||"DATA_BLOCKED";
+    const cls=state==="PRODUCING"?"s-ok":state==="IDLE"||state==="RATE_LIMITED"?"s-warn":
+              state==="DATA_BLOCKED"||state==="DISABLED"?"s-blocked":"s-crit";
+    return `<tr><td>${m.miner_id||"—"}</td><td class="off">${m.enriches||"—"}</td>
+      <td class="num">${cadence(m.cadence_seconds)}</td><td class="num">${num(m.records_total)}</td>
+      <td><span class="pill ${cls}">${state}</span></td></tr>`;
   }).join("");
   pill($("mine-pill"),num(mine.producing)+" PRODUCING",mine.producing?"s-ok":"s-blocked");
 
@@ -654,8 +658,11 @@ function render(d){
       <div class="ftrack"><div class="fbar${ratio>=1?"":" dim"}" style="width:${w}%"></div></div>
       <div class="fval">${num(have)}<span class="off">/${num(need)}</span></div></div>`;
   }).join("");
-  const ready=Object.values(dist).every(v=>(v.need||0)===0?true:(v.have||0)>=(v.need||0));
-  pill($("promo-pill"),ready?"READY":"ACCUMULATING",ready?"s-ok":"s-warn");
+  const measurable=Object.values(dist).filter(v=>(v.need||0)>0);
+  const evaluable=measurable.length>0;
+  const ready=evaluable&&measurable.every(v=>(v.have||0)>=(v.need||0));
+  pill($("promo-pill"),!evaluable?"NOT EVALUABLE":ready?"READY":"ACCUMULATING",
+    !evaluable?"s-blocked":ready?"s-ok":"s-warn");
 
   /* signer */
   const s=d.signer||{};

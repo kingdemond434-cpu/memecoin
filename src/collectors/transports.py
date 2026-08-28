@@ -738,6 +738,20 @@ class TelegramChannelTransport(Transport):
         self.buffer: Deque[Dict[str, Any]] = deque(maxlen=capacity)
         self.client: Any = None
         self.connected = False
+        self._owns_client = True
+        self._event_handler: Any = None
+
+    def attach_client(self, client: Any) -> None:
+        """Use an already connected, authorised client owned by the desk.
+
+        Telethon's SQLite session is single-writer.  Opening one client per
+        channel against the same session file makes the clients contend on
+        that database and can keep the entire source mesh in startup for
+        minutes.  One client can subscribe to every public channel, so the
+        desk shares its social-intelligence client with these transports.
+        """
+        self.client = client
+        self._owns_client = False
 
     async def start(self) -> None:
         """Connect to an ALREADY AUTHORISED session. Never prompts.
@@ -749,25 +763,33 @@ class TelegramChannelTransport(Transport):
         starting for ever. So the session file is checked first and its
         absence is refused with the command that creates it.
         """
-        api_id = os.getenv(self.api_id_env, "")
-        api_hash = os.getenv(self.api_hash_env, "")
-        if not api_id or not api_hash:
-            # Names, never values.
-            raise TransportError(
-                f"{self.api_id_env} and {self.api_hash_env} must both be set")
-        session_file = f"{self.session_name}.session"
-        if not os.path.exists(session_file):
-            raise TransportError(
-                f"no authorised Telegram session at {session_file}; run "
-                "`.venv/bin/python -m src.research.telegram_authorize` once, "
-                "interactively, before starting the desk")
         try:
-            from telethon import TelegramClient, events
+            from telethon import events
         except ImportError as exc:
             raise TransportError(f"Telethon is not installed: {exc}") from exc
-        self.client = TelegramClient(self.session_name, int(api_id), api_hash)
 
-        @self.client.on(events.NewMessage(chats=self.channel))
+        if self.client is None:
+            api_id = os.getenv(self.api_id_env, "")
+            api_hash = os.getenv(self.api_hash_env, "")
+            if not api_id or not api_hash:
+                # Names, never values.
+                raise TransportError(
+                    f"{self.api_id_env} and {self.api_hash_env} must both be set")
+            session_file = f"{self.session_name}.session"
+            if not os.path.exists(session_file):
+                raise TransportError(
+                    f"no authorised Telegram session at {session_file}; run "
+                    "`.venv/bin/python -m src.research.telegram_authorize` once, "
+                    "interactively, before starting the desk")
+            try:
+                from telethon import TelegramClient
+            except ImportError as exc:
+                raise TransportError(f"Telethon is not installed: {exc}") from exc
+            self.client = TelegramClient(self.session_name, int(api_id), api_hash)
+            await self.client.connect()
+        elif not bool(self.client.is_connected()):
+            raise TransportError("shared Telegram client is not connected")
+
         async def _handler(event):  # pragma: no cover - needs a live connection
             message = event.message
             self.buffer.append({
@@ -775,20 +797,28 @@ class TelegramChannelTransport(Transport):
                 "date": message.date.timestamp() if message.date else time.time(),
                 "sender_id": str(getattr(message, "sender_id", "") or self.channel)})
 
+        self._event_handler = _handler
+        self.client.add_event_handler(
+            self._event_handler, events.NewMessage(chats=self.channel))
+
         # connect(), not start(): start() is the one that prompts. A session
         # that exists but is no longer authorised is refused here rather than
         # silently connecting as nobody.
-        await self.client.connect()
         if not await self.client.is_user_authorized():
-            await self.client.disconnect()
+            if self._owns_client:
+                await self.client.disconnect()
             raise TransportError(
-                f"the Telegram session at {session_file} is no longer authorised; "
+                "the Telegram session is no longer authorised; "
                 "re-run src.research.telegram_authorize")
         self.connected = True
 
     async def stop(self) -> None:
         if self.client is not None:
-            await self.client.disconnect()
+            if self._event_handler is not None:
+                self.client.remove_event_handler(self._event_handler)
+                self._event_handler = None
+            if self._owns_client:
+                await self.client.disconnect()
             self.connected = False
 
     async def fetch(self) -> List[Dict[str, Any]]:
@@ -801,7 +831,8 @@ class TelegramChannelTransport(Transport):
 
     def report(self) -> Dict[str, Any]:
         return {**super().report(), "connected": self.connected,
-                "channel": self.channel, "buffered": len(self.buffer)}
+                "channel": self.channel, "buffered": len(self.buffer),
+                "shared_client": not self._owns_client}
 
 
 @dataclass
@@ -942,36 +973,44 @@ def build_transports(declarations: Sequence[Any], client: Optional[HttpClient] =
     return transports, report, client
 
 
-async def start_transports(transports: Dict[str, Any]) -> Dict[str, str]:
+async def start_transports(transports: Dict[str, Any], *,
+                           timeout_s: float = 15.0,
+                           concurrency: int = 16) -> Dict[str, str]:
     """Connect everything that holds a connection. Returns what failed, by name.
 
     Failures are returned rather than raised: one relay refusing a connection
     must not stop the other three hundred sources from starting.
     """
     failures: Dict[str, str] = {}
-    for source_id, transport in transports.items():
+    semaphore = asyncio.Semaphore(max(1, int(concurrency)))
+
+    async def start_one(source_id: str, transport: Any) -> None:
         starter = getattr(transport, "start", None)
         if starter is None:
-            continue
+            return
         try:
-            await starter()
+            async with semaphore:
+                await asyncio.wait_for(starter(), timeout=max(0.1, timeout_s))
         except Exception as exc:
             failures[source_id] = f"{type(exc).__name__}: {exc}"
             logger.warning("transport %s failed to start: %s", source_id, exc)
+    await asyncio.gather(*(start_one(source_id, transport)
+                           for source_id, transport in transports.items()))
     return failures
 
 
 async def stop_transports(transports: Dict[str, Any], client: Optional[HttpClient] = None
                           ) -> None:
-    for transport in transports.values():
+    async def stop_one(transport: Any) -> None:
         stopper = getattr(transport, "stop", None)
         if stopper is None:
-            continue
+            return
         try:
-            await stopper()
+            await asyncio.wait_for(stopper(), timeout=10.0)
         except Exception as exc:
             logger.debug("transport %s did not stop cleanly: %s",
                          getattr(transport, "source_id", "?"), exc)
+    await asyncio.gather(*(stop_one(transport) for transport in transports.values()))
     if client is not None:
         await client.close()
 

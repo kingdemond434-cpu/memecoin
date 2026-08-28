@@ -84,7 +84,8 @@ from src.strategies.action_value import (
 from src.collectors.event_source import Event, SourceMesh
 from src.collectors.registry import build_sources, expand_env_channels, load_declarations
 from src.collectors.transports import (
-    HttpClient, build_transports, start_transports, stop_transports, transport_report,
+    HttpClient, TelegramChannelTransport, build_transports, start_transports,
+    stop_transports, transport_report,
 )
 from src.strategies.decision_snapshot import (
     DecisionSnapshot, StateSequencer, guard as decision_guard, state_hash,
@@ -258,6 +259,8 @@ class MemecoinQuantDesk:
         self._candidate_semaphore: Optional[asyncio.Semaphore] = None
         self._web_runner: Optional[web.AppRunner] = None
         self.start_time = time.time()
+        self._readiness_cache: Dict[str, Any] = {}
+        self._readiness_cached_at = 0.0
         self.last_intelligence_update = 0.0
         self.sol_price_usd = 0.0
         self.wallet_equity_usd = 0.0
@@ -761,6 +764,11 @@ class MemecoinQuantDesk:
             declarations, self.http_client)
         injected = dict(getattr(self, "source_fetchers", {}) or {})
         self.transports: Dict[str, Any] = {**built, **injected}
+        shared_telegram = getattr(self.social_intel, "_telegram_client", None)
+        if shared_telegram is not None:
+            for transport in self.transports.values():
+                if isinstance(transport, TelegramChannelTransport):
+                    transport.attach_client(shared_telegram)
         self.source_fetchers: Dict[str, Any] = dict(self.transports)
         sources, self.source_registry_report = build_sources(
             declarations, self.source_fetchers)
@@ -988,7 +996,7 @@ class MemecoinQuantDesk:
             "market_observer", self._market_observer_loop())
         self._source_task = self._start_runtime_task(
             "source_consumer", self._source_consumer_loop())
-        self._persist_readiness(_jsonable(self.readiness()))
+        self._refresh_readiness_cache()
         _systemd_notify("READY=1\nSTATUS=DRY_RUN collectors active")
 
     async def stop(self):
@@ -1298,6 +1306,7 @@ class MemecoinQuantDesk:
             return False
         task = asyncio.create_task(self._candidate_pipeline(candidate))
         self._candidate_pipelines[token] = task
+        self.launch_census.awaiting_state(token, "candidate_pipeline_running")
         self._background_tasks.add(task)
 
         def completed(done: asyncio.Task):
@@ -1438,6 +1447,7 @@ class MemecoinQuantDesk:
         if prediction is None:
             self._record_blocked_decision(token, "DATA_BLOCKED_prediction_model", {})
             return
+        self.launch_census.decision_ready(token, "safety_liquidity_and_prediction_ready")
         if not self.dry_run and not self.champion_challenger.is_live(MODEL_HYPOTHESIS_ID):
             self._record_blocked_decision(token, "champion_not_promoted_for_live_authority", _jsonable(prediction))
             return
@@ -1554,11 +1564,13 @@ class MemecoinQuantDesk:
             should_trade = contested
             decision.update({"should_trade": should_trade, "trade_info": trade_info,
                              "contested_for_capital": True})
+        action = "ENTER" if should_trade else str(trade_info.get("reason", "IGNORE"))
+        self.launch_census.decide(token, action)
         decision_id = self.counterfactual_lab.record_decision(token, _jsonable(prediction), decision)
         self._record_trade_evidence_packet(
             token, candidate, risk, liquidity, trade_info, intelligence,
-            decision="ENTER" if should_trade else str(trade_info.get("reason", "REJECT")),
-            veto=veto.to_dict())
+            decision=action,
+            veto=hard_veto.to_dict())
         if not should_trade:
             return
         result = await self.execution_engine.execute_swap(
@@ -1620,6 +1632,7 @@ class MemecoinQuantDesk:
             "ratchet_stages": [],
         }
         self.elogw_engine.update_position(token, position)
+        self.launch_census.enter(token)
         staged = self._stage_exits(token, position)
         if staged is not None:
             position["staged_exits"] = staged.detail
@@ -1696,7 +1709,10 @@ class MemecoinQuantDesk:
         # Recorded so the weekly audit can ask what the rejected launches went
         # on to do. A missed monster is invisible unless the rejection was
         # written down next to the outcome.
-        self.launch_census.screen(token, reason)
+        if str(reason).upper().startswith("DATA_BLOCKED"):
+            self.launch_census.data_blocked(token, reason)
+        else:
+            self.launch_census.screen(token, reason)
         self._record_ops_event("trade_outcomes", {
             "token": token, "entered": False, "attempted": False,
             "rejection_reason": reason,
@@ -3402,6 +3418,7 @@ class MemecoinQuantDesk:
         started = await self.source_mesh.start()
         logger.info("SOURCE_MESH started %d producers (%d transports, %d connected)",
                     started, len(self.transports), len(self.transports) - len(failures))
+        self._refresh_readiness_cache()
         while self._running:
             try:
                 event = await self.source_mesh.next_event()
@@ -4176,7 +4193,7 @@ class MemecoinQuantDesk:
         """
         wallets: List[str] = []
         seen = set()
-        for source in (getattr(self.wallet_intelligence, "elite_wallets", None) or {},
+        for source in (getattr(self.wallet_intel, "elite_wallets", None) or {},
                        getattr(self, "_recent_funders", None) or {}):
             for address in source:
                 if address and address not in seen:
@@ -5310,6 +5327,7 @@ class MemecoinQuantDesk:
     def readiness(self) -> Dict[str, Any]:
         return {
             "mode": "DRY_RUN" if self.dry_run else "LIVE",
+            "uptime_seconds": max(0.0, time.time() - self.start_time),
             "live_submission_locked": os.getenv("ALLOW_LIVE_TRADING", "").lower() != "yes-i-understand",
             "offline": self.offline, "rpc": self.chain_registry.get_all_stats() if self.chain_registry else {},
             "yellowstone": self.yellowstone.get_status() if self.yellowstone else {"status": "NOT_STARTED"},
@@ -5468,9 +5486,22 @@ class MemecoinQuantDesk:
                     logger.debug("memory governor read failed: %s", exc)
                 _systemd_notify("WATCHDOG=1\nSTATUS=DRY_RUN collectors active")
                 await asyncio.sleep(10)
-            snapshot = _jsonable(self.readiness())
-            logger.info("HEALTH %s", json.dumps(snapshot, separators=(",", ":")))
-            self._persist_readiness(snapshot)
+            snapshot = self._refresh_readiness_cache()
+            stream = snapshot.get("stream_events") or {}
+            miners = snapshot.get("data_miners") or {}
+            tasks = snapshot.get("runtime_tasks") or {}
+            logger.info(
+                "HEALTH mode=%s stream_events=%s miners=%s/%s prediction=%s tasks=%s",
+                snapshot.get("mode"), stream.get("events_total", 0),
+                miners.get("producing", 0), miners.get("registered", 0),
+                snapshot.get("prediction"), tasks.get("status", "UNKNOWN"))
+
+    def _refresh_readiness_cache(self) -> Dict[str, Any]:
+        snapshot = _jsonable(self.readiness())
+        self._readiness_cache = snapshot
+        self._readiness_cached_at = time.time()
+        self._persist_readiness(snapshot)
+        return snapshot
 
     def _register_memory_reliefs(self) -> None:
         """What the desk gives up under pressure, in order of cheapness.
@@ -5775,7 +5806,11 @@ class MemecoinQuantDesk:
                                             "successful_exits": self.successful_exits}))
 
     async def _status_endpoint(self, request):
-        return web.json_response(_jsonable(self.readiness()))
+        snapshot = self._readiness_cache or self._refresh_readiness_cache()
+        payload = dict(snapshot)
+        payload["status_snapshot_age_seconds"] = max(
+            0.0, time.time() - self._readiness_cached_at)
+        return web.json_response(payload)
 
     async def _close_health_server(self):
         if self._web_runner:
