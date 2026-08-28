@@ -90,7 +90,8 @@ from src.research.web_miners import (
 from src.chains import pumpswap_route
 from solders.message import to_bytes_versioned
 from src.research.launch_census import (
-    LaunchCensus, LaunchRecord, MONSTER_MULTIPLE, Stage as CensusStage,
+    Disposition as CensusDisposition, LaunchCensus, LaunchRecord,
+    MONSTER_MULTIPLE, Stage as CensusStage,
 )
 from src.research import rug_mechanism
 from src.execution import signer_daemon
@@ -15798,6 +15799,21 @@ class TestTheCensusCountsEveryLaunchNotOnlyOurs(unittest.TestCase):
         self.assertEqual(report["funnel"]["data_blocked"], 1)
         self.assertEqual(report["screens"], {"real_reason": 1})
         self.assertEqual(report["funnel"]["unaccounted"], 0)
+
+    def test_awaiting_pipeline_becomes_explicitly_blocked_after_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "census.json"
+            census = LaunchCensus(path)
+            census.see("m")
+            census.awaiting_state("m", "candidate_pipeline_running")
+            self.assertTrue(census.save())
+            revived = LaunchCensus(path)
+            self.assertTrue(revived.load())
+            record = revived._records["m"]
+        self.assertIs(record.disposition, CensusDisposition.DATA_BLOCKED)
+        self.assertEqual(
+            record.disposition_reason,
+            "DATA_BLOCKED_pipeline_interrupted_by_restart")
 
     def test_totals_survive_eviction_of_the_detail_they_came_from(self):
         with tempfile.TemporaryDirectory() as tmp:

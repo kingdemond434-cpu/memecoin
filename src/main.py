@@ -1312,7 +1312,14 @@ class MemecoinQuantDesk:
             return False
         task = asyncio.create_task(self._candidate_pipeline(candidate))
         self._candidate_pipelines[token] = task
-        self.launch_census.awaiting_state(token, "candidate_pipeline_running")
+        if self.predictor is not None and not self.predictor._is_trained:
+            # The absence of a validated action model is known immediately.
+            # Keep collecting native risk/outcome evidence in this task, but
+            # do not leave the launch looking lost behind enrichment RPCs.
+            self.launch_census.data_blocked(
+                token, "DATA_BLOCKED_prediction_model_enrichment_running")
+        else:
+            self.launch_census.awaiting_state(token, "candidate_pipeline_running")
         self._background_tasks.add(task)
 
         def completed(done: asyncio.Task):

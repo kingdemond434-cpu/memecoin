@@ -622,6 +622,16 @@ class LaunchCensus:
                 migrated=row.get("migrated"), rugged=row.get("rugged"),
                 rug_mechanism=row.get("rug_mechanism", ""),
                 resolved_at=float(row.get("resolved_at", 0.0) or 0.0))
+        # No candidate coroutine survives a process restart. Persisted
+        # AWAITING_STATE records therefore cannot still be running; keeping
+        # them awaiting forever would manufacture a pipeline leak.
+        for record in self._records.values():
+            if record.disposition is Disposition.AWAITING_STATE:
+                record.stage = Stage.DATA_BLOCKED
+                record.disposition = Disposition.DATA_BLOCKED
+                record.disposition_reason = "DATA_BLOCKED_pipeline_interrupted_by_restart"
+                record.screen_reason = record.disposition_reason
+                record.disposition_updated_at = time.time()
         # Older states counted DATA_BLOCKED exits as screens.  Reclassify the
         # in-memory detail we can prove without inventing anything about
         # already-spilled rows.
