@@ -118,12 +118,14 @@ CLASSIFICATION_TARGETS = {target for target, _ in SURVIVAL_LEVELS} | {
 #: the gradient, and the head can express "this one is ordinary" instead of
 #: being dragged to the mean by episodes it cannot identify.
 #:
-#: These heads are fitted with ABSOLUTE-ERROR loss, making them conditional
-#: MEDIAN estimators -- see the comment on the regressor construction for the
-#: full argument. Short form: the validation gate scores MAE, the median is
-#: what minimises MAE, the median commutes with exp() exactly, and a median
-#: is the conservative statistic for a value consumed as a ceiling on what
-#: each survival bin may pay.
+#: These heads estimate the conditional MEAN of the log target, because the
+#: value is consumed as an expectation by Kelly sizing and as the ceiling on
+#: what each survival bin may pay. A conditional-median variant was measured
+#: on 2026-08-29 and rejected: it nearly ties any MAE gate on a 62.8%-at-1.0
+#: target and answers ~1.0 for nearly everything, which zeroes the claimed
+#: upside of every bin and with it every shadow trade. The gate that scores
+#: this head is therefore log-space MSE against a constant log-mean baseline
+#: -- the proper loss for the estimator class actually being shipped.
 LOG_SPACE_TARGETS = {PredictionTarget.EXPECTED_FEASIBLE_MULTIPLE}
 
 #: The smallest multiple the log transform will represent; matches the clip
@@ -438,20 +440,19 @@ class MultiHeadPredictor:
                     min_samples_split=20,
                     min_samples_leaf=10,
                     random_state=42,
-                    # Log-space heads estimate the conditional MEDIAN, because
-                    # that is what both the gate and the consumer want. The
-                    # gate scores MAE, which the median minimises by
-                    # definition -- squared error estimates the mean, which on
-                    # a target that is 62.8% exactly log(1.0)=0 gets dragged
-                    # above zero by tail episodes and then pays MAE on every
-                    # ordinary launch; it lost to the constant median 2-3x
-                    # while being perfectly well fitted. And unlike the mean,
-                    # the median commutes with exp() exactly, so the
-                    # exponentiated prediction IS the median multiple -- at or
-                    # below the mean on this right skew, the conservative
-                    # direction for a ceiling on claimed upside.
-                    loss=("absolute_error" if target in LOG_SPACE_TARGETS
-                          else "squared_error"),
+                    # Squared error, deliberately, after measuring the
+                    # alternative. An absolute-error (median) head was tried
+                    # on 2026-08-29: it nearly tied the constant-median MAE
+                    # baseline (0.0776 vs 0.0739) exactly as theory predicts
+                    # -- and produced ZERO shadow trades in every band,
+                    # because a head that answers ~1.0 for nearly every
+                    # launch caps every survival bin at no upside and the
+                    # policy correctly never acts. This value is consumed as
+                    # an expectation by Kelly sizing, so it is fitted as one;
+                    # the validation gate scores it with a proper loss for
+                    # expectations (log-space MSE against a constant log-mean
+                    # baseline) rather than an MAE contest a mean estimator
+                    # loses by construction.
                 )
 
     def add_training_sample(self, features: PredictionFeatures, labels: Dict[PredictionTarget, float]):

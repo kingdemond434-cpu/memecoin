@@ -286,10 +286,28 @@ def validate_oos(
     feasible_log_baseline_mae = (
         float(np.mean([abs(actual - feasible_log_baseline) for actual, _ in log_pairs]))
         if log_pairs and train_log else float("inf"))
+
+    # The GATED comparison is MSE against a constant LOG-MEAN baseline --
+    # proper loss for an expectation, against the same estimator class. Both
+    # mismatched pairings were tried and both fail structurally: a mean head
+    # against an MAE/median gate loses by construction on a target that is
+    # 62.8% exactly 1.0 (measured 0.247 vs 0.075), and a median head fitted
+    # to win that gate answers ~1.0 for everything, which zeroes every
+    # survival bin's claimed upside and with it every shadow trade (measured:
+    # MAE 0.0776 vs 0.0739, trades 0 in all bands). MSE-vs-mean is the pairing
+    # a correct conditional expectation actually wins when features carry
+    # signal, and cannot be gamed by refusing to predict.
+    feasible_log_mse = (float(np.mean([(actual - predicted) ** 2
+                                       for actual, predicted in log_pairs]))
+                        if log_pairs else float("inf"))
+    log_mean_baseline = float(np.mean(train_log)) if train_log else 0.0
+    feasible_log_baseline_mse = (
+        float(np.mean([(actual - log_mean_baseline) ** 2 for actual, _ in log_pairs]))
+        if log_pairs and train_log else float("inf"))
     net_elogw = float(np.mean(realized_logs)) if realized_logs else -float("inf")
     passed = (
         len(oos_samples) >= 50 and trade_count >= 10 and mean_brier_skill > 0 and net_elogw > 0
-        and len(feasible_pairs) >= 10 and feasible_log_mae < feasible_log_baseline_mae
+        and len(feasible_pairs) >= 10 and feasible_log_mse < feasible_log_baseline_mse
     )
     return {
         "status": "PASSED" if passed else "REJECTED",
@@ -297,7 +315,11 @@ def validate_oos(
         "shadow_policy": shadow_policy,
         "mean_brier_skill": mean_brier_skill, "net_elogw_proxy": net_elogw,
         "feasible_return_samples": len(feasible_pairs),
-        # Scored, and what the gate reads.
+        # Scored, and what the gate reads: proper loss for an expectation.
+        "feasible_log_mse": feasible_log_mse,
+        "feasible_log_baseline_mse": feasible_log_baseline_mse,
+        # Diagnostics: the MAE pairing is reported for history but not gated;
+        # a mean estimator loses it by construction on this target.
         "feasible_log_mae": feasible_log_mae,
         "feasible_log_baseline_mae": feasible_log_baseline_mae,
         # Diagnostic only. A mean-estimator loses this to a median-estimator

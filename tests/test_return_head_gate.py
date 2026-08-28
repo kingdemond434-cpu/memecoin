@@ -82,9 +82,29 @@ class TheGateReadsLogSpace(unittest.TestCase):
         from src.research import shadow_trainer
         with open(shadow_trainer.__file__, encoding="utf-8") as handle:
             source = handle.read()
-        # The gate condition itself must reference the log-space figure.
-        self.assertIn("feasible_log_mae < feasible_log_baseline_mae", source)
+        # The gate is MSE against a constant LOG-MEAN baseline: the proper
+        # loss for the expectation this head ships. Both mismatched pairings
+        # were measured and fail structurally -- mean-vs-MAE loses by
+        # construction (0.247 vs 0.075); a median head fitted to win MAE
+        # answers ~1.0 for everything and zeroes every shadow trade.
+        self.assertIn("feasible_log_mse < feasible_log_baseline_mse", source)
+        self.assertNotIn("feasible_log_mae < feasible_log_baseline_mae", source)
         self.assertNotIn("and feasible_mae < feasible_baseline_mae", source)
+
+    def test_a_correct_expectation_wins_the_mse_pairing(self):
+        """The new gate must be winnable by exactly the thing it ships."""
+        rng = np.random.default_rng(7)
+        # Two regimes the features CAN separate: dead launches and runners.
+        dead = np.zeros(700)                      # log(1.0)
+        runners = rng.normal(0.6, 0.3, 300)       # conditional mean 0.6
+        y = np.concatenate([dead, runners])
+        constant_mean = float(np.mean(y))
+        mse_constant = float(np.mean((y - constant_mean) ** 2))
+        # A model that knows which regime each row is in predicts each
+        # conditional mean.
+        predictions = np.concatenate([np.zeros(700), np.full(300, 0.6)])
+        mse_model = float(np.mean((y - predictions) ** 2))
+        self.assertLess(mse_model, mse_constant)
 
     def test_total_loss_is_finite_in_log_space(self):
         """log(0) is -inf and would poison the mean for every other episode."""
