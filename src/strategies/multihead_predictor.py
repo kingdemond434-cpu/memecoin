@@ -116,11 +116,14 @@ CLASSIFICATION_TARGETS = {target for target, _ in SURVIVAL_LEVELS} | {
 #:
 #: Fitting log(multiple) drops skew to -5.5, so no single 1606x episode owns
 #: the gradient, and the head can express "this one is ordinary" instead of
-#: being dragged to the mean by episodes it cannot identify. It also matches
-#: how the value is consumed: as a CEILING on what each survival bin may pay.
-#: Exponentiating a conditional log-mean yields a geometric mean, which is at
-#: or below the arithmetic mean -- the conservative direction for a cap on
-#: claimed upside, and the quantity the desk's log-wealth objective wants.
+#: being dragged to the mean by episodes it cannot identify.
+#:
+#: These heads are fitted with ABSOLUTE-ERROR loss, making them conditional
+#: MEDIAN estimators -- see the comment on the regressor construction for the
+#: full argument. Short form: the validation gate scores MAE, the median is
+#: what minimises MAE, the median commutes with exp() exactly, and a median
+#: is the conservative statistic for a value consumed as a ceiling on what
+#: each survival bin may pay.
 LOG_SPACE_TARGETS = {PredictionTarget.EXPECTED_FEASIBLE_MULTIPLE}
 
 #: The smallest multiple the log transform will represent; matches the clip
@@ -434,7 +437,21 @@ class MultiHeadPredictor:
                     subsample=0.8,
                     min_samples_split=20,
                     min_samples_leaf=10,
-                    random_state=42
+                    random_state=42,
+                    # Log-space heads estimate the conditional MEDIAN, because
+                    # that is what both the gate and the consumer want. The
+                    # gate scores MAE, which the median minimises by
+                    # definition -- squared error estimates the mean, which on
+                    # a target that is 62.8% exactly log(1.0)=0 gets dragged
+                    # above zero by tail episodes and then pays MAE on every
+                    # ordinary launch; it lost to the constant median 2-3x
+                    # while being perfectly well fitted. And unlike the mean,
+                    # the median commutes with exp() exactly, so the
+                    # exponentiated prediction IS the median multiple -- at or
+                    # below the mean on this right skew, the conservative
+                    # direction for a ceiling on claimed upside.
+                    loss=("absolute_error" if target in LOG_SPACE_TARGETS
+                          else "squared_error"),
                 )
 
     def add_training_sample(self, features: PredictionFeatures, labels: Dict[PredictionTarget, float]):

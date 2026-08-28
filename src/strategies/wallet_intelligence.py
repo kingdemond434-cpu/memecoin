@@ -302,11 +302,27 @@ class WalletIntelligenceEngine:
             try:
                 results = await self.rpc.batch_request(payload)
             except Exception as exc:
-                # A refused batch is one wallet's history, not a broken desk.
-                # Reported by name so a provider capping batch size is visible
-                # rather than looking like a wallet with no trades.
-                logger.debug("batched wallet history failed for %s: %s", wallet, exc)
-                continue
+                # Some free providers refuse batches outright -- publicnode
+                # answers 403 to a JSON-RPC array while serving the same
+                # method fine one call at a time. A refused batch therefore
+                # degrades to bounded sequential singles through the
+                # method-aware router (which knows who serves getTransaction)
+                # instead of becoming a hole in this wallet's history that
+                # reads downstream as "no trades".
+                logger.debug("batched wallet history failed for %s (%s); "
+                             "falling back to singles", wallet, exc)
+                semaphore = asyncio.Semaphore(3)
+
+                async def fetch_one(row):
+                    async with semaphore:
+                        try:
+                            return await self.rpc.request(
+                                "getTransaction", [row["signature"], options])
+                        except Exception:
+                            return None
+
+                results = await asyncio.gather(
+                    *(fetch_one(row) for row in chunk))
             for row, transaction in zip(chunk, results or []):
                 converted = self._standard_tx_to_enhanced(wallet, row, transaction)
                 if converted:
