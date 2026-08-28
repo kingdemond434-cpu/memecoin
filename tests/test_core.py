@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import types
+import urllib.error
 from collections import defaultdict, deque
 import unittest
 from dataclasses import asdict
@@ -59,7 +60,7 @@ from src.strategies.multihead_predictor import (
     MultiHeadPredictor, PredictionFeatures, band_for,
 )
 from src.collectors.registry import (
-    ADAPTER_KINDS, SourceDeclaration, SourceDiscovery, build_sources,
+    ADAPTER_KINDS, DEFAULT_POLL_INTERVALS, SourceDeclaration, SourceDiscovery, build_sources,
     expand_env_channels, load_declarations,
 )
 from src.collectors.adapters import (
@@ -5834,8 +5835,16 @@ class TestHealthChecks(unittest.TestCase):
     def test_a_dead_feed_is_critical(self):
         with tempfile.TemporaryDirectory() as directory:
             report = self._run(
-                self._readiness(yellowstone={"status": "DISCONNECTED"}), directory)
+                self._readiness(
+                    yellowstone={"status": "DISCONNECTED"},
+                    rpc_program_stream={"status": "DISCONNECTED"}), directory)
             self.assertEqual(self._state_of(report, "feed_yellowstone"), State.CRITICAL)
+
+    def test_a_dead_primary_feed_warns_when_the_fallback_is_streaming(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = self._run(
+                self._readiness(yellowstone={"status": "DISCONNECTED"}), directory)
+            self.assertEqual(self._state_of(report, "feed_yellowstone"), State.WARN)
 
     def test_a_feed_that_never_started_is_blocked_not_broken(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -5902,7 +5911,8 @@ class TestHealthChecks(unittest.TestCase):
     def test_the_report_ranks_worst_state_and_lists_escalations(self):
         with tempfile.TemporaryDirectory() as directory:
             report = self._run(self._readiness(
-                yellowstone={"status": "DISCONNECTED"}), directory)
+                yellowstone={"status": "DISCONNECTED"},
+                rpc_program_stream={"status": "DISCONNECTED"}), directory)
             self.assertEqual(report.worst, State.CRITICAL)
             self.assertIn("feed_yellowstone", [c.name for c in report.escalations])
             payload = report.to_dict()
@@ -12742,7 +12752,8 @@ class TestTheSourceUniverseIsActuallyWired(unittest.TestCase):
 
     def test_a_declaration_without_a_cadence_keeps_the_default(self):
         sources, _report = build_sources([self._declaration()], {"s": lambda: None})
-        self.assertEqual(sources[0].poll_interval_seconds, 1.0)
+        self.assertEqual(sources[0].poll_interval_seconds,
+                         DEFAULT_POLL_INTERVALS["rss"])
 
     def test_every_source_that_is_not_ready_is_not_ready_for_a_named_reason(self):
         """A share threshold would drift as coverage targets are added.

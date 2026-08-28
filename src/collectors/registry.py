@@ -230,26 +230,6 @@ def expand_env_channels(declarations: Sequence[SourceDeclaration],
     return existing + added
 
 
-def _adapter_options(factory: Callable[..., EventSource],
-                     options: Dict[str, Any]) -> Dict[str, Any]:
-    """The subset of a declaration's options this adapter accepts.
-
-    Read off the factory's own signature rather than from a hand-kept list:
-    a list would be one more thing to update when an adapter gains a
-    parameter, and forgetting would silently drop the parameter.
-    """
-    import inspect
-
-    try:
-        parameters = inspect.signature(factory).parameters
-    except (TypeError, ValueError):
-        return dict(options)
-    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD
-           for parameter in parameters.values()):
-        return dict(options)
-    return {name: value for name, value in options.items() if name in parameters}
-
-
 def _cadence_bucket(seconds: float) -> str:
     """Human bucket for a poll interval, for the coverage report."""
     value = float(seconds)
@@ -376,7 +356,7 @@ def build_sources(
             # an unexpected keyword -- and reported NO_FETCHER, which reads as
             # a missing transport rather than as a misrouted option.
             source = factory(declaration.source_id, fetch,
-                             **_adapter_options(factory, declaration.options))
+                             **_adapter_options(declaration))
             if declaration.degraded_after_seconds is not None:
                 source.degraded_after_seconds = declaration.degraded_after_seconds
             if declaration.dead_after_seconds is not None:

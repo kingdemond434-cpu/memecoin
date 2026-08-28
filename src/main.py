@@ -4656,7 +4656,10 @@ class MemecoinQuantDesk:
         if quote is not None and self.sol_price_usd > 0:
             value_usd = (float(quote.output_amount) / LAMPORTS_PER_SOL) * self.sol_price_usd
             remaining = max(float(position.get("remaining_cost_usd", 0.0) or 0.0), 1e-9)
-            return (value_usd / remaining, value_usd, "local_executable_quote",
+            measurement = ("local_pump_executable_sell"
+                           if token in self._latest_curve_state
+                           else "local_pumpswap_executable_sell")
+            return (value_usd / remaining, value_usd, measurement,
                     quote.price_impact_pct)
         # No local quote. A recent streamed price ratio is still a measurement
         # of this market, just not of this size -- so it is used, and labelled
@@ -4697,6 +4700,9 @@ class MemecoinQuantDesk:
         current_value = quote.output_amount / 1_000_000
         remaining_cost = max(float(position["remaining_cost_usd"]), 1e-9)
         multiple = current_value / remaining_cost
+        now = time.time()
+        impact = float(quote.price_impact_pct)
+        measurement = "jupiter_executable_sell"
         observation = {"type": "route", "feasible": True, "price_impact_pct": impact,
                        "value_usd": current_value, "price_multiple": multiple, "timestamp": now,
                        "measurement": measurement, "data_status": "OK"}
