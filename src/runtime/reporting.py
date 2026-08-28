@@ -466,6 +466,10 @@ class ReportingSurface:
             # Where the milliseconds go. The only thing on this page that
             # can tell you whether the next hour belongs to code or to money.
             "latency": self.latency.report(),
+            # Every decision and what it was judged against, ignored launches
+            # included. `ignore_share` is the line that matters: a corpus
+            # where IGNORE is a minority is still only recording trades.
+            "decision_corpus": self.counterfactual_corpus.report(),
             # Independent landing MECHANISMS, and which ones actually land.
             # Seven Jito regions is one mechanism; a router reporting one
             # mechanism has the redundancy of having none.

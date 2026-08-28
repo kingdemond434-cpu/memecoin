@@ -44,6 +44,9 @@ from src.research.dataset_builder import PointInTimeDatasetBuilder
 from src.research.feature_engine import build_features
 from src.research.global_research_miner import GlobalResearchMiner
 from src.research.calibration import CalibrationBook
+from src.research.counterfactual_corpus import (
+    ActionOption, CounterfactualCorpus, RouteOption,
+)
 from src.research.calibration import Provenance
 from src.research.fallback import FallbackResolver, Source
 from src.runtime.latency import LatencyLedger
@@ -396,6 +399,14 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
         # up, and an event that arrives with no ledger to open a trace on is
         # the one measurement that cannot be recovered later.
         self.latency = LatencyLedger()
+        # Every decision, including the launches walked away from. A corpus
+        # of trades taken can answer "did we make money" and cannot answer
+        # "should we have been there", and the second question is where the
+        # returns are.
+        self.counterfactual_corpus = CounterfactualCorpus(
+            path=str(Path(self.global_config.get("ops_state_dir", "data/state"))
+                     / "decision_corpus.jsonl")
+            if not self.offline else None)
         self.miner_offload: Optional[OffloadedPool] = None
         self.slot_value = SlotValueModel()
         self._mark_checked_at: Dict[str, float] = {}
@@ -521,6 +532,12 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
         Failures are logged and swallowed: a desk that cannot shut down
         because a disk is full is worse than one that loses a minute.
         """
+        # The corpus is append-only and buffered, so a shutdown that does not
+        # flush it loses decisions that cannot be reconstructed from anything.
+        try:
+            self.counterfactual_corpus.flush()
+        except Exception as exc:
+            logger.warning("could not flush the decision corpus: %s", exc)
         for name, ledger in (("forward evidence", self.forward_evidence),
                              ("launch census", self.launch_census),
                              ("calibration", self.calibration)):
@@ -914,6 +931,12 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
             decision.update({"should_trade": should_trade, "trade_info": trade_info,
                              "contested_for_capital": True})
         decision_id = self.counterfactual_lab.record_decision(token, _jsonable(prediction), decision)
+        # Frozen BEFORE the action, with every alternative the policy priced.
+        # A row amended afterwards leaks the future into its own features, and
+        # a model trained on that looks extraordinary in backtest and fails
+        # forward.
+        self._record_corpus_decision(token, decision_id, decision, trade_info,
+                                     should_trade)
         if not should_trade:
             # A launch we screened is a closed trace, not an abandoned one.
             # Screening is most of the funnel, and a ledger that only ever saw
@@ -1068,7 +1091,69 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
             "token": token, "entered": False, "attempted": False,
             "rejection_reason": reason,
         })
-        self.counterfactual_lab.record_decision(token, evidence, {"should_trade": False, "reason": reason})
+        decision_id = self.counterfactual_lab.record_decision(
+            token, evidence, {"should_trade": False, "reason": reason})
+        # The row that makes the corpus a corpus. A rejection recorded here
+        # and resolved from the census later is the only way the desk can
+        # ever learn that a screen was wrong -- a missed hundred-x costs
+        # nothing that any other ledger records.
+        try:
+            self.counterfactual_corpus.record(
+                decision_id or f"blocked:{token}:{time.time():.6f}", token,
+                state=_jsonable(evidence), chosen_action="ignore",
+                screen_reason=reason, regime=str(self.current_regime or "unknown"),
+                options=[ActionOption(action="ignore", status="OK")])
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("corpus row for %s not recorded: %s", token, exc)
+
+    def _record_corpus_decision(self, token: str, decision_id: str,
+                                decision: Dict[str, Any],
+                                trade_info: Optional[Dict[str, Any]],
+                                should_trade: bool) -> None:
+        """One frozen row: the state, every feasible action, and what was taken.
+
+        The action set is stored with each option's STATUS rather than with a
+        sentinel Q for the ones that were unavailable. An action the state
+        could not support -- ADD with no capital, REENTER on an open position
+        -- is infeasible, not terrible, and a large negative number would
+        teach the model the difference backwards.
+        """
+        corpus = getattr(self, "counterfactual_corpus", None)
+        if corpus is None:
+            return
+        info = trade_info or {}
+        scores = (decision.get("action_scores") or decision.get("scores") or [])
+        options = []
+        for score in scores:
+            if isinstance(score, dict):
+                options.append(ActionOption(
+                    action=str(score.get("action", "")),
+                    q=score.get("q"),
+                    status=str(score.get("status", "OK"))))
+        routes = []
+        router = getattr(self.execution_engine, "landing_router", None)
+        if router is not None:
+            try:
+                for route in router.enabled_routes():
+                    routes.append(RouteOption(name=route.name, kind=route.kind))
+            except Exception:  # pragma: no cover - defensive
+                routes = []
+        try:
+            corpus.record(
+                decision_id or f"decision:{token}:{time.time():.6f}", token,
+                state=_jsonable(decision.get("prediction") or {}),
+                options=options,
+                chosen_action=str(decision.get("action")
+                                  or ("enter" if should_trade else "ignore")),
+                chosen_q=info.get("elogw"),
+                size_fraction=info.get("position_fraction"),
+                entry_price=info.get("entry_price"),
+                routes=routes,
+                screen_reason=("" if should_trade
+                               else str(decision.get("reason", ""))),
+                regime=str(self.current_regime or "unknown"))
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("corpus decision for %s not recorded: %s", token, exc)
 
     def _prelaunch_context(self, deployer: str, detected_at: float) -> Optional[Dict[str, Any]]:
         profile = self.prelaunch.get_entity_profile(deployer) if deployer else None
@@ -2850,6 +2935,22 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
 
 
 
+    def _resolve_corpus(self, token: str, **outcome: Any) -> None:
+        """Attach an outcome to every decision made about one launch.
+
+        Every decision, not only the entry: a launch is decided on repeatedly
+        and resolving only the first would throw away every hold the desk got
+        right or wrong. Defensive, because a corpus write must never be able
+        to take down the stream handler that feeds it.
+        """
+        corpus = getattr(self, "counterfactual_corpus", None)
+        if corpus is None:
+            return
+        try:
+            corpus.resolve_by_mint(token, **outcome)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("corpus resolution for %s failed: %s", token, exc)
+
     def _resolve_census_death(self, token: str) -> None:
         """Classify how a token died and record it against the denominator.
 
@@ -2869,6 +2970,8 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
             return
         self.launch_census.resolve(
             token, rugged=True, rug_mechanism=verdict.mechanism.value)
+        self._resolve_corpus(token, rugged=True,
+                             rug_mechanism=verdict.mechanism.value)
         self._record_ops_event("rug_mechanisms", {
             "token": token, **verdict.to_dict()})
 
@@ -3564,6 +3667,10 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
                 # screen threw away.
                 self.launch_census.resolve(
                     token, peak_multiple=curve_multiple, at=stamp)
+                # The same peak, attached to every decision made about this
+                # launch. This is the counterfactual: what was available,
+                # measured on a token the desk may never have touched.
+                self._resolve_corpus(token, peak_multiple=curve_multiple)
             observation = {"type": "trade", "side": event.get("side"), "wallet": event.get("wallet"),
                            "amount": event.get("actual_token_amount_ui"),
                            "amount_raw": event.get("actual_token_delta_raw"),
