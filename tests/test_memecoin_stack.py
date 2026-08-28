@@ -97,6 +97,17 @@ class TestDisagreementAndVeto(unittest.TestCase):
         self.assertIn("connected_holder_concentration", permissive.unmeasured)
         self.assertEqual(strict.status, "DATA_BLOCKED")
 
+    def test_unavailable_critical_display_level_is_not_false_rug_evidence(self):
+        report = SimpleNamespace(
+            data_status="DATA_BLOCKED", blocked_checks=["mint_account"],
+            can_mint=False, can_freeze=False, token_extensions=[],
+            sell_route_feasible=None, checks={},
+            risk_level=SimpleNamespace(value="critical"), score=0)
+        verdict = RiskVeto(require_complete_safety=True).evaluate(report)
+        self.assertEqual(verdict.status, "DATA_BLOCKED")
+        self.assertNotIn("native_risk_level:critical", verdict.reasons)
+        self.assertIn("mint_account", verdict.unmeasured)
+
 
 class TestEvidenceAndIsolation(unittest.TestCase):
     def test_hash_chain_detects_rewrite(self):

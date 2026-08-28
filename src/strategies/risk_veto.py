@@ -82,7 +82,11 @@ class RiskVeto:
             reasons.append("catastrophic_exit_price_impact")
 
         level = evidence["risk_level"]
-        if level in {"high", "critical", "honeypot", "rugged"}:
+        # A fail-safe report may carry a critical display level while its
+        # underlying account read is unavailable. That is not observed proof
+        # of a rug. Preserve it as DATA_BLOCKED; only a complete native report
+        # can turn its derived risk level into a terminal hard reject.
+        if status == "OK" and level in {"high", "critical", "honeypot", "rugged"}:
             reasons.append(f"native_risk_level:{level}")
 
         dev_state = dev_state or {}
