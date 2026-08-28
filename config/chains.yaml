@@ -113,10 +113,25 @@ chains:
   solana:
     name: "Solana Mainnet"
     chain_id: "solana"
+    # Free endpoints are complementary, not redundant, and the manager now
+    # records refusals per METHOD so the pool is the union of what they each
+    # serve rather than the intersection. Measured 2026-08-28:
+    #   publicnode   getLatestBlockhash OK, getAccountInfo OK,
+    #                getTokenLargestAccounts 403 "Request blocked"
+    #   leorpc       getTokenLargestAccounts OK, getLatestBlockhash OK,
+    #                getAccountInfo 429
+    #   mainnet-beta getLatestBlockhash OK, getAccountInfo OK,
+    #                getTokenLargestAccounts 429
+    # APPENDED, never reordered: rpc_urls and ws_urls are paired by position,
+    # so moving an entry here silently hands a provider another provider's
+    # websocket. The keyless additions go last and carry no ws_url of their
+    # own, which leaves every existing pairing exactly as it was.
     rpc_urls:
       - "https://api.mainnet-beta.solana.com"
       - "https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
       - "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
+      - "https://solana-rpc.publicnode.com"
+      - "https://solana.leorpc.com/?api_key=FREE"
     ws_urls:
       - "wss://api.mainnet-beta.solana.com"
       - "wss://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"

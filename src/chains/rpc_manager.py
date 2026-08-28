@@ -5,7 +5,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -80,6 +80,18 @@ class EndpointHealth:
     #: that window spends nothing but the remaining quota of the retry budget.
     cooldown_until: float = 0.0
     last_status: int = 0
+    #: Methods this endpoint refuses outright, learned at runtime.
+    #:
+    #: Free providers do not merely rate-limit, they carve out methods:
+    #: publicnode answers getLatestBlockhash and getAccountInfo but 403s
+    #: getTokenLargestAccounts ("Request blocked"), while leorpc serves
+    #: getTokenLargestAccounts and 429s getAccountInfo. They are complementary
+    #: rather than redundant, so a refusal has to disqualify an endpoint for
+    #: ONE method instead of cooling it for all of them -- otherwise the pool
+    #: is only ever as capable as its weakest member, and every call to a
+    #: carved-out method burns the whole retry budget rediscovering the same
+    #: 403.
+    blocked_methods: Set[str] = field(default_factory=set)
 
 
 class RPCManager:
@@ -210,17 +222,24 @@ class RPCManager:
         else:
             ep.health = RPCHealth.DEGRADED
 
-    def _select_endpoint(self, prefer_ws: bool = False) -> Optional[EndpointHealth]:
+    def _select_endpoint(self, prefer_ws: bool = False,
+                         method: str = "") -> Optional[EndpointHealth]:
         now = time.time()
         candidates = [e for e in self.endpoints
-                      if e.health != RPCHealth.DOWN and e.cooldown_until <= now]
+                      if e.health != RPCHealth.DOWN and e.cooldown_until <= now
+                      and not (method and method in e.blocked_methods)]
         if not candidates:
             # Everything is either down or cooling. Prefer the endpoint whose
             # cooldown expires soonest over failing the call outright: a stale
             # answer beats no answer for enrichment, and the caller still sees
             # the refusal if that endpoint is still rate limited.
-            waiting = [e for e in self.endpoints if e.health != RPCHealth.DOWN]
+            waiting = [e for e in self.endpoints
+                       if e.health != RPCHealth.DOWN
+                       and not (method and method in e.blocked_methods)]
             if not waiting:
+                # Every endpoint that could serve this method is down or has
+                # carved it out. Returning one that answers 403 forever would
+                # dress a permanent refusal as a transient failure.
                 return None
             candidates = [min(waiting, key=lambda e: e.cooldown_until)]
         if prefer_ws:
@@ -239,9 +258,10 @@ class RPCManager:
         async with self._request_semaphore:
             last_refusal = ""
             for attempt in range(3):
-                ep = self._select_endpoint()
+                ep = self._select_endpoint(method=method)
                 if not ep:
-                    raise RuntimeError("No healthy RPC endpoints")
+                    raise RuntimeError(
+                        f"No healthy RPC endpoint serves {method}")
                 try:
                     async with self._session.post(
                         ep.endpoint.url,
@@ -268,7 +288,19 @@ class RPCManager:
                         if resp.status == 429:
                             cooldown = self._retry_after_seconds(resp, 30.0)
                         elif resp.status in (402, 403):
-                            cooldown = 60.0
+                            # A free provider carving out one expensive method
+                            # -- publicnode's "Request blocked" on
+                            # getTokenLargestAccounts -- is permanent for that
+                            # method and irrelevant to the rest. Recorded per
+                            # method so the endpoint keeps serving what it can
+                            # instead of being cooled wholesale, which is what
+                            # makes three partial free endpoints add up to one
+                            # usable pool.
+                            ep.blocked_methods.add(method)
+                            logger.warning(
+                                "RPC %s refuses %s (HTTP %s); excluded for that "
+                                "method only", _host_of(ep.endpoint.url), method,
+                                resp.status)
                         elif resp.status >= 500:
                             cooldown = self._retry_after_seconds(resp, 5.0)
                         self._penalise(ep, resp.status, cooldown)

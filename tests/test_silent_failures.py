@@ -332,3 +332,59 @@ class RestartFixableFaultsAreRepairedNotAnnounced(unittest.TestCase):
                       "optional_credentials_absent"):
             self.assertIn(fault, alerts)
             self.assertNotIn(fault, repairs)
+
+
+class FreeEndpointsAreComplementaryNotRedundant(unittest.TestCase):
+    """A method carve-out must cost one method, not the whole endpoint.
+
+    Free Solana providers each refuse a different expensive call: publicnode
+    403s getTokenLargestAccounts while serving getAccountInfo; leorpc does the
+    reverse. Cooling an endpoint wholesale on a 403 makes the pool only as
+    capable as its weakest member; excluding it per method makes the pool the
+    UNION of what they serve, which is the entire value of adding free tiers.
+    """
+
+    def manager(self):
+        config = ChainConfig(
+            name="Solana Mainnet", chain_id="solana",
+            chain_type=ChainType.SOLANA,
+            rpc_endpoints=[RPCEndpointConfig(url="https://a.invalid"),
+                           RPCEndpointConfig(url="https://b.invalid")],
+            explorer_api="", explorer_key="", native_token="SOL", decimals=9,
+            block_time=0.4, factories={}, routers={}, base_tokens=[],
+            min_liquidity_usd=0.0, max_tax=0.0, honeypot_check=False)
+        return RPCManager(config)
+
+    def test_a_blocked_method_does_not_disqualify_the_endpoint(self):
+        manager = self.manager()
+        blocked = manager.endpoints[0]
+        blocked.blocked_methods.add("getTokenLargestAccounts")
+        # Excluded for that method...
+        for _ in range(20):
+            self.assertIsNot(
+                manager._select_endpoint(method="getTokenLargestAccounts"),
+                blocked)
+        # ...and still eligible for everything else.
+        chosen = [manager._select_endpoint(method="getAccountInfo")
+                  for _ in range(40)]
+        self.assertTrue(any(item is blocked for item in chosen))
+
+    def test_no_endpoint_for_a_method_is_refused_not_faked(self):
+        """Returning a permanent 403-er would dress it as a transient error."""
+        manager = self.manager()
+        for endpoint in manager.endpoints:
+            endpoint.blocked_methods.add("getTokenLargestAccounts")
+        self.assertIsNone(
+            manager._select_endpoint(method="getTokenLargestAccounts"))
+        self.assertIsNotNone(manager._select_endpoint(method="getAccountInfo"))
+
+    def test_a_cooling_endpoint_still_serves_after_its_window(self):
+        """Method blocks are permanent; rate-limit cooldowns are not."""
+        manager = self.manager()
+        endpoint = manager.endpoints[0]
+        manager._penalise(endpoint, 429, cooldown=30.0)
+        endpoint.cooldown_until = 0.0   # window elapsed
+        endpoint.health = RPCHealth.HEALTHY
+        chosen = [manager._select_endpoint(method="getAccountInfo")
+                  for _ in range(40)]
+        self.assertTrue(any(item is endpoint for item in chosen))
