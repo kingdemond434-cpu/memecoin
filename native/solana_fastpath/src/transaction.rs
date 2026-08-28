@@ -158,6 +158,35 @@ pub fn sign_serialized_message(serialized_message: &[u8], signers: &[Signer32])
     signers.iter().map(|signer| signer.sign(serialized_message)).collect()
 }
 
+/// Assemble a transaction from a message somebody else signed.
+///
+/// The half of the path that matters for a desk whose signing key lives in a
+/// separate process. `build_signed` needs the secret; this needs only the
+/// signatures, so the whole isolation architecture survives being moved to
+/// Rust. Compile here, hand the message bytes to the signer, assemble the
+/// answer here. The key never enters this process.
+///
+/// Signatures are taken in the message's own signer order and are NOT
+/// reordered or matched by pubkey -- this function cannot see the public keys
+/// to match them against. A caller that supplies them out of order produces a
+/// transaction that fails, which is why the only caller is the one that
+/// compiled the message.
+pub fn assemble(serialized_message: &[u8], signatures: &[Vec<u8>])
+    -> Result<String, SignError>
+{
+    let mut out = Vec::with_capacity(
+        2 + signatures.len() * SIGNATURE_LEN + serialized_message.len());
+    encode_length(signatures.len(), &mut out);
+    for signature in signatures {
+        if signature.len() != SIGNATURE_LEN {
+            return Err(SignError::BadKeyLength(signature.len()));
+        }
+        out.extend_from_slice(signature);
+    }
+    out.extend_from_slice(serialized_message);
+    Ok(BASE64.encode(out))
+}
+
 pub fn pubkey_of(raw: &[u8]) -> Option<Pubkey> {
     if raw.len() != PUBKEY_LEN {
         return None;
@@ -229,6 +258,24 @@ mod tests {
     #[test]
     fn a_short_key_is_refused_rather_than_padded() {
         assert_eq!(Signer32::from_bytes(&[1, 2, 3]).err(), Some(SignError::BadKeyLength(3)));
+    }
+
+    #[test]
+    fn assembling_from_signatures_matches_signing_in_place() {
+        // The two paths must be interchangeable, because one of them is what
+        // an isolated signer forces and the other is what the tests exercise.
+        let payer = signer(7);
+        let instructions = [instruction([9u8; PUBKEY_LEN], vec![])];
+        let built = build_signed(&payer.public, &instructions, &[3u8; PUBKEY_LEN],
+                                 &[signer(7)], false).unwrap();
+        let assembled = assemble(&built.serialized_message,
+                                 &[built.signatures[0].to_vec()]).unwrap();
+        assert_eq!(assembled, built.to_base64());
+    }
+
+    #[test]
+    fn a_wrong_length_signature_is_refused_rather_than_padded() {
+        assert!(assemble(&[0u8; 32], &[vec![1, 2, 3]]).is_err());
     }
 
     #[test]

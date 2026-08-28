@@ -18454,3 +18454,295 @@ class TestLandingRouter(unittest.IsolatedAsyncioTestCase):
                                "detail": "no landing route is enabled"}})}
         self.assertIs(checks["breadth_landing_routes"].state, State.CRITICAL)
         self.assertTrue(checks["breadth_landing_routes"].escalate)
+
+
+class TestTxKernelPromotion(unittest.TestCase):
+    """The build path moves to Rust on byte parity, and never on a test alone."""
+
+    def setUp(self):
+        try:
+            import solana_fastpath  # noqa: F401
+        except ImportError:
+            self.skipTest("solana_fastpath is not built on this host")
+        import random as _random
+        _random.seed(17)
+
+    @staticmethod
+    def _fixture(accounts=26):
+        import random
+        from solders.keypair import Keypair
+        from solders.pubkey import Pubkey
+        from solders.instruction import AccountMeta, Instruction
+        from solders.hash import Hash
+        kp = Keypair.from_seed(bytes(random.randrange(256) for _ in range(32)))
+        payer = kp.pubkey()
+        bh = Hash(bytes(random.randrange(256) for _ in range(32)))
+        prog = Pubkey(bytes(random.randrange(256) for _ in range(32)))
+        metas = [AccountMeta(Pubkey(bytes(random.randrange(256) for _ in range(32))),
+                             False, index % 3 == 0) for index in range(accounts)]
+        metas.append(AccountMeta(payer, True, True))
+        return kp, payer, bh, [Instruction(prog, bytes(range(24)), metas)]
+
+    @staticmethod
+    def _solders_message(payer, instructions, blockhash):
+        from solders.message import MessageV0, to_bytes_versioned
+        return bytes(to_bytes_versioned(
+            MessageV0.try_compile(payer, instructions, [], blockhash)))
+
+    def test_shadow_never_lets_rust_build_the_transaction(self):
+        from src.execution.tx_kernel import TxKernel
+        kernel = TxKernel(mode="shadow")
+        for _ in range(10):
+            _kp, payer, bh, ixs = self._fixture()
+            kernel.compile_message(bytes(payer), ixs, bytes(bh),
+                                   lambda: self._solders_message(payer, ixs, bh))
+        report = kernel.report()
+        self.assertEqual(report["builds_by_rust"], 0)
+        self.assertGreater(report["agreements"], 0)
+        self.assertFalse(report["rust_authoritative"])
+
+    def test_auto_promotes_only_after_a_run_of_identical_bytes(self):
+        from src.execution.tx_kernel import TxKernel
+        kernel = TxKernel(mode="auto", promote_after=5, audit_rate=0.0)
+        for index in range(5):
+            _kp, payer, bh, ixs = self._fixture()
+            self.assertFalse(kernel.rust_authoritative, f"promoted early at {index}")
+            kernel.compile_message(bytes(payer), ixs, bytes(bh),
+                                   lambda: self._solders_message(payer, ixs, bh))
+        self.assertTrue(kernel.rust_authoritative)
+
+    def test_a_promoted_build_does_not_call_solders(self):
+        from src.execution.tx_kernel import TxKernel
+        kernel = TxKernel(mode="rust", audit_rate=0.0)
+        _kp, payer, bh, ixs = self._fixture()
+        calls = []
+
+        def solders():
+            calls.append(1)
+            return self._solders_message(payer, ixs, bh)
+
+        message = kernel.compile_message(bytes(payer), ixs, bytes(bh), solders)
+        self.assertEqual(calls, [])
+        self.assertEqual(message, self._solders_message(payer, ixs, bh))
+
+    def test_a_sample_of_promoted_builds_is_still_audited(self):
+        from src.execution.tx_kernel import TxKernel
+        # Audit everything, so the sampling path is exercised deterministically.
+        kernel = TxKernel(mode="rust", audit_rate=1.0)
+        for _ in range(5):
+            _kp, payer, bh, ixs = self._fixture()
+            kernel.compile_message(bytes(payer), ixs, bytes(bh),
+                                   lambda: self._solders_message(payer, ixs, bh))
+        report = kernel.report()
+        # A build path that stops being checked the moment it is trusted is a
+        # build path that drifts silently through a dependency upgrade.
+        self.assertEqual(report["audits_since_promotion"], 5)
+        self.assertEqual(report["agreements"], 5)
+
+    def test_one_byte_mismatch_demotes_it_permanently(self):
+        from src.execution.tx_kernel import TxKernel
+        kernel = TxKernel(mode="rust")
+
+        class Wrong:
+            def compile_v0_message(self, payer, instructions, blockhash):
+                return b"\x80" + b"\x00" * 40
+
+            def assemble_transaction(self, message, signatures):
+                return ""
+
+        kernel.native = Wrong()
+        _kp, payer, bh, ixs = self._fixture()
+        expected = self._solders_message(payer, ixs, bh)
+        got = kernel.compile_message(bytes(payer), ixs, bytes(bh), lambda: expected)
+        self.assertEqual(got, expected)
+        self.assertTrue(kernel.demoted_reason)
+        self.assertFalse(kernel.rust_authoritative)
+        # Structurally invalid, so the invariant catches it before any byte
+        # comparison does -- which is the point of having the invariant.
+        self.assertIn("invariant", kernel.demoted_reason)
+
+    def test_a_structurally_valid_but_different_message_is_caught_by_bytes(self):
+        """The case the invariant cannot see: right shape, wrong contents."""
+        from src.execution.tx_kernel import TxKernel
+        _kp, payer, bh, ixs = self._fixture()
+        expected = self._solders_message(payer, ixs, bh)
+        # Flip a byte inside the instruction data, past every field the
+        # invariant checks. Same length, same header, same payer, same
+        # blockhash, same instruction count -- and not the same transaction.
+        corrupted = bytearray(expected)
+        corrupted[-3] ^= 0xFF
+        corrupted = bytes(corrupted)
+
+        class Subtle:
+            def compile_v0_message(self, *args):
+                return corrupted
+
+            def assemble_transaction(self, *args):
+                return ""
+
+        kernel = TxKernel(mode="rust", audit_rate=1.0)
+        kernel.native = Subtle()
+        got = kernel.compile_message(bytes(payer), ixs, bytes(bh), lambda: expected)
+        self.assertEqual(got, expected)
+        self.assertTrue(kernel.demoted_reason)
+        self.assertIn("python_prefix", kernel.report()["divergence_example"])
+
+    def test_a_message_naming_the_wrong_fee_payer_is_refused(self):
+        """Account zero is debited by the runtime. Wrong here spends the wrong wallet."""
+        from src.execution.tx_kernel import TxKernel
+        _kp, payer, bh, ixs = self._fixture()
+        expected = self._solders_message(payer, ixs, bh)
+        swapped = bytearray(expected)
+        swapped[5:37] = b"\x77" * 32
+        swapped = bytes(swapped)
+
+        class WrongPayer:
+            def compile_v0_message(self, *args):
+                return swapped
+
+            def assemble_transaction(self, *args):
+                return ""
+
+        kernel = TxKernel(mode="rust", audit_rate=0.0)
+        kernel.native = WrongPayer()
+        got = kernel.compile_message(bytes(payer), ixs, bytes(bh), lambda: expected)
+        self.assertEqual(got, expected)
+        self.assertIn("fee payer", kernel.demoted_reason)
+
+    def test_a_message_carrying_a_stale_blockhash_is_refused(self):
+        from src.execution.tx_kernel import TxKernel
+        _kp, payer, bh, ixs = self._fixture()
+        expected = self._solders_message(payer, ixs, bh)
+        count = expected[4]
+        keys_end = 5 + count * 32
+        stale = bytearray(expected)
+        stale[keys_end:keys_end + 32] = b"\x55" * 32
+        stale = bytes(stale)
+
+        class StaleHash:
+            def compile_v0_message(self, *args):
+                return stale
+
+            def assemble_transaction(self, *args):
+                return ""
+
+        kernel = TxKernel(mode="rust", audit_rate=0.0)
+        kernel.native = StaleHash()
+        got = kernel.compile_message(bytes(payer), ixs, bytes(bh), lambda: expected)
+        self.assertEqual(got, expected)
+        self.assertIn("blockhash", kernel.demoted_reason)
+
+    def test_the_invariant_runs_on_promoted_builds_not_only_audited_ones(self):
+        """A sampled check means most wrong messages are signed before anyone looks."""
+        from src.execution.tx_kernel import TxKernel
+        _kp, payer, bh, ixs = self._fixture()
+        expected = self._solders_message(payer, ixs, bh)
+
+        class Garbage:
+            def compile_v0_message(self, *args):
+                return b"\x80" + b"\x00" * 40
+
+            def assemble_transaction(self, *args):
+                return ""
+
+        # Audit rate zero: nothing is compared. The invariant is the only
+        # thing standing between this and a submitted transaction.
+        kernel = TxKernel(mode="rust", audit_rate=0.0)
+        kernel.native = Garbage()
+        got = kernel.compile_message(bytes(payer), ixs, bytes(bh), lambda: expected)
+        self.assertEqual(got, expected)
+        self.assertEqual(kernel.report()["invariant_failures"], 1)
+
+    def test_the_assembled_transaction_matches_solders_byte_for_byte(self):
+        import base64
+        from solders.message import MessageV0
+        from solders.signature import Signature
+        from solders.transaction import VersionedTransaction
+        from src.execution.tx_kernel import TxKernel
+        kernel = TxKernel(mode="rust")
+        kp, payer, bh, ixs = self._fixture()
+        message = MessageV0.try_compile(payer, ixs, [], bh)
+        message_bytes = self._solders_message(payer, ixs, bh)
+        signature = bytes(kp.sign_message(message_bytes))
+        expected = base64.b64encode(bytes(VersionedTransaction.populate(
+            message, [Signature.from_bytes(signature)]))).decode()
+        self.assertEqual(
+            kernel.assemble(message_bytes, [signature], lambda: expected), expected)
+
+    def test_an_assembler_that_drops_the_message_is_caught_not_submitted(self):
+        import base64
+        from src.execution.tx_kernel import TxKernel
+        kernel = TxKernel(mode="rust")
+
+        class Corrupt:
+            def compile_v0_message(self, *args):
+                return b""
+
+            def assemble_transaction(self, message, signatures):
+                # Right shape, wrong body. This is the failure that signs
+                # cleanly and fails against accounts that do not exist.
+                return base64.b64encode(b"\x01" + b"\x00" * 64 + b"NOTTHEMESSAGE").decode()
+
+        kernel.native = Corrupt()
+        got = kernel.assemble(b"\x80" + b"\x11" * 40, [b"\x00" * 64],
+                              lambda: "SOLDERS")
+        self.assertEqual(got, "SOLDERS")
+        self.assertEqual(kernel.report()["invariant_failures"], 1)
+        self.assertIn("expected", kernel.report()["demoted_reason"])
+
+    def test_a_wrong_signature_count_is_caught(self):
+        import base64
+        from src.execution.tx_kernel import TxKernel
+        kernel = TxKernel(mode="rust")
+        message = b"\x80" + b"\x22" * 40
+
+        class TwoSigs:
+            def assemble_transaction(self, msg, signatures):
+                return base64.b64encode(b"\x02" + b"\x00" * 128 + message).decode()
+            def compile_v0_message(self, *args):
+                return message
+
+        kernel.native = TwoSigs()
+        got = kernel.assemble(message, [b"\x00" * 64], lambda: "SOLDERS")
+        self.assertEqual(got, "SOLDERS")
+        self.assertIn("signature count", kernel.report()["demoted_reason"])
+
+    def test_a_raising_extension_falls_back_rather_than_failing_the_trade(self):
+        from src.execution.tx_kernel import TxKernel
+        kernel = TxKernel(mode="rust")
+
+        class Exploding:
+            def compile_v0_message(self, *args):
+                raise RuntimeError("boom")
+
+            def assemble_transaction(self, *args):
+                raise RuntimeError("boom")
+
+        kernel.native = Exploding()
+        _kp, payer, bh, ixs = self._fixture()
+        expected = self._solders_message(payer, ixs, bh)
+        self.assertEqual(
+            kernel.compile_message(bytes(payer), ixs, bytes(bh), lambda: expected),
+            expected)
+        self.assertEqual(kernel.assemble(expected, [b"\x00" * 64], lambda: "S"), "S")
+        self.assertEqual(kernel.report()["rust_errors"], 2)
+
+    def test_the_extension_being_absent_is_reported_not_fatal(self):
+        from src.execution.tx_kernel import TxKernel
+        kernel = TxKernel(mode="auto")
+        kernel.native, kernel.native_status = None, "native extension unavailable"
+        _kp, payer, bh, ixs = self._fixture()
+        expected = self._solders_message(payer, ixs, bh)
+        self.assertEqual(
+            kernel.compile_message(bytes(payer), ixs, bytes(bh), lambda: expected),
+            expected)
+        self.assertEqual(kernel.report()["status"], "DATA_BLOCKED")
+
+    def test_the_key_never_reaches_the_extension(self):
+        import inspect
+        from src.execution import tx_kernel
+        source = inspect.getsource(tx_kernel)
+        # build_signed_transaction takes a secret key. Using it here would
+        # undo the signer isolation to save a few microseconds.
+        self.assertNotIn("build_signed_transaction(", source)
+        self.assertIn("assemble_transaction", source)

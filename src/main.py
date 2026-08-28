@@ -5041,6 +5041,13 @@ class MemecoinQuantDesk:
             "discovery": self.discovery_report(),
             "execution_conditions": self.execution_conditions_report(),
             "stream_events": self.stream_event_report(),
+            # Which implementation compiles and assembles a transaction, and
+            # on what evidence. Byte parity, so there is no tolerance to tune.
+            "tx_kernel": (self.execution_engine.tx_builder.tx_kernel.report()
+                          if getattr(getattr(self.execution_engine, "tx_builder", None),
+                                     "tx_kernel", None) is not None
+                          else {"status": "DATA_BLOCKED",
+                                "detail": "no transaction builder yet"}),
             "dry_build": (self.execution_engine.dry_build_report()
                           if self.execution_engine is not None
                           else {"status": "DATA_BLOCKED",

@@ -521,6 +521,20 @@ fn public_key_of(secret_key: &[u8]) -> PyResult<Vec<u8>> {
         .map_err(|err| PyValueError::new_err(format!("{err:?}")))
 }
 
+/// Assemble a transaction from a message the ISOLATED SIGNER signed.
+///
+/// The call the canonical path uses. `build_signed_transaction` needs the
+/// secret key and is therefore unusable by a desk whose signer lives in
+/// another process; this takes only signatures, so the compile and assemble
+/// steps move to Rust while the key stays exactly where it was.
+#[pyfunction]
+fn assemble_transaction(serialized_message: &[u8], signatures: Vec<Vec<u8>>)
+    -> PyResult<String>
+{
+    crate::transaction::assemble(serialized_message, &signatures)
+        .map_err(|err| PyValueError::new_err(format!("{err:?}")))
+}
+
 /// Compile, sign and encode in one call: the whole tail of the entry path.
 ///
 /// One call rather than three because the FFI round trip is a meaningful
@@ -573,6 +587,7 @@ fn solana_fastpath(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(associated_token_addresses, module)?)?;
     module.add_function(wrap_pyfunction!(associated_token_address, module)?)?;
     module.add_function(wrap_pyfunction!(compile_v0_message, module)?)?;
+    module.add_function(wrap_pyfunction!(assemble_transaction, module)?)?;
     module.add_function(wrap_pyfunction!(sign_message, module)?)?;
     module.add_function(wrap_pyfunction!(public_key_of, module)?)?;
     module.add_function(wrap_pyfunction!(build_signed_transaction, module)?)?;
