@@ -92,7 +92,10 @@ def _adapter_options(declaration: "SourceDeclaration") -> Dict[str, Any]:
     """
     options = declaration.options
     if declaration.kind == "rss":
-        return {"language": declaration.language}
+        # Top-level language is canonical. Keep accepting the older
+        # declaration shape so verified overlays produced before the schema
+        # cleanup do not silently lose multilingual classification.
+        return {"language": declaration.language or str(options.get("language", ""))}
     if declaration.kind == "telegram":
         return {"channel": str(options.get("channel", ""))}
     if declaration.kind == "discord":
