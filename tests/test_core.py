@@ -779,6 +779,48 @@ class TestOfficialSocialCollectors(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.mentions[0].token, mint)
         self.assertEqual(engine.mentions[0].engagement["views"], 3)
 
+    async def test_telegram_extracts_mint_from_scanner_button(self):
+        engine = self.make_engine()
+        mint = "FySyjuXTts9mTz2wjyuSXAz4bEBv6v5qxCTcLAMd4mVX"
+        account = SocialAccount(SocialPlatform.TELEGRAM, "scanner", "1", "Scanner")
+        message = SimpleNamespace(
+            id=43, message="New alert", raw_text="New alert",
+            date=SimpleNamespace(timestamp=lambda: time.time()),
+            views=1, forwards=0, replies=None, entities=[],
+            buttons=[[SimpleNamespace(text="Open chart", url=f"https://dexscreener.com/solana/{mint}")]],
+        )
+        await engine._process_telegram_message(account, message)
+        self.assertEqual([item.token for item in engine.mentions], [mint])
+
+    async def test_telegram_hot_callback_does_not_wait_for_causality_rpc(self):
+        gate = asyncio.Event()
+
+        async def blocked_rpc(method, params):
+            await gate.wait()
+            return {"value": []}
+
+        engine = self.make_engine()
+        engine.rpc = SimpleNamespace(request=blocked_rpc)
+        received = []
+
+        async def callback(signal):
+            received.append(signal)
+
+        engine.on_mention(callback)
+        mint = "FySyjuXTts9mTz2wjyuSXAz4bEBv6v5qxCTcLAMd4mVX"
+        account = SocialAccount(SocialPlatform.TELEGRAM, "scanner", "1", "Scanner")
+        message = SimpleNamespace(
+            id=44, message=mint, raw_text=mint,
+            date=SimpleNamespace(timestamp=lambda: time.time() - 0.01),
+            views=1, forwards=0, replies=None, entities=[], buttons=[],
+        )
+        await asyncio.wait_for(engine._process_telegram_message(account, message), 0.1)
+        self.assertEqual(received[0]["token"], mint)
+        self.assertIn("source_lag_ms", received[0])
+        self.assertTrue(engine._causality_tasks)
+        gate.set()
+        await asyncio.gather(*list(engine._causality_tasks))
+
     async def test_one_invalid_telegram_channel_does_not_mask_healthy_ingestion(self):
         engine = self.make_engine()
 
@@ -832,10 +874,56 @@ class TestNativeMintChecks(unittest.IsolatedAsyncioTestCase):
 
     def test_token_2022_permanent_delegate_extension(self):
         raw = self.mint_bytes()
-        raw.extend(b"\x01")
+        raw.extend(bytes(165 - len(raw)))
+        raw.extend(b"\x01")  # AccountType::Mint
         raw.extend(struct.pack("<HH", 12, 0))
         state = RugDetector.parse_spl_mint(bytes(raw), TOKEN_2022_PROGRAM)
         self.assertIn("permanent_delegate", state["extensions"])
+
+    def test_token_2022_tlv_terminator_and_padding(self):
+        raw = self.mint_bytes()
+        raw.extend(bytes(165 - len(raw)))
+        raw.extend(b"\x01")  # AccountType::Mint
+        raw.extend(struct.pack("<HH", 3, 32))
+        raw.extend(bytes(32))
+        raw.extend(bytes(16))  # unused, zeroed allocation space
+        state = RugDetector.parse_spl_mint(bytes(raw), TOKEN_2022_PROGRAM)
+        self.assertEqual(state["extensions"], ["mint_close_authority"])
+
+    def test_real_finalized_pump_token_2022_mint_layout(self):
+        # Finalized account data for CyHBQ6aFTVsU2imd4qu7qhLT5d3AdgGbDr7fYhNbpump,
+        # captured through getAccountInfo.  This 411-byte native fixture guards
+        # the padding/account-type boundary that the old offset-83 parser broke.
+        encoded = (
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIDGpH6NAwAGAQAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAARIAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALHb"
+            "YB6mZalkFj3eslCY3nW8eaKOGDixGYcENK+r3eqPEwCtAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAsdtgHqZlqWQWPd6yUJjedbx5oo4YOLEZhwQ0r6vd6o8HAAAA"
+            "Qm9vIGJvbwYAAABCb29ib29QAAAAaHR0cHM6Ly9pcGZzLmlvL2lwZnMvYmFma3JlaWh1"
+            "ZnJuN2JvaWE1bnZ4anVjNXlxa3FteDRqZHQzZmc3Z2VobHkzZjZ0eWVmcWljZmJ3bW0A"
+            "AAAA"
+        )
+        state = RugDetector.parse_spl_mint(base64.b64decode(encoded), TOKEN_2022_PROGRAM)
+        self.assertEqual(state["supply"], 1_000_000_000_000_000)
+        self.assertEqual(state["decimals"], 6)
+        self.assertEqual(state["extensions"], ["metadata_pointer", "token_metadata"])
+
+    def test_token_2022_rejects_pre_legacy_boundary_layout(self):
+        raw = self.mint_bytes()
+        raw.extend(b"\x01")
+        raw.extend(struct.pack("<HH", 12, 0))
+        with self.assertRaisesRegex(ValueError, "truncated Token-2022"):
+            RugDetector.parse_spl_mint(bytes(raw), TOKEN_2022_PROGRAM)
+
+    def test_token_2022_rejects_wrong_account_type(self):
+        raw = self.mint_bytes()
+        raw.extend(bytes(165 - len(raw)))
+        raw.extend(b"\x02")  # AccountType::Account, not Mint
+        raw.extend(struct.pack("<HH", 12, 0))
+        with self.assertRaisesRegex(ValueError, "mint account type"):
+            RugDetector.parse_spl_mint(bytes(raw), TOKEN_2022_PROGRAM)
 
     def test_invalid_authority_coption_is_rejected(self):
         with self.assertRaises(ValueError):
@@ -15622,10 +15710,11 @@ class TestTheCensusCountsEveryLaunchNotOnlyOurs(unittest.TestCase):
 
     def test_every_launch_has_one_explicit_disposition(self):
         census = LaunchCensus()
-        for mint in ("waiting", "blocked", "screened", "ignored", "probe", "entry"):
+        for mint in ("waiting", "blocked", "screened", "rejected", "ignored", "probe", "entry"):
             census.see(mint)
         census.data_blocked("blocked", "DATA_BLOCKED_liquidity")
         census.screen("screened", "veto_honeypot")
+        census.reject("rejected", "safety_veto:mint_authority_active")
         census.decision_ready("ignored")
         census.decide("ignored", "negative_elogw")
         census.decide("probe", "PROBE")
@@ -15636,7 +15725,18 @@ class TestTheCensusCountsEveryLaunchNotOnlyOurs(unittest.TestCase):
         self.assertEqual(sum(funnel["dispositions"].values()), funnel["seen"])
         self.assertEqual(funnel["data_blocked"], 1)
         self.assertEqual(funnel["awaiting_state"], 1)
+        self.assertEqual(funnel["decided_reject"], 1)
         self.assertEqual(funnel["entered"], 1)
+
+    def test_hard_reject_is_a_terminal_economic_decision(self):
+        census = LaunchCensus()
+        census.see("m")
+        census.reject("m", "safety_veto:freeze_authority_active")
+        funnel = census.report()["funnel"]
+        self.assertEqual(funnel["reached_a_decision"], 1)
+        self.assertEqual(funnel["decided_reject"], 1)
+        self.assertEqual(funnel["screened_out"], 0)
+        self.assertEqual(funnel["unaccounted"], 0)
 
     def test_legacy_unaccounted_launches_become_explicit_data_gaps(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -15654,6 +15754,32 @@ class TestTheCensusCountsEveryLaunchNotOnlyOurs(unittest.TestCase):
             funnel = census.report()["funnel"]
         self.assertEqual(funnel["data_blocked"], 2)
         self.assertEqual(funnel["unaccounted"], 0)
+
+    def test_complete_detail_repairs_stale_pipeline_aggregates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "census.json"
+            path.write_text(json.dumps({
+                "schema": "v2",
+                "totals": {
+                    "seen": 2, "screened": 99, "decided": 0, "entered": 0,
+                    "screened_by_reason": {"stale": 99},
+                    "dispositions": {"SCREENED": 99},
+                },
+                "spilled": 0,
+                "records": [
+                    {"mint": "a", "stage": "screened", "disposition": "SCREENED",
+                     "screen_reason": "real_reason", "detected_at": 1},
+                    {"mint": "b", "stage": "data_blocked", "disposition": "DATA_BLOCKED",
+                     "screen_reason": "DATA_BLOCKED_model", "detected_at": 2},
+                ],
+            }))
+            census = LaunchCensus(path)
+            self.assertTrue(census.load())
+            report = census.report()
+        self.assertEqual(report["funnel"]["screened_out"], 1)
+        self.assertEqual(report["funnel"]["data_blocked"], 1)
+        self.assertEqual(report["screens"], {"real_reason": 1})
+        self.assertEqual(report["funnel"]["unaccounted"], 0)
 
     def test_totals_survive_eviction_of_the_detail_they_came_from(self):
         with tempfile.TemporaryDirectory() as tmp:

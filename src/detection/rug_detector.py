@@ -290,12 +290,35 @@ class RugDetector:
         if mint_authority_tag not in {0, 1} or freeze_authority_tag not in {0, 1}:
             raise ValueError("invalid SPL COption authority tag")
         extensions: List[str] = []
-        if owner == TOKEN_2022_PROGRAM and len(data) > 83:
-            offset = 83  # byte 82 is AccountType::Mint in Token-2022
-            while offset + 4 <= len(data):
+        if owner == TOKEN_2022_PROGRAM and len(data) > 82:
+            # Token-2022 deliberately places extension TLV data after the
+            # 165-byte legacy token-account boundary, even for an 82-byte
+            # Mint.  Bytes 82..164 are zero padding, byte 165 is
+            # AccountType::Mint (1), and TLV starts at 166.  Starting at 83
+            # interprets the padding/account-type as a TLV header and falsely
+            # rejects valid extended mints.
+            if len(data) < 166:
+                raise ValueError("truncated Token-2022 extension header")
+            if any(data[82:165]):
+                raise ValueError("non-zero Token-2022 mint padding")
+            if data[165] != 1:
+                raise ValueError("invalid Token-2022 mint account type")
+            offset = 166
+            while offset < len(data):
+                if offset + 2 > len(data):
+                    raise ValueError("malformed Token-2022 TLV extension type")
+                extension_type = struct.unpack_from("<H", data, offset)[0]
+                # ExtensionType::Uninitialized terminates the used TLV area.
+                # Allocation padding after it must stay zeroed.
+                if extension_type == 0:
+                    if any(data[offset:]):
+                        raise ValueError("non-zero data after Token-2022 TLV terminator")
+                    break
+                if offset + 4 > len(data):
+                    raise ValueError("malformed Token-2022 TLV extension header")
                 extension_type, length = struct.unpack_from("<HH", data, offset)
                 offset += 4
-                if length < 0 or offset + length > len(data):
+                if offset + length > len(data):
                     raise ValueError("malformed Token-2022 TLV extension")
                 extensions.append(TOKEN_2022_EXTENSIONS.get(extension_type, f"unknown_{extension_type}"))
                 offset += length

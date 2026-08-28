@@ -91,6 +91,7 @@ class Disposition(Enum):
     DATA_BLOCKED = "DATA_BLOCKED"
     SCREENED = "SCREENED"
     DECISION_READY = "DECISION_READY"
+    DECIDED_REJECT = "DECIDED_REJECT"
     DECIDED_IGNORE = "DECIDED_IGNORE"
     DECIDED_PROBE = "DECIDED_PROBE"
     DECIDED_ENTER = "DECIDED_ENTER"
@@ -271,6 +272,27 @@ class LaunchCensus:
                        else Disposition.DECIDED_IGNORE)
         self._transition(record, Stage.DECIDED, disposition,
                          record.decided_action or "ignore")
+
+    def reject(self, mint: str, reason: str) -> None:
+        """Record a factually impossible/unsafe action as a terminal decision.
+
+        A hard reject is not a pre-decision disappearance. It is the economic
+        decision that every feasible size has unacceptable value because a
+        non-negotiable safety fact failed.
+        """
+        record = self._records.get(mint)
+        if record is None:
+            return
+        if record.stage not in (Stage.DECIDED, Stage.ENTERED):
+            if record.stage is Stage.SCREENED:
+                self._totals.screened = max(0, self._totals.screened - 1)
+                self._totals.screened_by_reason[record.screen_reason] = max(
+                    0, self._totals.screened_by_reason[record.screen_reason] - 1)
+                record.screen_reason = ""
+            self._totals.decided += 1
+        record.decided_action = "REJECT"
+        self._transition(record, Stage.DECIDED, Disposition.DECIDED_REJECT,
+                         str(reason or "unattributed_hard_reject"))
 
     def enter(self, mint: str) -> None:
         """A position was actually taken."""
@@ -462,6 +484,7 @@ class LaunchCensus:
                 "data_blocked": dispositions[Disposition.DATA_BLOCKED.value],
                 "awaiting_state": dispositions[Disposition.AWAITING_STATE.value],
                 "decision_ready": dispositions[Disposition.DECISION_READY.value],
+                "decided_reject": dispositions[Disposition.DECIDED_REJECT.value],
                 "decided_ignore": dispositions[Disposition.DECIDED_IGNORE.value],
                 "decided_probe": dispositions[Disposition.DECIDED_PROBE.value],
                 "decided_enter": dispositions[Disposition.DECIDED_ENTER.value],
@@ -614,4 +637,26 @@ class LaunchCensus:
                     self._totals.dispositions[Disposition.DATA_BLOCKED.value] += 1
                     record.stage = Stage.DATA_BLOCKED
                     record.disposition = Disposition.DATA_BLOCKED
+        # When no detail has been spilled, the records are the authoritative
+        # complete population. Repair stale aggregate pipeline counters from
+        # older writers or interrupted saves instead of showing contradictory
+        # screen totals on the dashboard. Outcome counters stay untouched.
+        if self.spilled == 0 and self._totals.seen == len(self._records):
+            dispositions: Dict[str, int] = defaultdict(int)
+            screened_by_reason: Dict[str, int] = defaultdict(int)
+            screened = decided = entered = 0
+            for record in self._records.values():
+                dispositions[record.disposition.value] += 1
+                if record.stage is Stage.SCREENED:
+                    screened += 1
+                    screened_by_reason[record.screen_reason or "unattributed"] += 1
+                if record.stage in (Stage.DECIDED, Stage.ENTERED):
+                    decided += 1
+                if record.stage is Stage.ENTERED:
+                    entered += 1
+            self._totals.dispositions = dispositions
+            self._totals.screened_by_reason = screened_by_reason
+            self._totals.screened = screened
+            self._totals.decided = decided
+            self._totals.entered = entered
         return True

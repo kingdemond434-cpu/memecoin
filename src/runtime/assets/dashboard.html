@@ -503,8 +503,8 @@ function render(d){
   const cells=[
     ["Launches seen",num(f.seen),"denominator, unfiltered"],
     ["Entered",num(f.entered),(f.seen?pct(f.entered/f.seen,2):"—")+" of launches"],
-    ["Reached decision",pct(mm.monster_capture_rate,1),
-      num((mm.monsters_decided_not_entered||0)+(mm.monsters_entered||0))+" of "+num(mm.monsters_resolved)+" monsters survived screens"],
+    ["Reached decision",f.seen?pct((f.reached_a_decision||0)/f.seen,1):"—",
+      num(f.reached_a_decision||0)+" of "+num(f.seen)+" launches; hard rejects count as decisions"],
     ["Monsters entered",
       mm.monsters_resolved?pct((mm.monsters_entered||0)/mm.monsters_resolved,1):"—",
       num(mm.monsters_entered)+" of "+num(mm.monsters_resolved)+" actually taken"],
@@ -520,7 +520,8 @@ function render(d){
   /* funnel */
   const stages=[["Seen",f.seen,false],["Awaiting state",f.awaiting_state,false],
     ["Data blocked",f.data_blocked,true],["Screened out",f.screened_out,true],
-    ["Decision ready",f.decision_ready,false],["Decided ignore",f.decided_ignore,true],
+    ["Decision ready",f.decision_ready,false],["Decided reject",f.decided_reject,true],
+    ["Decided ignore",f.decided_ignore,true],
     ["Decided probe",f.decided_probe,false],["Decided enter",f.decided_enter,false],
     ["Entered",f.entered,false]];
   const top=Math.max(1,f.seen||1);

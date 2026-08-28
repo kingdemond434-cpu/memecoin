@@ -1415,8 +1415,10 @@ class MemecoinQuantDesk:
             risk, dev_state=self.dev_wallet_monitor.state(token),
             connected_holder_pct=getattr(risk, "connected_cluster_pct", None))
         if hard_veto.status == "VETO":
+            veto_reason = "safety_veto:" + ",".join(
+                hard_veto.reasons or ["unattributed"])
             self._record_blocked_decision(
-                token, "safety_veto",
+                token, veto_reason,
                 {"risk": risk_data, "veto": hard_veto.to_dict()})
             return
         if ((risk.data_status == "DATA_BLOCKED"
@@ -1711,6 +1713,8 @@ class MemecoinQuantDesk:
         # written down next to the outcome.
         if str(reason).upper().startswith("DATA_BLOCKED"):
             self.launch_census.data_blocked(token, reason)
+        elif str(reason).startswith("safety_veto:"):
+            self.launch_census.reject(token, reason)
         else:
             self.launch_census.screen(token, reason)
         self._record_ops_event("trade_outcomes", {
