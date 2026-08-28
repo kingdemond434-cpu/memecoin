@@ -4,6 +4,19 @@ The VPS also runs other independent research workloads. A chronological
 trainer is useful only if it leaves the forward evidence collector alive, so
 the systemd unit treats insufficient currently available memory as a clean
 skip and tries again on the next hourly tick.
+
+The threshold is paired with the unit's ``MemoryMax``: never start unless at
+least as much memory is available as the trainer is permitted to consume.
+Both are calibrated on measured peaks -- ten successful runs peaked between
+339 MB and 482 MB -- rather than on a guess. An uncalibrated threshold is not
+a conservative one: set 3x above the real peak it skipped four consecutive
+hourly runs on a box with the memory to serve them, which stops the evidence
+this desk exists to accumulate while looking like caution. Recalibrated again
+2026-08-28 from 900 to 640 (peak 482 + 33% headroom) after six further hourly
+skips on a box whose pressure came from unrelated sessions, not the trainer.
+If the dataset grows the trainer past 640 MB, systemd kills that one run
+visibly -- a failed unit -- which is strictly better than the invisible skip:
+a failure names itself, a skip looks like patience.
 """
 
 from __future__ import annotations
@@ -31,7 +44,7 @@ def mem_available_mib(path: Path = Path("/proc/meminfo")) -> Optional[float]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--min-available-mib", type=float, default=1400.0)
+    parser.add_argument("--min-available-mib", type=float, default=640.0)
     parser.add_argument("--meminfo", type=Path, default=Path("/proc/meminfo"))
     args = parser.parse_args()
     available = mem_available_mib(args.meminfo)

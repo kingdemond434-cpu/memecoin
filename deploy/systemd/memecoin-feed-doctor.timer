@@ -1,0 +1,17 @@
+[Unit]
+Description=Check dead or blocked feeds for live replacements
+
+[Timer]
+# Ten minutes after boot, then every fifteen. A feed the desk has already
+# marked unhealthy has failed several consecutive polls, so this reacts within
+# a quarter hour of the mesh noticing rather than waiting for a human to read
+# a dashboard. Faster is not better: the probe hits the publisher, and the
+# publishers most likely to be checked are the ones that rate-limit.
+OnBootSec=10min
+OnUnitActiveSec=15min
+# Publishers see a fleet of these arrive on the same schedule otherwise.
+RandomizedDelaySec=180
+Persistent=true
+
+[Install]
+WantedBy=timers.target

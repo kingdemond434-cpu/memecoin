@@ -103,6 +103,81 @@ CLASSIFICATION_TARGETS = {target for target, _ in SURVIVAL_LEVELS} | {
     PredictionTarget.P_MIGRATION, PredictionTarget.P_RUG_30S, PredictionTarget.P_RUG_5M,
 }
 
+#: Regression heads fitted on log(target) and exponentiated on the way out.
+#:
+#: Feasible exit multiples run 0.02 to 1606 with skew 20.1, and 62.8% of them
+#: are EXACTLY 1.0. GradientBoostingRegressor defaults to squared error, whose
+#: gradient on that shape is owned by a handful of monster episodes; with
+#: features that only weakly separate the tail, the loss-minimising answer is
+#: the unconditional mean. That is precisely what the head learned -- measured
+#: out-of-sample it scored a log MAE of 1.415 against the 1.496 a constant
+#: emitting log(mean) would score. It was not weakly predictive, it was
+#: constant.
+#:
+#: Fitting log(multiple) drops skew to -5.5, so no single 1606x episode owns
+#: the gradient, and the head can express "this one is ordinary" instead of
+#: being dragged to the mean by episodes it cannot identify. It also matches
+#: how the value is consumed: as a CEILING on what each survival bin may pay.
+#: Exponentiating a conditional log-mean yields a geometric mean, which is at
+#: or below the arithmetic mean -- the conservative direction for a cap on
+#: claimed upside, and the quantity the desk's log-wealth objective wants.
+LOG_SPACE_TARGETS = {PredictionTarget.EXPECTED_FEASIBLE_MULTIPLE}
+
+#: The smallest multiple the log transform will represent; matches the clip
+#: already applied to this target so a total loss stays finite.
+LOG_TARGET_FLOOR = 0.02
+
+#: Extreme-tail survival heads that may fall back to a constant zero when
+#: their positive class is absent from the chronological fit window.
+#:
+#: `_is_trained` requires every head, and the fit window for the flash band
+#: (0-0.5s) held 2,141 rows against a 10x base rate of 0.29% -- a 100x, 250x
+#: or 500x positive simply may not exist in it. One absent 500x then blocked
+#: the ENTIRE band: the age band that matters most for sniping had no model at
+#: all, because of the head that matters least to whether an entry is taken.
+#:
+#: A constant zero for such a head is not an invented bootstrap score. It is
+#: the empirical base rate of the window it was fitted on, stated exactly; and
+#: zero is the conservative direction everywhere this value flows -- it
+#: removes claimed upside from the survival bins and keeps the mega-event
+#: reserve at baseline. The rungs the entry decision actually gates on (p_2x,
+#: p_5x) are NOT in this set and still block their band when uncoverable.
+OPTIONAL_TAIL_TARGETS = {
+    PredictionTarget.P_100X, PredictionTarget.P_250X, PredictionTarget.P_500X,
+}
+
+
+class ConstantZeroClassifier:
+    """A head that has never seen its positive class, stated as a model.
+
+    Module-level and stateless so it survives joblib round trips inside a
+    saved bundle. `predict_proba` mirrors sklearn's two-column shape.
+    """
+
+    def predict_proba(self, X):
+        rows = len(X)
+        out = np.zeros((rows, 2), dtype=float)
+        out[:, 0] = 1.0
+        return out
+
+    def predict(self, X):
+        return np.zeros(len(X), dtype=int)
+
+
+def _from_log_space(value: float) -> float:
+    """Invert the log fit, refusing to turn a runaway prediction into a cap.
+
+    exp() of a boosted-tree output is unbounded on the upside, and this value
+    ceilings what every survival bin may pay -- so an overflow here would not
+    raise, it would silently authorise an enormous claimed upside. Bounded at
+    the top of the survival curve, which is the most any consumer may believe.
+    """
+    ceiling = float(SURVIVAL_LEVELS[-1][1])
+    if not np.isfinite(value):
+        return LOG_TARGET_FLOOR
+    return float(np.clip(np.exp(np.clip(value, -50.0, np.log(ceiling))),
+                         LOG_TARGET_FLOOR, ceiling))
+
 
 @dataclass
 class PredictionFeatures:
@@ -299,7 +374,7 @@ class MultiHeadPrediction:
 
 
 class MultiHeadPredictor:
-    ARTIFACT_VERSION = 5
+    ARTIFACT_VERSION = 6
 
     def __init__(self, model_dir: str = "models"):
         self.model_dir = model_dir
@@ -387,6 +462,20 @@ class MultiHeadPredictor:
                     split = max(1, int(len(X) * 0.8))
                     X_fit, y_fit, X_cal, y_cal = X[:split], y[:split], X[split:], y[split:]
                     if len(np.unique(y_fit)) < 2:
+                        # An extreme-tail head whose positive class does not
+                        # exist in the window becomes a stated zero rather
+                        # than the reason the whole band has no model. Only
+                        # when there are truly no positives: a window that
+                        # HAS positives but lost them to ordering is a
+                        # coverage problem worth blocking on.
+                        if target in OPTIONAL_TAIL_TARGETS and int(np.sum(y_fit)) == 0:
+                            self.models[target] = ConstantZeroClassifier()
+                            results[target.value] = {
+                                "status": "untrained_conservative_zero",
+                                "samples": len(data),
+                                "calibration": "constant_zero_no_positive_class",
+                            }
+                            continue
                         raise ValueError("chronological fit window requires both classes")
                     model.fit(X_fit, y_fit)
                     calibration = "raw_probability"
@@ -396,8 +485,15 @@ class MultiHeadPredictor:
                         self.calibrators[target] = iso_reg
                         calibration = "isotonic_chronological"
                 else:
-                    model.fit(X, y)
-                    calibration = "not_applicable"
+                    # Log-space heads are fitted on log(y). Without this the
+                    # squared-error gradient is owned by the tail and the head
+                    # collapses to the unconditional mean; see LOG_SPACE_TARGETS.
+                    if target in LOG_SPACE_TARGETS:
+                        model.fit(X, np.log(np.clip(y, LOG_TARGET_FLOOR, None)))
+                        calibration = "log_space_regression"
+                    else:
+                        model.fit(X, y)
+                        calibration = "not_applicable"
                 
                 results[target.value] = {
                     "status": "trained", "samples": len(data), "calibration": calibration,
@@ -408,7 +504,10 @@ class MultiHeadPredictor:
                 logger.error(f"Training failed for {target.value}: {e}")
                 results[target.value] = {"status": "failed", "error": str(e)}
         
-        trained_targets = {PredictionTarget(key) for key, result in results.items() if result.get("status") == "trained"}
+        trained_targets = {
+            PredictionTarget(key) for key, result in results.items()
+            if result.get("status") in ("trained", "untrained_conservative_zero")
+        }
         required = set(PredictionTarget)
         self._is_trained = required.issubset(trained_targets)
         self.model_version = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
@@ -438,6 +537,8 @@ class MultiHeadPredictor:
                     setattr(pred, target.value, float(np.clip(prob, 0, 1)))
                 else:
                     val = model.predict(X)[0]
+                    if target in LOG_SPACE_TARGETS:
+                        val = _from_log_space(val)
                     if target == PredictionTarget.EXPECTED_SLIPPAGE:
                         val = np.clip(val, 0, 1)
                     elif target == PredictionTarget.EXPECTED_HOLD_TIME:
@@ -479,6 +580,8 @@ class MultiHeadPredictor:
                         setattr(pred, target.value, float(np.clip(prob, 0, 1)))
                     else:
                         val = model.predict(X[i:i+1])[0]
+                        if target in LOG_SPACE_TARGETS:
+                            val = _from_log_space(val)
                         if target == PredictionTarget.EXPECTED_SLIPPAGE:
                             val = np.clip(val, 0, 1)
                         elif target == PredictionTarget.EXPECTED_HOLD_TIME:
@@ -514,6 +617,12 @@ class MultiHeadPredictor:
             "feature_schema_hash": hashlib.sha256("\n".join(self.feature_names).encode()).hexdigest(),
             "validation_report": validation_report,
             "trained_at": time.time(),
+            # Which heads were fitted in log space. A raw-space head loaded by
+            # exponentiating code does not fail, it silently returns e^4.75 as
+            # a ceiling on claimed upside. The artifact version already gates
+            # this; the explicit stamp means a future head joining or leaving
+            # LOG_SPACE_TARGETS is caught too, when the version would not move.
+            "log_space_targets": sorted(item.value for item in LOG_SPACE_TARGETS),
         }
         joblib.dump(data, path)
         logger.info(f"Saved models to {path}")
@@ -528,6 +637,13 @@ class MultiHeadPredictor:
             raise ValueError("model feature schema mismatch")
         if (data.get("validation_report") or {}).get("status") != "PASSED":
             raise ValueError("model artifact lacks passed chronological validation")
+        expected_log_targets = sorted(item.value for item in LOG_SPACE_TARGETS)
+        if data.get("log_space_targets") != expected_log_targets:
+            # Refuse rather than exponentiate a head that was fitted raw.
+            raise ValueError(
+                "model artifact target-space mismatch: bundle has "
+                f"{data.get('log_space_targets')}, this build expects "
+                f"{expected_log_targets}")
         self.models = data["models"]
         self.calibrators = data["calibrators"]
         self.model_version = data["model_version"]
@@ -551,7 +667,15 @@ class MultiHeadPredictor:
                 self.load(candidate)
                 required = set(PredictionTarget)
                 missing = required.difference(self.models)
-                if missing or not CLASSIFICATION_TARGETS.issubset(self.calibrators):
+                # A constant-zero tail head has no calibrator by construction
+                # -- there is nothing to calibrate about a stated zero -- so
+                # the calibrator requirement applies to the heads that were
+                # actually fitted.
+                needs_calibrator = {
+                    target for target in CLASSIFICATION_TARGETS
+                    if not isinstance(self.models.get(target), ConstantZeroClassifier)
+                }
+                if missing or not needs_calibrator.issubset(self.calibrators):
                     raise ValueError(f"missing trained heads/calibrators: {sorted(item.value for item in missing)}")
                 return True
             except Exception as exc:

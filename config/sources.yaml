@@ -429,7 +429,7 @@ sources:
     poll_interval_seconds: 120
     degraded_after_seconds: 7200
     dead_after_seconds: 172800
-    options: {url: "https://www.odaily.news/feed", language: zh}
+    options: {url: "https://rss.odaily.news/rss/newsflash", language: zh}
   - id: rss:cn-panews
     kind: rss
     tier: 1
@@ -438,16 +438,59 @@ sources:
     poll_interval_seconds: 120
     degraded_after_seconds: 7200
     dead_after_seconds: 172800
-    options: {url: "https://www.panewslab.com/zh/rss", language: zh}
-  - id: rss:cn-techflow
+    options: {url: "https://www.panewslab.com/rss.xml", language: zh}
+  # TechFlow (techflowpost.com) retired its feed: /rss.xml, /rss/rss.xml and
+  # /rss/newsflash all answer 404, and nothing on the domain autodiscovers.
+  # Replaced by publishers verified live rather than left declared and dark,
+  # which is a coverage hole that reports as a dead source forever.
+  - id: rss:zh-blocktempo
     kind: rss
     tier: 2
     language: zh
-    region: cn
+    region: tw
     poll_interval_seconds: 300
     degraded_after_seconds: 21600
     dead_after_seconds: 259200
-    options: {url: "https://www.techflowpost.com/rss.xml", language: zh}
+    options: {url: "https://www.blocktempo.com/feed/", language: zh}
+  - id: rss:zh-abmedia
+    kind: rss
+    tier: 3
+    language: zh
+    region: tw
+    poll_interval_seconds: 300
+    degraded_after_seconds: 21600
+    dead_after_seconds: 259200
+    options: {url: "https://www.abmedia.io/feed", language: zh}
+  - id: rss:zh-zombit
+    kind: rss
+    tier: 3
+    language: zh
+    region: tw
+    poll_interval_seconds: 600
+    degraded_after_seconds: 43200
+    dead_after_seconds: 259200
+    options: {url: "https://zombit.info/feed/", language: zh}
+  # Odaily's long-form feed is already declared as odaily-post-rss in the
+  # verified overlay; it is not repeated here.
+  - id: rss:jp-neweconomy
+    kind: rss
+    tier: 2
+    language: ja
+    region: jp
+    poll_interval_seconds: 300
+    degraded_after_seconds: 21600
+    dead_after_seconds: 259200
+    options: {url: "https://www.neweconomy.jp/feed", language: ja}
+  - id: rss:jp-bittimes
+    kind: rss
+    tier: 3
+    language: ja
+    region: jp
+    poll_interval_seconds: 300
+    degraded_after_seconds: 21600
+    dead_after_seconds: 259200
+    options: {url: "https://bittimes.net/feed", language: ja}
+  # TokenPost KR is already declared below as rss:kr-tokenpost.
   - id: rss:cn-chaincatcher
     kind: rss
     tier: 2
@@ -474,7 +517,7 @@ sources:
     poll_interval_seconds: 300
     degraded_after_seconds: 21600
     dead_after_seconds: 259200
-    options: {url: "https://jp.cointelegraph.com/rss", language: ja}
+    options: {url: "https://cointelegraph.com/rss/tag/japan", language: ja}
   - id: rss:kr-blockmedia
     kind: rss
     tier: 2

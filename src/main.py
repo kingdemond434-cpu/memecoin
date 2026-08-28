@@ -752,9 +752,16 @@ class MemecoinQuantDesk:
             # tools/verify_sources.py writes and which wins on any id it
             # names. Endpoints that answered on the trading node beat
             # endpoints that looked plausible in a repository.
+            #
+            # sources.repaired.yaml comes last and is written by
+            # tools/feed_doctor.py: same-publisher URL corrections for feeds a
+            # publisher moved. It is absent until something breaks, and a
+            # missing overlay in a multi-file path is skipped rather than
+            # raising, so shipping without it is the normal case.
             self.global_config.get(
                 "source_registry",
-                "config/sources.yaml,config/sources.verified.yaml"))
+                "config/sources.yaml,config/sources.verified.yaml,"
+                "config/sources.repaired.yaml"))
         # The channels the operator already listed for the social collector.
         # Asking for them twice -- once in an env var, once in YAML -- is
         # asking for two lists that disagree.
@@ -2593,6 +2600,15 @@ class MemecoinQuantDesk:
         self.state_sequencer.bump(token)
         self._spawn_background(self._fetch_pool_account(token, pool))
 
+    # NOTE on `fee_schedule_unobserved`: seeding a fee-less pool from
+    # PumpFeeSchedule was tried on 2026-08-28 and reverted the same day. The
+    # schedule's legacy figure is the BONDING CURVE's published 100 bps; the
+    # first observed PumpSwap trade tail in the fixture suite charges 30 bps.
+    # A table-lookup seed would therefore have overstated every pool round
+    # trip by ~140 bps -- into research labels, not just entries. The pool
+    # becomes priceable the honest way within seconds of one readable trade
+    # tail; what actually starves `pools_priceable` is the RPC quota killing
+    # `_fetch_pool_account`, and the fix for that is quota, not fabrication.
     def _update_pool_state(self, token: str, event: Dict[str, Any]) -> None:
         """Adopt post-trade reserves and the fee bps that trade actually paid.
 
@@ -4780,11 +4796,24 @@ class MemecoinQuantDesk:
         tokens = list(self._market_observation_cohort)
         if not tokens:
             return
-        budget = min(int(self.global_config.get("market_observation_budget", 5)), len(tokens))
+        # Two budgets, because the two marks do not cost the same thing.
+        #
+        # A router mark takes a slot on the single shared Jupiter gate, which
+        # without an API key admits one request every 2.05s -- and a mark is
+        # TWO quotes. Ten of those in one pass is a twenty-second pass, which
+        # is why this loop could never deliver the 2s interval its own age
+        # rule asks for. A local mark is arithmetic over streamed state: no
+        # await, no quota, no gate. Charging them to the same budget rationed
+        # the free one at the price of the scarce one.
+        probe_lamports = int(self.global_config.get("market_probe_lamports", 10_000_000))
+        router_budget = min(int(self.global_config.get("market_observation_budget", 5)),
+                            len(tokens))
+        local_budget = min(int(self.global_config.get(
+            "market_local_observation_budget", 64)), len(tokens))
         now = time.time()
         inspected = 0
         due = []
-        while inspected < len(tokens) and budget > 0:
+        while inspected < len(tokens) and (router_budget > 0 or local_budget > 0):
             token = tokens[self._market_cursor % len(tokens)]
             self._market_cursor = (self._market_cursor + 1) % max(len(tokens), 1)
             inspected += 1
@@ -4795,8 +4824,16 @@ class MemecoinQuantDesk:
             interval = 2.0 if age < 60 else 10.0 if age < 300 else 60.0
             if now - self._market_observed_at.get(token, 0) < interval:
                 continue
+            priceable_locally = self._local_round_trip_probe(token, probe_lamports) is not None
+            if priceable_locally:
+                if local_budget <= 0:
+                    continue
+                local_budget -= 1
+            else:
+                if router_budget <= 0:
+                    continue
+                router_budget -= 1
             self._market_observed_at[token] = now
-            budget -= 1
             due.append(token)
         all_active = set(self.dataset_builder.active_episodes)
         for stale in set(self._market_observed_at) - all_active:
@@ -4826,8 +4863,80 @@ class MemecoinQuantDesk:
         for episode in newest[:limit - len(self._market_observation_cohort)]:
             self._market_observation_cohort.add(episode.token)
 
+    def _local_round_trip_probe(self, token: str, probe_lamports: int):
+        """The Jupiter round trip, priced from streamed state, with no await.
+
+        Research observation was the desk's slowest sense and its most
+        rate-limited: two router quotes per mark, through the ONE shared
+        Jupiter gate, which without an API key admits a request every 2.05s.
+        That is 0.245 observations a second for the whole cohort -- about 408
+        seconds between marks on a token whose decisive window is sixty. The
+        outcome labels are built from those marks, so 18.1% of launches that
+        actually traded up were recorded as never having been exitable: not a
+        venue fact, a sampling artifact.
+
+        The bonding curve and the pool both price their own impact locally --
+        `_follow_exit_quote` has relied on that for positions since the same
+        bug was fixed on the decision path. Buying `probe_lamports` and
+        selling the proceeds straight back is the identical measurement the
+        router was being asked for, at stream speed and no quota.
+
+        Returns None when the token has no streamed state, which is the honest
+        answer and sends the caller to the router.
+        """
+        if probe_lamports <= 0:
+            return None
+        curve = self._latest_curve_state.get(token)
+        if curve is not None:
+            bought = quote_buy(curve, probe_lamports)
+            if bought.data_status != "OK" or bought.output_amount <= 0:
+                return None
+            returned = quote_sell(curve, int(bought.output_amount))
+            if returned.data_status != "OK" or returned.output_amount <= 0:
+                return None
+            return (int(bought.output_amount), int(returned.output_amount),
+                    "local_pump_round_trip")
+        pool = self._latest_pool_state.get(token)
+        if pool is not None and pool.blocked_reason() is None:
+            bought = pool_quote_buy(pool, probe_lamports)
+            if bought.data_status != "OK" or bought.output_amount <= 0:
+                return None
+            returned = pool_quote_sell(pool, int(bought.output_amount))
+            if returned.data_status != "OK" or returned.output_amount <= 0:
+                return None
+            return (int(bought.output_amount), int(returned.output_amount),
+                    "local_pumpswap_round_trip")
+        return None
+
     async def _observe_token_market(self, token: str, observed_at: float):
         probe_lamports = int(self.global_config.get("market_probe_lamports", 10_000_000))
+
+        # Streamed state first. This is the same round trip the router would
+        # price, so it carries the same route_feasible meaning -- the sell leg
+        # is an executable quote against real reserves, not a price ratio.
+        local = self._local_round_trip_probe(token, probe_lamports)
+        if local is not None and self.sol_price_usd > 0:
+            token_amount, lamports_back, measurement = local
+            value_usd = (lamports_back / LAMPORTS_PER_SOL) * self.sol_price_usd
+            unit_price = value_usd / max(token_amount, 1)
+            entry_price = self._market_entry_price.setdefault(token, unit_price)
+            multiple = unit_price / max(entry_price, 1e-18)
+            # Round-trip loss IS the impact: what a buy and an immediate sell
+            # of this size gives back, against what it cost.
+            spent_usd = (probe_lamports / LAMPORTS_PER_SOL) * self.sol_price_usd
+            impact = max(0.0, 1.0 - (value_usd / max(spent_usd, 1e-18)))
+            self._marks_local += 1
+            observation = {
+                "type": "market_mark", "timestamp": observed_at, "data_status": "OK",
+                "price_usd": unit_price, "price_multiple": multiple, "value_usd": value_usd,
+                "route_feasible": True, "feasible": True, "price_impact_pct": impact,
+                "sol_price_usd": self.sol_price_usd, "measurement": measurement,
+            }
+            self.dataset_builder.record_market_observation(token, observation)
+            self.rug_hazard.record_observation(token, {**observation, "type": "route"})
+            self.counterfactual_lab.record_market_observation(token, multiple, observed_at)
+            return
+
         buy_quote = await self.jupiter.get_quote(WSOL_MINT, token, probe_lamports, slippage_bps=300)
         if not buy_quote or buy_quote.output_amount <= 0:
             observation = {"type": "route", "feasible": False, "timestamp": observed_at,

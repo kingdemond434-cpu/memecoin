@@ -262,25 +262,56 @@ class WalletIntelligenceEngine:
             self.data_status[wallet] = f"DATA_BLOCKED: wallet history unavailable: {e}"
             logger.debug(f"Wallet eval error: {e}")
 
+    #: Signatures per JSON-RPC batch. Providers cap batch size and oversized
+    #: batches are rejected whole, so this stays well inside the common limit.
+    RPC_HISTORY_BATCH = 25
+
     async def _rpc_wallet_history(self, wallet: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Provider-independent fallback using standard Solana transaction balance deltas."""
+        """Provider-independent fallback using standard Solana transaction balance deltas.
+
+        Batched, because this is the desk's single largest RPC consumer and it
+        runs when the cheap path is already gone. `_analyze_token_early_buyers`
+        calls it for up to twenty holders, so one token cost 20 x (1 + 50) =
+        ~1,020 requests. Worse, it is a FALLBACK: it runs precisely when the
+        Helius enhanced endpoint returned nothing, so the moment that provider
+        hits its quota this path multiplies the same work by fifty and spends
+        the remaining endpoints' quota too. That is the shape of the outage
+        observed on 2026-08-28 -- all three Solana endpoints at 429, with
+        getTransaction 75% of the refusals.
+
+        One batch of 25 replaces 25 round trips. Same data, same commitment,
+        ~50x fewer requests and one connection setup instead of fifty, which
+        is latency the hot path was paying for as well as quota.
+        """
         signatures = await self.rpc.request(
             "getSignaturesForAddress", [wallet, {"limit": limit, "commitment": "confirmed"}],
         )
-        semaphore = asyncio.Semaphore(5)
+        usable = [row for row in (signatures or [])
+                  if row.get("signature") and not row.get("err")]
+        if not usable:
+            return []
 
-        async def fetch(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            if not row.get("signature") or row.get("err"):
-                return None
-            async with semaphore:
-                tx = await self.rpc.request("getTransaction", [row["signature"], {
-                    "encoding": "jsonParsed", "commitment": "confirmed",
-                    "maxSupportedTransactionVersion": 0,
-                }])
-            return self._standard_tx_to_enhanced(wallet, row, tx)
-
-        rows = await asyncio.gather(*(fetch(row) for row in (signatures or [])), return_exceptions=True)
-        return [row for row in rows if isinstance(row, dict)]
+        options = {"encoding": "jsonParsed", "commitment": "confirmed",
+                   "maxSupportedTransactionVersion": 0}
+        rows: List[Dict[str, Any]] = []
+        for start in range(0, len(usable), self.RPC_HISTORY_BATCH):
+            chunk = usable[start:start + self.RPC_HISTORY_BATCH]
+            payload = [{"jsonrpc": "2.0", "id": index, "method": "getTransaction",
+                        "params": [row["signature"], options]}
+                       for index, row in enumerate(chunk)]
+            try:
+                results = await self.rpc.batch_request(payload)
+            except Exception as exc:
+                # A refused batch is one wallet's history, not a broken desk.
+                # Reported by name so a provider capping batch size is visible
+                # rather than looking like a wallet with no trades.
+                logger.debug("batched wallet history failed for %s: %s", wallet, exc)
+                continue
+            for row, transaction in zip(chunk, results or []):
+                converted = self._standard_tx_to_enhanced(wallet, row, transaction)
+                if converted:
+                    rows.append(converted)
+        return rows
 
     @staticmethod
     def _standard_tx_to_enhanced(wallet: str, signature_row: Dict[str, Any], tx: Any) -> Optional[Dict[str, Any]]:

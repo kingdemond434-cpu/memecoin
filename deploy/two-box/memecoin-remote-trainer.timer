@@ -1,0 +1,17 @@
+[Unit]
+Description=Hourly chronological training on the isolated trainer box
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+# Offset from the hour so the pull does not land on whatever else runs at :00,
+# and jittered so two trainer boxes would never rsync the collector in lockstep.
+RandomizedDelaySec=300
+# Catch up one missed run after a reboot. Training is chronological, so a
+# skipped hour is not lost evidence -- the next run reads it anyway -- but
+# starting promptly after downtime keeps the model age honest for the
+# collector's watchdog.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

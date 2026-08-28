@@ -410,7 +410,14 @@ def register_web_miners(pool: DataMinerPool, *, http: Any,
          wikipedia_attention_miner(http)),
         (MinerSpec(
             miner_id="web:youtube_recent", enriches=Enriches.NARRATIVE,
-            cadence_seconds=CADENCE_MINUTE, endpoint="youtube data api search",
+            # Hourly because search.list costs 100 of the 10,000 free daily
+            # quota units and this miner spends two per pass. At a one-minute
+            # cadence that is 288,000 units a day -- 28.8x the quota, spent by
+            # 00:50, after which YouTube answers 429 for the remaining 23
+            # hours and the shared key is dead for the deliberately budgeted
+            # rotation in social_intelligence too. Hourly costs 4,800 a day
+            # and leaves better than half the quota for that caller.
+            cadence_seconds=CADENCE_HOURLY, endpoint="youtube data api search",
             requires_env=("YOUTUBE_API_KEY",),
             detail="uploads in the last two hours for standing queries"),
          youtube_recent_miner(http, youtube_key)),

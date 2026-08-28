@@ -249,6 +249,46 @@ def _cadence_bucket(seconds: float) -> str:
     return "daily"
 
 
+#: The option that carries a declaration's endpoint, per kind. Two entries
+#: naming the same endpoint are the same source however they are spelled, so
+#: this is what lets the overlay merge below be id-spelling independent.
+ENDPOINT_OPTIONS: Dict[str, Tuple[str, ...]] = {
+    "rss": ("url",),
+    "official_site": ("url",),
+    "mastodon": ("instance",),
+    "nostr": ("relay",),
+    "code_repo": ("repo",),
+    "telegram": ("channel",),
+    "youtube": ("channel_id",),
+    "farcaster": ("hub_url",),
+    "bluesky": ("url",),
+}
+
+
+def _endpoint_identity(declaration: SourceDeclaration) -> Optional[Tuple[str, str]]:
+    """A spelling-independent key for the endpoint a declaration polls.
+
+    ``None`` for kinds that carry no endpoint option -- push-only queues and
+    metadata -- which are then merged by source_id alone as before.
+    """
+    keys = ENDPOINT_OPTIONS.get(declaration.kind)
+    if not keys:
+        return None
+    for key in keys:
+        raw = str((declaration.options or {}).get(key, "")).strip()
+        if not raw:
+            continue
+        value = raw.lower().rstrip("/")
+        if "//" in value:
+            parts = urlsplit(value)
+            if parts.netloc:
+                value = parts.netloc + parts.path.rstrip("/")
+                if parts.query:
+                    value = value + "?" + parts.query
+        return (declaration.kind, value)
+    return None
+
+
 def load_declarations(path: str) -> List[SourceDeclaration]:
     """Parse the source universe from YAML.
 
@@ -266,11 +306,27 @@ def load_declarations(path: str) -> List[SourceDeclaration]:
     paths = [item.strip() for item in str(path).split(",") if item.strip()]
     if len(paths) > 1:
         merged: Dict[str, SourceDeclaration] = {}
+        by_endpoint: Dict[Tuple[str, str], str] = {}
         for one in paths:
             if not os.path.exists(one):
                 logger.info("source registry overlay %s absent; skipping", one)
                 continue
             for declaration in load_declarations(one):
+                # Override by ENDPOINT, not just by source_id. The overlay is
+                # machine-generated with its own id convention, so matching on
+                # source_id alone let the same endpoint survive twice under two
+                # spellings -- which polls the remote host at double its
+                # declared cadence, for no extra coverage, and earns the whole
+                # mesh a rate limit that then reads as the source being dead.
+                endpoint = _endpoint_identity(declaration)
+                if endpoint is not None:
+                    previous = by_endpoint.get(endpoint)
+                    if previous is not None and previous != declaration.source_id:
+                        merged.pop(previous, None)
+                        logger.info(
+                            "source %s supersedes %s; both poll %s",
+                            declaration.source_id, previous, endpoint[1])
+                    by_endpoint[endpoint] = declaration.source_id
                 merged[declaration.source_id] = declaration
         return list(merged.values())
 

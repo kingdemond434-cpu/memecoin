@@ -2106,9 +2106,14 @@ def _write_hazard_episode(storage: Path, token: str, created_at: float, observat
         }, handle)
 
 
-def _build_hazard_fixture(storage: Path, count: int = 100):
-    """40 episodes interleaved rug/healthy (3-in-8 rug) so both the train
-    and the chronologically-last OOS fold contain rug episodes."""
+def _build_hazard_fixture(storage: Path, count: int = 200):
+    """Episodes interleaved rug/healthy (3-in-8 rug) so both the train and
+    the chronologically-last OOS fold contain rug episodes.
+
+    200, not 100: a hazard horizon now withholds its PASSED/REJECTED verdict
+    below ten out-of-sample positives (a five-positive REJECTED flips sign on
+    resampling), and at 100 episodes rug_30s lands nine -- one short of a
+    verdict either way. 200 puts every horizon comfortably over the floor."""
     for index in range(count):
         created_at = float(index * 1000)
         if index % 8 < 3:

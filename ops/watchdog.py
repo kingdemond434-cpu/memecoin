@@ -36,6 +36,12 @@ class Policy:
     persistent_fault_runs: int = 2
     training_stale_seconds: float = 93_600.0
     training_retry_seconds: float = 3_600.0
+    #: How long the Telegram mention count may stand still before the signal
+    #: path is called stalled. Across 38 channels the observed rate is about
+    #: one mention a minute, but it is bursty and genuinely quiet stretches
+    #: happen; half an hour is far outside them and still catches a real
+    #: outage inside the hour it would otherwise cost.
+    telegram_stall_seconds: float = 1_800.0
 
 
 @dataclass
@@ -113,6 +119,23 @@ def observed_faults(readiness: Dict[str, Any]) -> Tuple[List[str], List[str]]:
             and str(miners.get("status", "")).upper() == "DATA_BLOCKED"):
         alerts.append("all_runnable_data_miners_are_dark")
 
+    # Telegram is the desk's fastest human-signal path and the one whose
+    # failure is quietest: the session stays "connected", the handler stays
+    # registered, and messages simply stop. Nothing else here would notice,
+    # so the signal path is checked on its own terms rather than inferred
+    # from the source mesh totals it does not contribute to.
+    telegram = ((readiness.get("credentials") or {}).get("telegram") or {})
+    social_status = ((readiness.get("social") or {}).get("data_status") or {})
+    if telegram.get("keys_present"):
+        if not telegram.get("session_authorised"):
+            # Only an operator can fix this, and until they do the desk is
+            # blind to every channel while looking healthy.
+            alerts.append("telegram_session_unauthorised")
+        elif str(social_status.get("telegram", "")).upper().startswith("DATA_BLOCKED"):
+            alerts.append("telegram_signal_path_blocked")
+        elif not int(telegram.get("channels_listed", 0) or 0):
+            alerts.append("telegram_no_channels_configured")
+
     # These require evidence or an operator/provider.  Naming them makes the
     # watchdog complete without pretending a restart can manufacture a fix.
     if readiness.get("prediction") != "OK":
@@ -169,6 +192,21 @@ def decide(*, service_active: bool, service_enabled: bool,
             "restart_suppressed_by_cooldown" if not cooldown_ok
             else "restart_budget_exhausted")
 
+    # A stalled Telegram feed reports OK on every field it has, so the only
+    # evidence it has stopped is that the mention count is not moving. That
+    # needs memory across runs, which observed_faults deliberately has none
+    # of, so it is measured here against the persisted count.
+    telegram = ((readiness.get("credentials") or {}).get("telegram") or {})
+    if telegram.get("keys_present") and telegram.get("session_authorised"):
+        mentions = int(((readiness.get("social") or {}).get("total_mentions", 0)) or 0)
+        previous = state.get("telegram_mentions")
+        since = float(state.get("telegram_mentions_at", 0.0) or 0.0)
+        if previous is None or mentions != int(previous):
+            state["telegram_mentions"] = mentions
+            state["telegram_mentions_at"] = now
+        elif since and now - since > policy.telegram_stall_seconds:
+            plan.alerts.append("telegram_signals_stalled")
+
     if (training_age is not None
             and training_age > policy.training_stale_seconds
             and not trainer_active
@@ -215,6 +253,16 @@ def _send_telegram_alert(message: str) -> bool:
              or os.getenv("TELEGRAM_BOT_TOKEN", ""))
     chat_id = os.getenv("TELEGRAM_ALERT_CHAT_ID", "")
     if not token or not chat_id:
+        # Say so. An unconfigured alert channel returning a quiet False means
+        # every alert this watchdog has ever raised was written to a journal
+        # nobody is watching, and the desk looks silent-because-healthy
+        # instead of silent-because-nobody-is-listening. Names, never values.
+        missing = [name for name, value in (
+            ("TELEGRAM_ALERT_BOT_TOKEN or TELEGRAM_BOT_TOKEN", token),
+            ("TELEGRAM_ALERT_CHAT_ID", chat_id)) if not value]
+        logger.warning(
+            "ALERT NOT DELIVERED (%s unset); alert was: %s",
+            " and ".join(missing), message)
         return False
     body = urllib.parse.urlencode({"chat_id": chat_id, "text": message}).encode()
     request = urllib.request.Request(
@@ -283,27 +331,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             failures.append("start_trainer")
 
-    payload = {
-        "schema": WATCHDOG_SCHEMA_VERSION, "at": now,
-        "service_active": service_active, "service_enabled": service_enabled,
-        "readiness_age_seconds": readiness_age,
-        "plan": asdict(plan), "actions": actions, "failures": failures,
-        "dry_run": bool(args.dry_run),
-    }
-    state["last_run_at"] = now
-    state["last_plan"] = asdict(plan)
-    state["last_failures"] = failures
-    _write_json_atomic(state_path, state)
-    _append_event(event_path, payload)
-
     material = failures or plan.repair_reasons or plan.alerts
+    alert_delivered: Optional[bool] = None
     if material:
         summary = ("memecoin watchdog: "
                    f"actions={actions or ['none']} failures={failures or ['none']} "
                    f"repairs={plan.repair_reasons or ['none']} "
                    f"alerts={plan.alerts or ['none']}")
         logger.warning(summary)
-        _send_telegram_alert(summary)
+        alert_delivered = _send_telegram_alert(summary)
+
+    payload = {
+        "schema": WATCHDOG_SCHEMA_VERSION, "at": now,
+        "service_active": service_active, "service_enabled": service_enabled,
+        "readiness_age_seconds": readiness_age,
+        "plan": asdict(plan), "actions": actions, "failures": failures,
+        "dry_run": bool(args.dry_run),
+        # Whether anyone was actually told. Without this the ledger records
+        # that an alert was raised and leaves whether it arrived unknowable.
+        "alert_delivered": alert_delivered,
+    }
+    state["last_run_at"] = now
+    state["last_plan"] = asdict(plan)
+    state["last_failures"] = failures
+    state["last_alert_delivered"] = alert_delivered
+    _write_json_atomic(state_path, state)
+    _append_event(event_path, payload)
+
     return EXIT_FAILED if failures else EXIT_REPAIRED if actions else EXIT_OK
 
 

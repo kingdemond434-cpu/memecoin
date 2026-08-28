@@ -1,0 +1,46 @@
+[Unit]
+Description=Chronological training on the isolated trainer box
+Documentation=file:%h/.local/opt/memecoin-shadow/deploy/two-box/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/opt/memecoin-shadow
+EnvironmentFile=-%h/.config/memecoin-shadow/env
+
+# This box trains. It does not trade, and it holds no key that would let it.
+# Set after the EnvironmentFile so a stale env cannot reintroduce them.
+Environment=ALLOW_LIVE_TRADING=
+Environment=SOLANA_PRIVATE_KEY=
+
+Environment=COLLECTOR=10.0.0.2
+Environment=SSH_KEY=%h/.ssh/memecoin_sync
+
+# No ExecCondition memory guard here. That guard exists because the trainer
+# shares a box with the always-on collector; on a dedicated box there is
+# nothing to starve, and a guard that skips the only job the machine has is
+# how six consecutive hourly runs were lost.
+ExecStart=%h/.local/opt/memecoin-shadow/deploy/two-box/sync-and-train.sh
+
+# A whole cycle: pull ~250MB, three trainers, push. The observed training run
+# is ~12 minutes; this is generous enough for a slow link without letting a
+# hung transfer sit across the next tick.
+TimeoutStartSec=45min
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/opt/memecoin-shadow/data %h/.local/opt/memecoin-shadow/models
+UMask=0077
+
+# Measured peak across nine runs was 432 MB (339-482 MB). This bounds a leak
+# without being so tight that a larger dataset trips it.
+MemoryMax=1500M
+CPUQuota=180%
+Nice=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=memecoin-remote-trainer

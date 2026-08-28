@@ -1,0 +1,38 @@
+[Unit]
+Description=Find live replacements for dead or blocked source feeds
+After=memecoin-shadow.service
+Documentation=file:%h/.local/opt/memecoin-shadow/RUNBOOK.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/opt/memecoin-shadow
+EnvironmentFile=-%h/.config/memecoin-shadow/env
+Environment=ALLOW_LIVE_TRADING=
+Environment=SOLANA_PRIVATE_KEY=
+
+# Driven by what the running desk actually reports unhealthy, not by a blind
+# sweep of the whole registry. A full probe on every tick is how a doctor gets
+# its own IP rate-limited by the publishers it exists to keep alive, and the
+# publishers that rate-limit are exactly the ones already marked degraded.
+#
+# --apply writes SAME-PUBLISHER path corrections only, under the original
+# source_id, so the registry's id-keyed merge replaces the stale declaration.
+# A different publisher is never substituted automatically: that changes what
+# the mesh covers, which is an editorial call and not a repair.
+ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m tools.feed_doctor \
+  --from-status http://127.0.0.1:18080/status \
+  --repair --only-broken \
+  --apply %h/.local/opt/memecoin-shadow/config/sources.repaired.yaml
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/opt/memecoin-shadow/config %h/.local/opt/memecoin-shadow/data
+UMask=0077
+MemoryMax=256M
+CPUQuota=50%
+Nice=15
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=memecoin-feed-doctor
