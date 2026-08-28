@@ -360,6 +360,19 @@ class LaunchCensus:
                 if record.stage == Stage.SCREENED:
                     self._totals.monsters_by_screen[
                         record.screen_reason or "unattributed"] += 1
+                elif (record.stage == Stage.DECIDED
+                        and record.decided_action == "REJECT"):
+                    # A hard-rejected monster is the costliest kind of miss,
+                    # and its disposition reason carries the exact veto causes
+                    # ("safety_veto:mint_authority_active,..."). Attributing
+                    # it keeps the question answerable per CAUSE: which
+                    # specific veto is discarding upside, and is that cause
+                    # ever credited with a save. Every observed monster so
+                    # far died under one aggregate label, which made the veto
+                    # untunable -- the only options were "trust it all" or
+                    # "doubt it all".
+                    self._totals.monsters_by_screen[
+                        record.disposition_reason or "unattributed_reject"] += 1
         if migrated is not None and record.migrated is None:
             record.migrated = bool(migrated)
             if record.migrated:

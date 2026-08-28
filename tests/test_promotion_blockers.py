@@ -136,3 +136,34 @@ class FivepositivesDoNotSupportAVerdict(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RejectedMonstersAreAttributedByCause(unittest.TestCase):
+    """A vetoed monster must name WHICH veto cause discarded it.
+
+    All three observed monster discards carried one aggregate label, which
+    left the veto untunable: no way to see whether authority checks or exit
+    impact or developer flags were doing the discarding, or whether the same
+    cause ever earned a save.
+    """
+
+    def test_reject_reason_reaches_the_costliest_screens(self):
+        from src.research.launch_census import LaunchCensus
+        census = LaunchCensus()
+        census.see("MintA")
+        census.reject("MintA", "safety_veto:mint_authority_active")
+        census.resolve("MintA", peak_multiple=75.0)
+        report = census.report()
+        ranked = report["missed_monsters"]["costliest_screens"]
+        reasons = [row["reason"] for row in ranked]
+        self.assertIn("safety_veto:mint_authority_active", reasons)
+
+    def test_screened_monsters_keep_their_existing_attribution(self):
+        from src.research.launch_census import LaunchCensus
+        census = LaunchCensus()
+        census.see("MintB")
+        census.screen("MintB", "veto_safety")
+        census.resolve("MintB", peak_multiple=75.0)
+        reasons = [row["reason"] for row in
+                   census.report()["missed_monsters"]["costliest_screens"]]
+        self.assertIn("veto_safety", reasons)
