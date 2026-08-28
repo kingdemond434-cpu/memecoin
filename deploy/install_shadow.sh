@@ -74,8 +74,11 @@ fi
 if [ -n "$CARGO_BIN" ]; then
   echo "building the native extension"
   "$CARGO_BIN" build --release --manifest-path "$ROOT/native/solana_fastpath/Cargo.toml"
-  cp "$ROOT/native/solana_fastpath/target/release/libsolana_fastpath.so" \
-     "$ROOT/.venv/lib/python3."*"/site-packages/solana_fastpath.so"
+  VENV_SITE_PACKAGES="$("$ROOT/.venv/bin/python" -c \
+    'import sysconfig; print(sysconfig.get_path("platlib"))')"
+  install -m 0755 \
+    "$ROOT/native/solana_fastpath/target/release/libsolana_fastpath.so" \
+    "$VENV_SITE_PACKAGES/solana_fastpath.so"
 else
   echo "cargo not found; running on the Python reference path"
 fi
