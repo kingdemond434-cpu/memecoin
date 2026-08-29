@@ -14,7 +14,18 @@ StartLimitBurst=5
 [Service]
 Type=notify
 NotifyAccess=main
-WatchdogSec=90s
+# 90s measured 62 process kills in 7 days (2026-08-28's own MemoryMax
+# post-mortem) and, once that unrelated bug was fixed, 7 MORE kills in the
+# following 6 hours alone (2026-08-29) -- all "Failed with result 'watchdog'",
+# not an in-process hang. The ping loop that misses its deadline
+# (_health_loop in src/main.py) does nothing but sleep(10) and notify; if
+# even that starves for 90s, the OS is not scheduling this PROCESS at all,
+# which is what a shared box at load average ~4 on 2 vCPUs actually does
+# under real contention from other projects' timers. Raised to give that
+# real, measured contention room without making a genuine hang undetectable
+# for an unreasonable time -- this is DRY_RUN, so a slower kill costs
+# continuity, not capital.
+WatchdogSec=240s
 TimeoutStartSec=120s
 WorkingDirectory=%h/.local/opt/memecoin-shadow
 EnvironmentFile=-%h/.config/memecoin-shadow/env
