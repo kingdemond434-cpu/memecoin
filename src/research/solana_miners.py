@@ -39,7 +39,15 @@ from src.research.data_miners import (
 logger = logging.getLogger(__name__)
 
 # Public, documented, no account required.
-JUPITER_TOKENS_URL = "https://token.jup.ag/all"
+#
+# token.jup.ag/all is retired -- DNS no longer resolves it at all ("No address
+# associated with hostname"), not merely 404/410, which is why this miner ran
+# silent (0 records, ERROR state) rather than reporting a route to fix. The v2
+# tag endpoint is the live replacement; "verified" is the closer match to what
+# this miner actually wants ("the routable token universe") than the full
+# unfiltered list at cache.jup.ag/tokens, which runs ~14x larger (66MB vs
+# 4.7MB) for an hourly fetch on a memory-constrained box.
+JUPITER_TOKENS_URL = "https://api.jup.ag/tokens/v2/tag?query=verified"
 DEXSCREENER_PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEXSCREENER_BOOSTS_URL = "https://api.dexscreener.com/token-boosts/latest/v1"
 DEXSCREENER_PAIRS_URL = "https://api.dexscreener.com/latest/dex/tokens/{addresses}"
@@ -178,10 +186,13 @@ def jupiter_token_list_miner(client: Any) -> Callable[[], Awaitable[List[Dict]]]
         payload = await _get_json(client, JUPITER_TOKENS_URL)
         if not isinstance(payload, list):
             raise RuntimeError("token list did not return a list")
-        return [{"mint": item.get("address"), "symbol": item.get("symbol"),
+        # v2 keys the mint as "id", not "address" -- the field this miner's
+        # whole output is keyed on, so getting it wrong reads as an empty
+        # list rather than a broken mapping.
+        return [{"mint": item.get("id"), "symbol": item.get("symbol"),
                  "name": item.get("name"), "decimals": item.get("decimals"),
                  "tags": item.get("tags") or [], "data_status": "OK"}
-                for item in payload if isinstance(item, dict) and item.get("address")]
+                for item in payload if isinstance(item, dict) and item.get("id")]
 
     return fetch
 

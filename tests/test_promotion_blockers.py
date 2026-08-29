@@ -167,3 +167,60 @@ class RejectedMonstersAreAttributedByCause(unittest.TestCase):
         reasons = [row["reason"] for row in
                    census.report()["missed_monsters"]["costliest_screens"]]
         self.assertIn("veto_safety", reasons)
+
+
+class JupiterTokenListSurvivesTheRetiredDomain(unittest.TestCase):
+    """token.jup.ag/all no longer resolves at all -- DNS failure, not 404/410.
+
+    The miner ran silently (0 records, state ERROR) rather than reporting a
+    fixable route. The v2 tag endpoint is the live replacement and keys the
+    mint as "id", not "address" -- the field this miner's whole output is
+    keyed on, so getting it wrong reads as an empty list rather than a
+    mapping bug.
+    """
+
+    def test_the_url_is_not_the_retired_domain(self):
+        from src.research import solana_miners
+        self.assertNotIn("token.jup.ag", solana_miners.JUPITER_TOKENS_URL)
+        self.assertIn("api.jup.ag/tokens/v2", solana_miners.JUPITER_TOKENS_URL)
+
+    def test_the_miner_reads_id_not_address(self):
+        from src.research import solana_miners
+        with open(solana_miners.__file__, encoding="utf-8") as handle:
+            source = handle.read()
+        # The old field name must not still be read as the mint.
+        self.assertNotIn('item.get("address")', source)
+        self.assertIn('item.get("id")', source)
+
+
+class BackfillSurvivesTransientRpcExhaustion(unittest.TestCase):
+    """A shared-pool rate limit mid-run must not discard already-decoded work.
+
+    Measured 2026-08-29: a backfill sharing the free RPC pool with the live
+    desk hit simultaneous cooldowns on every endpoint serving
+    getSignaturesForAddress at page 17 (2,239 events already decoded) and
+    raised past the fetch loop entirely -- the write-out step never ran, so
+    hours of paging and every decoded event were discarded for a condition
+    that clears itself in seconds.
+    """
+
+    def source(self):
+        from tools import backfill_history
+        with open(backfill_history.__file__, encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_the_no_healthy_endpoint_error_is_caught_and_retried(self):
+        source = self.source()
+        self.assertIn('"No healthy RPC endpoint" not in str(exc)', source)
+        self.assertIn("retrying in", source)
+
+    def test_exhaustion_still_reaches_the_write_out(self):
+        """The retry loop must end in a `break`, not a raise, so control
+        falls through to run_backfill() instead of skipping it."""
+        source = self.source()
+        exhausted_at = source.index("exhausted = True")
+        write_out_at = source.index("_group_into_launches(collector.events)")
+        self.assertGreater(write_out_at, exhausted_at)
+
+    def test_the_report_names_an_early_stop(self):
+        self.assertIn('"stopped_early_rpc_exhausted": exhausted', self.source())

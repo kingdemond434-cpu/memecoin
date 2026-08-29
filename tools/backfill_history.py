@@ -176,14 +176,39 @@ async def extract(args: argparse.Namespace) -> int:
     before: Optional[str] = checkpoint.get("resume_before") or None
     oldest_seen: Optional[float] = None
 
+    exhausted = False
     try:
         while fetched < args.max_signatures:
             params: Dict[str, Any] = {"limit": min(1000, args.max_signatures - fetched),
                                       "commitment": "confirmed"}
             if before:
                 params["before"] = before
-            page = await rpc.request("getSignaturesForAddress",
-                                     [PUMP_PROGRAM, params])
+            # A backfill runs for hours ALONGSIDE the live desk, sharing the
+            # same free RPC pool -- both want getSignaturesForAddress at once,
+            # and a moment where every endpoint is simultaneously cooling for
+            # this method is transient, not fatal. Measured 2026-08-29: it
+            # killed a run at page 17 (2,239 events already decoded) with an
+            # unhandled RuntimeError, and because the exception escaped this
+            # loop entirely, ALL of that work was lost -- the write-out below
+            # never ran. Retried with backoff here; if truly exhausted after
+            # that, the loop ends but execution still reaches the write-out.
+            page = None
+            for backoff in (5, 15, 30, 60, 60):
+                try:
+                    page = await rpc.request("getSignaturesForAddress",
+                                             [PUMP_PROGRAM, params])
+                    break
+                except RuntimeError as exc:
+                    if "No healthy RPC endpoint" not in str(exc):
+                        raise
+                    logger.warning("RPC pool exhausted for signatures "
+                                   "(%s); retrying in %ds", exc, backoff)
+                    await asyncio.sleep(backoff)
+            if page is None:
+                logger.warning("RPC pool stayed exhausted; stopping here "
+                               "with %d events already decoded", len(collector.events))
+                exhausted = True
+                break
             page = [row for row in (page or []) if isinstance(row, dict)]
             if not page:
                 break
@@ -238,6 +263,7 @@ async def extract(args: argparse.Namespace) -> int:
         "limitations": report.limitation_counts,
         "output_dir": args.out,
         "resume_before": before,
+        "stopped_early_rpc_exhausted": exhausted,
     }, indent=1))
     # Zero episodes from nonzero signatures is the silent-zero shape this
     # desk keeps finding: make it loud.
