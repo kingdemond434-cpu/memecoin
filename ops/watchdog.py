@@ -90,6 +90,18 @@ class Policy:
     #: gap faster; long enough that a persistently-contended RPC pool is not
     #: hammered every 60s by the watchdog on top of the timer's own attempts.
     backfill_retry_seconds: float = 3_600.0
+    #: wallet_follow.model.wallets_tracked read zero for the desk's entire
+    #: history before 2026-08-29's fix (an unthrottled burst was exhausting
+    #: the free RPC pool on every single launch). How long it may stay at
+    #: zero WHILE launches keep arriving before that is called an anomaly
+    #: again rather than early pipeline warm-up: the deeper chain (wallet ->
+    #: score -> watch list -> follow -> resolve) has a 5-minute recalc cycle
+    #: and a 300s follow horizon built in, so anything shorter than this
+    #: would flag the pipeline's own normal warm-up as a fault.
+    wallet_tracking_dead_seconds: float = 7_200.0
+    #: Below this many newly-seen launches, "wallets_tracked is still zero"
+    #: is not yet evidence of anything -- there has been nothing to track.
+    wallet_tracking_min_launches: int = 20
 
 
 @dataclass
@@ -323,6 +335,29 @@ def decide(*, service_active: bool, service_enabled: bool,
                 state["telegram_mentions_at"] = now
             elif since and now - since > policy.telegram_stall_seconds:
                 persistent.append("telegram_signals_stalled")
+
+        # Alert-only, unlike the Telegram stall above: a restart is not the
+        # fix here, because the last time this read zero for the desk's
+        # entire history the cause was an unthrottled burst inside the
+        # wallet-intelligence pipeline itself (fixed 2026-08-29), not a
+        # connection that reconnecting repairs. A future zero-tracking
+        # regression needs the same kind of investigation, not a blind
+        # restart, so this names the anomaly rather than guessing at a
+        # remedy for a failure mode that could recur for an entirely
+        # different reason next time.
+        launches_seen = int(((readiness.get("launch_census") or {}).get("funnel") or {})
+                            .get("seen", 0) or 0)
+        wallets_tracked = int(((readiness.get("wallet_follow") or {}).get("model") or {})
+                              .get("wallets_tracked", 0) or 0)
+        if launches_seen >= policy.wallet_tracking_min_launches:
+            if wallets_tracked > 0:
+                state.pop("wallet_tracking_dead_since", None)
+            else:
+                since = float(state.get("wallet_tracking_dead_since", 0.0) or 0.0)
+                if not since:
+                    state["wallet_tracking_dead_since"] = now
+                elif now - since > policy.wallet_tracking_dead_seconds:
+                    plan.alerts.append("wallet_tracking_dead")
 
     consecutive = dict(state.get("consecutive_faults") or {})
     seen = set(immediate + persistent)

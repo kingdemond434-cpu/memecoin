@@ -280,3 +280,61 @@ class SomeAlertsHaveNoSafeAutomatedFix(unittest.TestCase):
         repairs, alerts = observed_faults(readiness)
         self.assertEqual(repairs, [])
         self.assertIn("optional_credentials_absent", alerts)
+
+
+class WalletTrackingDeathIsWatched(unittest.TestCase):
+    """wallets_tracked read zero for the desk's ENTIRE history before the
+    2026-08-29 fix (an unthrottled burst was exhausting the free RPC pool on
+    every launch). Alert-only, not a fixer: that specific cause is fixed, but
+    a future zero-tracking regression could have an entirely different one,
+    and a blind restart is not a substitute for the kind of investigation
+    that actually found it.
+    """
+
+    def _readiness(self, seen, tracked):
+        readiness = _healthy_readiness()
+        readiness["launch_census"] = {"funnel": {"seen": seen}}
+        readiness["wallet_follow"] = {"model": {"wallets_tracked": tracked}}
+        return readiness
+
+    def test_too_few_launches_is_not_yet_evidence(self):
+        """Nothing to track is not the same fault as failing to track."""
+        state = {}
+        readiness = self._readiness(seen=3, tracked=0)
+        plan = _call(readiness=readiness, state=state, now=10_000.0)
+        plan = _call(readiness=readiness, state=state, now=10_000.0 + 10_000)
+        self.assertNotIn("wallet_tracking_dead", plan.alerts)
+
+    def test_sustained_zero_despite_real_launch_flow_alerts(self):
+        state = {}
+        readiness = self._readiness(seen=200, tracked=0)
+        _call(readiness=readiness, state=state, now=10_000.0)
+        plan = _call(readiness=readiness, state=state, now=10_000.0 + 7_201)
+        self.assertIn("wallet_tracking_dead", plan.alerts)
+
+    def test_a_brief_zero_stretch_does_not_alert(self):
+        """The pipeline's own 5-minute recalc cycle and 300s follow horizon
+        must not be flagged as a fault during normal warm-up."""
+        state = {}
+        readiness = self._readiness(seen=200, tracked=0)
+        _call(readiness=readiness, state=state, now=10_000.0)
+        plan = _call(readiness=readiness, state=state, now=10_500.0)
+        self.assertNotIn("wallet_tracking_dead", plan.alerts)
+
+    def test_any_tracked_wallet_resets_the_clock(self):
+        state = {}
+        dead = self._readiness(seen=200, tracked=0)
+        _call(readiness=dead, state=state, now=10_000.0)
+        alive = self._readiness(seen=200, tracked=3)
+        _call(readiness=alive, state=state, now=15_000.0)
+        plan = _call(readiness=dead, state=state, now=15_100.0)
+        self.assertNotIn("wallet_tracking_dead", plan.alerts)
+
+    def test_no_fixer_is_proposed_for_this(self):
+        """Alert-only by design: the cause could differ next time."""
+        state = {}
+        readiness = self._readiness(seen=200, tracked=0)
+        _call(readiness=readiness, state=state, now=10_000.0)
+        plan = _call(readiness=readiness, state=state, now=10_000.0 + 7_201)
+        self.assertFalse(plan.restart_desk)
+        self.assertEqual(plan.reenable_units, [])
