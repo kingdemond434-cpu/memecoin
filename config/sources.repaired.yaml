@@ -3,11 +3,6 @@
 # source_id, language and region, and changes nothing but a path the
 # publisher moved. Regenerate rather than editing.
 sources:
-  # was: https://coinpost.jp/?feed=rss2
-  - id: coinpost-rss
-    kind: rss
-    language: ja
-    options: {url: "https://coinpost.jp/rss.xml", language: ja}
   # was: https://status.jup.ag/history.rss
   - id: jupiter-status
     kind: rss

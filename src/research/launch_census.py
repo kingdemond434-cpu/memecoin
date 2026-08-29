@@ -164,6 +164,12 @@ class _Totals:
     monsters_by_stage: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
     monsters_by_screen: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
     screened_by_reason: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    #: Hard-reject reasons (the RiskVeto's safety_veto:* causes) never pass
+    #: through screen() -- they are a different, earlier policy layer -- so
+    #: they need their own counter. Without it, a report that looks up a
+    #: reject reason in screened_by_reason finds nothing and reads as "this
+    #: reason never touched a launch" even while it is costing monsters.
+    rejected_by_reason: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
     rugs_by_mechanism: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
     dispositions: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
 
@@ -186,6 +192,11 @@ class LaunchCensus:
         self._totals = _Totals()
         self.spilled = 0
         self.expired_unresolved = 0
+        #: Outcomes that arrived for a mint whose detail had already left
+        #: memory. Counted rather than dropped, and reported, because a
+        #: silently discarded outcome makes a rate wrong in the flattering
+        #: direction.
+        self.resolutions_after_eviction = 0
 
     # --- the funnel ------------------------------------------------------
 
@@ -290,6 +301,7 @@ class LaunchCensus:
                     0, self._totals.screened_by_reason[record.screen_reason] - 1)
                 record.screen_reason = ""
             self._totals.decided += 1
+            self._totals.rejected_by_reason[str(reason or "unattributed_hard_reject")] += 1
         record.decided_action = "REJECT"
         self._transition(record, Stage.DECIDED, Disposition.DECIDED_REJECT,
                          str(reason or "unattributed_hard_reject"))
@@ -341,6 +353,16 @@ class LaunchCensus:
         """
         record = self._records.get(mint)
         if record is None:
+            # The mint has been evicted from memory, or belongs to a run
+            # before this one. Its OUTCOME still happened, and dropping it
+            # silently is how the desk produced three rug verdicts while
+            # reporting one rug: the classifier worked and the census threw
+            # the answer away. Counted here so the denominator and the
+            # mechanism tally stay honest even when the detail is gone.
+            if rugged:
+                self.resolutions_after_eviction += 1
+                self._totals.rugs += 1
+                self._totals.rugs_by_mechanism[rug_mechanism or "unclassified"] += 1
             return
         now = float(at if at is not None else time.time())
         first_resolution = record.peak_multiple is None
@@ -467,18 +489,40 @@ class LaunchCensus:
             "monster_capture_rate": (reached / monsters) if monsters else None,
             "costliest_screens": [
                 {"reason": reason, "monsters_discarded": count,
-                 "total_screened": totals.screened_by_reason.get(reason, 0),
+                 # A reason lives in exactly one of these two counters: the
+                 # graded ScreenPolicy's screened_by_reason, or the hard
+                 # RiskVeto's rejected_by_reason. Reading only the first made
+                 # every safety_veto:* row show 0 total rejected next to a
+                 # nonzero monster count -- not a broken screen, a lookup
+                 # into the wrong policy layer's counter.
+                 "total_screened": (totals.screened_by_reason.get(reason, 0)
+                                    + totals.rejected_by_reason.get(reason, 0)),
                  # Of everything this screen rejected, how much was a monster.
                  # A screen with a high rate is mispriced; a screen with a high
                  # count is expensive even at a low rate.
                  "monster_share_of_rejections": (
-                     count / totals.screened_by_reason[reason]
-                     if totals.screened_by_reason.get(reason) else None)}
+                     count / (totals.screened_by_reason.get(reason, 0)
+                              + totals.rejected_by_reason.get(reason, 0))
+                     if (totals.screened_by_reason.get(reason)
+                         or totals.rejected_by_reason.get(reason)) else None)}
                 for reason, count in ranked[:10]],
             "detail": ("" if monsters else
                        "no resolved monster yet; capture rate is unmeasurable "
                        "and is reported as null rather than as perfect"),
         }
+
+    def mints_pending_death_classification(self) -> List[str]:
+        """Resolved launches with no rug verdict yet -- candidates to classify.
+
+        A launch stays a candidate forever until something calls
+        ``resolve(..., rugged=...)`` for it, which is deliberate: a token
+        that merely looks alive right now (drawdown under the death
+        threshold) is not the same claim as "confirmed survived", and only
+        the caller that actually re-examines its trade history gets to make
+        that call.
+        """
+        return [mint for mint, record in self._records.items()
+                if record.resolved and record.rugged is None]
 
     def report(self) -> Dict[str, Any]:
         totals = self._totals
@@ -542,11 +586,13 @@ class LaunchCensus:
                 "monsters_by_stage": dict(self._totals.monsters_by_stage),
                 "monsters_by_screen": dict(self._totals.monsters_by_screen),
                 "screened_by_reason": dict(self._totals.screened_by_reason),
+                "rejected_by_reason": dict(self._totals.rejected_by_reason),
                 "rugs_by_mechanism": dict(self._totals.rugs_by_mechanism),
                 "dispositions": dict(self._totals.dispositions),
             },
             "spilled": self.spilled,
             "expired_unresolved": self.expired_unresolved,
+            "resolutions_after_eviction": self.resolutions_after_eviction,
             "records": [record.to_dict() for record in self._records.values()],
         }
 
@@ -596,10 +642,13 @@ class LaunchCensus:
             monsters_by_stage=defaultdict(int, totals.get("monsters_by_stage") or {}),
             monsters_by_screen=defaultdict(int, totals.get("monsters_by_screen") or {}),
             screened_by_reason=defaultdict(int, totals.get("screened_by_reason") or {}),
+            rejected_by_reason=defaultdict(int, totals.get("rejected_by_reason") or {}),
             rugs_by_mechanism=defaultdict(int, totals.get("rugs_by_mechanism") or {}),
             dispositions=dispositions)
         self.spilled = int(state.get("spilled", 0))
         self.expired_unresolved = int(state.get("expired_unresolved", 0))
+        self.resolutions_after_eviction = int(
+            state.get("resolutions_after_eviction", 0))
         self._records.clear()
         for row in state.get("records") or []:
             mint = row.get("mint")
@@ -667,18 +716,23 @@ class LaunchCensus:
         if self.spilled == 0 and self._totals.seen == len(self._records):
             dispositions: Dict[str, int] = defaultdict(int)
             screened_by_reason: Dict[str, int] = defaultdict(int)
+            rejected_by_reason: Dict[str, int] = defaultdict(int)
             screened = decided = entered = 0
             for record in self._records.values():
                 dispositions[record.disposition.value] += 1
                 if record.stage is Stage.SCREENED:
                     screened += 1
                     screened_by_reason[record.screen_reason or "unattributed"] += 1
+                if record.disposition is Disposition.DECIDED_REJECT:
+                    rejected_by_reason[
+                        record.disposition_reason or "unattributed_hard_reject"] += 1
                 if record.stage in (Stage.DECIDED, Stage.ENTERED):
                     decided += 1
                 if record.stage is Stage.ENTERED:
                     entered += 1
             self._totals.dispositions = dispositions
             self._totals.screened_by_reason = screened_by_reason
+            self._totals.rejected_by_reason = rejected_by_reason
             self._totals.screened = screened
             self._totals.decided = decided
             self._totals.entered = entered

@@ -231,7 +231,18 @@ class ScreenPolicy:
         return {
             "schema": SCREEN_POLICY_SCHEMA_VERSION,
             "status": "OK" if total else "DATA_BLOCKED",
-            "detail": ("" if total else "no launch has been screened yet"),
+            # A launch reaches this graded screen only after clearing the
+            # hard RiskVeto -- an earlier, binary layer that short-circuits
+            # on an impossibility (mint authority live, no sell route, ...)
+            # before this one ever runs. This being 0 does not mean nothing
+            # was screened: the census's own "screens" totals carry the
+            # safety_veto:* rejections from that earlier layer, counted
+            # separately because they are a different policy with different
+            # semantics, not a missing or broken instance of this one.
+            "detail": ("" if total else
+                       "no launch has reached the graded economic screen yet "
+                       "-- see the hard safety veto's own counts if this "
+                       "reads as zero while launches are being rejected"),
             "evaluated": total,
             "full_size": self.full,
             "reduced": self.reduced,

@@ -155,6 +155,28 @@ chains:
 
 global:
   enabled_chains: ["solana"]
+  # Tokens the hazard model keeps RESIDENT. Not a limit on how many tokens
+  # the desk observes: evictions spill their full history to the research
+  # lake first (hazard_spill_path), so observation accumulates across
+  # millions of mints while memory stays bounded by what this box has.
+  #
+  # ops/watchdog.py owns this value at runtime. Repeated OOM kills shrink
+  # it automatically and a long clean run restores it, so edit the number
+  # freely but expect the watchdog to have the last word on a box under
+  # real pressure.
+  hazard_max_tracked_tokens: 1000
+  hazard_spill_path: data/launch_episodes/hazard_observations.jsonl
+  # Relief fires against the OBSERVED kill point, not the cgroup limit.
+  # The cgroup cap is 944 MB, but this box is shared and has no swap, so
+  # the GLOBAL OOM killer picks this process -- the largest single one --
+  # at roughly 450-500 MB whenever the box runs short. Measured
+  # 2026-08-29: twelve kills in one hour, not one of which came close to
+  # 944 MB. Defaults of 0.70/0.85 put trim at 661 MB and shed at 802 MB,
+  # both ABOVE the zone where this desk actually dies, so neither would
+  # ever fire in the one failure they exist to prevent. 0.50/0.68 puts
+  # trim at 472 MB and shed at 642 MB, straddling the real kill zone.
+  memory_soft_fraction: 0.50
+  memory_hard_fraction: 0.68
   max_concurrent_positions: 10
   max_position_size_usd: 500
   # Percentage of equity at the START of the UTC day, so the budget scales

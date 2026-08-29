@@ -8,9 +8,12 @@ coverage that makes that unnecessary next time.
 """
 
 import unittest
+import os
+import subprocess
 from pathlib import Path
 
-from ops.watchdog import FLEET_UNITS, Policy, decide, observed_faults
+from ops.watchdog import (
+    FLEET_UNITS, BlockedBreakdown, Policy, decide, observed_faults)
 from tools.credential_doctor import check_all, parse_env_file
 
 
@@ -405,3 +408,174 @@ class FeedDoctorSurvivesADeskMidRestart(unittest.TestCase):
         with open("deploy/systemd/memecoin-feed-doctor.service", encoding="utf-8") as f:
             unit = f.read()
         self.assertIn("SuccessExitStatus=1 2", unit)
+
+
+class RepeatedOomKillsShrinkTheDesksOwnFootprint(unittest.TestCase):
+    """2026-08-29: 28 OOM kills in one hour, at ~2 minute intervals, while
+    the desk's own cgroup ceiling sat untouched. Box-wide pressure is not
+    this desk's to fix, but being the fattest resident target on a shared
+    box is, so the watchdog shrinks what it actually controls."""
+
+    def test_one_kill_is_a_neighbour_having_a_bad_minute(self):
+        plan = _call(oom_kill_timestamps=[9_990.0], hazard_token_cap=8_000)
+        self.assertIsNone(plan.set_hazard_token_cap)
+
+    def test_two_kills_in_the_window_shrink_the_resident_cap(self):
+        plan = _call(oom_kill_timestamps=[9_900.0, 9_990.0],
+                     hazard_token_cap=8_000)
+        self.assertEqual(plan.set_hazard_token_cap, 4_800)
+        self.assertTrue(any("oom_killed" in reason
+                            for reason in plan.repair_reasons))
+
+    def test_kills_older_than_the_window_do_not_count(self):
+        plan = _call(oom_kill_timestamps=[100.0, 200.0], hazard_token_cap=8_000)
+        self.assertIsNone(plan.set_hazard_token_cap)
+
+    def test_the_same_bad_hour_is_not_re_read_into_a_second_shrink(self):
+        """Without this the cap ratchets to its floor on one piece of
+        evidence: the shrink must be judged on what happened after it."""
+        state = {"hazard_cap_changed_at": 9_995.0}
+        plan = _call(state=state, oom_kill_timestamps=[9_900.0, 9_990.0],
+                     hazard_token_cap=4_800)
+        self.assertIsNone(plan.set_hazard_token_cap)
+
+    def test_kills_after_the_last_shrink_do_shrink_again(self):
+        state = {"hazard_cap_changed_at": 9_000.0}
+        plan = _call(state=state, oom_kill_timestamps=[9_900.0, 9_990.0],
+                     hazard_token_cap=4_800)
+        self.assertEqual(plan.set_hazard_token_cap, 2_880)
+
+    def test_the_cap_never_shrinks_below_the_floor(self):
+        """A cap driven to nothing by a problem this desk did not cause
+        would make it blind rather than small."""
+        plan = _call(oom_kill_timestamps=[9_900.0, 9_990.0],
+                     hazard_token_cap=1_000)
+        self.assertIsNone(plan.set_hazard_token_cap)
+        self.assertIn("oom_killed_at_minimum_resident_cap", plan.alerts)
+
+    def test_a_long_clean_run_restores_the_cap_one_step(self):
+        state = {"hazard_cap_changed_at": 10_000.0 - 21_601.0,
+                 "hazard_cap_baseline": 8_000}
+        plan = _call(state=state, oom_kill_timestamps=[], hazard_token_cap=4_800)
+        self.assertEqual(plan.set_hazard_token_cap, 8_000)
+
+    def test_recovery_never_climbs_past_the_original_baseline(self):
+        state = {"hazard_cap_changed_at": 10_000.0 - 21_601.0,
+                 "hazard_cap_baseline": 5_000}
+        plan = _call(state=state, oom_kill_timestamps=[], hazard_token_cap=4_800)
+        self.assertEqual(plan.set_hazard_token_cap, 5_000)
+
+    def test_a_short_clean_run_is_not_yet_a_recovery(self):
+        state = {"hazard_cap_changed_at": 9_900.0, "hazard_cap_baseline": 8_000}
+        plan = _call(state=state, oom_kill_timestamps=[], hazard_token_cap=4_800)
+        self.assertIsNone(plan.set_hazard_token_cap)
+
+    def test_an_unreadable_cap_disables_the_fixer_rather_than_guessing(self):
+        plan = _call(oom_kill_timestamps=[9_900.0, 9_990.0],
+                     hazard_token_cap=None)
+        self.assertIsNone(plan.set_hazard_token_cap)
+
+
+class ANearlyFullDiskDropsOnlySupersededSpill(unittest.TestCase):
+    """Disk-full stops the evidence ledger and the episode writer too, not
+    just the model that filled it -- so it needs a fixer, not only an alert.
+    The rotated (.1) spill is the one thing safe to delete unattended."""
+
+    def test_a_healthy_disk_drops_nothing(self):
+        plan = _call(disk_used_fraction=0.50)
+        self.assertFalse(plan.drop_rotated_spill)
+
+    def test_a_nearly_full_disk_both_alerts_and_fixes(self):
+        plan = _call(disk_used_fraction=0.95)
+        self.assertIn("disk_nearly_full", plan.alerts)
+        self.assertTrue(plan.drop_rotated_spill)
+
+    def test_an_unreadable_disk_reading_does_not_delete_on_a_guess(self):
+        plan = _call(disk_used_fraction=None)
+        self.assertFalse(plan.drop_rotated_spill)
+
+
+class UnpriceableLaunchesAreReportedWithTheirCause(unittest.TestCase):
+    """A DATA_BLOCKED launch is one the desk saw and threw away, so this is
+    its own hit rate at its job -- 82% on 2026-08-29. The alert names the
+    dominant reason, because a percentage nobody can act on is not an
+    alert."""
+
+    def _blocked(self, launches, blocked, reasons):
+        return BlockedBreakdown(launches=launches, blocked=blocked, reasons=reasons)
+
+    def test_a_healthy_share_is_silent(self):
+        plan = _call(blocked=self._blocked(200, 20, {"x": 20}))
+        self.assertFalse([a for a in plan.alerts if "unpriceable" in a])
+
+    def test_a_high_share_names_the_dominant_cause(self):
+        plan = _call(blocked=self._blocked(
+            200, 160, {"DATA_BLOCKED_prediction_model": 150,
+                       "DATA_BLOCKED_safety_checks": 10}))
+        alert = next(a for a in plan.alerts if "unpriceable" in a)
+        self.assertIn("DATA_BLOCKED_prediction_model", alert)
+        self.assertIn("80%", alert)
+        self.assertEqual(plan.data_blocked_leading_reason,
+                         "DATA_BLOCKED_prediction_model")
+
+    def test_too_few_launches_is_noise_not_evidence(self):
+        plan = _call(blocked=self._blocked(10, 10, {"x": 10}))
+        self.assertFalse([a for a in plan.alerts if "unpriceable" in a])
+
+    def test_no_census_reading_raises_nothing(self):
+        plan = _call(blocked=None)
+        self.assertFalse([a for a in plan.alerts if "unpriceable" in a])
+
+    def test_it_does_not_pretend_to_fix_what_it_cannot(self):
+        """Every safe automatic remedy is already built; what remains is an
+        untrained model or an unserved RPC method. A watchdog that 'fixed' a
+        block by relaxing what counts as priceable would manufacture
+        decisions the evidence does not support."""
+        plan = _call(blocked=self._blocked(200, 200, {"y": 200}))
+        self.assertTrue([a for a in plan.alerts if "unpriceable" in a])
+        self.assertFalse(plan.restart_desk)
+        self.assertIsNone(plan.set_hazard_token_cap)
+
+
+class TheDefaultBranchIsGuardedLocally(unittest.TestCase):
+    """The audit found main unprotected with required checks disabled, so a
+    red suite could land on it unnoticed. Server-side protection is the real
+    fix; this is the half enforceable from the machine, and it catches the
+    realistic failure -- the wrong branch at 2am -- before anything leaves."""
+
+    HOOK = Path("deploy/hooks/pre-push")
+
+    def _run(self, ref_line):
+        return subprocess.run([str(self.HOOK)], input=ref_line, text=True,
+                              capture_output=True)
+
+    def test_the_hook_exists_and_is_executable(self):
+        self.assertTrue(self.HOOK.exists())
+        self.assertTrue(os.access(self.HOOK, os.X_OK), "hook must be executable")
+
+    def test_a_direct_push_to_main_is_refused(self):
+        result = self._run("refs/heads/main a refs/heads/main b\n")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("refusing a direct push", result.stderr)
+
+    def test_master_is_guarded_too(self):
+        self.assertEqual(
+            self._run("refs/heads/master a refs/heads/master b\n").returncode, 1)
+
+    def test_a_feature_branch_is_allowed(self):
+        self.assertEqual(
+            self._run("refs/heads/feature a refs/heads/feature b\n").returncode, 0)
+
+    def test_a_tag_push_is_not_a_branch_push(self):
+        self.assertEqual(
+            self._run("refs/tags/v1 a refs/tags/v1 b\n").returncode, 0)
+
+    def test_the_refusal_names_the_deliberate_escape(self):
+        """A guard rail nobody can pass on purpose gets disabled entirely."""
+        result = self._run("refs/heads/main a refs/heads/main b\n")
+        self.assertIn("--no-verify", result.stderr)
+
+    def test_the_repository_actually_uses_this_hooks_path(self):
+        configured = subprocess.run(
+            ["git", "config", "core.hooksPath"], capture_output=True, text=True)
+        self.assertEqual(configured.stdout.strip(), "deploy/hooks")

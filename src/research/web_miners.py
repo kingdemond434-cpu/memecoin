@@ -37,6 +37,9 @@ import time
 import urllib.parse
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
+from src.research.world_miners import (
+    GDELT_LASTUPDATE_URL, gdelt_world_news_miner,
+)
 from src.research.data_miners import (
     CADENCE_DAILY, CADENCE_HOURLY, CADENCE_MINUTE, CADENCE_QUARTER,
     DataMinerPool, Enriches, MinerSpec, RateLimited,
@@ -445,6 +448,20 @@ def register_web_miners(pool: DataMinerPool, *, http: Any,
             detail="public repos touching the programs we decode; runs on "
                    "GitHub's public rate limit, GITHUB_TOKEN raises it"),
          github_activity_miner(http, github_token)),
+        (MinerSpec(
+            miner_id="world:gdelt_news", enriches=Enriches.NARRATIVE,
+            # GDELT republishes every 15 minutes and there is nothing to
+            # gain from asking more often than it publishes.
+            cadence_seconds=CADENCE_QUARTER, endpoint=GDELT_LASTUPDATE_URL,
+            # No key, no account, no monthly allowance -- the reason this
+            # source is here. Worldwide mainstream news in 100+ languages,
+            # which makes it a narrative DISCOVERY layer: what the world is
+            # talking about before a coin is named after it. Measured
+            # 2026-08-29, a 15-minute slice carried 467 records and 1 that
+            # mentioned this desk's subjects, so returning nothing is the
+            # normal case here and is not a fault.
+            detail="worldwide public news; quota-free raw 15-minute files"),
+         gdelt_world_news_miner(http)),
     )
     return {spec.miner_id: pool.register(spec, fetch)
             for spec, fetch in registrations}

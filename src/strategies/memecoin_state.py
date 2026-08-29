@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections import OrderedDict
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field
 from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence
@@ -348,3 +349,92 @@ def social_price_disagreement(
         "evidence_score": social_log_change - max(0.0, price_log_change),
         "social_points": len(social_points), "market_points": len(market_points),
     }
+
+
+#: Wallets tracked per token, and tokens tracked at once, by the
+#: stream-derived holder ledger below. Bounded for the same reason the
+#: hazard model is: this desk was OOM-killed twelve times in an hour on
+#: 2026-08-29 by dicts keyed by mint that nothing ever evicted.
+LEDGER_MAX_WALLETS_PER_TOKEN = 512
+LEDGER_MAX_TOKENS = 2_000
+
+
+class ObservedHolderLedger:
+    """Holder concentration from the trades we watched, with no RPC call.
+
+    ``getTokenLargestAccounts`` is the canonical way to ask who holds a mint,
+    and on 2026-08-29 no endpoint in the free pool would serve it: publicnode
+    answers 403, mainnet-beta 429, and the one provider that does was itself
+    failing 159 of 181 calls. Holder structure was therefore DATA_BLOCKED for
+    every launch, which alone accounted for 41 of 63 blocked launches in a
+    fifteen-minute sample.
+
+    But for a token that launched seconds ago the desk has already seen EVERY
+    trade, and each carries the wallet and a signed token delta. Summing them
+    reconstructs the holder set exactly, for free, at stream latency.
+
+    What this measures, stated precisely because it is NOT the same quantity
+    the RPC returns: concentration among tokens that have MOVED, not among
+    total supply. Supply still sitting on the curve is not a holding, and a
+    share-of-supply number would need a total this cannot see at T0. Anything
+    consuming it should read it as float concentration, and the snapshots it
+    produces are labelled ``observed_trades`` so it can never be pooled with
+    an RPC reading of a different quantity.
+    """
+
+    def __init__(self, max_wallets: int = LEDGER_MAX_WALLETS_PER_TOKEN,
+                 max_tokens: int = LEDGER_MAX_TOKENS):
+        self.max_wallets = max(16, int(max_wallets))
+        self.max_tokens = max(64, int(max_tokens))
+        self._balances: "OrderedDict[str, Dict[str, float]]" = OrderedDict()
+        self.tokens_evicted = 0
+
+    def record_trade(self, token: str, wallet: str, token_delta: float) -> None:
+        """One observed fill. Positive for a buy, negative for a sell."""
+        if not token or not wallet or not token_delta:
+            return
+        book = self._balances.get(token)
+        if book is None:
+            book = {}
+            self._balances[token] = book
+            self._evict_if_needed()
+        self._balances.move_to_end(token)
+        book[wallet] = book.get(wallet, 0.0) + float(token_delta)
+        # A wallet that sold everything is not a holder. Dropped rather than
+        # kept at zero so "unique holders" counts holders.
+        if book[wallet] <= 0:
+            book.pop(wallet, None)
+        elif len(book) > self.max_wallets:
+            # Keep the largest: concentration is a top-N question, and the
+            # dust is what a bound can afford to lose.
+            for small, _ in sorted(book.items(), key=lambda kv: kv[1])[
+                    :len(book) - self.max_wallets]:
+                book.pop(small, None)
+
+    def _evict_if_needed(self) -> None:
+        while len(self._balances) > self.max_tokens:
+            self._balances.popitem(last=False)
+            self.tokens_evicted += 1
+
+    def snapshot(self, token: str) -> Optional[Dict[str, Any]]:
+        """Concentration among observed holders, or None if nothing observed.
+
+        None rather than zeros: no trades seen is not a flat distribution,
+        and a zero here would read as a perfectly dispersed token.
+        """
+        book = self._balances.get(token)
+        if not book:
+            return None
+        held = sorted((value for value in book.values() if value > 0), reverse=True)
+        total = sum(held)
+        if total <= 0:
+            return None
+        return {
+            "top_10_pct": 100.0 * sum(held[:10]) / total,
+            "top_20_pct": 100.0 * sum(held[:20]) / total,
+            "unique_holders": len(held),
+            "source": "observed_trades",
+            # Names the denominator so this is never mistaken for a share of
+            # total supply, which is a different and larger number.
+            "concentration_basis": "observed_float",
+        }

@@ -42,7 +42,8 @@ from src.execution.jupiter_jito import (
     SolanaTransactionBuilder,
     USDC_MINT,
 )
-from src.research.dataset_builder import PointInTimeDatasetBuilder
+from src.research.dataset_builder import (
+    PointInTimeDatasetBuilder, PUMP_INITIAL_VIRTUAL_SOL, PUMP_INITIAL_VIRTUAL_TOKEN)
 from src.research.feature_engine import build_features
 from src.research.global_research_miner import GlobalResearchMiner
 from src.research.calibration import CalibrationBook
@@ -50,7 +51,8 @@ from src.research.chain_miners import register_chain_miners
 from src.execution.signer import signer_from_env
 from src.research.calibration import Provenance
 from src.research.fallback import FallbackResolver, Rung, Source
-from src.runtime.memory_governor import Band, MemoryGovernor, Relief
+from src.runtime.memory_governor import (
+    Band, MemoryGovernor, Relief, DEFAULT_SOFT_FRACTION, DEFAULT_HARD_FRACTION)
 from src.research.launch_census import LaunchCensus
 from src.research import rug_mechanism
 from src.research.launch_census import MONSTER_MULTIPLE
@@ -123,7 +125,8 @@ from src.execution.pump_fees import (
 from src.execution.tradeability import curve_tradeability, exit_capacity_ratio, pool_tradeability
 from src.strategies.distribution import DistributionDetector
 from src.strategies.memecoin_state import (
-    DevEvent, DevWalletMonitor, HolderTrajectoryMonitor, RotationTrade,
+    DevEvent, DevWalletMonitor, HolderTrajectoryMonitor,
+    ObservedHolderLedger, RotationTrade,
     SmartWalletRotationTracker, social_price_disagreement,
 )
 from src.strategies.profit_sweeper import ProfitIsolationPolicy
@@ -147,7 +150,8 @@ from src.strategies.source_genealogy import (
     SourceGenealogy, SourcePost, build_source_dna,
 )
 from src.strategies.public_coordination import PublicCoordinationMiner
-from src.strategies.rug_hazard import ContinuousRugHazardModel
+from src.strategies.rug_hazard import (ContinuousRugHazardModel,
+                                       DEFAULT_MAX_TRACKED_TOKENS)
 from src.strategies.social_intelligence import SocialIntelligenceEngine
 from src.strategies.wallet_intelligence import WalletIntelligenceEngine
 from src.strategies.wallet_value import FollowOutcome
@@ -162,6 +166,13 @@ logger = logging.getLogger(__name__)
 
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 MODEL_HYPOTHESIS_ID = "production_multihead_v1"
+
+#: How long a token must sit with no new observation before a death verdict
+#: is even attempted. Below this, "no new trade yet" and "dead" are
+#: indistinguishable, and classifying too early is how a token still
+#: mid-launch gets permanently mislabeled the moment it goes one tick
+#: without a trade.
+DEATH_CLASSIFICATION_QUIET_S = 300.0
 
 
 # Rejections that mean "capital is committed elsewhere", not "this token is
@@ -449,6 +460,11 @@ class MemecoinQuantDesk:
         # risk, actor and social reports. They are kept as measurements rather
         # than parallel trading authorities.
         self.holder_trajectory = HolderTrajectoryMonitor()
+        # Holder structure without an RPC call. getTokenLargestAccounts is
+        # unserved by the free pool (publicnode 403, mainnet-beta 429), which
+        # was blocking 41 of 63 launches in a measured sample; every trade we
+        # already decode carries the wallet and a signed token delta.
+        self.observed_holders = ObservedHolderLedger()
         self.dev_wallet_monitor = DevWalletMonitor()
         self.rotation_tracker = SmartWalletRotationTracker()
         self.risk_veto: RiskVeto = RiskVeto()
@@ -461,6 +477,16 @@ class MemecoinQuantDesk:
         with open(self.config_path, encoding="utf-8") as handle:
             self.config = yaml.safe_load(handle)
         self.global_config = self.config.get("global", {})
+        # The governor is constructed in __init__, where global_config is
+        # still empty, so its fractions silently took their defaults and
+        # memory_soft_fraction/memory_hard_fraction had never once applied.
+        # Rebinding here rather than moving the construction: the governor
+        # is registered with reliefs by components built between there and
+        # here, and replacing the object would drop them.
+        self.memory.soft_fraction = float(
+            self.global_config.get("memory_soft_fraction", DEFAULT_SOFT_FRACTION))
+        self.memory.hard_fraction = float(
+            self.global_config.get("memory_hard_fraction", DEFAULT_HARD_FRACTION))
         self.risk_veto = RiskVeto(
             require_complete_safety=bool(
                 self.global_config.get("require_complete_veto_inputs", False)),
@@ -600,8 +626,16 @@ class MemecoinQuantDesk:
             self.adversarial.set_fakeability(feature, fakeability)
         self.info_graph = InformationLeadGraph(self.solana_config, self.solana_rpc, self.genealogy,
                                                self.wallet_intel, self.social_intel, self.prelaunch)
-        self.rug_hazard = ContinuousRugHazardModel(self.solana_config, self.solana_rpc, self.genealogy,
-                                                   self.wallet_intel, self.adversarial)
+        self.rug_hazard = ContinuousRugHazardModel(
+            self.solana_config, self.solana_rpc, self.genealogy,
+            self.wallet_intel, self.adversarial,
+            max_tracked_tokens=int(self.global_config.get(
+                "hazard_max_tracked_tokens", DEFAULT_MAX_TRACKED_TOKENS)),
+            # Evicted token history lands in the research lake rather than
+            # being dropped, so the resident bound costs memory residency
+            # and not evidence.
+            spill_path=Path(self.global_config.get(
+                "hazard_spill_path", "data/launch_episodes/hazard_observations.jsonl")))
         self.public_coordination = PublicCoordinationMiner(self.genealogy, self.wallet_intel)
         self.social_intel.on_mention(self._on_social_mention)
         if not self.offline:
@@ -940,7 +974,11 @@ class MemecoinQuantDesk:
             await self.execution_engine.start()
 
     async def _setup_detection_and_risk(self):
-        self.rug_detector = RugDetector(self.solana_config, self.solana_rpc, self.jupiter)
+        self.rug_detector = RugDetector(
+            self.solana_config, self.solana_rpc, self.jupiter,
+            # The streamed curve, so a mint the router has never indexed is
+            # still known to be sellable back to its own bonding curve.
+            curve_state_provider=self._latest_curve_state.get)
         self.detection_engine = TokenDetectionEngine(self.chain_registry)
 
     async def _setup_research(self):
@@ -992,6 +1030,10 @@ class MemecoinQuantDesk:
         if self.offline:
             return
         self._running = True
+        # Before any loop runs: an open follow is an unresolved measurement,
+        # and discarding it on restart is why no wallet ever reached the
+        # 12-outcome ranking threshold.
+        self.load_follow_candidates()
         await self._setup_health_server()
         # Four independent loops rather than one clocked sweep. The two that
         # decide -- candidates and redecisions -- are driven by events and
@@ -2790,6 +2832,65 @@ class MemecoinQuantDesk:
             del pending[:-64]
         return True
 
+    def _follow_state_path(self) -> Path:
+        return (Path(self.global_config.get("ops_state_dir", "data/state"))
+                / "follow_candidates.json")
+
+    def save_follow_candidates(self) -> bool:
+        """Checkpoint open follows so a restart does not void them.
+
+        A follow is an unresolved measurement with a 300s horizon, and the
+        wallet model needs 12 resolved outcomes before it will rank a wallet
+        at all. Holding them only in memory meant every restart threw away
+        every follow still inside its horizon: measured 2026-08-29, 56 open
+        follows against 9 resolved outcomes across 7 wallets, so no wallet
+        could ever reach the threshold on a desk that restarts. The records
+        are plain JSON-safe dicts, so this is a straight dump.
+        """
+        try:
+            path = self._follow_state_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"schema": "v1", "saved_at": time.time(),
+                       "candidates": self._follow_candidates}
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            tmp.replace(path)
+            return True
+        except (OSError, TypeError, ValueError) as exc:
+            logger.warning("follow checkpoint failed: %s: %s",
+                           type(exc).__name__, exc)
+            return False
+
+    def load_follow_candidates(self) -> int:
+        """Restore open follows. Returns how many were revived.
+
+        Follows already past their horizon are dropped rather than resolved
+        against a price hours later: the horizon defines what the
+        measurement MEANS, and closing one late would record a different
+        experiment under the same name.
+        """
+        path = self._follow_state_path()
+        if not path.exists():
+            return 0
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            logger.warning("follow checkpoint unreadable, discarded: %s", exc)
+            return 0
+        horizon = float(self.global_config.get("follow_horizon_seconds", 300.0))
+        cutoff = time.time() - horizon
+        revived = 0
+        for token, pending in (payload.get("candidates") or {}).items():
+            kept = [item for item in pending
+                    if isinstance(item, dict)
+                    and float(item.get("opened_at", 0) or 0) > cutoff]
+            if kept:
+                self._follow_candidates[token] = kept
+                revived += len(kept)
+        if revived:
+            logger.info("revived %d open follows from checkpoint", revived)
+        return revived
+
     def _resolve_follow_candidates(self, now: Optional[float] = None) -> int:
         """Close out follows that have reached their horizon.
 
@@ -2847,12 +2948,29 @@ class MemecoinQuantDesk:
         }
 
     def _prune_curve_static(self) -> int:
-        """Drop static facts for tokens the hot state no longer tracks."""
-        stale = [key for key in self._curve_static
-                 if key not in self.hot_state.active_tokens]
-        for key in stale:
-            self._curve_static.pop(key, None)
-        return len(stale)
+        """Drop static facts for tokens the hot state no longer tracks.
+
+        Also prunes the latest curve and pool state on the same rule. Those
+        two were unbounded dicts keyed by mint -- they grew with every
+        launch the stream reported and nothing ever removed an entry, which
+        is the same shape of leak that OOM-killed this service on
+        2026-08-29. hot_state.active_tokens is the right boundary because
+        it is itself hard-capped and age-expiring, so "still active there"
+        already means "recent enough to be worth pricing".
+
+        An open position is kept whatever the hot state says: a position we
+        cannot quote an exit for is the one state we must never discard.
+        """
+        held = set(self.elogw_engine.open_positions)
+        dropped = 0
+        for store in (self._curve_static, self._latest_curve_state,
+                      self._latest_pool_state):
+            stale = [key for key in store
+                     if key not in self.hot_state.active_tokens and key not in held]
+            for key in stale:
+                store.pop(key, None)
+            dropped += len(stale)
+        return dropped
 
     def _cost_model(self, token: str, at_utc: Optional[float] = None) -> Dict[str, Any]:
         """The round-trip protocol cost of this token, priced rather than assumed.
@@ -4265,8 +4383,26 @@ class MemecoinQuantDesk:
         residual that absorbs every unexplained death is how a rug model
         learns nothing while reporting full coverage.
         """
+        # Cheapest test first, and without materialising anything: this runs
+        # for every resolved-but-unlabelled launch on every sweep, and the
+        # overwhelming majority are still trading. Asking the model for its
+        # O(1) last-touched beats scanning up to 750 observations per token
+        # across thousands of tokens on a box already CPU-stalled ~21%.
+        last_seen = self.rug_hazard.last_touched(token)
+        if last_seen is None:
+            return
+        if time.time() - last_seen < DEATH_CLASSIFICATION_QUIET_S:
+            return
         observations = list(self.rug_hazard.observations.get(token, ()) or ())
         if not observations:
+            return
+        priced = sum(1 for row in observations if row.get("price_multiple") is not None)
+        if priced < 2:
+            # classify() cannot compute a drawdown from fewer than two priced
+            # points and would report UNCLASSIFIED -- which reads identically
+            # to "died, cause unknown" below even though nothing here shows
+            # it died at all. A token we've barely priced is not evidence of
+            # a rug; it's evidence we weren't watching yet.
             return
         pool = self._latest_pool_state.get(token)
         verdict = rug_mechanism.classify(
@@ -4277,6 +4413,67 @@ class MemecoinQuantDesk:
             token, rugged=True, rug_mechanism=verdict.mechanism.value)
         self._record_ops_event("rug_mechanisms", {
             "token": token, **verdict.to_dict()})
+
+    def _prune_hazard_tracking(self) -> int:
+        """Bound the hazard model's per-token memory. Returns tokens evicted.
+
+        The model registers every launch the stream reports and never let
+        one go, which is what OOM-killed this service repeatedly under a
+        continuous pump.fun feed -- the growth is in the NUMBER of tokens,
+        so no per-token cap could have caught it.
+
+        Only open positions are protected by name, and that is deliberate.
+        A token being actively decided on is written to on every trade, so
+        recency already keeps it -- eviction takes the STALEST first. The
+        broader sets are the wrong tool here: hot_state.active_tokens is
+        capped at 4,000, which is above this cap and would defeat it
+        outright, and the curve/pool state dicts are themselves unbounded,
+        so protecting by them would mean one leak holding another open.
+
+        A token we hold must never be evicted at any staleness: the exit
+        policy reads its hazard, and a silently blinded exit is a far worse
+        failure than the memory it costs to keep.
+        """
+        # Classify on the way out. The sweep only reaches resident tokens,
+        # so without this a token evicted while still unlabelled has its
+        # question closed silently -- and eviction takes exactly the stale
+        # tokens that are most likely to be dead.
+        return self.rug_hazard.prune(
+            set(self.elogw_engine.open_positions),
+            on_evict=self._classify_before_eviction)
+
+    def _classify_before_eviction(self, token: str) -> None:
+        """Give a token one last chance at a death verdict.
+
+        The quiet-period guard is deliberately skipped: eviction already
+        means this token is among the stalest tracked, which is the same
+        evidence the guard exists to establish.
+        """
+        observations = list(self.rug_hazard.observations.get(token, ()) or ())
+        priced = sum(1 for row in observations
+                     if row.get("price_multiple") is not None)
+        if priced < 2:
+            return
+        pool = self._latest_pool_state.get(token)
+        verdict = rug_mechanism.classify(observations, migrated=(pool is not None))
+        if verdict.mechanism is rug_mechanism.RugMechanism.SURVIVED:
+            return
+        self.launch_census.resolve(
+            token, rugged=True, rug_mechanism=verdict.mechanism.value)
+        self._record_ops_event("rug_mechanisms", {
+            "token": token, "at": "eviction", **verdict.to_dict()})
+
+    def _sweep_rug_classification(self) -> None:
+        """Give every resolved-but-unlabeled launch a chance at a verdict.
+
+        _resolve_census_death above was written to do exactly this and had
+        no caller anywhere in the desk -- the reason rugs sat at 0 across
+        thousands of resolved launches was never that memecoins on this feed
+        don't rug, it was that nothing ever asked. Runs on the same 60s
+        cadence as the rest of the intelligence loop, off the decision path.
+        """
+        for token in self.launch_census.mints_pending_death_classification():
+            self._resolve_census_death(token)
 
     def _measured_congestion(self) -> Optional[float]:
         """Chain congestion in [0, 1], or None when unmeasured.
@@ -5180,6 +5377,11 @@ class MemecoinQuantDesk:
         self._resolve_follow_candidates()
         self._refresh_independence()
         self._publish_attribution()
+        self._sweep_rug_classification()
+        self._prune_hazard_tracking()
+        # Checkpointed on the same cadence the follows are resolved on, so a
+        # restart costs at most one cycle of measurement rather than all of it.
+        self.save_follow_candidates()
         if self.dry_run:
             latest_mtime = self._latest_model_mtime()
             if latest_mtime > self._model_artifact_mtime:
@@ -5215,6 +5417,31 @@ class MemecoinQuantDesk:
                 regime=str(self.current_regime or "unknown"))
             self.wallet_intel.record_token_lifecycle(token, launch_at=event.get("timestamp", time.time()))
             self.dev_wallet_monitor.register(token, event.get("creator", ""))
+            # Seed the curve at its protocol-defined starting depth. The
+            # CreateEvent carries no reserves, so without this the desk is
+            # blind at exactly T0 -- _local_liquidity returns 0, liquidity
+            # is DATA_BLOCKED, and the launch cannot be priced at the one
+            # instant a sniper has to price it. Measured across 400 live
+            # episodes, liquidity_features was 0% populated at T0.
+            #
+            # These are program constants, not a claim about this token, and
+            # they are verified continuously: pump_curve_invariant_holds
+            # checks the constant product against every curve later observed
+            # on the stream. The seed is replaced by the real reserves on the
+            # first trade event, so it is only ever the pre-first-trade
+            # answer -- and it is an UPPER BOUND, since real reserves are
+            # not knowable here.
+            if token not in self._latest_curve_state:
+                self._latest_curve_state[token] = BondingCurveState(
+                    virtual_token_reserves=PUMP_INITIAL_VIRTUAL_TOKEN,
+                    virtual_sol_reserves=PUMP_INITIAL_VIRTUAL_SOL,
+                    # Real reserves are genuinely unknown before any trade.
+                    # Zero keeps every frontier built on this labelled as the
+                    # upper bound it is rather than as a measurement.
+                    real_token_reserves=0, real_sol_reserves=0,
+                    token_total_supply=int(event.get("token_total_supply", 0) or 0),
+                    complete=False, creator=str(event.get("creator", "") or ""),
+                )
             self.dataset_builder.start_episode(
                 token, event.get("creator", ""), event.get("program", PumpFunMonitor.PUMP_FUN_PROGRAM),
                 event.get("bonding_curve", ""), WSOL_MINT, detected_at=event.get("timestamp", time.time()),
@@ -5232,6 +5459,7 @@ class MemecoinQuantDesk:
                     "creator": str(event["creator"]),
                     "token_total_supply": int(event.get("token_total_supply", 0) or 0),
                 }
+
             # Derive the twenty-seven accounts now, while nothing is waiting.
             # They are derivations of constants for this (mint, creator,
             # wallet) and never change, so paying for them at execution time
@@ -5313,7 +5541,32 @@ class MemecoinQuantDesk:
                            "instruction_token_amount": event.get("token_amount", 0),
                            "quote_limit_amount": event.get("quote_limit_amount", 0),
                            "timestamp": event.get("timestamp", time.time()), "slot": event.get("slot"),
-                           "signature": event.get("signature"), "program": event.get("program")}
+                           "signature": event.get("signature"), "program": event.get("program"),
+                           # Curve depth, carried on the event we already
+                           # decoded. Recorded here because liquidity_features
+                           # was measured 0% populated at t0 across 400 live
+                           # episodes: it waited for a DexScreener quote, and
+                           # a pre-migration launch CANNOT be on DexScreener
+                           # at t0. The reserves are the liquidity for a
+                           # bonding curve, they arrive free with the trade,
+                           # and storing them keeps the derivation
+                           # point-in-time -- a snapshot reads only the
+                           # observations at or before its own as_of.
+                           "virtual_sol_reserves": virtual_sol or None,
+                           "virtual_token_reserves": virtual_token or None}
+            # Reconstruct the holder set from fills we watched. Free, exact
+            # for a launch this young, and available at stream latency
+            # rather than behind an RPC method nothing will serve.
+            delta = event.get("actual_token_delta_raw")
+            if event.get("wallet") and delta:
+                self.observed_holders.record_trade(
+                    token, str(event["wallet"]), float(delta))
+                observed = self.observed_holders.snapshot(token)
+                if observed:
+                    self.holder_trajectory.record_mapping(
+                        token, observed,
+                        timestamp=observation["timestamp"],
+                        source="observed_trades")
             # Our own transactions come back on this same stream. Telling the
             # execution engine the moment one appears is what turns fill
             # reconciliation from a poll into a notification.

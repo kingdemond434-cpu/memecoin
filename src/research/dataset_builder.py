@@ -152,6 +152,38 @@ class LaunchEpisode:
     prelaunch_status: str = "DATA_BLOCKED"
 
 
+#: pump.fun initialises every bonding curve with these virtual reserves.
+#: A protocol constant, not a per-token fact, which is what makes using it
+#: at T0 legitimate where inventing a token's mint authority would not be.
+#:
+#: Verified against this desk's own stream rather than trusted from
+#: documentation: the curve is constant-product, so k = sol * token must
+#: hold for any later observation of the same curve. Measured 2026-08-29 on
+#: an observed first trade (30.769 SOL / 1.046e15 tokens), k matched the
+#: value implied by these constants to 1e-6 percent. PUMP_CURVE_K exists so
+#: that check can run continuously instead of once.
+PUMP_INITIAL_VIRTUAL_SOL = 30_000_000_000
+PUMP_INITIAL_VIRTUAL_TOKEN = 1_073_000_000_000_000
+PUMP_CURVE_K = PUMP_INITIAL_VIRTUAL_SOL * PUMP_INITIAL_VIRTUAL_TOKEN
+
+#: How far an observed curve may drift from the constant product before the
+#: invariant is treated as no longer describing this token. Fees and
+#: rounding move k slightly; a different curve shape moves it a lot.
+PUMP_CURVE_K_TOLERANCE = 0.05
+
+
+def pump_curve_invariant_holds(sol_reserves: float, token_reserves: float) -> bool:
+    """Does an observed curve still satisfy the initialisation constant?
+
+    Returns False for anything that is not recognisably the same curve, so
+    a protocol change or a non-standard launch degrades to MISSING rather
+    than to a confident wrong number.
+    """
+    if sol_reserves <= 0 or token_reserves <= 0:
+        return False
+    return abs(sol_reserves * token_reserves - PUMP_CURVE_K) / PUMP_CURVE_K <= PUMP_CURVE_K_TOLERANCE
+
+
 class PointInTimeDatasetBuilder:
     def __init__(
         self,
@@ -484,15 +516,97 @@ class PointInTimeDatasetBuilder:
             if item.get("liquidity_usd") is not None and float(item.get("timestamp", 0) or 0) <= as_of
         ]
         if not observed:
-            return {"status": "DATA_BLOCKED", "reason": "liquidity_not_observed"}
+            return self._liquidity_from_curve(episode, as_of)
         latest = max(observed, key=lambda item: item.get("timestamp", 0))
         return {
             "status": "OK",
+            "source": "quoted",
             "liquidity_usd": latest.get("liquidity_usd"),
             "liquidity_locked": latest.get("liquidity_locked"),
             "lp_burned_pct": latest.get("lp_burned_pct"),
             "route_feasible": latest.get("route_feasible"),
             "price_impact_pct": latest.get("price_impact_pct"),
+        }
+
+    def _liquidity_from_curve(self, episode: LaunchEpisode,
+                              as_of: float) -> Dict[str, Any]:
+        """Depth from the bonding curve when no external quote exists yet.
+
+        A pre-migration launch is not on DexScreener at t0 and never will be
+        while it is still on the curve, so waiting for a quote left this
+        feature 0% populated at the exact moment a decision is made --
+        measured across 400 live episodes. For a bonding curve the reserves
+        ARE the liquidity: SOL reserves are what a sell can be absorbed by,
+        and they arrive on the same trade event already being decoded.
+
+        Point-in-time by construction: only observations at or before
+        ``as_of`` are read, so a snapshot cannot see depth that had not
+        happened yet.
+
+        Reported in SOL, not USD. Converting would need a SOL price this
+        builder does not have at the snapshot instant, and inventing one
+        would put a guess into the training set wearing a measurement's
+        label. A consumer that needs USD applies its own PIT price.
+        """
+        priced = [
+            item for item in episode.market_observations
+            if item.get("virtual_sol_reserves") is not None
+            and float(item.get("timestamp", 0) or 0) <= as_of
+        ]
+        if not priced:
+            # Before the first trade there is nothing observed to read, and
+            # the CreateEvent carries no reserves -- so a launch is blind at
+            # exactly T0, the instant a decision is made. The initialisation
+            # constants are a property of the PROGRAM rather than of this
+            # token, so using them here states a protocol fact rather than
+            # inventing a measurement. Labelled INVARIANT so nothing
+            # downstream can mistake it for an observation of this curve.
+            return {
+                "status": "OK",
+                "source": "protocol_invariant",
+                "provenance": "INVARIANT",
+                "liquidity_sol": PUMP_INITIAL_VIRTUAL_SOL / 1e9,
+                "curve_sol_reserves": float(PUMP_INITIAL_VIRTUAL_SOL),
+                "curve_token_reserves": float(PUMP_INITIAL_VIRTUAL_TOKEN),
+                "route_feasible": True,
+                "liquidity_usd": None,
+                "liquidity_locked": None,
+                "lp_burned_pct": None,
+                "price_impact_pct": None,
+                "detail": ("curve initialisation constants; no trade has been "
+                           "observed yet, so this is the protocol's starting "
+                           "depth rather than a reading of this curve"),
+            }
+        latest = max(priced, key=lambda item: float(item.get("timestamp", 0) or 0))
+        sol_reserves = float(latest.get("virtual_sol_reserves") or 0.0)
+        token_reserves = float(latest.get("virtual_token_reserves") or 0.0)
+        if sol_reserves <= 0 or token_reserves <= 0:
+            return {"status": "DATA_BLOCKED", "reason": "curve_reserves_empty"}
+        # An observed curve that no longer satisfies the initialisation
+        # constant is not this protocol's curve any more. Saying so beats
+        # reporting depth from a shape we do not recognise.
+        if not pump_curve_invariant_holds(sol_reserves, token_reserves):
+            return {"status": "DATA_BLOCKED",
+                    "reason": "observed_curve_violates_pump_constant_product",
+                    "curve_sol_reserves": sol_reserves,
+                    "curve_token_reserves": token_reserves}
+        return {
+            "status": "OK",
+            # Named so a model can learn that curve depth and a routed quote
+            # are different measurements rather than pooling them as one.
+            "source": "bonding_curve",
+            "provenance": "MEASURED",
+            "liquidity_sol": sol_reserves / 1e9,
+            "curve_sol_reserves": sol_reserves,
+            "curve_token_reserves": token_reserves,
+            # A curve with reserves always has a route; that is the property
+            # that distinguishes it from a pool that may have none.
+            "route_feasible": True,
+            # Deliberately absent rather than zero: not measured here.
+            "liquidity_usd": None,
+            "liquidity_locked": None,
+            "lp_burned_pct": None,
+            "price_impact_pct": None,
         }
 
     async def _capture_social_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:

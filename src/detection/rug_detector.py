@@ -118,15 +118,24 @@ class TokenRiskReport:
 
 
 class RugDetector:
-    def __init__(self, chain_config: ChainConfig, rpc: RPCManager, quote_provider: Any = None):
+    def __init__(self, chain_config: ChainConfig, rpc: RPCManager, quote_provider: Any = None,
+                 curve_state_provider: Any = None):
         self.chain_config = chain_config
         self.rpc = rpc
         self.quote_provider = quote_provider
+        #: Returns the streamed bonding-curve state for a mint, or None.
+        #: Consulted BEFORE the router, because a token still on its curve
+        #: has a sell route by construction and the router has never heard
+        #: of it -- see _check_sell_route.
+        self.curve_state_provider = curve_state_provider
         self._cache: Dict[str, Tuple[TokenRiskReport, float]] = {}
         self._cache_ttl = 30
 
     def set_quote_provider(self, quote_provider: Any):
         self.quote_provider = quote_provider
+
+    def set_curve_state_provider(self, provider: Any):
+        self.curve_state_provider = provider
 
     async def analyze(
         self,
@@ -248,7 +257,7 @@ class RugDetector:
         elif not route_feasible:
             warnings.append("No executable token-to-USDC route")
             score -= 60
-        elif float(route.get("price_impact_pct", 0)) > 0.20:
+        elif float(route.get("price_impact_pct") or 0.0) > 0.20:
             warnings.append("Sell route price impact exceeds 20%")
             score -= 25
 
@@ -477,6 +486,38 @@ class RugDetector:
         return "1" * zeros + encoded
 
     async def _solana_sell_route(self, mint: str, mint_state: Dict[str, Any]) -> Dict[str, Any]:
+        # The curve first. A pump.fun mint that has not migrated is sold
+        # back to its own bonding curve, which this desk executes natively --
+        # so a sell route EXISTS by construction and its impact is exact
+        # arithmetic on the reserves.
+        #
+        # Asking the router instead was the single largest source of
+        # rejection on this desk: measured 2026-08-29, every one of 419
+        # decided launches was rejected by the hard safety veto and never
+        # reached the economic layer at all, with sell_route_unavailable in
+        # 240 of them and catastrophic_exit_price_impact in 181. Jupiter has
+        # not indexed a mint that is seconds old, and the old code turned
+        # that ignorance into {"status": "OK", "feasible": False} -- a
+        # CONFIDENT false rather than a gap, which is why it hard-vetoed
+        # instead of degrading to uncertainty.
+        curve = None
+        if self.curve_state_provider is not None:
+            try:
+                curve = self.curve_state_provider(mint)
+            except Exception:
+                curve = None
+        if curve is not None and getattr(curve, "tradeable", False):
+            return {
+                "status": "OK",
+                "feasible": True,
+                "venue": "bonding_curve",
+                # Selling back to the curve is the route. Impact is a
+                # function of size against reserves and is priced by the
+                # sizing engine, which knows the size; asserting a number
+                # here without one would be inventing the position.
+                "price_impact_pct": None,
+                "detail": "native bonding-curve exit; router not consulted",
+            }
         if not self.quote_provider or not getattr(self.quote_provider, "_session", None):
             return {"status": "DATA_BLOCKED", "feasible": None, "reason": "quote provider unavailable"}
         amount = min(max(1, mint_state["supply"] // 10_000), 1_000 * 10 ** mint_state["decimals"])
@@ -485,7 +526,12 @@ class RugDetector:
         except Exception as exc:
             return {"status": "DATA_BLOCKED", "feasible": None, "error": str(exc)}
         if not quote:
-            return {"status": "OK", "feasible": False}
+            # The router has no route. For a mint it has never indexed that
+            # is ignorance, not a property of the token, and the difference
+            # decides whether this hard-vetoes or merely adds uncertainty.
+            return {"status": "DATA_BLOCKED", "feasible": None,
+                    "reason": "router returned no route; it may not have "
+                              "indexed this mint yet"}
         return {
             "status": "OK",
             "feasible": quote.output_amount > 0,

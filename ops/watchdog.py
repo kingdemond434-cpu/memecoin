@@ -103,6 +103,45 @@ class Policy:
     #: Below this many newly-seen launches, "wallets_tracked is still zero"
     #: is not yet evidence of anything -- there has been nothing to track.
     wallet_tracking_min_launches: int = 20
+    #: OOM kills tolerated in the window below before the watchdog stops
+    #: treating them as the box's other tenants and starts shrinking this
+    #: desk's own resident footprint. One kill is a neighbour having a bad
+    #: minute; two inside the window is this desk being the fattest target
+    #: repeatedly, which is a thing it can actually do something about.
+    oom_kills_before_shrink: int = 2
+    oom_window_seconds: float = 3_600.0
+    #: How far each shrink step cuts the resident token cap, and the floor
+    #: it will never cut below. The floor matters: a cap driven to nothing
+    #: by a box-wide problem this desk did not cause would make it blind
+    #: rather than small, and a blind desk is not a survivable one.
+    oom_shrink_factor: float = 0.6
+    oom_min_tracked_tokens: int = 1_000
+    #: Sustained clean uptime before the cap is allowed back up one step.
+    #: Longer than the shrink trigger on purpose: shrinking is cheap and
+    #: reversible, growing back into a kill is neither.
+    oom_recovery_seconds: float = 21_600.0
+    #: Share of NEW launches that may be DATA_BLOCKED before the desk is
+    #: failing at its own job. This is not a vanity metric: a launch the
+    #: desk cannot price is one it cannot decide on, and on 2026-08-29 it
+    #: was 82% -- every one of those a launch seen and thrown away. Judged
+    #: on recent launches only, because the cumulative figure carries
+    #: thousands of pre-fix records that can never be unblocked.
+    data_blocked_alert_fraction: float = 0.50
+    #: Below this many recent launches the share is noise, not evidence.
+    data_blocked_min_launches: int = 50
+
+
+@dataclass
+class BlockedBreakdown:
+    """Recent DATA_BLOCKED launches and what each was waiting on."""
+
+    launches: int = 0
+    blocked: int = 0
+    reasons: Dict[str, int] = field(default_factory=dict)
+
+    @property
+    def fraction(self) -> float:
+        return (self.blocked / self.launches) if self.launches else 0.0
 
 
 @dataclass
@@ -122,6 +161,20 @@ class Plan:
     #: applies without a restart, so there is nothing to debounce.
     correct_memory_ceiling: Optional[Tuple[int, int]] = None
     start_backfill: bool = False
+    #: New value for the desk's resident token cap, written to config and
+    #: applied on the next restart. This is the OOM fixer: the desk's own
+    #: footprint is the only part of a shared box's memory pressure this
+    #: watchdog can actually move, so repeated kills shrink it and a long
+    #: clean run lets it back up.
+    set_hazard_token_cap: Optional[int] = None
+    #: Delete the superseded (.1) research spill generation when the disk
+    #: is nearly full. Safe because it is already-rotated history, not the
+    #: live file and not anything the desk decides with.
+    drop_rotated_spill: bool = False
+    #: The dominant reason recent launches could not be priced, named so an
+    #: operator is told WHICH gap to close rather than that a number is
+    #: high. A percentage nobody can act on is not an alert.
+    data_blocked_leading_reason: str = ""
     repair_reasons: List[str] = field(default_factory=list)
     alerts: List[str] = field(default_factory=list)
 
@@ -245,7 +298,10 @@ def decide(*, service_active: bool, service_enabled: bool,
            backfill_checkpoint_age: Optional[float] = None,
            own_memory_max_bytes: Optional[int] = None,
            total_physical_bytes: Optional[int] = None,
-           desk_rss_bytes: Optional[int] = None) -> Plan:
+           desk_rss_bytes: Optional[int] = None,
+           oom_kill_timestamps: Sequence[float] = (),
+           hazard_token_cap: Optional[int] = None,
+           blocked: Optional["BlockedBreakdown"] = None) -> Plan:
     """Pure repair decision, separated so restart storms are testable.
 
     Every argument here is a value main() already read; decide() does no I/O
@@ -258,6 +314,45 @@ def decide(*, service_active: bool, service_enabled: bool,
     immediate: List[str] = []
     persistent: List[str] = []
 
+    # --- OOM: shrink our own footprint, the only part we control ---------
+    # A shared box's memory pressure is not this desk's to fix, but being
+    # the largest resident process on it is. Repeated kills therefore cut
+    # the desk's resident token cap rather than only reporting the kill.
+    if hazard_token_cap is not None:
+        # Only kills since the last change count. Without this the same bad
+        # hour is re-read on every run and ratchets the cap to its floor on
+        # one piece of evidence -- the shrink has to be judged on what
+        # happened AFTER it, not on the history that triggered it.
+        changed_at = float(state.get("hazard_cap_changed_at", 0.0) or 0.0)
+        recent_kills = [stamp for stamp in oom_kill_timestamps
+                        if now - stamp <= policy.oom_window_seconds
+                        and stamp > changed_at]
+        if len(recent_kills) >= policy.oom_kills_before_shrink:
+            shrunk = max(policy.oom_min_tracked_tokens,
+                         int(hazard_token_cap * policy.oom_shrink_factor))
+            if shrunk < hazard_token_cap:
+                plan.set_hazard_token_cap = shrunk
+                plan.repair_reasons.append(
+                    f"oom_killed_{len(recent_kills)}x_shrinking_resident_cap"
+                    f"_{hazard_token_cap}_to_{shrunk}")
+                state["hazard_cap_changed_at"] = now
+            else:
+                # Already at the floor. Cutting further would make the desk
+                # blind rather than small, so this becomes a report: the
+                # pressure is coming from outside and needs a human.
+                plan.alerts.append("oom_killed_at_minimum_resident_cap")
+        elif not recent_kills:
+            baseline = int(state.get("hazard_cap_baseline", 0) or 0)
+            if (baseline and hazard_token_cap < baseline and changed_at
+                    and now - changed_at > policy.oom_recovery_seconds):
+                restored = min(baseline,
+                               int(hazard_token_cap / policy.oom_shrink_factor))
+                plan.set_hazard_token_cap = restored
+                plan.repair_reasons.append(
+                    f"clean_since_last_shrink_restoring_cap_"
+                    f"{hazard_token_cap}_to_{restored}")
+                state["hazard_cap_changed_at"] = now
+
     if available_mib is not None:
         if available_mib < policy.training_guard_min_mib:
             since = float(state.get("low_memory_since", 0.0) or 0.0)
@@ -268,8 +363,37 @@ def decide(*, service_active: bool, service_enabled: bool,
         else:
             state.pop("low_memory_since", None)
 
+    # --- launches the desk cannot price -----------------------------------
+    # A DATA_BLOCKED launch is one seen and thrown away, so this is the
+    # desk's own hit rate at its job. Alert names the DOMINANT reason rather
+    # than the percentage: "82% blocked" is not actionable, "82% blocked,
+    # mostly waiting on the prediction model" is.
+    #
+    # Deliberately alert-only. Every safe automatic remedy for a blocked
+    # launch has already been built -- deriving liquidity from the curve,
+    # holder structure from watched fills, the protocol invariant at T0 --
+    # and what remains is either an untrained model or an unserved RPC
+    # method. A watchdog cannot train a model, and one that "fixed" a block
+    # by relaxing what counts as priceable would be manufacturing decisions
+    # the evidence does not support.
+    if blocked is not None and blocked.launches >= policy.data_blocked_min_launches:
+        if blocked.fraction >= policy.data_blocked_alert_fraction:
+            leading = max(blocked.reasons.items(), key=lambda kv: kv[1],
+                          default=("unattributed", 0))
+            plan.data_blocked_leading_reason = leading[0]
+            plan.alerts.append(
+                f"launches_unpriceable:{blocked.fraction:.0%}:{leading[0]}")
+
     if disk_used_fraction is not None and disk_used_fraction >= policy.disk_usage_alert_fraction:
         plan.alerts.append("disk_nearly_full")
+        # Rotated research spill is the one thing here safe to delete
+        # unattended: it is a SECOND generation, already superseded by the
+        # live file, and losing it costs history rather than correctness.
+        # Nothing else on this disk qualifies -- the evidence ledger is a
+        # hash chain, episodes are the training corpus, and models are what
+        # the desk decides with. A disk fixer that deleted any of those
+        # would be trading a recoverable outage for an unrecoverable one.
+        plan.drop_rotated_spill = True
 
     if backfill_checkpoint_age is not None and backfill_checkpoint_age > policy.backfill_stale_seconds:
         plan.alerts.append("backfill_stalled")
@@ -430,6 +554,112 @@ def _read_meminfo_field(field_name: str) -> Optional[int]:
     return None
 
 
+def _recent_blocked(root: Path, now: float,
+                    window_seconds: float = 3_600.0) -> Optional["BlockedBreakdown"]:
+    """DATA_BLOCKED share over RECENT launches, with the reasons.
+
+    Recent only, and that is the whole point. The cumulative figure carries
+    every launch the desk ever saw, including thousands recorded before a
+    fix that can never be applied retroactively, so it reports a problem
+    long after it is solved and gives an operator nothing to act on.
+    """
+    path = root / "data" / "state" / "launch_census.json"
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    cutoff = now - window_seconds
+    result = BlockedBreakdown()
+    for record in state.get("records") or []:
+        try:
+            seen_at = float(record.get("detected_at") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if seen_at < cutoff:
+            continue
+        result.launches += 1
+        if record.get("disposition") == "DATA_BLOCKED":
+            result.blocked += 1
+            reason = str(record.get("disposition_reason") or "unattributed")
+            result.reasons[reason] = result.reasons.get(reason, 0) + 1
+    return result
+
+
+def _oom_kill_timestamps(unit: str, window_seconds: float,
+                         now: float) -> List[float]:
+    """When systemd recorded an oom-kill for this unit, newest last.
+
+    Read from the journal rather than from a counter the watchdog keeps
+    itself, because a watchdog's own state file cannot survive the thing it
+    is measuring: an OOM that takes out the box takes the counter with it.
+    """
+    since = time.strftime("%Y-%m-%d %H:%M:%S",
+                          time.localtime(now - window_seconds))
+    try:
+        result = subprocess.run(
+            ["journalctl", "--user", "-u", unit, "--since", since,
+             "--output", "short-unix", "--no-pager"],
+            capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    stamps: List[float] = []
+    for line in result.stdout.splitlines():
+        if "oom-kill" not in line and "OOM killer" not in line:
+            continue
+        try:
+            stamps.append(float(line.split(None, 1)[0]))
+        except (IndexError, ValueError):
+            continue
+    return sorted(stamps)
+
+
+def _hazard_token_cap(config_path: Path) -> Optional[int]:
+    """The desk's configured resident token cap, or None if unreadable.
+
+    Parsed by hand rather than with yaml: this module's only dependency is
+    the standard library, so a missing PyYAML in the watchdog's environment
+    cannot disable the watchdog.
+    """
+    try:
+        for row in config_path.read_text(encoding="utf-8").splitlines():
+            stripped = row.strip()
+            if stripped.startswith("hazard_max_tracked_tokens:"):
+                return int(stripped.split(":", 1)[1].strip())
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _set_hazard_token_cap(config_path: Path, value: int) -> bool:
+    """Write the cap back, atomically, preserving everything else.
+
+    A line rewrite rather than a yaml round-trip on purpose: re-emitting
+    this file through a serialiser would strip every comment in it, and the
+    comments are where the reasoning for each threshold lives.
+    """
+    try:
+        original = config_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    lines = original.splitlines(keepends=True)
+    replaced = False
+    for index, row in enumerate(lines):
+        if row.strip().startswith("hazard_max_tracked_tokens:"):
+            indent = row[:len(row) - len(row.lstrip())]
+            lines[index] = f"{indent}hazard_max_tracked_tokens: {value}\n"
+            replaced = True
+            break
+    if not replaced:
+        return False
+    try:
+        temporary = config_path.with_suffix(config_path.suffix + ".tmp")
+        temporary.write_text("".join(lines), encoding="utf-8")
+        temporary.replace(config_path)
+        return True
+    except OSError:
+        return False
+
+
 def _own_memory_max_bytes(controller: "Systemctl", unit: str) -> Optional[int]:
     raw = controller.show_property(unit, "MemoryMax")
     if not raw or raw == "infinity":
@@ -540,6 +770,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     readiness = _read_json(readiness_path)
     desk_rss_bytes = (readiness.get("memory") or {}).get("rss_bytes")
+    desk_config_path = root / "config" / "chains.yaml"
+    hazard_token_cap = _hazard_token_cap(desk_config_path)
+    # The first reading is the baseline the cap is allowed to climb back to.
+    # Recorded once, so a later shrink cannot become the new ceiling and
+    # ratchet the desk permanently smaller across unrelated pressure events.
+    if hazard_token_cap is not None and not state.get("hazard_cap_baseline"):
+        state["hazard_cap_baseline"] = hazard_token_cap
     plan = decide(
         service_active=service_active, service_enabled=service_enabled,
         readiness=readiness, readiness_age=readiness_age,
@@ -551,7 +788,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         backfill_checkpoint_age=_backfill_checkpoint_age(root, now),
         own_memory_max_bytes=_own_memory_max_bytes(controller, args.desk_unit),
         total_physical_bytes=_read_meminfo_field("MemTotal"),
-        desk_rss_bytes=desk_rss_bytes)
+        desk_rss_bytes=desk_rss_bytes,
+        oom_kill_timestamps=_oom_kill_timestamps(
+            args.desk_unit, Policy().oom_window_seconds, now),
+        hazard_token_cap=hazard_token_cap,
+        blocked=_recent_blocked(root, now))
 
     actions: List[str] = []
     failures: List[str] = []
@@ -569,6 +810,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "set-property", args.desk_unit,
             f"MemoryHigh={high}", f"MemoryMax={ceiling}")
         (actions if result.returncode == 0 else failures).append("correct_memory_ceiling")
+    if plan.drop_rotated_spill and not args.dry_run:
+        rotated = sorted(
+            (root / "data" / "launch_episodes").glob("*.jsonl.1"))
+        freed = 0
+        for path in rotated:
+            try:
+                freed += path.stat().st_size
+                path.unlink()
+            except OSError:
+                failures.append(f"drop_rotated_spill:{path.name}")
+        if rotated and not failures:
+            actions.append(f"drop_rotated_spill:{freed // 1_000_000}MB")
+    if plan.set_hazard_token_cap is not None and not args.dry_run:
+        if _set_hazard_token_cap(desk_config_path, plan.set_hazard_token_cap):
+            actions.append(f"set_hazard_token_cap:{plan.set_hazard_token_cap}")
+            # The desk reads config once at startup, so the new cap binds on
+            # the next restart. Not restarting here on purpose: an OOM kill
+            # already restarts it, and adding our own restart on top of that
+            # would be a restart storm dressed as a repair.
+        else:
+            failures.append("set_hazard_token_cap")
     if plan.start_backfill and not args.dry_run:
         result = controller.call("--no-block", "start", args.backfill_unit)
         if result.returncode == 0:

@@ -88,6 +88,43 @@ def read_rss_bytes() -> Optional[int]:
         return None
 
 
+def _own_cgroup_paths() -> List[str]:
+    """cgroup v2/v1 limit files for THIS process, most specific first.
+
+    /sys/fs/cgroup/memory.max is the ROOT cgroup, and under systemd's
+    unified hierarchy it does not exist at all -- the limit lives at the
+    unit's own path. Reading only the root meant every lookup missed and
+    fell through to total system RAM: measured 2026-08-29, the desk was
+    governing against 4 GB while its real cap was 900 MB, so it reported
+    band CALM at 11% of a ceiling it is killed long before reaching and
+    NONE of its relief valves had ever fired.
+    """
+    paths: List[str] = []
+    try:
+        for row in Path("/proc/self/cgroup").read_text().splitlines():
+            parts = row.split(":", 2)
+            if len(parts) != 3:
+                continue
+            controller, relative = parts[1], parts[2]
+            if controller not in ("", "memory"):
+                continue
+            relative = relative.strip().lstrip("/")
+            base = Path("/sys/fs/cgroup")
+            if controller == "memory":
+                base = base / "memory"
+            unit = base / relative if relative else base
+            # Walk up: a unit without its own cap inherits its slice's.
+            while True:
+                paths.append(str(unit / ("memory.max" if controller == ""
+                                         else "memory.limit_in_bytes")))
+                if unit == base or unit.parent == unit:
+                    break
+                unit = unit.parent
+    except OSError:
+        pass
+    return paths
+
+
 def detect_ceiling_bytes() -> Optional[int]:
     """The cgroup memory limit, which is what actually kills us.
 
@@ -95,7 +132,8 @@ def detect_ceiling_bytes() -> Optional[int]:
     with its own cap, and on a shared box the system total is a number nobody
     is allowed to reach.
     """
-    for path in ("/sys/fs/cgroup/memory.max",
+    for path in (*_own_cgroup_paths(),
+                 "/sys/fs/cgroup/memory.max",
                  "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
         try:
             text = Path(path).read_text().strip()

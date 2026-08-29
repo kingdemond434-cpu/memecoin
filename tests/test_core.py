@@ -4,6 +4,8 @@ import asyncio
 import base64
 import gzip
 import hashlib
+import io
+import zipfile
 import json
 import functools
 import inspect
@@ -42,6 +44,8 @@ from src.chains.yellowstone_grpc import (
     extract_system_transfers,
 )
 from src.detection.rug_detector import TOKEN_2022_PROGRAM, TOKEN_PROGRAM, RugDetector
+from src.strategies.risk_veto import RiskVeto
+from tools.veto_replay import replay, veto_causes
 from src.detection.token_detector import DetectionSource, TokenCandidate
 from src.execution.landing_model import (
     BID_BUCKETS, Attempt, LandingModel, bid_bucket, congestion_bucket,
@@ -82,6 +86,8 @@ from src.research.chain_miners import (
     account_balance_miner, deployer_history_miner, lp_supply_miner,
     network_health_miner, priority_fee_miner, register_chain_miners,
 )
+from src.research.world_miners import parse_gkg, parse_lastupdate
+from src.strategies.memecoin_state import ObservedHolderLedger
 from src.research.web_miners import (
     coingecko_trending_miner, dexscreener_search_miner, github_activity_miner,
     hackernews_miner, reddit_new_miner, register_web_miners,
@@ -95,7 +101,8 @@ from src.research.launch_census import (
 )
 from src.research import rug_mechanism
 from src.execution import signer_daemon
-from src.runtime.memory_governor import Band, MemoryGovernor, Relief
+from src.runtime.memory_governor import (
+    Band, MemoryGovernor, Relief, _own_cgroup_paths)
 from src.research.fallback import (
     FallbackResolver, FactLadder, Resolution, Rung, Source,
 )
@@ -194,6 +201,8 @@ from src.strategies.wallet_intelligence import (
 from src.research.dataset_builder import (
     SNAPSHOT_OFFSETS_S, TAIL_THRESHOLDS, LaunchEpisode, LaunchSnapshot,
     PointInTimeDatasetBuilder, SnapshotTimepoint,
+    PUMP_INITIAL_VIRTUAL_SOL, PUMP_INITIAL_VIRTUAL_TOKEN, PUMP_CURVE_K,
+    pump_curve_invariant_holds,
 )
 from src.research.shadow_trainer import (
     SNAPSHOT_ORDER, chronological_episode_split, train_age_bands, train_shadow,
@@ -14364,13 +14373,42 @@ class TestStreamedCurveStateIsBuildable(unittest.TestCase):
         self.assertIn("_latest_curve_state[token] = state", text)
         self.assertIn("request_redecision", text)
 
-    def test_static_facts_are_pruned_against_the_hot_state(self):
+    def _prunable_desk(self, **overrides):
         desk = SimpleNamespace(
             _curve_static={"live": {}, "stale": {}},
+            _latest_curve_state={}, _latest_pool_state={},
+            elogw_engine=SimpleNamespace(open_positions={}),
             hot_state=SimpleNamespace(active_tokens={"live"}))
+        for key, value in overrides.items():
+            setattr(desk, key, value)
+        return desk
+
+    def test_static_facts_are_pruned_against_the_hot_state(self):
+        desk = self._prunable_desk()
         dropped = MemecoinQuantDesk._prune_curve_static(desk)
         self.assertEqual(dropped, 1)
         self.assertEqual(set(desk._curve_static), {"live"})
+
+    def test_the_unbounded_curve_and_pool_state_are_pruned_too(self):
+        """Both were dicts keyed by mint that nothing ever removed from."""
+        desk = self._prunable_desk(
+            _latest_curve_state={"live": object(), "stale": object()},
+            _latest_pool_state={"live": object(), "stale": object()})
+        dropped = MemecoinQuantDesk._prune_curve_static(desk)
+        self.assertEqual(dropped, 3)
+        self.assertEqual(set(desk._latest_curve_state), {"live"})
+        self.assertEqual(set(desk._latest_pool_state), {"live"})
+
+    def test_an_open_position_survives_however_cold_the_hot_state_is(self):
+        """A position we cannot quote an exit for is what must never be lost."""
+        desk = self._prunable_desk(
+            _curve_static={"held": {}},
+            _latest_curve_state={"held": object()},
+            _latest_pool_state={"held": object()},
+            elogw_engine=SimpleNamespace(open_positions={"held": object()}),
+            hot_state=SimpleNamespace(active_tokens=set()))
+        self.assertEqual(MemecoinQuantDesk._prune_curve_static(desk), 0)
+        self.assertEqual(set(desk._latest_curve_state), {"held"})
 
 
 class TestSourceMeshStreams(unittest.IsolatedAsyncioTestCase):
@@ -15861,6 +15899,29 @@ class TestTheCensusCountsEveryLaunchNotOnlyOurs(unittest.TestCase):
         self.assertEqual(costliest["monsters_discarded"], 1)
         self.assertAlmostEqual(costliest["monster_share_of_rejections"], 1.0)
 
+    def test_a_hard_vetoed_monster_shows_its_true_rejection_total_not_zero(self):
+        """reject() is a different counter than screen() -- costliest_screens
+        must add both, or a safety_veto reason with real rejections reads as
+        a screen that discarded a monster while touching nothing else."""
+        census = LaunchCensus()
+        census.see("safe", at=1.0)
+        census.see("vetoed", at=1.0)
+        census.see("also_vetoed", at=1.0)
+        census.decide("safe", "probe")
+        census.enter("safe")
+        census.reject("vetoed", "safety_veto:catastrophic_exit_price_impact")
+        census.reject("also_vetoed", "safety_veto:catastrophic_exit_price_impact")
+        census.resolve("safe", peak_multiple=12.0)
+        census.resolve("vetoed", peak_multiple=40.0)
+        census.resolve("also_vetoed", peak_multiple=2.0)
+        report = census.missed_monster_report()
+        costliest = report["costliest_screens"][0]
+        self.assertEqual(costliest["reason"], "safety_veto:catastrophic_exit_price_impact")
+        self.assertEqual(costliest["monsters_discarded"], 1)
+        # Two launches were rejected under this reason, not zero.
+        self.assertEqual(costliest["total_screened"], 2)
+        self.assertAlmostEqual(costliest["monster_share_of_rejections"], 0.5)
+
     def test_the_peak_ratchets_and_never_records_the_way_back_down(self):
         census = LaunchCensus()
         census.see("m")
@@ -16109,6 +16170,258 @@ class TestRugMechanismsAreNamedOrHonestlyUnnamed(unittest.TestCase):
         self.assertEqual(report["unclassified"], 10)
         self.assertAlmostEqual(report["unclassified_share"], 1.0)
         self.assertIn("measurement gap", report["detail"])
+
+
+class TestTheHazardModelIsMemoryBounded(unittest.TestCase):
+    """hazard_states, observations and token_metadata were all keyed by mint
+    with no eviction. On a continuous launch feed that grows until the kernel
+    kills the process -- which is exactly what happened on 2026-08-29, at
+    roughly eight-minute intervals, with the cgroup ceiling never touched."""
+
+    def _model(self, max_tracked_tokens=3):
+        return ContinuousRugHazardModel(
+            SimpleNamespace(name="solana"), None, None, None, None,
+            max_tracked_tokens=max_tracked_tokens)
+
+    def test_under_the_cap_nothing_is_evicted(self):
+        model = self._model(max_tracked_tokens=100)
+        for index in range(10):
+            model.record_observation(f"t{index}", {"type": "trade"})
+        self.assertEqual(model.prune(), 0)
+        self.assertEqual(len(model.observations), 10)
+
+    def test_past_the_cap_the_stalest_tokens_go_first(self):
+        model = self._model(max_tracked_tokens=100)
+        for index in range(10):
+            model.record_observation(f"t{index}", {"type": "trade"})
+            # Force a distinct touch order rather than relying on clock
+            # resolution, which can tie on a fast machine.
+            model._last_touched[f"t{index}"] = float(index)
+        model.max_tracked_tokens = 4
+        self.assertEqual(model.prune(), 6)
+        self.assertEqual(set(model.observations), {"t6", "t7", "t8", "t9"})
+        self.assertEqual(set(model.hazard_states), {"t6", "t7", "t8", "t9"})
+        self.assertEqual(model.tokens_evicted, 6)
+
+    def test_a_protected_token_survives_however_stale(self):
+        """Evicting a token we hold would silently blind the exit policy."""
+        model = self._model(max_tracked_tokens=100)
+        for index in range(10):
+            model.record_observation(f"t{index}", {"type": "trade"})
+            model._last_touched[f"t{index}"] = float(index)
+        model.max_tracked_tokens = 4
+        model.prune(protected={"t0"})
+        self.assertIn("t0", model.observations)
+        # The floor still held: something stale went in its place.
+        self.assertNotIn("t1", model.observations)
+
+    def test_every_per_token_store_is_cleared_together(self):
+        """A mint left in one dict and gone from another is a slower leak."""
+        model = self._model()
+        model.max_tracked_tokens = 1
+        model.register_token("keep", {"deployer": "d"})
+        model.record_observation("stale", {"type": "trade"})
+        model.token_metadata["stale"] = {"deployer": "d"}
+        model._last_touched["stale"] = 0.0
+        model.prune()
+        for store in (model.observations, model.hazard_states,
+                      model.token_metadata, model._last_touched):
+            self.assertNotIn("stale", store)
+
+    def test_protection_larger_than_the_cap_does_not_force_an_eviction(self):
+        """If the desk legitimately holds that much, the bound yields."""
+        model = self._model(max_tracked_tokens=2)
+        for index in range(5):
+            model.record_observation(f"t{index}", {"type": "trade"})
+        held = {f"t{index}" for index in range(5)}
+        self.assertEqual(model.prune(protected=held), 0)
+        self.assertEqual(len(model.observations), 5)
+
+    def test_a_single_hot_token_cannot_take_the_whole_cgroup(self):
+        """maxlen was 5,000 observations -- ~9.7 MB for one mint."""
+        model = self._model(max_tracked_tokens=100)
+        for _ in range(2_000):
+            model.record_observation("hot", {"type": "trade"})
+        self.assertEqual(len(model.observations["hot"]),
+                         model.max_observations_per_token)
+
+    def test_eviction_spills_history_rather_than_discarding_it(self):
+        """The bound is on what is RESIDENT, not on what is observed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hazard.jsonl"
+            model = ContinuousRugHazardModel(
+                SimpleNamespace(name="solana"), None, None, None, None,
+                spill_path=path)
+            model.max_tracked_tokens = 1
+            model.record_observation("stale", {"type": "trade", "price_multiple": 2.0})
+            model.record_observation("fresh", {"type": "trade"})
+            model._last_touched["stale"] = 0.0
+            self.assertEqual(model.prune(), 1)
+            self.assertNotIn("stale", model.observations)
+            rows = [json.loads(line) for line in
+                    path.read_text().splitlines() if line.strip()]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["token"], "stale")
+            self.assertEqual(len(rows[0]["observations"]), 1)
+            self.assertEqual(model.tokens_spilled, 1)
+
+    def test_a_token_with_nothing_observed_writes_no_empty_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hazard.jsonl"
+            model = ContinuousRugHazardModel(
+                SimpleNamespace(name="solana"), None, None, None, None,
+                spill_path=path)
+            model.max_tracked_tokens = 1
+            model.register_token("empty")
+            model.register_token("other")
+            model._last_touched["empty"] = 0.0
+            model.prune()
+            self.assertEqual(model.tokens_spilled, 0)
+            self.assertFalse(path.exists())
+
+    def test_the_spill_rotates_rather_than_filling_the_disk(self):
+        """An append-only lake trades an OOM bound for a disk-full one, and
+        a full disk stops the evidence ledger too -- not just this model."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hazard.jsonl"
+            model = ContinuousRugHazardModel(
+                SimpleNamespace(name="solana"), None, None, None, None,
+                spill_path=path, max_spill_bytes=1_000_000)
+            model.max_tracked_tokens = 1
+            path.write_bytes(b"x" * 1_200_000)
+            model.record_observation("stale", {"type": "trade"})
+            model.record_observation("fresh", {"type": "trade"})
+            model._last_touched["stale"] = 0.0
+            model.prune()
+            self.assertEqual(model.spill_rotations, 1)
+            rotated = path.with_suffix(path.suffix + ".1")
+            self.assertTrue(rotated.exists())
+            # The live file is the new one, holding only the fresh spill.
+            self.assertLess(path.stat().st_size, 1_000_000)
+            rows = [json.loads(line) for line in
+                    path.read_text().splitlines() if line.strip()]
+            self.assertEqual(rows[0]["token"], "stale")
+
+    def test_a_small_spill_file_is_not_rotated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hazard.jsonl"
+            model = ContinuousRugHazardModel(
+                SimpleNamespace(name="solana"), None, None, None, None,
+                spill_path=path, max_spill_bytes=10_000_000)
+            model.max_tracked_tokens = 1
+            model.record_observation("stale", {"type": "trade"})
+            model.record_observation("fresh", {"type": "trade"})
+            model._last_touched["stale"] = 0.0
+            model.prune()
+            self.assertEqual(model.spill_rotations, 0)
+            self.assertFalse(path.with_suffix(path.suffix + ".1").exists())
+
+    def test_a_failed_spill_is_counted_not_silent(self):
+        """An invisible hole is what makes a research corpus quietly wrong."""
+        model = ContinuousRugHazardModel(
+            SimpleNamespace(name="solana"), None, None, None, None,
+            spill_path=Path("/proc/nonexistent-dir/hazard.jsonl"))
+        model.max_tracked_tokens = 1
+        model.record_observation("stale", {"type": "trade"})
+        model.record_observation("fresh", {"type": "trade"})
+        model._last_touched["stale"] = 0.0
+        model.prune()
+        self.assertEqual(model.spill_failures, 1)
+        self.assertEqual(model.tokens_spilled, 0)
+
+
+class TestTheCensusKnowsWhichLaunchesStillNeedADeathVerdict(unittest.TestCase):
+    """The accessor _resolve_census_death's caller relies on to find work."""
+
+    def test_an_unresolved_launch_is_not_a_candidate(self):
+        census = LaunchCensus()
+        census.see("m", creator="dev")
+        self.assertEqual(census.mints_pending_death_classification(), [])
+
+    def test_a_resolved_unrugged_launch_is_a_candidate(self):
+        census = LaunchCensus()
+        census.see("m", creator="dev")
+        census.resolve("m", peak_multiple=2.0)
+        self.assertEqual(census.mints_pending_death_classification(), ["m"])
+
+    def test_a_launch_already_given_a_verdict_is_not_asked_again(self):
+        census = LaunchCensus()
+        census.see("m", creator="dev")
+        census.resolve("m", peak_multiple=2.0)
+        census.resolve("m", rugged=False)
+        self.assertEqual(census.mints_pending_death_classification(), [])
+
+
+class TestRugDeathClassificationIsActuallyWired(unittest.TestCase):
+    """_resolve_census_death existed with no caller anywhere in the desk.
+
+    Every resolved launch reported rugged=None forever, which is the entire
+    reason rug_share_of_resolved read 0.0% -- indistinguishable, from the
+    dashboard alone, from "this feed genuinely has no rugs".
+    """
+
+    def _path(self, multiples, start=0.0, **extra):
+        return [{"type": "trade", "price_multiple": m, "timestamp": start + i,
+                 **extra} for i, m in enumerate(multiples)]
+
+    def _desk(self, observations):
+        resolved_calls = []
+        ops_events = []
+        census = SimpleNamespace(
+            resolve=lambda token, **kw: resolved_calls.append((token, kw)))
+        touched = {"m": max((float(r.get("timestamp", 0) or 0)
+                             for r in observations), default=None)}
+        desk = SimpleNamespace(
+            rug_hazard=SimpleNamespace(
+                observations={"m": observations},
+                last_touched=lambda token: touched.get(token)),
+            _latest_pool_state={}, launch_census=census,
+            _record_ops_event=lambda stream, payload: ops_events.append(
+                (stream, payload)),
+            _resolved_calls=resolved_calls, _ops_events=ops_events)
+        desk._resolve_census_death = (
+            lambda token: MemecoinQuantDesk._resolve_census_death(desk, token))
+        return desk
+
+    def test_a_token_still_trading_is_not_yet_judged(self):
+        """Last trade seconds ago: still mid-launch, not dead."""
+        desk = self._desk(self._path([1.0, 5.0, 0.1], start=time.time() - 2))
+        MemecoinQuantDesk._resolve_census_death(desk, "m")
+        self.assertEqual(desk._resolved_calls, [])
+
+    def test_a_quiet_token_priced_only_once_is_not_judged(self):
+        """One priced point can't show a drawdown -- not evidence of a rug."""
+        rows = [{"type": "trade", "price_multiple": 1.0, "timestamp": 0.0}]
+        desk = self._desk(rows)
+        MemecoinQuantDesk._resolve_census_death(desk, "m")
+        self.assertEqual(desk._resolved_calls, [])
+
+    def test_a_quiet_survivor_is_not_recorded_as_rugged(self):
+        desk = self._desk(self._path([1.0, 2.0, 1.8]))
+        MemecoinQuantDesk._resolve_census_death(desk, "m")
+        self.assertEqual(desk._resolved_calls, [])
+
+    def test_a_quiet_confirmed_death_is_recorded_with_its_mechanism(self):
+        desk = self._desk(self._path([1.0, 5.0, 0.1], migrated=False))
+        MemecoinQuantDesk._resolve_census_death(desk, "m")
+        self.assertEqual(len(desk._resolved_calls), 1)
+        token, kw = desk._resolved_calls[0]
+        self.assertEqual(token, "m")
+        self.assertTrue(kw["rugged"])
+        self.assertEqual(kw["rug_mechanism"], RugMechanism.MIGRATION_STALL.value)
+        self.assertEqual(len(desk._ops_events), 1)
+
+    def test_no_observations_at_all_is_not_judged(self):
+        desk = self._desk([])
+        MemecoinQuantDesk._resolve_census_death(desk, "unseen")
+        self.assertEqual(desk._resolved_calls, [])
+
+    def test_the_sweep_asks_the_census_which_mints_need_a_verdict(self):
+        desk = self._desk(self._path([1.0, 5.0, 0.1], migrated=False))
+        desk.launch_census.mints_pending_death_classification = lambda: ["m"]
+        MemecoinQuantDesk._sweep_rug_classification(desk)
+        self.assertEqual(len(desk._resolved_calls), 1)
+        self.assertEqual(desk._resolved_calls[0][0], "m")
 
 
 class TestCalibrationAnswersWhetherTheNumbersAreTrue(unittest.TestCase):
@@ -16993,6 +17306,42 @@ class TestTheDeskShedsContextBeforeTheKernelShedsIt(unittest.TestCase):
         gov._box = box
         return gov
 
+    def test_the_configured_fractions_are_actually_bound(self):
+        """The governor is built in __init__ where global_config is still
+        empty, so memory_soft_fraction/memory_hard_fraction silently took
+        their defaults and had never once applied. initialize() must rebind
+        them after the YAML is read."""
+        source = Path("src/main.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        init = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.AsyncFunctionDef)
+                    and node.name == "initialize")
+        text = ast.unparse(init)
+        self.assertIn("memory.soft_fraction", text)
+        self.assertIn("memory.hard_fraction", text)
+        self.assertIn("memory_soft_fraction", text)
+        # Rebound, not reconstructed: a fresh governor would drop every
+        # relief registered between __init__ and here.
+        self.assertNotIn("self.memory = MemoryGovernor", text)
+
+    def test_the_ceiling_comes_from_our_own_cgroup_not_the_root(self):
+        """The bug that made every relief valve inert: it read
+        /sys/fs/cgroup/memory.max -- the ROOT cgroup, which does not exist
+        under systemd's unified hierarchy -- so every lookup missed and fell
+        through to total system RAM. Measured 2026-08-29: the desk governed
+        against 4 GB while its real cap was 900 MB, reported band CALM at
+        11% of a ceiling it is killed long before reaching, and had never
+        fired a single trim or shed."""
+        paths = _own_cgroup_paths()
+        self.assertTrue(paths, "no cgroup paths derived from /proc/self/cgroup")
+        # Most specific first, so a unit's own cap wins over its slice's.
+        self.assertTrue(paths[0].endswith(("memory.max", "memory.limit_in_bytes")))
+        self.assertNotEqual(paths[0], "/sys/fs/cgroup/memory.max")
+        for candidate in paths:
+            self.assertTrue(candidate.startswith("/sys/fs/cgroup"))
+        # Walks upward: later entries are ancestors of earlier ones.
+        self.assertGreater(len(paths[0]), len(paths[-1]))
+
     def test_an_unreadable_footprint_disables_it_rather_than_assuming_calm(self):
         gov = MemoryGovernor(ceiling_bytes=1000, read_rss=lambda: None)
         self.assertIs(gov.observe(), Band.UNMEASURED)
@@ -17807,3 +18156,722 @@ class TestBoundedOperationalWatchdog(unittest.TestCase):
         checks = {item.name: item for item in check_runtime_surfaces(readiness)}
         self.assertEqual(checks["runtime_tasks"].state, State.CRITICAL)
         self.assertTrue(checks["runtime_tasks"].escalate)
+
+
+class TestSubmitSignedActuallyRecordsALanding(unittest.IsolatedAsyncioTestCase):
+    """_submit_signed referenced compute_unit_limit and slot_value as FREE
+    NAMES -- neither was a parameter, a local, or a module global. Every real
+    fill would have raised NameError at the landing-model record, after the
+    transaction had already gone out.
+
+    Dry run never reaches submission, so the whole suite stayed green over a
+    guaranteed live-path crash. This test exercises the real call so the bug
+    cannot come back: no mocking of _submit_signed itself."""
+
+    async def _engine(self):
+        engine = ExecutionEngine.__new__(ExecutionEngine)
+        engine.dry_run = False
+        engine.region = "test"
+        engine.landing_model = LandingModel()
+        engine.native_compute_unit_limit = 400_000
+        engine.tx_builder = SimpleNamespace(public_key="P", last_blockhash_age_slots=3)
+        engine.jito = SimpleNamespace(
+            send_bundle=self._fail_if_called, get_tip_floor_lamports=self._fail_if_called)
+        engine.current_congestion = lambda: 0.25
+        engine._send_raw_transaction = lambda signed: self._ok("SIG")
+        engine._wait_for_fill = lambda sig, i, o: self._fill()
+        return engine
+
+    async def _fail_if_called(self, *a, **k):
+        raise AssertionError("jito path must not be taken in this test")
+
+    async def _ok(self, value):
+        return value
+
+    async def _fill(self):
+        return {"filled": True, "landed": True, "slot": 42, "leader": "V1",
+                "input_amount": 1_000, "output_amount": 2_000, "fee": 5,
+                "native_balance_delta_lamports": -1_005}
+
+    async def test_a_real_submission_records_the_attempt_without_a_nameerror(self):
+        engine = await self._engine()
+        result = await engine._submit_signed(
+            "signed", 1_000, 100, time.time(),
+            jito_tip=0, use_jito=False, route_type=RouteType.PUMP_NATIVE,
+            input_mint="A", output_mint="B")
+        self.assertTrue(result.filled)
+        self.assertEqual(len(engine.landing_model._attempts), 1)
+
+    async def test_the_compute_limit_recorded_is_the_one_built_with(self):
+        """Recorded, not reconstructed: it is unrecoverable after the fact."""
+        engine = await self._engine()
+        await engine._submit_signed(
+            "signed", 1_000, 100, time.time(),
+            jito_tip=0, use_jito=False, route_type=RouteType.PUMP_NATIVE,
+            compute_unit_limit=400_000)
+        self.assertEqual(engine.landing_model._attempts[0].compute_units, 400_000)
+
+    async def test_slot_value_is_carried_when_the_caller_knows_it(self):
+        engine = await self._engine()
+        await engine._submit_signed(
+            "signed", 1_000, 100, time.time(),
+            jito_tip=0, use_jito=False, route_type=RouteType.PUMP_NATIVE,
+            slot_value=SimpleNamespace(decay_per_slot=0.125))
+        self.assertAlmostEqual(engine.landing_model._attempts[0].slot_value, 0.125)
+
+    async def test_an_absent_slot_value_records_none_not_zero(self):
+        """Zero decay is a measurement; unknown decay is not."""
+        engine = await self._engine()
+        await engine._submit_signed(
+            "signed", 1_000, 100, time.time(),
+            jito_tip=0, use_jito=False, route_type=RouteType.PUMP_NATIVE)
+        self.assertIsNone(engine.landing_model._attempts[0].slot_value)
+
+    def test_the_native_route_forwards_both_values(self):
+        """The chain that made this unreachable: execute_swap knew slot_value,
+        _execute_native dropped it, _submit_signed then read it as a global."""
+        source = inspect.getsource(ExecutionEngine._execute_native)
+        self.assertIn("compute_unit_limit=self.native_compute_unit_limit", source)
+        self.assertIn("slot_value=slot_value", source)
+        self.assertIn("slot_value", inspect.signature(
+            ExecutionEngine._execute_native).parameters)
+
+
+class TestLiquidityIsDerivedFromTheCurveWhenNoQuoteExists(unittest.TestCase):
+    """liquidity_features was 0% populated at t0 across 400 live episodes.
+
+    It waited for a DexScreener-style quote, and a pre-migration pump.fun
+    launch CANNOT be on DexScreener at t0 -- it is still on the bonding
+    curve. The reserves are the liquidity, and they arrive free on the same
+    trade event the desk already decodes."""
+
+    def _builder(self):
+        return PointInTimeDatasetBuilder.__new__(PointInTimeDatasetBuilder)
+
+    def _episode(self, observations):
+        return SimpleNamespace(token="M", market_observations=observations)
+
+    def _curve_obs(self, ts, sol=30_000_000_000, tok=1_073_000_000_000_000):
+        return {"type": "trade", "timestamp": ts,
+                "virtual_sol_reserves": sol, "virtual_token_reserves": tok}
+
+    def test_curve_reserves_become_liquidity_when_no_quote_exists(self):
+        b = self._builder()
+        out = b._liquidity_from_curve(self._episode([self._curve_obs(10.0)]), 20.0)
+        self.assertEqual(out["status"], "OK")
+        self.assertEqual(out["source"], "bonding_curve")
+        self.assertAlmostEqual(out["liquidity_sol"], 30.0)
+        self.assertTrue(out["route_feasible"])
+
+    def test_it_is_point_in_time_and_cannot_see_later_depth(self):
+        """The whole discipline: a t0 snapshot must not read t100 reserves.
+
+        It may fall back to the protocol invariant, but it must never report
+        the LATER curve -- that is the leakage this guards."""
+        b = self._builder()
+        later = 99_000_000_000
+        ep = self._episode([self._curve_obs(100.0, sol=later,
+                                            tok=PUMP_CURVE_K // later)])
+        out = b._liquidity_from_curve(ep, as_of=10.0)
+        self.assertEqual(out["provenance"], "INVARIANT")
+        self.assertNotAlmostEqual(out["curve_sol_reserves"], float(later))
+
+    def test_the_latest_observation_at_or_before_as_of_wins(self):
+        b = self._builder()
+        ep = self._episode([
+            self._curve_obs(1.0, sol=10_000_000_000, tok=PUMP_CURVE_K // 10_000_000_000),
+            self._curve_obs(5.0, sol=50_000_000_000, tok=PUMP_CURVE_K // 50_000_000_000),
+            self._curve_obs(50.0, sol=99_000_000_000, tok=PUMP_CURVE_K // 99_000_000_000)])
+        out = b._liquidity_from_curve(ep, as_of=9.0)
+        self.assertEqual(out["provenance"], "MEASURED")
+        self.assertAlmostEqual(out["liquidity_sol"], 50.0)
+
+    def test_trades_without_reserves_fall_back_to_the_invariant(self):
+        """Instruction-decoded trades carry no reserves; that is not a
+        reason to be blind at T0 when the protocol constant is known."""
+        b = self._builder()
+        out = b._liquidity_from_curve(self._episode([{"type": "trade", "timestamp": 1.0}]), 9.0)
+        self.assertEqual(out["status"], "OK")
+        self.assertEqual(out["provenance"], "INVARIANT")
+
+    def test_an_empty_curve_is_blocked_not_reported_as_zero_liquidity(self):
+        b = self._builder()
+        ep = self._episode([self._curve_obs(1.0, sol=0, tok=0)])
+        out = b._liquidity_from_curve(ep, 9.0)
+        # We DID observe this curve and it read empty. That is a real
+        # measurement of a dead curve, not an absence of one, so the
+        # invariant must not paper over it.
+        self.assertEqual(out["status"], "DATA_BLOCKED")
+        self.assertEqual(out["reason"], "curve_reserves_empty")
+
+    def test_usd_is_left_unmeasured_rather_than_guessed(self):
+        """Inventing a SOL price would put a guess in wearing a label."""
+        b = self._builder()
+        out = b._liquidity_from_curve(self._episode([self._curve_obs(1.0)]), 9.0)
+        self.assertIsNone(out["liquidity_usd"])
+
+    def test_before_any_trade_t0_uses_the_verified_protocol_invariant(self):
+        """The CreateEvent carries no reserves, so a launch is blind at
+        exactly T0 -- the instant a decision is made. Initialisation
+        constants are a property of the PROGRAM, not of this token."""
+        b = self._builder()
+        out = b._liquidity_from_curve(self._episode([]), as_of=10.0)
+        self.assertEqual(out["status"], "OK")
+        self.assertEqual(out["source"], "protocol_invariant")
+        self.assertEqual(out["provenance"], "INVARIANT")
+        self.assertAlmostEqual(out["liquidity_sol"], 30.0)
+
+    def test_an_observed_curve_is_labelled_measured_not_invariant(self):
+        b = self._builder()
+        out = b._liquidity_from_curve(self._episode([self._curve_obs(1.0)]), 9.0)
+        self.assertEqual(out["provenance"], "MEASURED")
+
+    def test_the_invariant_is_checked_against_the_constant_product(self):
+        """Documentation is trusted only where the stream agrees with it."""
+        self.assertTrue(pump_curve_invariant_holds(
+            PUMP_INITIAL_VIRTUAL_SOL, PUMP_INITIAL_VIRTUAL_TOKEN))
+        # The real first trade measured 2026-08-29.
+        self.assertTrue(pump_curve_invariant_holds(30_769_347_702, 1_046_171_039_498_398))
+
+    def test_a_curve_that_is_not_this_protocol_degrades_to_missing(self):
+        """A different curve shape must not be reported as depth."""
+        self.assertFalse(pump_curve_invariant_holds(30_000_000_000, 1_000))
+        b = self._builder()
+        ep = self._episode([self._curve_obs(1.0, sol=30_000_000_000, tok=1_000)])
+        out = b._liquidity_from_curve(ep, 9.0)
+        self.assertEqual(out["status"], "DATA_BLOCKED")
+        self.assertIn("constant_product", out["reason"])
+
+    def test_a_real_quote_still_wins_and_is_labelled_as_quoted(self):
+        b = self._builder()
+        ep = self._episode([
+            {"type": "market", "timestamp": 1.0, "liquidity_usd": 4_200.0,
+             "route_feasible": True, "price_impact_pct": 1.5},
+            self._curve_obs(1.0)])
+        out = asyncio.run(b._capture_liquidity_features(ep, 9.0))
+        self.assertEqual(out["source"], "quoted")
+        self.assertEqual(out["liquidity_usd"], 4_200.0)
+
+    def test_the_trade_observation_actually_carries_the_reserves(self):
+        """Without this the derivation above has nothing to read."""
+        source = inspect.getsource(MemecoinQuantDesk._on_pump_event)
+        self.assertIn('"virtual_sol_reserves": virtual_sol', source)
+        self.assertIn('"virtual_token_reserves": virtual_token', source)
+
+
+class TestQuotaFreeWorldNewsMiner(unittest.TestCase):
+    """GDELT is here for its funding model, not its subject matter: raw
+    files anyone may read, with no key and no monthly allowance to exhaust.
+    The desk's Helius allowance DID exhaust on 2026-08-29 (429 max usage
+    reached), which is what made T0 chain facts unavailable."""
+
+    MANIFEST = (
+        "22990 abc http://data.gdeltproject.org/gdeltv2/20260829213000.export.CSV.zip\n"
+        "46009 def http://data.gdeltproject.org/gdeltv2/20260829213000.mentions.CSV.zip\n"
+        "2079294 ghi http://data.gdeltproject.org/gdeltv2/20260829213000.gkg.csv.zip\n")
+
+    def test_the_manifest_is_forced_to_https(self):
+        """GDELT publishes http:// URLs; plain http returned zero bytes from
+        this host while the identical https URL returned 200."""
+        feeds = parse_lastupdate(self.MANIFEST)
+        self.assertEqual(set(feeds), {"export", "mentions", "gkg"})
+        for url in feeds.values():
+            self.assertTrue(url.startswith("https://"), url)
+
+    def test_an_unreadable_manifest_yields_nothing_rather_than_raising(self):
+        """A format change should stop this miner, not take the pool down."""
+        self.assertEqual(parse_lastupdate("garbage without three fields"), {})
+        self.assertEqual(parse_lastupdate(""), {})
+
+    def _gkg_zip(self, rows):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as archive:
+            archive.writestr("slice.gkg.csv", "\n".join(rows))
+        return buf.getvalue()
+
+    def _row(self, ident, source, url, themes="MEDICAL;GENERAL_HEALTH",
+             persons="", orgs="", extra="solana rally"):
+        cols = [ident, "20260829213000", "1", source, url, "", "", themes,
+                "", "", "", persons, "", orgs] + [""] * 13
+        return "\t".join(cols) + "\t" + extra
+
+    def test_only_rows_mentioning_our_subjects_are_kept(self):
+        payload = self._gkg_zip([
+            self._row("a", "example.com", "https://example.com/1", extra="solana surges"),
+            self._row("b", "other.com", "https://other.com/2", extra="local weather"),
+        ])
+        records = parse_gkg(payload)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["id"], "a")
+        self.assertIn("solana", records[0]["matched_terms"])
+
+    def test_semicolon_fields_are_split_for_the_entity_resolver(self):
+        payload = self._gkg_zip([self._row(
+            "a", "example.com", "https://example.com/1",
+            themes="CRYPTO;FINANCE", persons="elon musk", orgs="pump fun;solana")])
+        record = parse_gkg(payload)[0]
+        self.assertEqual(record["themes"], ["CRYPTO", "FINANCE"])
+        self.assertEqual(record["organisations"], ["pump fun", "solana"])
+        self.assertEqual(record["persons"], ["elon musk"])
+
+    def test_a_truncated_row_is_skipped_not_half_read(self):
+        payload = self._gkg_zip(["short\trow\tsolana"])
+        self.assertEqual(parse_gkg(payload), [])
+
+    def test_the_record_cap_bounds_one_slice(self):
+        rows = [self._row(str(i), "e.com", f"https://e.com/{i}") for i in range(50)]
+        self.assertEqual(len(parse_gkg(self._gkg_zip(rows), max_records=10)), 10)
+
+    def test_a_payload_that_is_not_a_zip_says_so(self):
+        with self.assertRaises(RuntimeError) as caught:
+            parse_gkg(b"not a zip at all")
+        self.assertIn("not a zip", str(caught.exception))
+
+    def test_returning_nothing_is_normal_and_not_an_error(self):
+        """A 15-minute slice measured 2026-08-29 had 467 records and one
+        relevant row. Empty passes must not read as a broken miner."""
+        payload = self._gkg_zip([self._row("a", "e.com", "https://e.com/1",
+                                           extra="entirely unrelated news")])
+        self.assertEqual(parse_gkg(payload), [])
+
+
+class TestHolderStructureIsDerivedFromWatchedTrades(unittest.TestCase):
+    """getTokenLargestAccounts is unserved by the free RPC pool -- publicnode
+    403s it, mainnet-beta 429s it, and the one provider that serves it was
+    failing 159 of 181 calls on 2026-08-29. That blocked holder structure for
+    every launch: 41 of 63 blocked launches in a measured sample.
+
+    For a token seconds old the desk has already watched every trade, and
+    each carries a wallet and a signed token delta."""
+
+    def test_buys_accumulate_into_a_holder_set(self):
+        led = ObservedHolderLedger()
+        led.record_trade("m", "a", 100.0)
+        led.record_trade("m", "b", 300.0)
+        snap = led.snapshot("m")
+        self.assertEqual(snap["unique_holders"], 2)
+        self.assertAlmostEqual(snap["top_10_pct"], 100.0)
+        self.assertEqual(snap["source"], "observed_trades")
+
+    def test_a_wallet_that_sold_out_is_not_a_holder(self):
+        led = ObservedHolderLedger()
+        led.record_trade("m", "a", 100.0)
+        led.record_trade("m", "b", 100.0)
+        led.record_trade("m", "a", -100.0)
+        self.assertEqual(led.snapshot("m")["unique_holders"], 1)
+
+    def test_concentration_reflects_the_top_holders(self):
+        led = ObservedHolderLedger()
+        led.record_trade("m", "whale", 900.0)
+        for i in range(30):
+            led.record_trade("m", f"small{i}", 10.0)
+        snap = led.snapshot("m")
+        self.assertEqual(snap["unique_holders"], 31)
+        # whale + 9 smalls = 990 of 1200
+        self.assertAlmostEqual(snap["top_10_pct"], 100.0 * 990 / 1200, places=6)
+        self.assertGreater(snap["top_20_pct"], snap["top_10_pct"])
+
+    def test_nothing_observed_is_none_not_zero(self):
+        """A zero here would read as a perfectly dispersed token."""
+        self.assertIsNone(ObservedHolderLedger().snapshot("never-seen"))
+
+    def test_the_basis_is_named_so_it_is_never_pooled_with_rpc_supply(self):
+        """This measures share of FLOAT that moved, not share of supply."""
+        led = ObservedHolderLedger()
+        led.record_trade("m", "a", 5.0)
+        self.assertEqual(led.snapshot("m")["concentration_basis"], "observed_float")
+
+    def test_wallets_per_token_are_bounded_keeping_the_largest(self):
+        led = ObservedHolderLedger(max_wallets=16)
+        led.record_trade("m", "whale", 10_000.0)
+        for i in range(200):
+            led.record_trade("m", f"dust{i}", 1.0)
+        snap = led.snapshot("m")
+        self.assertLessEqual(snap["unique_holders"], 16)
+        # The whale must survive: concentration is a top-N question.
+        self.assertGreater(snap["top_10_pct"], 90.0)
+
+    def test_tokens_tracked_are_bounded(self):
+        led = ObservedHolderLedger(max_tokens=64)
+        for i in range(200):
+            led.record_trade(f"t{i}", "w", 1.0)
+        self.assertLessEqual(len(led._balances), 64)
+        self.assertGreater(led.tokens_evicted, 0)
+
+    def test_the_desk_feeds_the_ledger_from_the_trade_stream(self):
+        source = inspect.getsource(MemecoinQuantDesk._on_pump_event)
+        self.assertIn("observed_holders.record_trade", source)
+        self.assertIn('source="observed_trades"', source)
+
+
+class TestOpenFollowsSurviveARestart(unittest.TestCase):
+    """A follow is an unresolved measurement with a 300s horizon, and the
+    wallet model needs 12 resolved outcomes before it ranks a wallet at all.
+    Held only in memory, every restart voided every in-flight follow:
+    measured 2026-08-29, 56 open follows against 9 resolved outcomes across
+    7 wallets. No wallet could ever reach the threshold."""
+
+    def _desk(self, tmp, candidates=None):
+        desk = SimpleNamespace(
+            global_config={"ops_state_dir": tmp, "follow_horizon_seconds": 300.0},
+            _follow_candidates=candidates if candidates is not None else {})
+        for name in ("_follow_state_path", "save_follow_candidates",
+                     "load_follow_candidates"):
+            setattr(desk, name, getattr(MemecoinQuantDesk, name).__get__(desk))
+        return desk
+
+    def _candidate(self, wallet="w", opened_at=None):
+        return {"wallet": wallet, "token": "m",
+                "observed_at": time.time(), "opened_at": opened_at or time.time(),
+                "cost_lamports": 500_000_000, "size_tokens": 1_000, "regime": "r"}
+
+    def test_open_follows_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            desk = self._desk(tmp, {"m": [self._candidate()]})
+            self.assertTrue(desk.save_follow_candidates())
+            revived = self._desk(tmp)
+            self.assertEqual(revived.load_follow_candidates(), 1)
+            self.assertEqual(revived._follow_candidates["m"][0]["wallet"], "w")
+
+    def test_a_follow_past_its_horizon_is_not_revived(self):
+        """Closing one late records a different experiment under one name."""
+        with tempfile.TemporaryDirectory() as tmp:
+            stale = self._candidate(opened_at=time.time() - 900)
+            self._desk(tmp, {"m": [stale]}).save_follow_candidates()
+            revived = self._desk(tmp)
+            self.assertEqual(revived.load_follow_candidates(), 0)
+            self.assertEqual(revived._follow_candidates, {})
+
+    def test_no_checkpoint_yet_is_not_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self._desk(tmp).load_follow_candidates(), 0)
+
+    def test_a_corrupt_checkpoint_is_discarded_not_trusted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "follow_candidates.json"
+            path.write_text("{not json", encoding="utf-8")
+            self.assertEqual(self._desk(tmp).load_follow_candidates(), 0)
+
+    def test_the_save_is_atomic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            desk = self._desk(tmp, {"m": [self._candidate()]})
+            desk.save_follow_candidates()
+            self.assertTrue((Path(tmp) / "follow_candidates.json").exists())
+            self.assertFalse((Path(tmp) / "follow_candidates.json.tmp").exists())
+
+    def test_the_desk_restores_before_any_loop_starts(self):
+        source = inspect.getsource(MemecoinQuantDesk.start)
+        self.assertIn("load_follow_candidates", source)
+        self.assertLess(source.index("load_follow_candidates"),
+                        source.index("_setup_health_server"))
+
+
+class TestASellRouteExistsOnTheCurveItself(unittest.TestCase):
+    """Every one of 419 decided launches was rejected by the hard safety
+    veto on 2026-08-29 and never reached the economic layer: 240 for
+    sell_route_unavailable, 181 for catastrophic_exit_price_impact.
+
+    Both came from asking Jupiter for a token->USDC route on a mint seconds
+    old that it has never indexed, then recording its ignorance as
+    {"status": "OK", "feasible": False} -- a CONFIDENT false. A pump.fun
+    mint on its curve is sold back to that curve, which this desk executes
+    natively."""
+
+    def _detector(self, curve=None, quote_provider=None):
+        det = RugDetector.__new__(RugDetector)
+        det.quote_provider = quote_provider
+        det.curve_state_provider = (lambda mint: curve) if curve is not None else None
+        return det
+
+    def _curve(self, tradeable=True):
+        return SimpleNamespace(tradeable=tradeable)
+
+    def test_a_live_curve_is_a_feasible_sell_route(self):
+        det = self._detector(curve=self._curve())
+        route = asyncio.run(det._solana_sell_route("m", {"supply": 10**15, "decimals": 6}))
+        self.assertEqual(route["status"], "OK")
+        self.assertTrue(route["feasible"])
+        self.assertEqual(route["venue"], "bonding_curve")
+
+    def test_the_curve_route_asserts_no_impact_without_a_size(self):
+        """Impact is a function of size; naming one here invents the position."""
+        det = self._detector(curve=self._curve())
+        route = asyncio.run(det._solana_sell_route("m", {"supply": 10**15, "decimals": 6}))
+        self.assertIsNone(route["price_impact_pct"])
+
+    def test_a_migrated_curve_falls_through_to_the_router(self):
+        """A completed curve is not tradeable; the pool is the venue."""
+        det = self._detector(curve=self._curve(tradeable=False))
+        route = asyncio.run(det._solana_sell_route("m", {"supply": 10**15, "decimals": 6}))
+        self.assertEqual(route["status"], "DATA_BLOCKED")
+
+    def test_router_ignorance_is_unmeasured_not_a_confident_false(self):
+        """This single distinction decides veto versus uncertainty."""
+        provider = SimpleNamespace(
+            _session=object(), get_quote=lambda *a, **k: _none_coro())
+        det = self._detector(quote_provider=provider)
+        route = asyncio.run(det._solana_sell_route("m", {"supply": 10**15, "decimals": 6}))
+        self.assertEqual(route["status"], "DATA_BLOCKED")
+        self.assertIsNone(route["feasible"])
+
+    def test_the_veto_does_not_fire_on_an_unmeasured_route(self):
+        report = SimpleNamespace(
+            sell_route_feasible=None, checks={"sell_route": {"price_impact_pct": None}},
+            risk_level="LOW", data_status="OK", ownership_renounced=True,
+            can_mint=False, can_freeze=False, token_extensions=[])
+        result = RiskVeto().evaluate(report)
+        self.assertNotIn("sell_route_unavailable", result.reasons)
+        self.assertNotIn("catastrophic_exit_price_impact", result.reasons)
+
+    def test_the_desk_gives_the_detector_the_streamed_curve(self):
+        source = inspect.getsource(MemecoinQuantDesk._setup_detection_and_risk)
+        self.assertIn("curve_state_provider=self._latest_curve_state.get", source)
+
+
+async def _none_coro():
+    return None
+
+
+class TestFreshnessMeansDataArrivedNotThatWeLooked(unittest.TestCase):
+    """_monitor_loop calls register_token for every tracked token every two
+    seconds. Stamping freshness there meant nothing was ever seen as quiet,
+    which silently disabled death classification: 2,714 launches awaiting a
+    verdict produced exactly one on 2026-08-29."""
+
+    def _model(self):
+        return ContinuousRugHazardModel(
+            SimpleNamespace(name="solana"), None, None, None, None)
+
+    def test_re_registering_does_not_refresh_freshness(self):
+        model = self._model()
+        model.record_observation("m", {"type": "trade"})
+        model._last_touched["m"] = 1000.0
+        model.register_token("m")                      # what the monitor does
+        self.assertEqual(model.last_touched("m"), 1000.0)
+
+    def test_a_real_observation_does_refresh_freshness(self):
+        model = self._model()
+        model.record_observation("m", {"type": "trade"})
+        model._last_touched["m"] = 1000.0
+        model.record_observation("m", {"type": "trade"})
+        self.assertGreater(model.last_touched("m"), 1000.0)
+
+    def test_a_first_registration_is_stamped_so_it_can_age(self):
+        model = self._model()
+        model.register_token("m")
+        self.assertIsNotNone(model.last_touched("m"))
+
+    def test_a_quiet_token_becomes_classifiable(self):
+        """The whole point: stale tokens must be reachable by the sweep."""
+        model = self._model()
+        model.record_observation("m", {"type": "trade"})
+        model._last_touched["m"] = time.time() - 3600
+        for _ in range(5):
+            model.register_token("m")
+        self.assertLess(model.last_touched("m"), time.time() - 3000)
+
+
+class TestAnEvictedTokenStillGetsAVerdict(unittest.TestCase):
+    """The death sweep can only reach RESIDENT tokens, so eviction silently
+    closed the question for anything it removed -- and eviction takes the
+    stalest tokens, which are exactly the ones most likely to be dead.
+    Measured 2026-08-29 across 71,748 spilled tokens: 107 satisfied the
+    death criteria and not one had been classified."""
+
+    def _model(self, max_tracked=100):
+        return ContinuousRugHazardModel(
+            SimpleNamespace(name="solana"), None, None, None, None,
+            max_tracked_tokens=max_tracked)
+
+    def test_the_hook_fires_for_each_evicted_token(self):
+        model = self._model()
+        for index in range(10):
+            model.record_observation(f"t{index}", {"type": "trade"})
+            model._last_touched[f"t{index}"] = float(index)
+        model.max_tracked_tokens = 4
+        seen = []
+        self.assertEqual(model.prune(on_evict=seen.append), 6)
+        self.assertEqual(len(seen), 6)
+        self.assertIn("t0", seen)
+
+    def test_the_hook_sees_observations_before_they_are_dropped(self):
+        model = self._model()
+        model.record_observation("stale", {"type": "trade", "price_multiple": 5.0})
+        model.record_observation("fresh", {"type": "trade"})
+        model._last_touched["stale"] = 0.0
+        model.max_tracked_tokens = 1
+        captured = {}
+        model.prune(on_evict=lambda t: captured.setdefault(
+            t, len(model.observations.get(t, ()))))
+        self.assertEqual(captured["stale"], 1)
+
+    def test_a_raising_hook_does_not_cost_the_archive_copy(self):
+        """A callback fault must not also lose the spill."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "spill.jsonl"
+            model = ContinuousRugHazardModel(
+                SimpleNamespace(name="solana"), None, None, None, None,
+                spill_path=path)
+            model.record_observation("stale", {"type": "trade"})
+            model.record_observation("fresh", {"type": "trade"})
+            model._last_touched["stale"] = 0.0
+            model.max_tracked_tokens = 1
+            def boom(token):
+                raise ValueError("classifier exploded")
+            self.assertEqual(model.prune(on_evict=boom), 1)
+            self.assertEqual(model.tokens_spilled, 1)
+
+    def test_no_hook_still_evicts(self):
+        model = self._model()
+        model.record_observation("a", {"type": "trade"})
+        model.record_observation("b", {"type": "trade"})
+        model._last_touched["a"] = 0.0
+        model.max_tracked_tokens = 1
+        self.assertEqual(model.prune(), 1)
+
+    def test_the_desk_classifies_on_the_way_out(self):
+        source = inspect.getsource(MemecoinQuantDesk._prune_hazard_tracking)
+        self.assertIn("on_evict=self._classify_before_eviction", source)
+
+    def test_eviction_classification_needs_two_priced_points(self):
+        desk = SimpleNamespace(
+            rug_hazard=SimpleNamespace(observations={"m": [{"type": "trade"}]}),
+            _latest_pool_state={}, launch_census=SimpleNamespace(
+                resolve=lambda *a, **k: self.fail("must not classify")),
+            _record_ops_event=lambda *a, **k: None)
+        MemecoinQuantDesk._classify_before_eviction(desk, "m")
+
+
+class TestACascadeCountsWalletsNotSellOrders(unittest.TestCase):
+    """A live verdict on 2026-08-29 read "24 of 5 first-block buyers
+    exited", which cannot happen. exits counted sell TRANSACTIONS while the
+    cohort counted unique WALLETS, so one wallet selling repeatedly could
+    stand in for the whole cohort and fire a cascade on ordinary trading.
+
+    A false mechanism label is worse than none: it trains the one head that
+    currently passes validation on an event that did not occur."""
+
+    def _path(self, multiples, start=0.0):
+        return [{"type": "trade", "price_multiple": m, "timestamp": start + i,
+                 "side": "buy", "wallet": "seed"}
+                for i, m in enumerate(multiples)]
+
+    def test_one_wallet_selling_repeatedly_is_not_a_cascade(self):
+        rows = self._path([1.0, 5.0, 0.1])
+        for i in range(5):
+            rows.append({"type": "trade", "side": "buy", "wallet": f"w{i}",
+                         "timestamp": 1.0, "amount": 10})
+        # a single cohort member sells thirty times
+        for i in range(30):
+            rows.append({"type": "trade", "side": "sell", "wallet": "w0",
+                         "timestamp": 50.0 + i, "amount": 1})
+        verdict = rug_mechanism.classify(rows, migrated=False)
+        self.assertIsNot(verdict.mechanism, RugMechanism.SNIPER_CASCADE)
+
+    def test_most_of_the_cohort_leaving_together_is_still_a_cascade(self):
+        rows = self._path([1.0, 5.0, 0.1])
+        for i in range(5):
+            rows.append({"type": "trade", "side": "buy", "wallet": f"w{i}",
+                         "timestamp": 1.0, "amount": 10})
+        for i in range(4):                      # 4 of 5 distinct wallets exit
+            rows.append({"type": "trade", "side": "sell", "wallet": f"w{i}",
+                         "timestamp": 50.0 + i, "amount": 10})
+        verdict = rug_mechanism.classify(rows, migrated=False)
+        self.assertIs(verdict.mechanism, RugMechanism.SNIPER_CASCADE)
+        self.assertLessEqual(verdict.evidence["exited"], verdict.evidence["cohort"])
+
+    def test_exited_can_never_exceed_the_cohort(self):
+        rows = self._path([1.0, 5.0, 0.1])
+        for i in range(6):
+            rows.append({"type": "trade", "side": "buy", "wallet": f"w{i}",
+                         "timestamp": 1.0, "amount": 10})
+        for i in range(6):
+            for _ in range(9):
+                rows.append({"type": "trade", "side": "sell", "wallet": f"w{i}",
+                             "timestamp": 50.0, "amount": 1})
+        verdict = rug_mechanism.classify(rows, migrated=False)
+        if verdict.mechanism is RugMechanism.SNIPER_CASCADE:
+            self.assertLessEqual(verdict.evidence["exited"], verdict.evidence["cohort"])
+
+
+class TestAnOutcomeForAnEvictedMintIsStillCounted(unittest.TestCase):
+    """The desk wrote three rug verdicts while reporting one rug: the
+    classifier worked and resolve() dropped the answer because the mint's
+    detail had already left memory."""
+
+    def test_a_rug_for_an_unknown_mint_still_counts(self):
+        census = LaunchCensus()
+        census.resolve("gone", rugged=True, rug_mechanism="lp_pull")
+        report = census.report()
+        self.assertEqual(report["outcomes"]["rugs"], 1)
+        self.assertEqual(report["rug_mechanisms"], {"lp_pull": 1})
+        self.assertEqual(census.resolutions_after_eviction, 1)
+
+    def test_a_non_rug_resolution_for_an_unknown_mint_is_not_invented(self):
+        census = LaunchCensus()
+        census.resolve("gone", peak_multiple=5.0)
+        self.assertEqual(census.report()["outcomes"]["rugs"], 0)
+        self.assertEqual(census.resolutions_after_eviction, 0)
+
+    def test_the_count_survives_a_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "census.json"
+            census = LaunchCensus(path)
+            census.resolve("gone", rugged=True, rug_mechanism="freeze")
+            census.save()
+            revived = LaunchCensus(path)
+            revived.load()
+            self.assertEqual(revived.resolutions_after_eviction, 1)
+
+
+class TestTheVetoReplayJudgesRealisableNotPeak(unittest.TestCase):
+    """Nothing measured what the safety veto cost: it rejected 100% of
+    decided launches and no report asked what those launches then did.
+
+    The trap this guards: nearly every launch trades above its open at some
+    instant, so judging a veto on the PEAK declares every one of them guilty
+    and argues for removing safety from launches that lose money."""
+
+    def _rejected(self, mint, reason, peak=None):
+        return {"mint": mint, "disposition": "DECIDED_REJECT",
+                "disposition_reason": reason, "peak_multiple": peak}
+
+    def test_compound_reasons_split_into_every_cause(self):
+        """Attributing a compound veto wholly to the first cause is how one
+        veto hides behind a louder one."""
+        self.assertEqual(
+            veto_causes("safety_veto:native_risk_level:critical,sell_route_unavailable"),
+            ["native_risk_level:critical", "sell_route_unavailable"])
+        self.assertEqual(veto_causes("screened_out_for_other_reasons"), [])
+
+    def test_a_peak_that_is_not_realisable_earns_the_veto_its_place(self):
+        rows = [self._rejected(f"m{i}", "safety_veto:x", peak=1.3) for i in range(40)]
+        cause = replay(rows)["causes"][0]
+        self.assertGreater(cause["mean_log_peak"], 0)          # peaked up
+        self.assertLess(cause["mean_log_realisable"], 0)       # but not tradeable
+        self.assertEqual(cause["verdict"], "EARNING_ITS_PLACE")
+
+    def test_a_genuinely_costly_veto_is_still_called_out(self):
+        rows = [self._rejected(f"m{i}", "safety_veto:x", peak=20.0) for i in range(40)]
+        cause = replay(rows)["causes"][0]
+        self.assertEqual(cause["verdict"], "COSTING_GROWTH")
+        self.assertEqual(cause["monsters_discarded"], 40)
+
+    def test_too_few_samples_is_blocked_not_declared_free(self):
+        rows = [self._rejected(f"m{i}", "safety_veto:rare", peak=1.0) for i in range(5)]
+        cause = replay(rows)["causes"][0]
+        self.assertEqual(cause["status"], "DATA_BLOCKED")
+        self.assertNotIn("verdict", cause)
+
+    def test_unresolved_rejections_are_counted_never_treated_as_flat(self):
+        """Treating unobserved as zero-return makes every veto look free."""
+        rows = ([self._rejected(f"m{i}", "safety_veto:x", peak=1.2) for i in range(30)]
+                + [self._rejected(f"u{i}", "safety_veto:x") for i in range(11)])
+        cause = replay(rows)["causes"][0]
+        self.assertEqual(cause["resolved"], 30)
+        self.assertEqual(cause["unresolved"], 11)
+
+    def test_a_mint_is_counted_once_across_state_and_spill(self):
+        """The lake and live state overlap; double counting would inflate."""
+        rows = [self._rejected("dup", "safety_veto:x", peak=2.0)] * 40
+        self.assertEqual(replay(rows)["causes"][0]["status"], "DATA_BLOCKED")
