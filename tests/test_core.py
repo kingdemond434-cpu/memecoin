@@ -9602,6 +9602,77 @@ class TestWalletObservationPath(unittest.IsolatedAsyncioTestCase):
                       engine.data_status["live_wallet_watch"])
 
 
+class TestEarlyBuyerAnalysisIsThrottled(unittest.IsolatedAsyncioTestCase):
+    """wallet_follow, actor_graph and capital_rotation all read zero for the
+    entire 2026-08-29 session -- not because the RPC calls were wrong (each
+    one succeeds when reproduced individually) but because
+    _analyze_token_early_buyers awaited up to 20 wallet-history fetches
+    DIRECTLY per single token_created event. Each fetch is itself
+    getSignaturesForAddress plus batched getTransaction calls, so one launch
+    could burst 20+ concurrent RPC calls against a free-tier pool -- and once
+    the failures stopped being silently swallowed at debug level, the journal
+    showed every one of them failing with "No healthy RPC endpoint serves
+    ...". The lookups were correct; the volume was the bug. The fix routes
+    discovered owners through the existing throttled queue
+    (_history_worker_loop, ~1.1s/wallet with dedup) instead of awaiting them
+    inline.
+    """
+
+    def _engine(self):
+        engine = WalletIntelligenceEngine.__new__(WalletIntelligenceEngine)
+        engine.data_status = {}
+        engine._queued_history_wallets = set()
+        engine._history_candidates = deque(maxlen=100)
+        engine._history_evaluated_at = {}
+        engine.genealogy = SimpleNamespace(wallets={})
+        return engine
+
+    async def test_twenty_holders_queue_instead_of_bursting(self):
+        # 32-44 chars each, matching _queue_wallet_history's own address
+        # length guard -- real base58 pubkeys, not test shorthand.
+        owners = [f"Owner{i:02d}11111111111111111111111111111" for i in range(20)]
+        engine = self._engine()
+        calls = {"count": 0}
+
+        async def fake_request(method, params):
+            if method == "getTokenLargestAccounts":
+                return {"value": [{"address": f"acct{i}"} for i in range(20)]}
+            if method == "getMultipleAccounts":
+                calls["count"] += 1
+                return {"value": [
+                    {"data": {"parsed": {"info": {"owner": owner}}}}
+                    for owner in owners]}
+            self.fail(f"unexpected direct RPC call during analysis: {method}")
+
+        engine.rpc = SimpleNamespace(request=fake_request)
+
+        async def fail_if_awaited_directly(*args, **kwargs):
+            self.fail("_evaluate_new_wallet was awaited directly -- the "
+                     "burst this test exists to prevent")
+        engine._evaluate_new_wallet = fail_if_awaited_directly
+
+        await WalletIntelligenceEngine._analyze_token_early_buyers(engine, "mint1")
+
+        self.assertEqual(len(engine._history_candidates), 20)
+        self.assertEqual(engine.data_status["holders:mint1"], "OK")
+        # Exactly the RPC calls the holder lookup itself needs -- nothing
+        # per-wallet leaked into this path.
+        self.assertEqual(calls["count"], 1)
+
+    async def test_an_already_known_wallet_is_not_requeued(self):
+        engine = self._engine()
+        engine.genealogy.wallets["known"] = object()
+
+        async def fake_request(method, params):
+            if method == "getTokenLargestAccounts":
+                return {"value": [{"address": "acct0"}]}
+            return {"value": [{"data": {"parsed": {"info": {"owner": "known"}}}}]}
+
+        engine.rpc = SimpleNamespace(request=fake_request)
+        await WalletIntelligenceEngine._analyze_token_early_buyers(engine, "mint2")
+        self.assertEqual(len(engine._history_candidates), 0)
+
+
 class TestDecisionContribution(unittest.TestCase):
     """Coverage says a module ran. This says whether it mattered.
 

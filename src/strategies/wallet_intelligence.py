@@ -232,7 +232,19 @@ class WalletIntelligenceEngine:
             for item in (account_data or {}).get("value", []):
                 owner = (((item or {}).get("data") or {}).get("parsed") or {}).get("info", {}).get("owner")
                 if owner and owner not in self.genealogy.wallets:
-                    await self._evaluate_new_wallet(owner, token)
+                    # Queued through the throttled worker (_history_worker_loop,
+                    # ~1.1s/wallet with dedup and a 1h re-evaluation cooldown),
+                    # not awaited directly here. This method fires on EVERY
+                    # token_created event and each one can name up to 20
+                    # holders -- awaiting _evaluate_new_wallet inline meant up
+                    # to 20 concurrent getSignaturesForAddress + getTransaction
+                    # bursts per single launch, which is what was actually
+                    # exhausting the free RPC pool: every call this produced
+                    # failed with "No healthy RPC endpoint serves ..." once
+                    # the failures stopped being silent (2026-08-29) and could
+                    # finally be seen. The lookups were correct; the volume
+                    # was the bug.
+                    self._queue_wallet_history(owner, token)
             self.data_status[f"holders:{token}"] = "OK"
         except Exception as e:
             self.data_status[f"holders:{token}"] = f"DATA_BLOCKED: {e}"
