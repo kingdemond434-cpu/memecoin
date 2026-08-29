@@ -392,3 +392,16 @@ class LedgerDoctorActuallyRunsTheVerification(unittest.TestCase):
         with open("deploy/systemd/memecoin-ledger-doctor.service", encoding="utf-8") as f:
             unit = f.read()
         self.assertIn("SuccessExitStatus=1", unit)
+
+
+class FeedDoctorSurvivesADeskMidRestart(unittest.TestCase):
+    """Measured 2026-08-29: this timer fired in the exact 10-second window a
+    desk restart left the status port down -- exit 2, "connection refused" --
+    and the unit read as genuinely FAILED, not the already-handled exit-1
+    informational case. Transient and self-resolving on the next tick; the
+    desk's own down-state is already the watchdog's job to report."""
+
+    def test_both_informational_exit_codes_are_declared_non_fatal(self):
+        with open("deploy/systemd/memecoin-feed-doctor.service", encoding="utf-8") as f:
+            unit = f.read()
+        self.assertIn("SuccessExitStatus=1 2", unit)
