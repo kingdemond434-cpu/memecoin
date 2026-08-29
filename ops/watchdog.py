@@ -13,6 +13,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import subprocess
 import time
 import urllib.parse
@@ -25,6 +26,28 @@ logger = logging.getLogger("ops.watchdog")
 
 WATCHDOG_SCHEMA_VERSION = "v1"
 EXIT_OK, EXIT_REPAIRED, EXIT_FAILED = 0, 1, 2
+
+#: Every unit this desk owns, checked for the exact failure observed
+#: 2026-08-29: a cross-project OOM event took down the desk service and all
+#: five timers by disabling them, not merely stopping them, so nothing came
+#: back on its own restart-always policy or its next scheduled tick.
+#:
+#: Limitation, stated rather than hidden: this check runs FROM
+#: memecoin-watchdog.timer, so the one entry it cannot recover unaided is its
+#: own timer being disabled -- nothing would be running to notice. The weekly
+#: audit-pack timer is a second, independent trigger point for the same
+#: check, which bounds the outage to at most a week even in that exact case,
+#: rather than fixing it outright.
+FLEET_UNITS: Tuple[str, ...] = (
+    "memecoin-shadow.service",
+    "memecoin-watchdog.timer",
+    "memecoin-health.timer",
+    "memecoin-shadow-trainer.timer",
+    "memecoin-feed-doctor.timer",
+    "memecoin-audit-pack.timer",
+    "memecoin-backfill.timer",
+    "memecoin-credential-doctor.timer",
+)
 
 
 @dataclass
@@ -42,6 +65,26 @@ class Policy:
     #: happen; half an hour is far outside them and still catches a real
     #: outage inside the hour it would otherwise cost.
     telegram_stall_seconds: float = 1_800.0
+    #: Mirrors the live training_guard's own --min-available-mib (see
+    #: src/runtime/training_guard.py). Declared here too, deliberately,
+    #: rather than imported: this alert is about visibility into a condition
+    #: that already cost six silent hourly skips on 2026-08-28, and a
+    #: watchdog whose threshold constant depends on the exact module it is
+    #: warning about is one refactor away from silently losing that warning.
+    training_guard_min_mib: float = 640.0
+    #: How long available memory may stay under that floor before the
+    #: watchdog says so on its own, rather than waiting for
+    #: training_stale_seconds (26h) to notice indirectly. Three hours is
+    #: three missed hourly attempts -- a real pattern, not one bad tick.
+    training_low_memory_alert_seconds: float = 10_800.0
+    #: Disk full breaks everything downstream at once: episodes cannot be
+    #: written, the trade-evidence hash chain cannot append, models cannot
+    #: save. 90% leaves headroom to alert before the failure, not after it.
+    disk_usage_alert_fraction: float = 0.90
+    #: The backfill timer runs every 6h; three missed cycles (18h) is a
+    #: pattern, not one contended run losing to the live desk for RPC quota
+    #: -- which is expected and already handled by the tool's own retry.
+    backfill_stale_seconds: float = 64_800.0
 
 
 @dataclass
@@ -49,6 +92,12 @@ class Plan:
     restart_desk: bool = False
     start_trainer: bool = False
     enable_desk: bool = False
+    #: Units found disabled and queued for `systemctl --user enable`.
+    #: Unconditional, unlike restart_desk: enabling an already-enabled unit
+    #: is a no-op, so there is no flapping risk this needs to be debounced
+    #: against, and the whole point is to close this gap faster than the
+    #: two-observation rule would.
+    reenable_units: List[str] = field(default_factory=list)
     repair_reasons: List[str] = field(default_factory=list)
     alerts: List[str] = field(default_factory=list)
 
@@ -165,11 +214,53 @@ def observed_faults(readiness: Dict[str, Any]) -> Tuple[List[str], List[str]]:
 def decide(*, service_active: bool, service_enabled: bool,
            readiness: Dict[str, Any], readiness_age: Optional[float],
            state: Dict[str, Any], now: float, policy: Policy,
-           trainer_active: bool, training_age: Optional[float]) -> Plan:
-    """Pure repair decision, separated so restart storms are testable."""
+           trainer_active: bool, training_age: Optional[float],
+           disabled_units: Sequence[str] = (),
+           available_mib: Optional[float] = None,
+           disk_used_fraction: Optional[float] = None,
+           backfill_checkpoint_age: Optional[float] = None,
+           own_memory_max_bytes: Optional[int] = None,
+           total_physical_bytes: Optional[int] = None) -> Plan:
+    """Pure repair decision, separated so restart storms are testable.
+
+    Every argument here is a value main() already read; decide() does no I/O
+    of its own so the whole decision stays a plain function of its inputs,
+    which is what makes restart storms and alert thresholds testable without
+    a live systemd, a live desk, or a live filesystem behind them.
+    """
     plan = Plan(enable_desk=not service_enabled)
+    plan.reenable_units = [unit for unit in disabled_units]
     immediate: List[str] = []
     persistent: List[str] = []
+
+    if available_mib is not None:
+        if available_mib < policy.training_guard_min_mib:
+            since = float(state.get("low_memory_since", 0.0) or 0.0)
+            if not since:
+                state["low_memory_since"] = now
+            elif now - since > policy.training_low_memory_alert_seconds:
+                plan.alerts.append("training_guard_memory_starved")
+        else:
+            state.pop("low_memory_since", None)
+
+    if disk_used_fraction is not None and disk_used_fraction >= policy.disk_usage_alert_fraction:
+        plan.alerts.append("disk_nearly_full")
+
+    if backfill_checkpoint_age is not None and backfill_checkpoint_age > policy.backfill_stale_seconds:
+        plan.alerts.append("backfill_stalled")
+
+    if total_physical_bytes is not None:
+        # Exactly tonight's incident: a per-cgroup ceiling set above physical
+        # RAM (or no ceiling at all, on a box with zero swap) cannot bind, so
+        # the GLOBAL OOM killer picks a victim from the whole machine instead
+        # -- which is how this service was killed 62 times in 7 days and took
+        # another project's units down with it. A correct fix already exists
+        # as a drop-in (memecoin-shadow.service.d/10-blast-radius.conf, owned
+        # by the other project's automation); this exists to notice if that
+        # drop-in is ever removed or reverted rather than silently
+        # regressing back into the same failure.
+        if own_memory_max_bytes is None or own_memory_max_bytes > total_physical_bytes:
+            plan.alerts.append("own_memory_ceiling_exceeds_physical_ram")
     if not service_active:
         immediate.append("desk_service_inactive")
     elif readiness_age is None:
@@ -246,6 +337,51 @@ class Systemctl:
     def enabled(self, unit: str) -> bool:
         return self.call("is-enabled", "--quiet", unit).returncode == 0
 
+    def show_property(self, unit: str, prop: str) -> str:
+        result = self.call("show", unit, "-p", prop, "--value")
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _read_meminfo_field(field_name: str) -> Optional[int]:
+    """Bytes for one /proc/meminfo field, or None if it cannot be read.
+
+    Duplicated from src.runtime.training_guard's approach rather than
+    imported, for the same reason the memory threshold is duplicated in
+    Policy: this module's only dependency should be the standard library, so
+    a broken import elsewhere in the desk cannot also take out its watchdog.
+    """
+    try:
+        for row in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if row.startswith(f"{field_name}:"):
+                return int(row.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _own_memory_max_bytes(controller: "Systemctl", unit: str) -> Optional[int]:
+    raw = controller.show_property(unit, "MemoryMax")
+    if not raw or raw == "infinity":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _backfill_checkpoint_age(root: Path, now: float) -> Optional[float]:
+    path = root / "data/state/backfill_checkpoint.json"
+    data = _read_json(path)
+    updated_at = data.get("updated_at")
+    if updated_at is None:
+        # Absent before the first run ever completes -- not a fault, just
+        # too early to have an opinion.
+        return None
+    try:
+        return now - float(updated_at)
+    except (TypeError, ValueError):
+        return None
+
 
 def _latest_training_age(model_dir: Path, now: float) -> float:
     paths = [model_dir / name for name in (
@@ -319,17 +455,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     readiness_age = (now - readiness_path.stat().st_mtime
                      if readiness_path.exists() else None)
     state = _read_json(state_path)
+
+    disabled_units = [unit for unit in FLEET_UNITS if not controller.enabled(unit)]
+    try:
+        usage = shutil.disk_usage(root)
+        disk_used_fraction = 1.0 - (usage.free / max(usage.total, 1))
+    except OSError:
+        disk_used_fraction = None
+    mem_available_bytes = _read_meminfo_field("MemAvailable")
+    available_mib = (mem_available_bytes / (1024 * 1024)
+                     if mem_available_bytes is not None else None)
+
     plan = decide(
         service_active=service_active, service_enabled=service_enabled,
         readiness=_read_json(readiness_path), readiness_age=readiness_age,
         state=state, now=now, policy=Policy(), trainer_active=trainer_active,
-        training_age=_latest_training_age(root / "models", now))
+        training_age=_latest_training_age(root / "models", now),
+        disabled_units=disabled_units,
+        available_mib=available_mib,
+        disk_used_fraction=disk_used_fraction,
+        backfill_checkpoint_age=_backfill_checkpoint_age(root, now),
+        own_memory_max_bytes=_own_memory_max_bytes(controller, args.desk_unit),
+        total_physical_bytes=_read_meminfo_field("MemTotal"))
 
     actions: List[str] = []
     failures: List[str] = []
     if plan.enable_desk and not args.dry_run:
         result = controller.call("enable", args.desk_unit)
         (actions if result.returncode == 0 else failures).append("enable_desk")
+    for unit in plan.reenable_units:
+        if args.dry_run:
+            break
+        result = controller.call("enable", unit)
+        (actions if result.returncode == 0 else failures).append(f"reenable:{unit}")
     if plan.restart_desk and not args.dry_run:
         result = controller.call("restart", args.desk_unit)
         if result.returncode == 0:
