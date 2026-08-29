@@ -17,11 +17,24 @@ skips on a box whose pressure came from unrelated sessions, not the trainer.
 If the dataset grows the trainer past 640 MB, systemd kills that one run
 visibly -- a failed unit -- which is strictly better than the invisible skip:
 a failure names itself, a skip looks like patience.
+
+A skip used to cost a full hour, not just the memory: the timer tried once
+on OnCalendar=hourly, and a skip meant the next chance was 60 minutes away
+even if memory freed up 5 minutes later. Recalibrated 2026-08-29 to check
+every 15 minutes instead (memecoin-shadow-trainer.timer), which quadruples
+the chances of catching a viable window -- and needs a SECOND gate here so
+that does not also mean training four times as often once memory is
+available. --min-minutes-since-last-success reads the same report mtimes
+ops/watchdog.py already uses for training-staleness, duplicated rather than
+imported for the same reason MemAvailable is read directly here: this
+guard's only dependency should be the standard library, so nothing else in
+the desk can break it.
 """
 
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -42,11 +55,32 @@ def mem_available_mib(path: Path = Path("/proc/meminfo")) -> Optional[float]:
     return None
 
 
+def minutes_since_last_training(model_dir: Path) -> Optional[float]:
+    """None if training has never produced a report -- not yet a wait."""
+    paths = [model_dir / name for name in (
+        "last_training_report.json", "last_hazard_training_report.json",
+        "last_exit_policy_report.json")]
+    existing = [path for path in paths if path.exists()]
+    if not existing:
+        return None
+    return (time.time() - min(path.stat().st_mtime for path in existing)) / 60.0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--min-available-mib", type=float, default=640.0)
     parser.add_argument("--meminfo", type=Path, default=Path("/proc/meminfo"))
+    parser.add_argument("--model-dir", type=Path, default=Path("models"))
+    parser.add_argument("--min-minutes-since-last-success", type=float, default=50.0)
     args = parser.parse_args()
+
+    since = minutes_since_last_training(args.model_dir)
+    if since is not None and since < args.min_minutes_since_last_success:
+        print("TRAINING_GUARD=SKIP "
+              f"reason=trained_recently minutes_since={since:.1f} "
+              f"required_minutes={args.min_minutes_since_last_success:.0f}")
+        return 1
+
     available = mem_available_mib(args.meminfo)
     if available is None:
         print("TRAINING_GUARD=SKIP reason=MemAvailable_unreadable")

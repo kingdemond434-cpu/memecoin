@@ -1,10 +1,12 @@
 import asyncio
+import dataclasses
 import logging
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 import json
 import numpy as np
@@ -73,7 +75,8 @@ class WalletIntelligenceEngine:
         genealogy: GenealogyGraph,
         helius_key: str,
         min_trades_for_ranking: int = 20,
-        recalc_interval_hours: int = 1
+        recalc_interval_hours: int = 1,
+        state_path: "str | Path | None" = None,
     ):
         self.chain_config = chain_config
         self.rpc = rpc
@@ -129,21 +132,104 @@ class WalletIntelligenceEngine:
         
         self._helius_base = "https://api.helius.xyz/v0"
 
+        # Every restart wiped this pipeline back to zero -- measured
+        # 2026-08-29: the desk restarted twice in 20 minutes under this
+        # shared box's contention, and the wallet pipeline needs roughly
+        # 20-40 minutes of UNBROKEN uptime (20+ classified trades per
+        # wallet, a 5-minute recalc cycle, a 300s follow-resolution
+        # horizon) to produce its first signal. A pipeline that never gets
+        # an unbroken window that long never proves anything, however
+        # correctly it is now throttled. regime_performances is the source
+        # of truth wallet_scores is recomputed FROM every 5 minutes, so
+        # that (plus genealogy.wallets, its trade-count backing) is what
+        # gets persisted -- not wallet_scores itself, which is a derived
+        # cache the next recalc would silently overwrite with a fresh,
+        # empty one anyway if the source data were not also restored.
+        self._state_path = Path(state_path) if state_path else Path(
+            "data/state/wallet_intelligence.json")
+
+    def _save_state(self) -> None:
+        try:
+            regime_performances = {
+                wallet: {
+                    regime.value: dataclasses.asdict(perf)
+                    for regime, perf in regimes.items()
+                }
+                for wallet, regimes in self.regime_performances.items()
+            }
+            for wallet, regimes in regime_performances.items():
+                for regime_value, perf in regimes.items():
+                    perf["regime"] = perf["regime"].value if isinstance(
+                        perf["regime"], WalletRegime) else perf["regime"]
+            wallets = {}
+            for address, profile in self.genealogy.wallets.items():
+                row = dataclasses.asdict(profile)
+                row["entity_type"] = profile.entity_type.value
+                row["funding_sources"] = sorted(profile.funding_sources)
+                row["cashout_destinations"] = sorted(profile.cashout_destinations)
+                row["related_wallets"] = sorted(profile.related_wallets)
+                wallets[address] = row
+            payload = {
+                "schema": "v1", "saved_at": time.time(),
+                "regime_performances": regime_performances,
+                "wallets": wallets,
+            }
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._state_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            tmp.replace(self._state_path)
+        except Exception as exc:  # a failed checkpoint must not crash the recalc loop
+            logger.warning("Wallet-intelligence state save failed: %s: %s",
+                           type(exc).__name__, exc)
+
+    def _load_state(self) -> None:
+        if not self._state_path.exists():
+            return
+        try:
+            payload = json.loads(self._state_path.read_text(encoding="utf-8"))
+            for wallet, regimes in (payload.get("regime_performances") or {}).items():
+                restored: Dict[WalletRegime, WalletRegimePerformance] = {}
+                for regime_value, row in regimes.items():
+                    row = dict(row)
+                    row["regime"] = WalletRegime(row["regime"])
+                    restored[WalletRegime(regime_value)] = WalletRegimePerformance(**row)
+                self.regime_performances[wallet] = restored
+            for address, row in (payload.get("wallets") or {}).items():
+                row = dict(row)
+                row["entity_type"] = EntityType(row["entity_type"])
+                row["funding_sources"] = set(row.get("funding_sources") or ())
+                row["cashout_destinations"] = set(row.get("cashout_destinations") or ())
+                row["related_wallets"] = set(row.get("related_wallets") or ())
+                self.genealogy.wallets[address] = WalletProfile(**row)
+            age_s = time.time() - float(payload.get("saved_at", 0.0) or 0.0)
+            logger.info("Wallet-intelligence state restored: %d wallets, "
+                       "%d regime-performance rows, saved %.0fs ago",
+                       len(payload.get("wallets") or {}),
+                       sum(len(v) for v in (payload.get("regime_performances") or {}).values()),
+                       age_s)
+        except Exception as exc:
+            # A checkpoint that cannot be trusted is not loaded. Rebuilding
+            # from zero costs uptime; loading corrupted regime history into
+            # a wallet's score costs correctness, which is worse.
+            logger.warning("Wallet-intelligence state discarded, unreadable: "
+                           "%s: %s", type(exc).__name__, exc)
+
     async def start(self, initial_wallets: List[str] = None):
+        self._load_state()
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30),
             connector=aiohttp.TCPConnector(limit=50)
         )
         self._running = True
-        
+
         if initial_wallets:
             self._live_watch_wallets.update(initial_wallets)
-        
+
         self._hunter_task = asyncio.create_task(self._hunter_loop())
         self._watcher_task = asyncio.create_task(self._watcher_loop())
         self._recalc_task = asyncio.create_task(self._recalc_loop())
         self._history_task = asyncio.create_task(self._history_worker_loop())
-        
+
         await self._initial_discovery()
 
     async def stop(self):
@@ -185,6 +271,11 @@ class WalletIntelligenceEngine:
             try:
                 await self._recalculate_all_scores()
                 await self._update_live_watch_list()
+                # Checkpointed on the same 5-minute cadence recalc already
+                # runs on, not a separate timer: this is exactly how often
+                # the source data (regime_performances) actually changes, so
+                # a more frequent save would just rewrite the same bytes.
+                self._save_state()
             except Exception as e:
                 logger.error(f"Recalc loop error: {e}")
             await asyncio.sleep(300)

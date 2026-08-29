@@ -574,7 +574,10 @@ class MemecoinQuantDesk:
     async def _setup_intelligence(self):
         helius = os.getenv("HELIUS_API_KEY", "")
         self.genealogy = GenealogyGraph(self.solana_config, self.solana_rpc, helius)
-        self.wallet_intel = WalletIntelligenceEngine(self.solana_config, self.solana_rpc, self.genealogy, helius)
+        state_root = Path(self.global_config.get("ops_state_dir", "data/state"))
+        self.wallet_intel = WalletIntelligenceEngine(
+            self.solana_config, self.solana_rpc, self.genealogy, helius,
+            state_path=state_root / "wallet_intelligence.json")
         self.social_intel = SocialIntelligenceEngine(
             self.solana_config, self.solana_rpc, self.genealogy, self.wallet_intel,
             {"helius": helius, "x_bearer": os.getenv("X_BEARER_TOKEN", ""),

@@ -8,6 +8,10 @@ WorkingDirectory=%h/.local/opt/memecoin-shadow
 EnvironmentFile=-%h/.config/memecoin-shadow/env
 Environment=ALLOW_LIVE_TRADING=
 Environment=SOLANA_PRIVATE_KEY=
+# Two gates, since the timer (2026-08-29) now asks every 15 minutes instead
+# of once an hour: --min-available-mib is the memory floor, and
+# --min-minutes-since-last-success (default 50) is what stops a 4x more
+# frequent ASK from becoming a 4x more frequent TRAIN once memory clears.
 ExecCondition=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.runtime.training_guard --min-available-mib 640
 ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.research.shadow_trainer --storage data/launch_episodes --model-dir models --min-samples 250
 ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.research.hazard_trainer --storage data/launch_episodes --model-dir models --min-rows 250

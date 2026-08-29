@@ -187,9 +187,9 @@ from src.strategies.reentry import (
     BARRED_DISPOSITIONS, ExitDisposition, ReentryBook, ReentryPolicy, classify_exit,
 )
 from src.strategies.public_coordination import PublicCoordinationMiner
-from src.strategies.genealogy_graph import WalletProfile
+from src.strategies.genealogy_graph import EntityType, GenealogyGraph, WalletProfile
 from src.strategies.wallet_intelligence import (
-    WalletIntelligenceEngine, WalletRegime, WalletScore,
+    WalletIntelligenceEngine, WalletRegime, WalletRegimePerformance, WalletScore,
 )
 from src.research.dataset_builder import (
     SNAPSHOT_OFFSETS_S, TAIL_THRESHOLDS, LaunchEpisode, LaunchSnapshot,
@@ -9671,6 +9671,101 @@ class TestEarlyBuyerAnalysisIsThrottled(unittest.IsolatedAsyncioTestCase):
         engine.rpc = SimpleNamespace(request=fake_request)
         await WalletIntelligenceEngine._analyze_token_early_buyers(engine, "mint2")
         self.assertEqual(len(engine._history_candidates), 0)
+
+
+class TestWalletStateSurvivesARestart(unittest.TestCase):
+    """Measured 2026-08-29: the desk restarted twice in 20 minutes under
+    this shared box's contention, and the wallet pipeline needs roughly
+    20-40 minutes of UNBROKEN uptime (a 20-trade sample floor per wallet, a
+    5-minute recalc cycle, a 300s follow-resolution horizon) to produce its
+    first signal. Every restart wiped it back to zero with nothing persisted.
+
+    regime_performances is the SOURCE the derived wallet_scores cache is
+    recomputed from every 5 minutes -- persisting only wallet_scores would
+    have the next recalc silently overwrite it with a fresh, empty one, so
+    genealogy.wallets and regime_performances are what get saved.
+    """
+
+    def _bare_engine(self):
+        engine = WalletIntelligenceEngine.__new__(WalletIntelligenceEngine)
+        engine.regime_performances = {}
+        engine.genealogy = GenealogyGraph.__new__(GenealogyGraph)
+        engine.genealogy.wallets = {}
+        return engine
+
+    def test_a_full_round_trip_restores_enum_keys_and_set_fields(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "wallet_intelligence.json"
+            engine = self._bare_engine()
+            engine._state_path = path
+            engine.regime_performances["W1"] = {
+                WalletRegime.EARLY_CURVE: WalletRegimePerformance(
+                    wallet="W1", regime=WalletRegime.EARLY_CURVE,
+                    trades=22, win_rate_2x=0.4, realized_pnl=12.5),
+            }
+            engine.genealogy.wallets["W1"] = WalletProfile(
+                address="W1", entity_type=EntityType.WALLET,
+                first_seen=1.0, last_seen=2.0, tx_count=27,
+                funding_sources={"F1", "F2"}, related_wallets={"P1"})
+            engine._save_state()
+
+            restored = self._bare_engine()
+            restored._state_path = path
+            restored._load_state()
+
+        perf = restored.regime_performances["W1"][WalletRegime.EARLY_CURVE]
+        self.assertEqual(perf.trades, 22)
+        self.assertIsInstance(perf.regime, WalletRegime)
+        profile = restored.genealogy.wallets["W1"]
+        self.assertEqual(profile.tx_count, 27)
+        self.assertEqual(profile.funding_sources, {"F1", "F2"})
+        self.assertIsInstance(profile.entity_type, EntityType)
+
+    def test_no_checkpoint_yet_leaves_state_empty_not_erroring(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            engine = self._bare_engine()
+            engine._state_path = Path(directory) / "absent.json"
+            engine._load_state()  # must not raise
+        self.assertEqual(engine.regime_performances, {})
+
+    def test_a_corrupted_checkpoint_is_discarded_not_trusted(self):
+        """Loading corrupted regime history into a score costs correctness,
+        which is worse than the cost of rebuilding from zero."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "wallet_intelligence.json"
+            path.write_text("{not valid json")
+            engine = self._bare_engine()
+            engine._state_path = path
+            engine._load_state()  # must not raise
+        self.assertEqual(engine.regime_performances, {})
+
+    def test_save_is_atomic(self):
+        """A crash mid-write must never leave a half-written checkpoint
+        where the .json filename is; systemd's own watchdog has killed this
+        process mid-execution multiple times tonight."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "wallet_intelligence.json"
+            engine = self._bare_engine()
+            engine._state_path = path
+            engine.genealogy.wallets["W1"] = WalletProfile(
+                address="W1", entity_type=EntityType.WALLET,
+                first_seen=1.0, last_seen=2.0)
+            engine._save_state()
+            self.assertFalse(path.with_suffix(".json.tmp").exists())
+            self.assertTrue(path.exists())
+
+    def test_the_recalc_loop_checkpoints_on_its_own_cadence(self):
+        with open(WalletIntelligenceEngine.__module__.replace(".", "/") + ".py",
+                 encoding="utf-8") as f:
+            source = f.read()
+        recalc_at = source.index("async def _recalc_loop")
+        save_at = source.index("self._save_state()", recalc_at)
+        sleep_at = source.index("await asyncio.sleep(300)", recalc_at)
+        self.assertLess(save_at, sleep_at)
 
 
 class TestDecisionContribution(unittest.TestCase):
