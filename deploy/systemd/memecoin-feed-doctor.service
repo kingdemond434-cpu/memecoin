@@ -5,6 +5,12 @@ Documentation=file:%h/.local/opt/memecoin-shadow/RUNBOOK.md
 
 [Service]
 Type=oneshot
+# 1 means "ran fine, some feeds are still broken with only speculative
+# candidates for a human to pick" -- informational for interactive/scripted
+# use, not a service defect. Without this every such run shows up in
+# `systemctl --user list-units --failed`, which is noise a cross-project
+# health sweep could mistake for a real problem.
+SuccessExitStatus=1
 WorkingDirectory=%h/.local/opt/memecoin-shadow
 EnvironmentFile=-%h/.config/memecoin-shadow/env
 Environment=ALLOW_LIVE_TRADING=
