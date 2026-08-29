@@ -17620,7 +17620,11 @@ class TestBoundedOperationalWatchdog(unittest.TestCase):
         timer = (root / "deploy/systemd/memecoin-watchdog.timer").read_text()
         installer = (root / "deploy/install_shadow.sh").read_text()
         self.assertIn("Type=notify", desk)
-        self.assertIn("WatchdogSec=90s", desk)
+        # Raised from 90s on 2026-08-29 after 7 systemd-watchdog kills in 6h:
+        # the ping loop is a bare sleep(10)+notify, so missing it for 90s on
+        # this shared, oversubscribed box was the OS not scheduling the
+        # process at all, not an in-process hang.
+        self.assertIn("WatchdogSec=240s", desk)
         self.assertIn("OnUnitActiveSec=60s", timer)
         self.assertIn("enable --now memecoin-watchdog.timer", installer)
 

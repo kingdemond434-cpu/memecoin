@@ -236,7 +236,15 @@ class WalletIntelligenceEngine:
             self.data_status[f"holders:{token}"] = "OK"
         except Exception as e:
             self.data_status[f"holders:{token}"] = f"DATA_BLOCKED: {e}"
-            logger.debug("Token holder analysis error: %s", e)
+            # This was logged at debug, which the desk never enables by
+            # default (LOG_LEVEL defaults to INFO) -- so every failure on
+            # this path, for as long as it has existed, was invisible. It is
+            # the entry point for the entire wallet-intelligence pipeline
+            # (actor_graph, wallet_follow, capital_rotation all read zero
+            # downstream of it), which is a strange thing to have been
+            # debugging blind.
+            logger.warning("Token holder analysis failed for %s: %s: %s",
+                           token, type(e).__name__, e)
 
     async def analyze_token_early_buyers(self, token: str):
         """Public entrypoint used by the canonical launch stream."""
@@ -260,7 +268,14 @@ class WalletIntelligenceEngine:
             await self._build_wallet_history(wallet, txs)
         except Exception as e:
             self.data_status[wallet] = f"DATA_BLOCKED: wallet history unavailable: {e}"
-            logger.debug(f"Wallet eval error: {e}")
+            # Also silent at debug before now -- see the identical note on
+            # _analyze_token_early_buyers's except block. This is the step
+            # that actually fetches a wallet's trade history (Helius, then
+            # the free RPC pool); a session/attribute error here (e.g. a
+            # None self._session before start() has completed) would have
+            # failed every single call and never shown once.
+            logger.warning("Wallet history evaluation failed for %s: %s: %s",
+                           wallet, type(e).__name__, e)
 
     #: Signatures per JSON-RPC batch. Providers cap batch size and oversized
     #: batches are rejected whole, so this stays well inside the common limit.
@@ -690,7 +705,11 @@ class WalletIntelligenceEngine:
                             for tx in txs:
                                 await self._process_live_transaction(wallet, tx)
                 except Exception as e:
-                    logger.debug(f"Live watch error for {wallet}: {e}")
+                    # Also promoted from debug: a wallet on the live watch
+                    # list going silently unpolled has the same downstream
+                    # effect as never having been watched at all.
+                    logger.warning("Live watch poll failed for %s: %s: %s",
+                                   wallet, type(e).__name__, e)
 
         # Concurrently, because one slow wallet used to delay every wallet
         # behind it, and the delay was invisible.
