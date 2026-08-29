@@ -9,7 +9,7 @@ coverage that makes that unnecessary next time.
 
 import unittest
 
-from ops.watchdog import FLEET_UNITS, Policy, decide
+from ops.watchdog import FLEET_UNITS, Policy, decide, observed_faults
 from tools.credential_doctor import check_all, parse_env_file
 
 
@@ -190,3 +190,93 @@ def json_of(verdict):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OwnMemoryCeilingIsCorrectedNotJustAnnounced(unittest.TestCase):
+    """The exact fix the other project's drop-in already applies once,
+    reapplied automatically -- self-calibrated from measured RSS rather than
+    a constant, since a hardcoded guess never checked against this box's
+    physical RAM is the entire original bug."""
+
+    def test_a_bad_ceiling_is_corrected_from_measured_rss(self):
+        plan = _call(own_memory_max_bytes=4 * 1024**3,
+                    total_physical_bytes=3814 * 1024**2,
+                    desk_rss_bytes=500 * 1024**2)
+        self.assertIsNotNone(plan.correct_memory_ceiling)
+        high, ceiling = plan.correct_memory_ceiling
+        self.assertLess(high, ceiling)
+        self.assertLess(ceiling, 3814 * 1024**2)  # never proposes the bug itself
+
+    def test_the_correction_never_exceeds_a_safe_share_of_total_ram(self):
+        """Even a huge measured RSS must not eat the whole shared box."""
+        plan = _call(own_memory_max_bytes=None,
+                    total_physical_bytes=3814 * 1024**2,
+                    desk_rss_bytes=3000 * 1024**2)
+        high, ceiling = plan.correct_memory_ceiling
+        self.assertLessEqual(ceiling, int(3814 * 1024**2 * 0.45))
+
+    def test_without_a_measured_rss_no_guess_is_made(self):
+        """No constant fallback: an uncalibrated number is the original bug."""
+        plan = _call(own_memory_max_bytes=4 * 1024**3,
+                    total_physical_bytes=3814 * 1024**2,
+                    desk_rss_bytes=None)
+        self.assertIsNone(plan.correct_memory_ceiling)
+        self.assertIn("own_memory_ceiling_exceeds_physical_ram", plan.alerts)
+
+    def test_a_healthy_ceiling_proposes_no_correction(self):
+        plan = _call(own_memory_max_bytes=900 * 1024**2,
+                    total_physical_bytes=3814 * 1024**2,
+                    desk_rss_bytes=400 * 1024**2)
+        self.assertIsNone(plan.correct_memory_ceiling)
+
+
+class StalledBackfillIsRetriedNotJustAnnounced(unittest.TestCase):
+    """Idempotent and checkpointed, so a retry is safe -- unlike guessing
+    which process to kill for the memory/disk alerts."""
+
+    def test_a_stall_triggers_a_retry(self):
+        plan = _call(backfill_checkpoint_age=70_000.0, state={})
+        self.assertTrue(plan.start_backfill)
+        self.assertIn("backfill_stalled", plan.alerts)
+
+    def test_a_recent_retry_is_not_repeated_immediately(self):
+        state = {"last_backfill_start_at": 9_950.0}
+        plan = _call(backfill_checkpoint_age=70_000.0, state=state, now=10_000.0)
+        self.assertFalse(plan.start_backfill)
+
+    def test_a_stale_enough_retry_fires_again(self):
+        state = {"last_backfill_start_at": 5_000.0}
+        plan = _call(backfill_checkpoint_age=70_000.0, state=state, now=10_000.0)
+        self.assertTrue(plan.start_backfill)
+
+    def test_no_stall_means_no_retry(self):
+        plan = _call(backfill_checkpoint_age=3_600.0)
+        self.assertFalse(plan.start_backfill)
+
+
+class SomeAlertsHaveNoSafeAutomatedFix(unittest.TestCase):
+    """Not everything alert-only was left that way by omission. These stay
+    alerts because the only available "fix" is either destructive (kill an
+    unidentified process to free memory or disk), needs a secret only a
+    human holds, needs interactive auth, or requires a passing model --
+    which is this desk's entire open research question, not an operational
+    fault."""
+
+    def test_low_memory_has_no_auto_kill(self):
+        state = {}
+        _call(available_mib=100.0, state=state, now=10_000.0)
+        plan = _call(available_mib=100.0, state=state, now=25_000.0)
+        self.assertIn("training_guard_memory_starved", plan.alerts)
+        # No field on Plan proposes killing anything; nothing to assert
+        # false on other than the alert existing without a paired action.
+
+    def test_disk_pressure_has_no_auto_delete(self):
+        plan = _call(disk_used_fraction=0.95)
+        self.assertIn("disk_nearly_full", plan.alerts)
+
+    def test_missing_credentials_has_no_auto_repair(self):
+        readiness = _healthy_readiness()
+        readiness["credentials"] = {"absent": [{"name": "X_BEARER_TOKEN"}]}
+        repairs, alerts = observed_faults(readiness)
+        self.assertEqual(repairs, [])
+        self.assertIn("optional_credentials_absent", alerts)

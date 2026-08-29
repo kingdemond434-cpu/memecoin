@@ -85,6 +85,11 @@ class Policy:
     #: pattern, not one contended run losing to the live desk for RPC quota
     #: -- which is expected and already handled by the tool's own retry.
     backfill_stale_seconds: float = 64_800.0
+    #: How often the watchdog itself may retry a stalled backfill. Shorter
+    #: than the timer's own 6h cadence, since the whole point is closing the
+    #: gap faster; long enough that a persistently-contended RPC pool is not
+    #: hammered every 60s by the watchdog on top of the timer's own attempts.
+    backfill_retry_seconds: float = 3_600.0
 
 
 @dataclass
@@ -98,6 +103,12 @@ class Plan:
     #: against, and the whole point is to close this gap faster than the
     #: two-observation rule would.
     reenable_units: List[str] = field(default_factory=list)
+    #: (MemoryHigh bytes, MemoryMax bytes) to apply live via `systemctl
+    #: set-property` when the desk's own ceiling cannot bind on this box.
+    #: Unconditional like reenable_units: set-property is idempotent and
+    #: applies without a restart, so there is nothing to debounce.
+    correct_memory_ceiling: Optional[Tuple[int, int]] = None
+    start_backfill: bool = False
     repair_reasons: List[str] = field(default_factory=list)
     alerts: List[str] = field(default_factory=list)
 
@@ -220,7 +231,8 @@ def decide(*, service_active: bool, service_enabled: bool,
            disk_used_fraction: Optional[float] = None,
            backfill_checkpoint_age: Optional[float] = None,
            own_memory_max_bytes: Optional[int] = None,
-           total_physical_bytes: Optional[int] = None) -> Plan:
+           total_physical_bytes: Optional[int] = None,
+           desk_rss_bytes: Optional[int] = None) -> Plan:
     """Pure repair decision, separated so restart storms are testable.
 
     Every argument here is a value main() already read; decide() does no I/O
@@ -248,6 +260,14 @@ def decide(*, service_active: bool, service_enabled: bool,
 
     if backfill_checkpoint_age is not None and backfill_checkpoint_age > policy.backfill_stale_seconds:
         plan.alerts.append("backfill_stalled")
+        # The tool is idempotent and checkpointed -- kicking it once more is
+        # a safe repair, unlike killing whatever is consuming memory or disk
+        # would be. Retried, not repeated every tick: if the stall is
+        # persistent RPC contention rather than a one-off, spamming `start`
+        # every 60s wastes the exact quota it is trying to use.
+        last_attempt = float(state.get("last_backfill_start_at", 0.0) or 0.0)
+        if now - last_attempt >= policy.backfill_retry_seconds:
+            plan.start_backfill = True
 
     if total_physical_bytes is not None:
         # Exactly tonight's incident: a per-cgroup ceiling set above physical
@@ -261,6 +281,21 @@ def decide(*, service_active: bool, service_enabled: bool,
         # regressing back into the same failure.
         if own_memory_max_bytes is None or own_memory_max_bytes > total_physical_bytes:
             plan.alerts.append("own_memory_ceiling_exceeds_physical_ram")
+            # Repaired live via `systemctl set-property` -- the exact
+            # mechanism the other project's own fix used, applied without a
+            # restart. Self-calibrating from the desk's OWN measured RSS
+            # rather than a constant, because a hardcoded guess baked into
+            # this file is exactly how the original bug (MemoryMax=4G,
+            # never once checked against this box's 3814 MB) happened.
+            # Capped at a fraction of total RAM so a correction cannot itself
+            # starve everything else running on a shared box.
+            if desk_rss_bytes and desk_rss_bytes > 0:
+                high = min(int(desk_rss_bytes * 1.6), int(total_physical_bytes * 0.35))
+                ceiling = min(int(desk_rss_bytes * 2.2), int(total_physical_bytes * 0.45))
+                floor = 256 * 1024 * 1024
+                high = max(high, floor)
+                ceiling = max(ceiling, high + 128 * 1024 * 1024)
+                plan.correct_memory_ceiling = (high, ceiling)
     if not service_active:
         immediate.append("desk_service_inactive")
     elif readiness_age is None:
@@ -432,6 +467,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--root", default=".")
     parser.add_argument("--desk-unit", default="memecoin-shadow.service")
     parser.add_argument("--trainer-unit", default="memecoin-shadow-trainer.service")
+    parser.add_argument("--backfill-unit", default="memecoin-backfill.service")
     parser.add_argument("--dry-run", action="store_true",
                         help="decide and record without calling systemctl")
     args = parser.parse_args(argv)
@@ -466,9 +502,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     available_mib = (mem_available_bytes / (1024 * 1024)
                      if mem_available_bytes is not None else None)
 
+    readiness = _read_json(readiness_path)
+    desk_rss_bytes = (readiness.get("memory") or {}).get("rss_bytes")
     plan = decide(
         service_active=service_active, service_enabled=service_enabled,
-        readiness=_read_json(readiness_path), readiness_age=readiness_age,
+        readiness=readiness, readiness_age=readiness_age,
         state=state, now=now, policy=Policy(), trainer_active=trainer_active,
         training_age=_latest_training_age(root / "models", now),
         disabled_units=disabled_units,
@@ -476,7 +514,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         disk_used_fraction=disk_used_fraction,
         backfill_checkpoint_age=_backfill_checkpoint_age(root, now),
         own_memory_max_bytes=_own_memory_max_bytes(controller, args.desk_unit),
-        total_physical_bytes=_read_meminfo_field("MemTotal"))
+        total_physical_bytes=_read_meminfo_field("MemTotal"),
+        desk_rss_bytes=desk_rss_bytes)
 
     actions: List[str] = []
     failures: List[str] = []
@@ -488,6 +527,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             break
         result = controller.call("enable", unit)
         (actions if result.returncode == 0 else failures).append(f"reenable:{unit}")
+    if plan.correct_memory_ceiling and not args.dry_run:
+        high, ceiling = plan.correct_memory_ceiling
+        result = controller.call(
+            "set-property", args.desk_unit,
+            f"MemoryHigh={high}", f"MemoryMax={ceiling}")
+        (actions if result.returncode == 0 else failures).append("correct_memory_ceiling")
+    if plan.start_backfill and not args.dry_run:
+        result = controller.call("--no-block", "start", args.backfill_unit)
+        if result.returncode == 0:
+            actions.append("start_backfill")
+            state["last_backfill_start_at"] = now
+        else:
+            failures.append("start_backfill")
     if plan.restart_desk and not args.dry_run:
         result = controller.call("restart", args.desk_unit)
         if result.returncode == 0:
