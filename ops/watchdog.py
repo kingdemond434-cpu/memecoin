@@ -47,6 +47,7 @@ FLEET_UNITS: Tuple[str, ...] = (
     "memecoin-audit-pack.timer",
     "memecoin-backfill.timer",
     "memecoin-credential-doctor.timer",
+    "memecoin-ledger-doctor.timer",
 )
 
 

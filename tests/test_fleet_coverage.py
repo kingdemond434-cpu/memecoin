@@ -8,6 +8,7 @@ coverage that makes that unnecessary next time.
 """
 
 import unittest
+from pathlib import Path
 
 from ops.watchdog import FLEET_UNITS, Policy, decide, observed_faults
 from tools.credential_doctor import check_all, parse_env_file
@@ -63,6 +64,7 @@ class DisabledFleetUnitsAreReenabledImmediately(unittest.TestCase):
             "memecoin-health.timer", "memecoin-shadow-trainer.timer",
             "memecoin-feed-doctor.timer", "memecoin-audit-pack.timer",
             "memecoin-backfill.timer", "memecoin-credential-doctor.timer",
+            "memecoin-ledger-doctor.timer",
         }
         self.assertEqual(set(FLEET_UNITS), expected)
 
@@ -338,3 +340,55 @@ class WalletTrackingDeathIsWatched(unittest.TestCase):
         plan = _call(readiness=readiness, state=state, now=10_000.0 + 7_201)
         self.assertFalse(plan.restart_desk)
         self.assertEqual(plan.reenable_units, [])
+
+
+class LedgerDoctorActuallyRunsTheVerification(unittest.TestCase):
+    """TradeEvidenceLedger.verify() was a complete, correct hash-chain
+    walk that existed only in the test suite -- the live status field
+    ("hash_chain": true) means only "this process holds a hash in memory
+    right now" and says nothing about the file on disk. This is the
+    proprietary moat (70,000+ tamper-evident records); an auditor that has
+    never run is not evidence the audit would pass.
+    """
+
+    def _ledger(self, directory):
+        from src.research.trade_evidence import TradeEvidenceLedger
+        path = Path(directory) / "evidence.jsonl"
+        ledger = TradeEvidenceLedger(path)
+        ledger.record("candidate", {"mint": "a"}, timestamp=1)
+        ledger.record("decision", {"decision": "reject"}, timestamp=2)
+        return path
+
+    def test_an_intact_chain_reports_ok(self):
+        import tempfile
+        from tools.ledger_doctor import main
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._ledger(directory)
+            self.assertEqual(main(["--path", str(path), "--json"]), 0)
+
+    def test_a_tampered_chain_is_caught_and_named(self):
+        import json as json_module
+        import tempfile
+        from tools.ledger_doctor import main
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._ledger(directory)
+            rows = path.read_text().splitlines()
+            changed = json_module.loads(rows[0])
+            changed["payload"]["mint"] = "tampered"
+            rows[0] = json_module.dumps(changed)
+            path.write_text("\n".join(rows) + "\n")
+            self.assertEqual(main(["--path", str(path), "--json"]), 1)
+
+    def test_no_ledger_yet_is_not_a_fault(self):
+        import tempfile
+        from tools.ledger_doctor import main
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nonexistent.jsonl"
+            self.assertEqual(main(["--path", str(path), "--json"]), 0)
+
+    def test_the_service_treats_a_broken_chain_as_success(self):
+        """Learned from feed-doctor and credential-doctor: a run that finds
+        and reports a real problem must not itself read as a failed unit."""
+        with open("deploy/systemd/memecoin-ledger-doctor.service", encoding="utf-8") as f:
+            unit = f.read()
+        self.assertIn("SuccessExitStatus=1", unit)

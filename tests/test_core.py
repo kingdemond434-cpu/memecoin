@@ -15490,12 +15490,18 @@ class TestTheExpandedSetRegistersAndDeclaresItself(unittest.TestCase):
             registered = register_web_miners(pool, http=_StubHttp({}),
                                              search_terms=list)
         self.assertFalse(registered["web:youtube_recent"])
-        self.assertFalse(registered["web:program_repos"])
+        # program_repos is NOT in this set as of 2026-08-29: its own fetch
+        # code was already written to support running tokenless against
+        # GitHub's public 60-req/hr limit (Authorization header omitted when
+        # the token is absent), spending one request per hourly tick -- and
+        # declaring the credential required blocked a miner the code already
+        # supported running for free. A real token still raises the ceiling.
+        self.assertTrue(registered["web:program_repos"])
         # Keyless ones still run.
         self.assertTrue(registered["web:reddit_new"])
         awaiting = pool.report()["awaiting_credentials"]
         self.assertIn("web:youtube_recent", awaiting)
-        self.assertIn("web:program_repos", awaiting)
+        self.assertNotIn("web:program_repos", awaiting)
 
     def test_the_expanded_set_covers_the_new_enrichments(self):
         pool = DataMinerPool()

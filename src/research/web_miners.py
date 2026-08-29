@@ -434,8 +434,16 @@ def register_web_miners(pool: DataMinerPool, *, http: Any,
         (MinerSpec(
             miner_id="web:program_repos", enriches=Enriches.NARRATIVE,
             cadence_seconds=CADENCE_HOURLY, endpoint=GITHUB_SEARCH_URL,
-            requires_env=("GITHUB_TOKEN",),
-            detail="public repos touching the programs we decode"),
+            # NOT required: github_activity_miner already supports running
+            # tokenless (Authorization header omitted when the token is
+            # absent) against GitHub's public 60-req/hr limit, and this
+            # miner spends one request per hourly tick -- 1/60th of that
+            # budget. Declaring the credential required blocked the miner
+            # entirely (DATA_BLOCKED: missing credentials) instead of using
+            # the free tier the fetch code was already written to support.
+            # A real token still raises the ceiling to 5,000/hr if supplied.
+            detail="public repos touching the programs we decode; runs on "
+                   "GitHub's public rate limit, GITHUB_TOKEN raises it"),
          github_activity_miner(http, github_token)),
     )
     return {spec.miner_id: pool.register(spec, fetch)
