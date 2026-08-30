@@ -80,6 +80,18 @@ class HealthThresholds:
     min_execution_attempts_for_verdict: int = 20
     training_stale_seconds: float = 172_800.0
     max_data_blocked_token_share: float = 0.50
+    # A stream that opened and delivers nothing looked healthy for hours. So
+    # did a router filing every update as the wrong type, and a decoder that
+    # never saw the instruction carrying launches. Each of those is a check
+    # now, because each produced an empty denominator behind a green status.
+    stream_silent_seconds: float = 180.0
+    census_stall_seconds: float = 900.0
+    min_dry_build_success: float = 0.90
+    miner_silent_seconds: float = 1_800.0
+    min_miners_producing: int = 3
+    evidence_stale_seconds: float = 600.0
+    max_source_dead_share: float = 0.60
+    landing_log_stale_seconds: float = 86_400.0
 
 
 def _read_json(path: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -363,6 +375,327 @@ def check_models(readiness: Dict[str, Any], model_dir: Path, now: float,
     return checks
 
 
+def check_pipeline(readiness: Dict[str, Any], now: float,
+                   thresholds: HealthThresholds,
+                   previous: Optional[Dict[str, Any]] = None) -> List[Check]:
+    """The chain from stream to denominator, checked at every joint.
+
+    Three separate defects produced an empty launch census behind a passing
+    status: a stream reporting a connection as delivery, a router filing every
+    update as the first field name in a list, and a decoder that never saw the
+    CPI-wrapped instruction carrying launches. None of them was visible as a
+    failure anywhere. Each is a check here now, at the joint where it broke.
+    """
+    checks: List[Check] = []
+
+    stream = readiness.get("stream_events") or {}
+    total = stream.get("total") or 0
+    creations = stream.get("token_created") or 0
+    if not total:
+        checks.append(Check(
+            "pipeline_stream_events", State.CRITICAL,
+            "no chain event has reached the desk; nothing downstream can fill",
+            evidence={"total": total}, escalate=True))
+    elif not creations:
+        checks.append(Check(
+            "pipeline_stream_events", State.CRITICAL,
+            f"{total} events delivered and not one creation; the decoder is "
+            "naming trades and missing launches",
+            evidence={"total": total, "by_type": stream.get("by_type")},
+            escalate=True))
+    else:
+        checks.append(Check("pipeline_stream_events", State.OK,
+                            f"{creations} creations of {total} events",
+                            evidence={"token_created": creations}))
+
+    yellow = readiness.get("yellowstone") or {}
+    quiet = yellow.get("seconds_since_response")
+    if yellow.get("status") == "DATA_BLOCKED":
+        checks.append(Check(
+            "pipeline_stream_delivery", State.CRITICAL,
+            yellow.get("detail") or "the stream is connected and silent",
+            evidence=dict(yellow), escalate=True))
+    elif quiet is not None and quiet > thresholds.stream_silent_seconds:
+        checks.append(Check(
+            "pipeline_stream_delivery", State.CRITICAL,
+            f"no stream response for {quiet:.0f}s",
+            evidence={"seconds_since_response": quiet}, escalate=True))
+    else:
+        checks.append(Check("pipeline_stream_delivery", State.OK, "",
+                            evidence={"responses": yellow.get("responses")}))
+
+    decoder = readiness.get("pump_decoder") or {}
+    if decoder.get("status") == "DEGRADED":
+        checks.append(Check(
+            "pipeline_decoder", State.CRITICAL, decoder.get("detail", ""),
+            evidence={"unmatched": decoder.get("unmatched_prefixes"),
+                      "matched": decoder.get("matched")}, escalate=True))
+    elif decoder.get("status") == "OK":
+        checks.append(Check("pipeline_decoder", State.OK, "",
+                            evidence={"matched": decoder.get("matched")}))
+
+    census = ((readiness.get("launch_census") or {}).get("funnel") or {})
+    seen = census.get("seen")
+    if seen is None:
+        checks.append(Check("pipeline_census", State.DATA_BLOCKED,
+                            "the census has not reported"))
+    elif previous is not None:
+        before = ((previous.get("launch_census") or {}).get("funnel") or {}).get("seen")
+        elapsed = now - float(previous.get("_observed_at", now))
+        if (before is not None and seen <= before
+                and elapsed > thresholds.census_stall_seconds):
+            checks.append(Check(
+                "pipeline_census", State.CRITICAL,
+                f"the denominator has not moved in {elapsed:.0f}s; launches "
+                "are arriving and not being counted, or none are arriving",
+                evidence={"seen": seen, "previous": before}, escalate=True))
+        else:
+            checks.append(Check("pipeline_census", State.OK, "",
+                                evidence={"seen": seen}))
+    else:
+        checks.append(Check("pipeline_census", State.OK, "",
+                            evidence={"seen": seen}))
+
+    build = readiness.get("dry_build") or {}
+    rate = build.get("success_rate")
+    if rate is not None and rate < thresholds.min_dry_build_success:
+        checks.append(Check(
+            "pipeline_execution_build", State.CRITICAL,
+            f"only {rate:.0%} of transactions build; with capital these are "
+            "rejected trades",
+            evidence={"failures": build.get("failures")}, escalate=True))
+    elif rate is not None:
+        checks.append(Check("pipeline_execution_build", State.OK, "",
+                            evidence={"built": build.get("built")}))
+    return checks
+
+
+def check_subsystems(readiness: Dict[str, Any], root: Path, now: float,
+                     thresholds: HealthThresholds) -> List[Check]:
+    """Everything that can degrade without stopping the process.
+
+    A desk does not usually fail by crashing. It fails by continuing to run
+    with one subsystem quietly producing nothing, which is why every one of
+    these is checked separately rather than inferred from the process being
+    alive.
+    """
+    checks: List[Check] = []
+
+    miners = readiness.get("data_miners") or {}
+    producing = miners.get("producing")
+    if producing is None:
+        checks.append(Check("subsystem_miners", State.DATA_BLOCKED,
+                            "the miner pool has not reported"))
+    elif producing < thresholds.min_miners_producing:
+        checks.append(Check(
+            "subsystem_miners", State.WARN,
+            f"only {producing} miner(s) producing; the context that explains "
+            "a price path is not being collected",
+            evidence={"silent": miners.get("silent"),
+                      "awaiting": miners.get("awaiting_credentials")}))
+    else:
+        checks.append(Check("subsystem_miners", State.OK, "",
+                            evidence={"producing": producing,
+                                      "records": miners.get("total_records")}))
+
+    memory = readiness.get("memory") or {}
+    band = memory.get("band")
+    if band == "shed":
+        checks.append(Check(
+            "subsystem_memory", State.CRITICAL,
+            "the governor is shedding context to stay inside the ceiling; "
+            "this host is undersized for this workload",
+            evidence=dict(memory), escalate=True))
+    elif band == "trim":
+        checks.append(Check("subsystem_memory", State.WARN,
+                            "trimming caches under memory pressure",
+                            evidence=dict(memory)))
+    elif band == "unmeasured":
+        checks.append(Check("subsystem_memory", State.DATA_BLOCKED,
+                            "the footprint cannot be read on this host"))
+    else:
+        checks.append(Check("subsystem_memory", State.OK, "",
+                            evidence={"fraction": memory.get("fraction")}))
+
+    signer = readiness.get("signer") or {}
+    if signer.get("halted") and signer.get("isolated"):
+        checks.append(Check(
+            "subsystem_signer", State.CRITICAL,
+            f"the isolated signer is halted: {signer.get('halt_reason', '')}",
+            evidence=dict(signer), escalate=True))
+    elif signer.get("mode") == "local":
+        checks.append(Check(
+            "subsystem_signer", State.WARN,
+            "the private key is held in the trading process; correct for "
+            "shadow, wrong for capital",
+            evidence={"mode": "local"}))
+    elif signer.get("mode"):
+        checks.append(Check("subsystem_signer", State.OK, "",
+                            evidence={"mode": signer.get("mode")}))
+
+    facts = readiness.get("fact_ladder") or {}
+    degraded = facts.get("degraded_facts") or []
+    if degraded:
+        checks.append(Check(
+            "subsystem_fact_ladder", State.WARN,
+            "these facts are usually inferred rather than read: "
+            + ", ".join(degraded[:5]),
+            evidence={"degraded": degraded}))
+
+    calibration = readiness.get("calibration") or {}
+    if calibration.get("models_miscalibrated"):
+        checks.append(Check(
+            "subsystem_calibration", State.WARN,
+            calibration.get("detail", "a model is miscalibrated"),
+            evidence={"count": calibration.get("models_miscalibrated")}))
+
+    conditions = readiness.get("execution_conditions") or {}
+    if conditions.get("status") == "DATA_BLOCKED":
+        checks.append(Check(
+            "subsystem_execution_conditions", State.WARN,
+            "bids are being made against an unknown congestion bucket",
+            evidence={}))
+
+    for name, filename, stale in (
+            ("evidence", "forward_evidence.json", thresholds.evidence_stale_seconds),
+            ("census", "launch_census.json", thresholds.evidence_stale_seconds)):
+        path = root / "data" / "state" / filename
+        if not path.exists():
+            checks.append(Check(f"persistence_{name}", State.DATA_BLOCKED,
+                                f"{filename} has never been written"))
+            continue
+        age = now - path.stat().st_mtime
+        if age > stale:
+            checks.append(Check(
+                f"persistence_{name}", State.CRITICAL,
+                f"{filename} has not been written for {age:.0f}s; a restart "
+                "now would lose everything since",
+                evidence={"age_s": age}, escalate=True))
+        else:
+            checks.append(Check(f"persistence_{name}", State.OK, "",
+                                evidence={"age_s": round(age, 1)}))
+    return checks
+
+
+def check_breadth(readiness: Dict[str, Any]) -> List[Check]:
+    """Whether the global data universe is actually answering.
+
+    Four separate questions, deliberately not merged. A substituted domain is
+    healthy -- that is the ladder working. A DARK domain is a question the
+    desk asks continuously and cannot answer. A silent channel book is a
+    Telegram side that has stopped reading. A discovery gap is a hole in our
+    own decoder, and it is the one that looks like a calm market from inside.
+    """
+    checks: List[Check] = []
+
+    substitution = readiness.get("substitution") or {}
+    dark = substitution.get("dark") or []
+    substituted = substitution.get("substituted") or []
+    if not substitution:
+        checks.append(Check("breadth_substitution", State.DATA_BLOCKED,
+                            "the substitution registry has not reported"))
+    elif dark:
+        checks.append(Check(
+            "breadth_substitution", State.CRITICAL,
+            "no endpoint left for: " + ", ".join(dark[:6])
+            + "; these questions currently have no answer at all",
+            evidence={"dark": dark, "substitutions": substitution.get("substitutions")},
+            escalate=True))
+    elif substituted:
+        # Not a warning. This is the ladder doing exactly its job, and paging
+        # on it would train an operator to ignore the page that matters.
+        checks.append(Check("breadth_substitution", State.OK, "",
+                            evidence={"running_on_substitute": substituted[:8]}))
+    else:
+        checks.append(Check("breadth_substitution", State.OK, "",
+                            evidence={"domains": substitution.get("domains")}))
+
+    coverage = (substitution.get("coverage") or {})
+    declared = coverage.get("regions_declared")
+    proven = coverage.get("regions_proven")
+    if declared is None or proven is None:
+        checks.append(Check("breadth_regions", State.DATA_BLOCKED,
+                            "regional coverage has not been measured"))
+    elif proven == 0 and declared:
+        checks.append(Check(
+            "breadth_regions", State.WARN,
+            f"{declared} regions declared and none has returned a record; "
+            "the breadth is configuration, not coverage",
+            evidence={"unproven": coverage.get("unproven_regions")}))
+    else:
+        checks.append(Check("breadth_regions", State.OK, "",
+                            evidence={"proven": proven, "declared": declared}))
+
+    telegram = readiness.get("telegram_channels") or {}
+    status = telegram.get("status")
+    if status == "DATA_BLOCKED":
+        checks.append(Check(
+            "breadth_telegram", State.WARN,
+            telegram.get("detail")
+            or "no verified public Telegram channel; discovery has not converged",
+            evidence={"candidates": telegram.get("candidates"),
+                      "rejected": telegram.get("rejected")}))
+    elif status == "DEGRADED":
+        checks.append(Check("breadth_telegram", State.WARN,
+                            telegram.get("detail") or "verified channels have gone silent",
+                            evidence={"silent": (telegram.get("silent") or [])[:10]}))
+    elif not telegram:
+        checks.append(Check("breadth_telegram", State.DATA_BLOCKED,
+                            "the channel book has not reported"))
+    else:
+        checks.append(Check("breadth_telegram", State.OK, "",
+                            evidence={"verified": telegram.get("verified"),
+                                      "mints_seen": telegram.get("mints_seen")}))
+
+    discovery = readiness.get("discovery") or {}
+    if not discovery or discovery.get("status") == "DATA_BLOCKED":
+        checks.append(Check("breadth_discovery", State.DATA_BLOCKED,
+                            "no external pool discovery yet this run"))
+    elif discovery.get("status") == "DEGRADED":
+        checks.append(Check(
+            "breadth_discovery", State.WARN, discovery.get("detail", ""),
+            evidence={"missed": discovery.get("missed_by_our_stream"),
+                      "seen": discovery.get("external_pools_seen")}))
+    else:
+        checks.append(Check("breadth_discovery", State.OK, "",
+                            evidence={"coverage": discovery.get("coverage")}))
+
+    router = readiness.get("landing_router") or {}
+    if not router:
+        checks.append(Check("breadth_landing_routes", State.DATA_BLOCKED,
+                            "the landing router has not reported"))
+    elif router.get("status") == "DATA_BLOCKED":
+        checks.append(Check(
+            "breadth_landing_routes", State.CRITICAL,
+            router.get("detail") or "no landing route is enabled; a signed "
+                                    "transaction has nowhere to go",
+            escalate=True))
+    elif router.get("status") == "DEGRADED":
+        checks.append(Check(
+            "breadth_landing_routes", State.WARN, router.get("detail", ""),
+            evidence={"mechanisms": router.get("mechanisms"),
+                      "enabled": router.get("enabled")}))
+    else:
+        checks.append(Check("breadth_landing_routes", State.OK, "",
+                            evidence={"mechanisms": router.get("mechanisms"),
+                                      "measured": router.get("measured_routes")}))
+
+    identity = readiness.get("identity_watch") or {}
+    if not identity:
+        checks.append(Check("breadth_identity", State.DATA_BLOCKED,
+                            "the figure registry has not reported"))
+    elif identity.get("status") == "DEGRADED":
+        checks.append(Check(
+            "breadth_identity", State.WARN, identity.get("detail", ""),
+            evidence={"figures": identity.get("figures"),
+                      "with_channels": identity.get("figures_with_channels")}))
+    else:
+        checks.append(Check("breadth_identity", State.OK, "",
+                            evidence={"figures": identity.get("figures"),
+                                      "claims_found": identity.get("claims_found")}))
+    return checks
+
+
 def check_resources(root: Path, thresholds: HealthThresholds) -> List[Check]:
     """Disk and memory. Measured, and DATA_BLOCKED where the platform hides them."""
     checks: List[Check] = []
@@ -614,6 +947,7 @@ def run_health_checks(
         checks.extend(check_runtime_surfaces(readiness))
         checks.extend(check_intelligence_coverage(readiness))
         checks.append(check_champions(readiness))
+        checks.extend(check_breadth(readiness))
     else:
         # Everything that reads the snapshot degrades together, and says so.
         # Reporting these as OK would manufacture confidence exactly where

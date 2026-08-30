@@ -305,7 +305,100 @@ fn probe_value(position: &Position, bins: &[Bin]) -> f64 {
 }
 
 /// Score every action against holding. Mirrors `ActionValuePolicy.score`.
+/// The two actions that need a distribution the position itself does not have.
+///
+/// Passed alongside `Position` rather than inside it so `Position` stays
+/// `Copy` and every existing caller is untouched. Both are `None` for most
+/// decisions, which is correct: a launch nobody has exited has no re-entry
+/// candidate, and a book with no better idea has no replacement.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Alternatives<'a> {
+    /// The forward distribution for buying this token AGAIN after an exit.
+    /// Its own distribution, never the incumbent's -- reusing the open
+    /// position's would let a token that has already been exited inherit the
+    /// conviction built before the exit.
+    pub reentry: Option<&'a [Bin]>,
+    /// A specific better candidate this position could be swapped into.
+    pub replacement: Option<&'a [Bin]>,
+    /// How much of the book that candidate would take.
+    pub replacement_fraction: Option<f64>,
+}
+
+/// E[log W] of exiting and immediately funding a NAMED alternative.
+///
+/// Distinct from EXIT, which credits the generic best-alternative rate.
+/// Charging the candidate's entry cost is what stops REPLACE from looking
+/// like a free upgrade over EXIT.
+fn replace_value(position: &Position, alternatives: &Alternatives) -> f64 {
+    let bins = match alternatives.replacement {
+        Some(bins) if !bins.is_empty() => bins,
+        _ => return f64::NEG_INFINITY,
+    };
+    let added = match alternatives.replacement_fraction {
+        Some(value) if value > 0.0 => value,
+        _ => return f64::NEG_INFINITY,
+    };
+    let held = position.held_fraction;
+    let multiple = position.current_multiple.max(0.0);
+    let freed = held * multiple;
+    if added > freed + (1.0 - held) {
+        return f64::NEG_INFINITY;
+    }
+    let capacity = position.exit_capacity_ratio.unwrap_or(0.0).clamp(0.0, 1.0);
+    let sold = held * capacity;
+    let proceeds = sold * multiple * (1.0 - position.exit_cost);
+    let cash = (1.0 - held) + proceeds - added;
+    if cash < 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    // What the venue could not absorb stays in the old token. Ignoring it
+    // would price REPLACE as a clean swap when it is usually a partial one.
+    let stranded = (held - sold) * multiple;
+    expected_log(bins, |gross| {
+        cash + stranded + added * (1.0 + gross) - added * position.entry_cost
+    })
+}
+
+/// E[log W] of buying back in after an exit. A new trade, competing as one.
+fn reenter_value(position: &Position, alternatives: &Alternatives) -> f64 {
+    let bins = match alternatives.reentry {
+        Some(bins) if !bins.is_empty() => bins,
+        _ => return f64::NEG_INFINITY,
+    };
+    if position.held_fraction > 0.0 {
+        // Still open, so re-entry is not the question being asked.
+        return f64::NEG_INFINITY;
+    }
+    let added = match position.add_fraction {
+        Some(value) if value > 0.0 => value,
+        _ => return f64::NEG_INFINITY,
+    };
+    let cash = 1.0 - added;
+    if cash < 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    expected_log(bins, |gross| {
+        cash + added * (1.0 + capture(position, gross)) - added * position.entry_cost
+    })
+}
+
 pub fn score(position: &Position, survival: &Survival, min_edge: f64, max_add: f64) -> Decision {
+    score_with(
+        position,
+        survival,
+        min_edge,
+        max_add,
+        &Alternatives::default(),
+    )
+}
+
+pub fn score_with(
+    position: &Position,
+    survival: &Survival,
+    min_edge: f64,
+    max_add: f64,
+    alternatives: &Alternatives,
+) -> Decision {
     let bins = probability_bins(survival);
     if bins.is_empty() {
         return blocked("no forward distribution");
@@ -358,6 +451,11 @@ pub fn score(position: &Position, survival: &Survival, min_edge: f64, max_add: f
         Action::Ignore,
         if flat { baseline } else { f64::NEG_INFINITY },
     );
+    // The two that need a distribution of their own. Both score
+    // NEG_INFINITY -- and therefore INFEASIBLE rather than merely bad --
+    // when the caller supplied none, which is most decisions.
+    push(Action::Replace, replace_value(position, alternatives));
+    push(Action::Reenter, reenter_value(position, alternatives));
 
     let best =
         scores

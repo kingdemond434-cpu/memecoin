@@ -468,7 +468,8 @@ fn pumpswap_account_list_status() -> &'static str {
     add_capacity_fraction, probe_fraction, min_edge, max_add_fraction, live,
     max_position_fraction,
     max_single_commit_fraction, min_commit_fraction, min_exit_capacity,
-    live_unlocked
+    live_unlocked, reentry_bins = None, replacement_bins = None,
+    replacement_fraction = None
 ))]
 fn t0_decide(
     age_seconds: f64,
@@ -497,16 +498,13 @@ fn t0_decide(
     min_commit_fraction: f64,
     min_exit_capacity: f64,
     live_unlocked: bool,
-) -> PyResult<(
-    String,
-    f64,
-    String,
-    bool,
-    Option<String>,
-    Option<String>,
-    f64,
-    Vec<(String, f64, bool)>,
-)> {
+    // (probability, gross) pairs for the two actions whose distribution
+    // the position itself does not carry. Absent for most decisions.
+    reentry_bins: Option<Vec<(f64, f64)>>,
+    replacement_bins: Option<Vec<(f64, f64)>>,
+    replacement_fraction: Option<f64>,
+) -> PyResult<(String, f64, String, bool, Option<String>, Option<String>, f64, Vec<(String, f64, bool)>)>
+{
     if levels.len() != crate::policy::SURVIVAL_MULTIPLES.len() {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "expected {} survival levels, got {}",
@@ -528,6 +526,21 @@ fn t0_decide(
         },
         0.0,
     );
+
+    // Converted to the policy's own Bin here rather than passed as tuples,
+    // so the kernel never sees a shape chosen on the Python side.
+    let to_bins = |rows: &Option<Vec<(f64, f64)>>| -> Option<Vec<crate::policy::Bin>> {
+        rows.as_ref().map(|rows| {
+            rows.iter()
+                .map(|(probability, gross)| crate::policy::Bin {
+                    probability: *probability,
+                    gross: *gross,
+                })
+                .collect()
+        })
+    };
+    let reentry = to_bins(&reentry_bins);
+    let replacement = to_bins(&replacement_bins);
 
     let inputs = crate::decide::Inputs {
         position: crate::policy::Position {
@@ -552,6 +565,11 @@ fn t0_decide(
         min_edge,
         max_add_fraction,
         live,
+        alternatives: crate::policy::Alternatives {
+            reentry: reentry.as_deref(),
+            replacement: replacement.as_deref(),
+            replacement_fraction,
+        },
     };
     let limits = crate::safety::Limits {
         max_position_fraction,
@@ -609,6 +627,172 @@ fn t0_age_band(age_seconds: f64) -> &'static str {
     crate::policy::age_band(age_seconds)
 }
 
+// --- addresses, messages and signing -------------------------------------
+
+fn key32(raw: &[u8], what: &str) -> PyResult<instruction::Pubkey> {
+    crate::transaction::pubkey_of(raw).ok_or_else(|| {
+        PyValueError::new_err(format!("{what} must be exactly 32 bytes, got {}", raw.len()))
+    })
+}
+
+/// `find_program_address`, returning (address, bump).
+#[pyfunction]
+fn find_program_address(seeds: Vec<Vec<u8>>, program_id: &[u8])
+    -> PyResult<(Vec<u8>, u8)>
+{
+    let program = key32(program_id, "program_id")?;
+    let refs: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_slice()).collect();
+    crate::pubkey::find_program_address(&refs, &program)
+        .map(|(address, bump)| (address.to_vec(), bump))
+        .map_err(|err| PyValueError::new_err(format!("{err:?}")))
+}
+
+/// The SPL associated token account for (owner, token_program, mint).
+#[pyfunction]
+fn associated_token_address(owner: &[u8], token_program: &[u8], mint: &[u8],
+                            associated_token_program: &[u8]) -> PyResult<Vec<u8>> {
+    crate::pubkey::associated_token_address(
+        &key32(owner, "owner")?, &key32(token_program, "token_program")?,
+        &key32(mint, "mint")?,
+        &key32(associated_token_program, "associated_token_program")?)
+        .map(|address| address.to_vec())
+        .map_err(|err| PyValueError::new_err(format!("{err:?}")))
+}
+
+/// Derive many PDAs in one crossing.
+///
+/// MEASURED RESULT, kept here because it is worth more than the function is:
+/// this is SLOWER than solders for the same eleven addresses. 78us for
+/// solders, 84us calling this eleven times, 90us calling it once with all
+/// eleven. Batching made it worse, not better.
+///
+/// The reason is marshalling, not hashing. solders holds `Pubkey` as a native
+/// Rust object, so its `find_program_address` copies nothing; this takes
+/// Python `bytes`, and pyo3 allocates and copies every nested list on the way
+/// in. At eleven 32-byte seeds the copying costs more than the SHA-256 saves.
+///
+/// So the Python entry path should keep using solders for address derivation.
+/// This is retained for callers already holding raw bytes on this side of the
+/// boundary -- inside `build_signed_transaction`, where no crossing happens --
+/// and as the record of a plausible optimisation that measurement refuted.
+#[pyfunction]
+fn find_program_addresses(batch: Vec<(Vec<Vec<u8>>, Vec<u8>)>)
+    -> PyResult<Vec<(Vec<u8>, u8)>>
+{
+    let mut out = Vec::with_capacity(batch.len());
+    for (seeds, program_id) in batch {
+        let program = key32(&program_id, "program_id")?;
+        let refs: Vec<&[u8]> = seeds.iter().map(|seed| seed.as_slice()).collect();
+        let (address, bump) = crate::pubkey::find_program_address(&refs, &program)
+            .map_err(|err| PyValueError::new_err(format!("{err:?}")))?;
+        out.push((address.to_vec(), bump));
+    }
+    Ok(out)
+}
+
+/// Derive many associated token accounts in one crossing.
+#[pyfunction]
+fn associated_token_addresses(batch: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+                              associated_token_program: &[u8]) -> PyResult<Vec<Vec<u8>>> {
+    let ata_program = key32(associated_token_program, "associated_token_program")?;
+    let mut out = Vec::with_capacity(batch.len());
+    for (owner, token_program, mint) in batch {
+        out.push(crate::pubkey::associated_token_address(
+            &key32(&owner, "owner")?, &key32(&token_program, "token_program")?,
+            &key32(&mint, "mint")?, &ata_program)
+            .map_err(|err| PyValueError::new_err(format!("{err:?}")))?
+            .to_vec());
+    }
+    Ok(out)
+}
+
+/// One instruction as Python passes it: (program_id, [(pubkey, signer, writable)], data).
+type RawInstruction = (Vec<u8>, Vec<(Vec<u8>, bool, bool)>, Vec<u8>);
+
+fn to_instructions(raw: Vec<RawInstruction>) -> PyResult<Vec<instruction::Instruction>> {
+    let mut out = Vec::with_capacity(raw.len());
+    for (program_id, metas, data) in raw {
+        let mut accounts = Vec::with_capacity(metas.len());
+        for (pubkey, is_signer, is_writable) in metas {
+            accounts.push(instruction::AccountMeta {
+                pubkey: key32(&pubkey, "account")?, is_signer, is_writable });
+        }
+        out.push(instruction::Instruction {
+            program_id: key32(&program_id, "program_id")?, accounts, data });
+    }
+    Ok(out)
+}
+
+/// Compile a v0 message and return the exact bytes that get signed.
+///
+/// Exposed separately from signing so the Python path can compare these bytes
+/// against solders' before anything is promoted onto the money path. Equal
+/// bytes are the only evidence that matters; a passing unit test is not.
+#[pyfunction]
+fn compile_v0_message(payer: &[u8], instructions: Vec<RawInstruction>,
+                      recent_blockhash: &[u8]) -> PyResult<Vec<u8>> {
+    let message = crate::message::compile(
+        &key32(payer, "payer")?, &to_instructions(instructions)?,
+        &key32(recent_blockhash, "recent_blockhash")?)
+        .map_err(|err| PyValueError::new_err(format!("{err:?}")))?;
+    Ok(message.serialize())
+}
+
+/// Sign an already-serialised message. The bridge for incremental adoption.
+#[pyfunction]
+fn sign_message(serialized_message: &[u8], secret_key: &[u8]) -> PyResult<Vec<u8>> {
+    let signer = crate::transaction::Signer32::from_bytes(secret_key)
+        .map_err(|err| PyValueError::new_err(format!("{err:?}")))?;
+    Ok(signer.sign(serialized_message).to_vec())
+}
+
+/// The public key for a secret. Lets the caller check which account will sign
+/// without the secret ever being formatted or returned.
+#[pyfunction]
+fn public_key_of(secret_key: &[u8]) -> PyResult<Vec<u8>> {
+    crate::transaction::Signer32::from_bytes(secret_key)
+        .map(|signer| signer.public.to_vec())
+        .map_err(|err| PyValueError::new_err(format!("{err:?}")))
+}
+
+/// Assemble a transaction from a message the ISOLATED SIGNER signed.
+///
+/// The call the canonical path uses. `build_signed_transaction` needs the
+/// secret key and is therefore unusable by a desk whose signer lives in
+/// another process; this takes only signatures, so the compile and assemble
+/// steps move to Rust while the key stays exactly where it was.
+#[pyfunction]
+fn assemble_transaction(serialized_message: &[u8], signatures: Vec<Vec<u8>>)
+    -> PyResult<String>
+{
+    crate::transaction::assemble(serialized_message, &signatures)
+        .map_err(|err| PyValueError::new_err(format!("{err:?}")))
+}
+
+/// Compile, sign and encode in one call: the whole tail of the entry path.
+///
+/// One call rather than three because the FFI round trip is a meaningful
+/// share of the work at this size, and because a caller that can hold a
+/// half-built transaction is a caller that can submit one.
+///
+/// Returns (base64 transaction, base58 signature).
+#[pyfunction]
+#[pyo3(signature = (payer, instructions, recent_blockhash, secret_keys, allow_partial = false))]
+fn build_signed_transaction(payer: &[u8], instructions: Vec<RawInstruction>,
+                            recent_blockhash: &[u8], secret_keys: Vec<Vec<u8>>,
+                            allow_partial: bool) -> PyResult<(String, String)> {
+    let mut signers = Vec::with_capacity(secret_keys.len());
+    for secret in &secret_keys {
+        signers.push(crate::transaction::Signer32::from_bytes(secret)
+            .map_err(|err| PyValueError::new_err(format!("{err:?}")))?);
+    }
+    let transaction = crate::transaction::build_signed(
+        &key32(payer, "payer")?, &to_instructions(instructions)?,
+        &key32(recent_blockhash, "recent_blockhash")?, &signers, allow_partial)
+        .map_err(|err| PyValueError::new_err(format!("{err:?}")))?;
+    Ok((transaction.to_base64(), transaction.signature_b58()))
+}
+
 #[pymodule]
 fn solana_fastpath(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(quote_buy_from_account, module)?)?;
@@ -636,6 +820,15 @@ fn solana_fastpath(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(t0_decide, module)?)?;
     module.add_function(wrap_pyfunction!(survival_bins, module)?)?;
     module.add_function(wrap_pyfunction!(t0_age_band, module)?)?;
+    module.add_function(wrap_pyfunction!(find_program_address, module)?)?;
+    module.add_function(wrap_pyfunction!(find_program_addresses, module)?)?;
+    module.add_function(wrap_pyfunction!(associated_token_addresses, module)?)?;
+    module.add_function(wrap_pyfunction!(associated_token_address, module)?)?;
+    module.add_function(wrap_pyfunction!(compile_v0_message, module)?)?;
+    module.add_function(wrap_pyfunction!(assemble_transaction, module)?)?;
+    module.add_function(wrap_pyfunction!(sign_message, module)?)?;
+    module.add_function(wrap_pyfunction!(public_key_of, module)?)?;
+    module.add_function(wrap_pyfunction!(build_signed_transaction, module)?)?;
     module.add("IMPLEMENTATION", "rust-pyo3-abi3")?;
     Ok(())
 }

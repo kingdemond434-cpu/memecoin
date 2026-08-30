@@ -66,6 +66,16 @@ MONSTER_MULTIPLE = 10.0
 #: still waiting on is the only kind whose detail we still need.
 DEFAULT_MAX_RECORDS = 20_000
 
+def rug_mechanism_monster_threshold() -> float:
+    """One definition of "monster", shared by the census and calibration.
+
+    Two thresholds that drift apart would make "missed monster" and
+    "monster probability" answer subtly different questions, and nothing
+    would look wrong.
+    """
+    return MONSTER_MULTIPLE
+
+
 #: How long an unresolved launch is kept before being written off as
 #: unobserved. Long enough to catch a slow migration, short enough that a
 #: restart-heavy week does not fill memory with launches nobody will resolve.
@@ -222,6 +232,15 @@ class LaunchCensus:
         self._totals.dispositions[Disposition.AWAITING_STATE.value] += 1
         self._evict_if_needed()
         return record
+
+    def knows(self, mint: str) -> bool:
+        """Has this launch been counted at all.
+
+        Asked by discovery: a pool an outside operator reported that this
+        never saw is a hole in our own decoding, and from the inside that
+        failure is indistinguishable from a quiet market.
+        """
+        return bool(mint) and mint in self._records
 
     def screen(self, mint: str, reason: str) -> None:
         """A launch filtered out before it reached a decision.

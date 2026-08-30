@@ -8,16 +8,12 @@ both an explicit ``--live`` launch and the execution engine's independent
 import argparse
 import asyncio
 import base64
-import collections
 from collections import deque
-import hashlib
 import json
 import logging
 import math
 import os
-import socket
 import time
-from dataclasses import asdict, is_dataclass, replace as dataclasses_replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -29,8 +25,11 @@ from solders.keypair import Keypair
 from src.chains.provider_credentials import normalize_provider_environment
 from src.chains.rpc_manager import ChainRegistry, RPCManager
 from src.chains.yellowstone_grpc import (
-    NATIVE_FASTPATH_STATUS, PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
-    create_combined_subscription, native_t0_decide,
+    PumpFunMonitor,
+    PumpSwapMonitor,
+    RaydiumMonitor,
+    SolanaRpcProgramStream,
+    YellowstoneClient,
 )
 from src.detection.rug_detector import RugDetector
 from src.detection.token_detector import DetectionSource, TokenCandidate, TokenDetectionEngine
@@ -39,65 +38,76 @@ from src.execution.jupiter_jito import (
     JupiterClient,
     JitoClient,
     PriorityFeeOptimizer,
-    SolanaTransactionBuilder,
     USDC_MINT,
 )
+from src.strategies.risk_veto import RiskVeto
+from src.strategies.memecoin_state import (
+    DevEvent, DevWalletMonitor, HolderTrajectoryMonitor, ObservedHolderLedger,
+    SmartWalletRotationTracker, social_price_disagreement)
+from src.research.trade_evidence import TradeEvidenceLedger
 from src.research.dataset_builder import (
-    PointInTimeDatasetBuilder, PUMP_INITIAL_VIRTUAL_SOL, PUMP_INITIAL_VIRTUAL_TOKEN)
+    PointInTimeDatasetBuilder, PUMP_INITIAL_VIRTUAL_SOL,
+    PUMP_INITIAL_VIRTUAL_TOKEN)
 from src.research.feature_engine import build_features
 from src.research.global_research_miner import GlobalResearchMiner
 from src.research.calibration import CalibrationBook
-from src.research.chain_miners import register_chain_miners
-from src.execution.signer import signer_from_env
+from src.research.counterfactual_corpus import (
+    ActionOption, CounterfactualCorpus, RouteOption,
+)
 from src.research.calibration import Provenance
-from src.research.fallback import FallbackResolver, Rung, Source
+from src.research.fallback import FallbackResolver, Source
+from src.runtime.latency import LatencyLedger
+from src.runtime.serialisation import jsonable as _jsonable
+from src.runtime.reporting import ReportingSurface
+from src.runtime.ingestion import MinedRecordIngestion
+from src.runtime.evidence import EvidenceRecording
+from src.runtime.supervision import TaskSupervision
+from src.runtime.maintenance import DeskMaintenance
+from src.runtime.wiring import SubsystemWiring
+from src.runtime.offload import OffloadedPool, install_fast_event_loop
 from src.runtime.memory_governor import (
-    Band, MemoryGovernor, Relief, DEFAULT_SOFT_FRACTION, DEFAULT_HARD_FRACTION)
+    Band, MemoryGovernor, Relief, DEFAULT_SOFT_FRACTION,
+    DEFAULT_HARD_FRACTION)
 from src.research.launch_census import LaunchCensus
 from src.research import rug_mechanism
-from src.research.launch_census import MONSTER_MULTIPLE
-
-
-def rug_mechanism_monster_threshold() -> float:
-    """One definition of "monster", shared by the census and calibration.
-
-    Two thresholds that drift apart would make "missed monster" and
-    "monster probability" answer subtly different questions, and nothing
-    would look wrong.
-    """
-    return MONSTER_MULTIPLE
+from src.research.launch_census import (
+    MONSTER_MULTIPLE, rug_mechanism_monster_threshold)
 from src.strategies.screen_policy import (
     ScreenPolicy, ScreenReading, Verdict as ScreenVerdict, graded, veto,
 )
 from src.research.data_miners import DataMinerPool
-from src.research.solana_miners import register_solana_miners
-from src.research.web_miners import register_web_miners
+from src.research.source_catalogue import default_registry
+from src.research.telegram_miners import (
+    ChannelBook, extract_handles, register_telegram_miners,
+)
+from src.research.identity_watch import IdentityWatch
 from src.research.forward_evidence import ForwardEvidence, Outcome as ForwardOutcome
 from src.research.contribution import (
     ContributionLedger, GateFlip, action_value_contributions,
 )
-from src.research.attribution import EdgeDecayMonitor
-from src.research.trade_evidence import TradeEvidenceLedger, evidence_packet
-from src.runtime.hot_state import HotState, HotStateBudget
 from src.strategies.action_value import (
-    Action as ActionValue, ActionScore, ActionValuePolicy, Decision as ActionDecision,
+    Action as ActionValue, ActionValuePolicy, Decision as ActionDecision,
     PositionState as ActionState,
 )
-from src.collectors.event_source import Event, SourceMesh
-from src.collectors.registry import build_sources, expand_env_channels, load_declarations
+from src.collectors.event_source import Event
 from src.collectors.transports import (
-    HttpClient, TelegramChannelTransport, build_transports, start_transports,
-    stop_transports, transport_report,
+    build_transports,
+    start_transports,
+    stop_transports,
+    transport_report,
 )
 from src.strategies.decision_snapshot import (
     DecisionSnapshot, StateSequencer, guard as decision_guard, state_hash,
 )
 from src.strategies.actor_graph import (
-    BuyerDNA, Entry, IndependenceReport, SwarmPredictor, WalletIndependence,
-    aggregate_smart_flow, build_fingerprint,
+    Entry,
+    IndependenceReport,
+    SwarmPredictor,
+    WalletIndependence,
+    build_fingerprint,
 )
-from src.strategies.champion_challenger import ChampionChallengerFramework, HypothesisSpec, TrialResult
-from src.strategies.exit_policy import ExitPolicy, evaluate_exit, load_latest_exit_policy
+from src.strategies.champion_challenger import ChampionChallengerFramework
+from src.strategies.exit_policy import ExitPolicy, evaluate_exit
 from src.strategies.genealogy_graph import GenealogyGraph
 from src.strategies.information_graph import (
     AdversarialAdaptationDetector,
@@ -111,27 +121,16 @@ from src.chains.pump_curve import (
     LAMPORTS_PER_SOL, BondingCurveState, parse_bonding_curve, quote_buy, quote_sell,
 )
 from src.chains.pump_curve import quote_sell as curve_quote_sell
-from src.chains.idl import report as idl_report
-from src.chains.pump_route import (
-    TOKEN_2022_PROGRAM, TOKEN_PROGRAM, NativePumpRoute, PumpRouteConfig,
-)
+from src.chains.pump_route import TOKEN_PROGRAM, NativePumpRoute, PumpRouteConfig
 from src.chains.pumpswap_curve import PumpSwapPoolState
 from src.chains.pumpswap_curve import quote_buy as pool_quote_buy
 from src.chains.pumpswap_curve import quote_sell as pool_quote_sell
-from src.chains.pumpswap_route import PoolState, PumpSwapRoute, PumpSwapRouteConfig, parse_pool
+from src.chains.pumpswap_route import PoolState, parse_pool
 from src.execution.pump_fees import (
     DEFAULT_SCHEDULE as PUMP_FEE_SCHEDULE, VENUE_BONDING_CURVE,
 )
 from src.execution.tradeability import curve_tradeability, exit_capacity_ratio, pool_tradeability
 from src.strategies.distribution import DistributionDetector
-from src.strategies.memecoin_state import (
-    DevEvent, DevWalletMonitor, HolderTrajectoryMonitor,
-    ObservedHolderLedger, RotationTrade,
-    SmartWalletRotationTracker, social_price_disagreement,
-)
-from src.strategies.profit_sweeper import ProfitIsolationPolicy
-from src.strategies.risk_veto import RiskVeto
-from src.strategies.mega_event import MegaEventReserve
 from src.strategies.escape import (
     EscapeEstimate, HazardMechanism, LandingLatency, escape_probability,
     hazard_curve_from_probabilities, mechanisms_from_signals,
@@ -139,40 +138,33 @@ from src.strategies.escape import (
 from src.strategies.monster import (
     MonsterEvidence, MonsterState, MonsterStateMachine, hold_versus_exit,
 )
-from src.strategies.opportunity_allocator import Opportunity, OpportunityAllocator
-from src.runtime.intelligence_manifest import CoverageTracker, audit as audit_intelligence
+from src.strategies.opportunity_allocator import Opportunity
 from src.strategies.prelaunch_intent import PrelaunchIntentModel
-from src.strategies.authenticity import (
-    AuthenticityResolver, EntityRegistry, ProofLevel, SourceSignal, load_entities,
-)
-from src.strategies.reentry import ReentryBook, ReentryPolicy, ReentryVerdict
-from src.strategies.source_genealogy import (
-    SourceGenealogy, SourcePost, build_source_dna,
-)
+from src.strategies.authenticity import EntityRegistry, ProofLevel, SourceSignal, load_entities
+from src.strategies.reentry import ReentryVerdict
+from src.strategies.source_genealogy import SourcePost, build_source_dna
 from src.strategies.public_coordination import PublicCoordinationMiner
-from src.strategies.rug_hazard import (ContinuousRugHazardModel,
-                                       DEFAULT_MAX_TRACKED_TOKENS)
+from src.strategies.rug_hazard import ContinuousRugHazardModel
 from src.strategies.social_intelligence import SocialIntelligenceEngine
 from src.strategies.wallet_intelligence import WalletIntelligenceEngine
 from src.strategies.wallet_value import FollowOutcome
-from src.strategies.t0_kernel import SurvivalInputs, T0Kernel
-from src.strategies.funder_ancestry import FunderAncestry, compress_independence
+from src.strategies.t0_kernel import SurvivalInputs
+from src.strategies.funder_ancestry import compress_independence
 from src.execution.staged_exits import StagedExits
-from src.execution.slot_value import SlotValueModel, urgency_adjusted_edge
+from src.execution.slot_value import SlotValueModel
 from src.strategies.disagreement import DisagreementModel, views_from_intelligence
 from src.strategies.ignition import IgnitionModel, touches_from_events
 
 logger = logging.getLogger(__name__)
 
+#: How long a token must sit with no new observation before a death
+#: verdict is attempted. Below this, "no new trade yet" and "dead" are
+#: indistinguishable, and classifying early permanently brands a token that
+#: is only mid-launch.
+DEATH_CLASSIFICATION_QUIET_S = 300.0
+
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 MODEL_HYPOTHESIS_ID = "production_multihead_v1"
-
-#: How long a token must sit with no new observation before a death verdict
-#: is even attempted. Below this, "no new trade yet" and "dead" are
-#: indistinguishable, and classifying too early is how a token still
-#: mid-launch gets permanently mislabeled the moment it goes one tick
-#: without a trade.
-DEATH_CLASSIFICATION_QUIET_S = 300.0
 
 
 # Rejections that mean "capital is committed elsewhere", not "this token is
@@ -184,39 +176,11 @@ CAPACITY_REJECTIONS = frozenset({
 })
 
 
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, Enum):
-        return value.value
-    if is_dataclass(value):
-        return _jsonable(asdict(value))
-    if isinstance(value, dict):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_jsonable(item) for item in value]
-    return value
 
 
-def _systemd_notify(message: str) -> bool:
-    """Send readiness/watchdog state without adding a runtime dependency.
-
-    The user service sets ``NOTIFY_SOCKET``.  When the desk is launched by a
-    developer or a test there is no socket and this is deliberately a no-op.
-    """
-    address = os.getenv("NOTIFY_SOCKET", "")
-    if not address:
-        return False
-    if address.startswith("@"):
-        address = "\0" + address[1:]
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as client:
-            client.sendto(message.encode(), address)
-        return True
-    except OSError as exc:
-        logger.warning("systemd notification failed: %s", exc)
-        return False
-
-
-class MemecoinQuantDesk:
+class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
+                       DeskMaintenance, TaskSupervision, EvidenceRecording,
+                       SubsystemWiring):
     def __init__(self, config_path: str = "config/chains.yaml", *, dry_run_override: Optional[bool] = None,
                  offline: bool = False):
         self.config_path = config_path
@@ -261,22 +225,21 @@ class MemecoinQuantDesk:
         self._main_task: Optional[asyncio.Task] = None
         self._health_task: Optional[asyncio.Task] = None
         self._market_task: Optional[asyncio.Task] = None
+        self._background_tasks: set[asyncio.Task] = set()
+        self._candidate_pipelines: Dict[str, asyncio.Task] = {}
+        self._candidate_semaphore: Optional[asyncio.Semaphore] = None
+        self._web_runner: Optional[web.AppRunner] = None
+        # Telegram can replay its configured channels as soon as the client
+        # connects, before the PIT dataset finishes constructing. Preserve
+        # those signals and drain them once every downstream consumer exists.
+        self.trade_evidence: Optional[TradeEvidenceLedger] = None
         self._fatal_task_event = asyncio.Event()
         self._fatal_task_detail = ""
         self._task_health: Dict[str, Dict[str, Any]] = {}
         self._background_failures = 0
-        self._background_tasks: set[asyncio.Task] = set()
-        # Telegram can replay its configured channels as soon as the client
-        # connects, before the PIT dataset finishes constructing. Preserve
-        # those signals and drain them once every downstream consumer exists.
         self._pending_social_signals: deque = deque(maxlen=10_000)
         self._pending_social_dropped = 0
-        self._candidate_pipelines: Dict[str, asyncio.Task] = {}
-        self._candidate_semaphore: Optional[asyncio.Semaphore] = None
-        self._web_runner: Optional[web.AppRunner] = None
         self.start_time = time.time()
-        self._readiness_cache: Dict[str, Any] = {}
-        self._readiness_cached_at = 0.0
         self.last_intelligence_update = 0.0
         self.sol_price_usd = 0.0
         self.wallet_equity_usd = 0.0
@@ -343,6 +306,18 @@ class MemecoinQuantDesk:
             Path(self.global_config.get("ops_state_dir", "data/state"))
             / "launch_census.json")
         self.launch_census.load()
+        # Holder structure without an RPC call. getTokenLargestAccounts is
+        # unserved by the free pool (publicnode 403, mainnet-beta 429) and
+        # was blocking 41 of 63 launches in a measured sample; every trade
+        # already decoded carries a wallet and a signed token delta.
+        self.observed_holders = ObservedHolderLedger()
+        # Measurements, not parallel trading authorities: each reports into
+        # the decision record so the audit can tell a module that ran from
+        # one that never did. A contributor with no slot is an orphan.
+        self.holder_trajectory = HolderTrajectoryMonitor()
+        self.dev_wallet_monitor = DevWalletMonitor()
+        self.rotation_tracker = SmartWalletRotationTracker()
+        self.risk_veto: RiskVeto = RiskVeto()
         self._census_saved_at = 0.0
         # Are the stated probabilities true? Kelly is exquisitely sensitive to
         # them and nothing has ever checked.
@@ -357,6 +332,7 @@ class MemecoinQuantDesk:
         self._redecision_tasks: List[asyncio.Task] = []
         self._safety_task: Optional[asyncio.Task] = None
         self._intelligence_task: Optional[asyncio.Task] = None
+        self._parity_task: Optional[asyncio.Task] = None
         self._source_task: Optional[asyncio.Task] = None
         # Coverage says a module was consulted; this says whether it mattered.
         # A component that is disconnected and one that is connected but inert
@@ -368,13 +344,6 @@ class MemecoinQuantDesk:
         self._market_entry_price: Dict[str, float] = {}
         self._curve_entry_price: Dict[str, float] = {}
         self._latest_stream_mark: Dict[str, Dict[str, float]] = {}
-        self._router_mark_cache: Dict[str, Dict[str, float]] = {}
-        self._router_mark_inflight: Set[str] = set()
-        self._router_mark_checked_at: Dict[str, float] = {}
-        self._native_decisions = 0
-        self._native_parity_matches = 0
-        self._native_parity_mismatches = 0
-        self._native_decision_fallbacks = 0
         # Latest bonding-curve reserves decoded straight off the trade
         # stream, so exit capacity is answerable locally in the window a
         # decision actually has, with no RPC round trip.
@@ -444,6 +413,34 @@ class MemecoinQuantDesk:
         self._wallet_readings: Dict[str, Any] = {}
         self.data_miners = DataMinerPool()
         self.miner_registration: Dict[str, bool] = {}
+        # Global breadth. Built in _setup_research; declared here so an
+        # offline desk and a half-constructed one both report them honestly
+        # rather than raising on a status call.
+        self.substitution = default_registry()
+        self.channel_book: Optional[ChannelBook] = None
+        self.identity_watch = IdentityWatch()
+        # Pools an outside operator saw. `_discovery_misses` counts the ones
+        # our own stream never reported, which is the only measurement of how
+        # complete the census denominator actually is.
+        self._discovered_pools: Dict[str, float] = {}
+        self._discovery_misses = 0
+        # Launches that claim a public figure, most recent last. Bounded:
+        # this is a display and training surface, not a store of record.
+        self._identity_claims: Dict[str, Any] = {}
+        # Where the milliseconds actually go. Built here rather than in
+        # _setup_research because the stream can deliver before research is
+        # up, and an event that arrives with no ledger to open a trace on is
+        # the one measurement that cannot be recovered later.
+        self.latency = LatencyLedger()
+        # Every decision, including the launches walked away from. A corpus
+        # of trades taken can answer "did we make money" and cannot answer
+        # "should we have been there", and the second question is where the
+        # returns are.
+        self.counterfactual_corpus = CounterfactualCorpus(
+            path=str(Path(self.global_config.get("ops_state_dir", "data/state"))
+                     / "decision_corpus.jsonl")
+            if not self.offline else None)
+        self.miner_offload: Optional[OffloadedPool] = None
         self.slot_value = SlotValueModel()
         self._mark_checked_at: Dict[str, float] = {}
         self._mark_checks = 0
@@ -456,57 +453,20 @@ class MemecoinQuantDesk:
         self._closed_pnl: Dict[str, float] = {}
         self._market_cursor = 0
         self._model_artifact_mtime = 0.0
-        # Explicit memecoin mechanics which were previously spread across
-        # risk, actor and social reports. They are kept as measurements rather
-        # than parallel trading authorities.
-        self.holder_trajectory = HolderTrajectoryMonitor()
-        # Holder structure without an RPC call. getTokenLargestAccounts is
-        # unserved by the free pool (publicnode 403, mainnet-beta 429), which
-        # was blocking 41 of 63 launches in a measured sample; every trade we
-        # already decode carries the wallet and a signed token delta.
-        self.observed_holders = ObservedHolderLedger()
-        self.dev_wallet_monitor = DevWalletMonitor()
-        self.rotation_tracker = SmartWalletRotationTracker()
-        self.risk_veto: RiskVeto = RiskVeto()
-        self.trade_evidence: Optional[TradeEvidenceLedger] = None
-        self.profit_isolation: Optional[ProfitIsolationPolicy] = None
-        self._safety_refreshed_at: Dict[str, float] = {}
 
     async def initialize(self):
         normalize_provider_environment(os.environ)
         with open(self.config_path, encoding="utf-8") as handle:
             self.config = yaml.safe_load(handle)
         self.global_config = self.config.get("global", {})
-        # The governor is constructed in __init__, where global_config is
-        # still empty, so its fractions silently took their defaults and
-        # memory_soft_fraction/memory_hard_fraction had never once applied.
-        # Rebinding here rather than moving the construction: the governor
-        # is registered with reliefs by components built between there and
-        # here, and replacing the object would drop them.
+        # The governor is constructed before the config is read, so
+        # memory_soft_fraction/memory_hard_fraction silently took defaults
+        # and had never once applied. Rebound rather than reconstructed:
+        # components built in between register reliefs on this object.
         self.memory.soft_fraction = float(
             self.global_config.get("memory_soft_fraction", DEFAULT_SOFT_FRACTION))
         self.memory.hard_fraction = float(
             self.global_config.get("memory_hard_fraction", DEFAULT_HARD_FRACTION))
-        self.risk_veto = RiskVeto(
-            require_complete_safety=bool(
-                self.global_config.get("require_complete_veto_inputs", False)),
-            max_exit_impact_pct=float(
-                self.global_config.get("max_veto_exit_impact_pct", 0.20)),
-            max_liquidity_fraction=float(
-                self.global_config.get("max_liquidity_fraction", 0.01)),
-        )
-        state_root = Path(self.global_config.get("ops_state_dir", "data/state"))
-        self.trade_evidence = TradeEvidenceLedger(
-            state_root / "trade_evidence.jsonl")
-        self.profit_isolation = ProfitIsolationPolicy(
-            working_capital_usd=float(self.global_config.get(
-                "profit_isolation_working_capital_usd",
-                self.global_config.get("paper_equity_usd", 10_000))),
-            sweep_trigger_usd=float(self.global_config.get(
-                "profit_isolation_trigger_usd", 1_000)),
-            isolation_fraction=float(self.global_config.get(
-                "profit_isolation_fraction", 1.0)),
-        )
         self._candidate_semaphore = asyncio.Semaphore(
             int(self.global_config.get("max_candidate_concurrency", 8))
         )
@@ -520,560 +480,31 @@ class MemecoinQuantDesk:
         await self._setup_detection_and_risk()
         await self._setup_research()
         await self._flush_pending_social_signals()
-        # Connect event producers last. Yellowstone can deliver immediately
-        # after subscribe; connecting it before the portfolio, actor graph and
-        # PIT lake existed sent real transactions into a half-built desk.
+        # The stream connects LAST, after every consumer exists. A producer
+        # that starts first delivers events into a desk that has nothing
+        # wired to handle them, and those launches are lost silently.
         await self._setup_yellowstone()
         await self._refresh_portfolio_state()
         logger.info("Desk initialized: mode=%s live_submission_locked=%s", "DRY_RUN" if self.dry_run else "LIVE",
                     os.getenv("ALLOW_LIVE_TRADING", "").lower() != "yes-i-understand")
 
-    async def _setup_keys(self):
-        encoded = os.getenv("SOLANA_PRIVATE_KEY", "").strip()
-        if not encoded:
-            if not self.dry_run:
-                raise RuntimeError("SOLANA_PRIVATE_KEY is required for live mode")
-            self.keypair = Keypair()
-            logger.warning("Using an ephemeral paper wallet; no private key was loaded")
-            return
-        try:
-            if encoded.startswith("["):
-                raw = bytes(json.loads(encoded))
-                self.keypair = Keypair.from_bytes(raw)
-            else:
-                try:
-                    self.keypair = Keypair.from_base58_string(encoded)
-                except ValueError:
-                    raw = base64.b64decode(encoded, validate=True)
-                    self.keypair = Keypair.from_bytes(raw) if len(raw) == 64 else Keypair.from_seed(raw)
-        except (ValueError, TypeError, json.JSONDecodeError) as exc:
-            raise RuntimeError("SOLANA_PRIVATE_KEY has an unsupported or invalid encoding") from exc
-        logger.info("Wallet public key: %s", self.keypair.pubkey())
 
-    async def _setup_chains(self):
-        self.chain_registry = ChainRegistry(self.config_path)
-        enabled = self.global_config.get("enabled_chains", ["solana"])
-        if "solana" not in enabled:
-            raise RuntimeError("Solana must be enabled for this build")
-        if self.offline:
-            chain = self.chain_registry.get_chain("solana")
-            self.chain_registry.rpc_managers["solana"] = RPCManager(chain)
-        else:
-            await self.chain_registry.start_all(enabled)
-        self.solana_config = self.chain_registry.get_chain("solana")
-        self.solana_rpc = self.chain_registry.get_rpc("solana")
-        if not self.solana_config or not self.solana_rpc:
-            raise RuntimeError("Solana chain configuration is unavailable")
 
-    async def _setup_yellowstone(self):
-        endpoint = os.getenv("YELLOWSTONE_GRPC_URL", "").strip()
-        self.yellowstone = YellowstoneClient(
-            endpoint or "https://yellowstone.invalid",
-            os.getenv("YELLOWSTONE_GRPC_TOKEN", os.getenv("HELIUS_API_KEY", "")),
-        )
-        connected = False if self.offline or not endpoint else await self.yellowstone.connect()
-        if self.offline:
-            self.yellowstone.status = "DATA_BLOCKED"
-            self.yellowstone.status_detail = "offline smoke-test mode"
-        elif not endpoint:
-            self.yellowstone.status = "DATA_BLOCKED"
-            self.yellowstone.status_detail = "YELLOWSTONE_GRPC_URL is missing; RPC fallback enabled"
-        if connected:
-            self.pump_monitor = PumpFunMonitor(self.yellowstone, self._on_pump_event)
-            self.pump_swap_monitor = PumpSwapMonitor(self.yellowstone, self._on_pump_event)
-            self.raydium_monitor = RaydiumMonitor(self.yellowstone, self._on_raydium_event)
-            # Register every decoder before the stream task can dispatch its
-            # first response. Subscription starts the receive task.
-            await self.yellowstone.subscribe(create_combined_subscription())
-        elif not self.offline:
-            self.rpc_program_stream = SolanaRpcProgramStream(
-                self.solana_rpc, [PumpFunMonitor.PUMP_FUN_PROGRAM, PumpSwapMonitor.PUMP_AMM_PROGRAM,
-                                  RaydiumMonitor.RAYDIUM_AMM_V4, RaydiumMonitor.RAYDIUM_CPMM,
-                                  RaydiumMonitor.RAYDIUM_CLMM, RaydiumMonitor.METEORA_DLMM,
-                                  RaydiumMonitor.METEORA_DYNAMIC_AMM, RaydiumMonitor.ORCA_WHIRLPOOL]
-            )
-            self.pump_monitor = PumpFunMonitor(self.rpc_program_stream, self._on_pump_event)
-            self.pump_swap_monitor = PumpSwapMonitor(self.rpc_program_stream, self._on_pump_event)
-            self.raydium_monitor = RaydiumMonitor(self.rpc_program_stream, self._on_raydium_event)
-            await self.rpc_program_stream.start()
 
-    async def _setup_intelligence(self):
-        helius = os.getenv("HELIUS_API_KEY", "")
-        self.genealogy = GenealogyGraph(self.solana_config, self.solana_rpc, helius)
-        state_root = Path(self.global_config.get("ops_state_dir", "data/state"))
-        self.wallet_intel = WalletIntelligenceEngine(
-            self.solana_config, self.solana_rpc, self.genealogy, helius,
-            state_path=state_root / "wallet_intelligence.json")
-        self.social_intel = SocialIntelligenceEngine(
-            self.solana_config, self.solana_rpc, self.genealogy, self.wallet_intel,
-            {"helius": helius, "x_bearer": os.getenv("X_BEARER_TOKEN", ""),
-             "telegram": os.getenv("TELEGRAM_BOT_TOKEN", ""),
-             "telegram_api_id": os.getenv("TELEGRAM_API_ID", ""),
-             "telegram_api_hash": os.getenv("TELEGRAM_API_HASH", ""),
-             "telegram_channels": os.getenv("TELEGRAM_CHANNELS", ""),
-             "youtube": os.getenv("YOUTUBE_API_KEY", ""),
-             "reddit": os.getenv("REDDIT_CLIENT_ID", ""),
-             "reddit_secret": os.getenv("REDDIT_CLIENT_SECRET", "")},
-        )
-        self.prelaunch = PrelaunchIntentModel(self.solana_config, self.solana_rpc, self.genealogy, self.wallet_intel, helius)
-        self.counterfactual_lab = CounterfactualExecutionLab()
-        self.adversarial = AdversarialAdaptationDetector()
-        for feature, fakeability in {
-            "buyer_count": 0.9, "fresh_wallet_volume": 0.8, "social_engagement": 0.85,
-            "wallet_history_6m": 0.2, "independent_funding": 0.3, "creator_genealogy": 0.15,
-            "narrative_acceleration": 0.4, "real_liquidity": 0.1,
-        }.items():
-            self.adversarial.set_fakeability(feature, fakeability)
-        self.info_graph = InformationLeadGraph(self.solana_config, self.solana_rpc, self.genealogy,
-                                               self.wallet_intel, self.social_intel, self.prelaunch)
-        self.rug_hazard = ContinuousRugHazardModel(
-            self.solana_config, self.solana_rpc, self.genealogy,
-            self.wallet_intel, self.adversarial,
-            max_tracked_tokens=int(self.global_config.get(
-                "hazard_max_tracked_tokens", DEFAULT_MAX_TRACKED_TOKENS)),
-            # Evicted token history lands in the research lake rather than
-            # being dropped, so the resident bound costs memory residency
-            # and not evidence.
-            spill_path=Path(self.global_config.get(
-                "hazard_spill_path", "data/launch_episodes/hazard_observations.jsonl")))
-        self.public_coordination = PublicCoordinationMiner(self.genealogy, self.wallet_intel)
-        self.social_intel.on_mention(self._on_social_mention)
-        if not self.offline:
-            # Seed the watch list from distilled DNA before the engine
-            # starts. Without it the desk rediscovers every wallet from
-            # scratch on each restart and its own accumulated history --
-            # 56,636 observed wallets as of 2026-08-29 -- contributes
-            # nothing to what it chooses to watch.
-            seeds = self._wallet_dna_seeds()
-            for component in (self.genealogy, self.wallet_intel, self.social_intel, self.prelaunch,
-                              self.info_graph, self.rug_hazard):
-                if component is self.wallet_intel and seeds:
-                    await component.start(initial_wallets=seeds)
-                else:
-                    await component.start()
 
-    def _wallet_dna_seeds(self) -> List[str]:
-        """Wallets worth watching, from distilled history. Never invented.
 
-        Ranked on the SHRUNK enrichment, so a wallet cannot earn a seat by
-        touching one token that happened to moon -- the raw rate put
-        one-resolved-token wallets at the top when this was first built,
-        which is noise wearing the costume of a ranking.
 
-        A missing or unreadable artifact yields nothing rather than an
-        error: the desk must start without it, and a seed list is an
-        accelerator, not a dependency.
-        """
-        path = Path(self.global_config.get("ops_state_dir", "data/state")) / "wallet_dna.json"
-        minimum = int(self.global_config.get("wallet_dna_min_resolved", 10))
-        limit = int(self.global_config.get("wallet_dna_seed_limit", 500))
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return []
-        seeds = [
-            str(row.get("wallet"))
-            for row in (payload.get("records") or [])
-            if row.get("wallet")
-            and int(row.get("resolved_tokens") or 0) >= minimum
-            and (row.get("monster_enrichment") or 0.0) > 1.0
-        ]
-        if seeds:
-            logger.info("seeding wallet watch list with %d wallets distilled "
-                        "from %s observed launches", len(seeds[:limit]),
-                        payload.get("universe_resolved"))
-        return seeds[:limit]
 
-    async def _setup_prediction(self):
-        # One brain per launch age. A pooled model trained across every horizon
-        # learns the average launch and there is no such thing: at 100ms the
-        # holder distribution does not exist yet, and by five minutes the
-        # features that mattered at 100ms have been overwritten by their own
-        # consequences. The pooled model stays as a LABELLED bridge while the
-        # per-band artifacts accumulate; `band_status` on every prediction says
-        # which answered, so promotion can require the band's own.
-        self.predictor = AgeBandedPredictor(
-            os.getenv("MODEL_DIR", "models"),
-            allow_pooled_fallback=bool(
-                self.global_config.get("allow_pooled_model_fallback", True)),
-        )
-        loaded = self.predictor.load_latest()
-        model_loaded = any(loaded.values())
-        trained_policy, policy_report = load_latest_exit_policy(os.getenv("MODEL_DIR", "models"))
-        # Without a validated policy the operator's configured hold time still
-        # governs; a trained policy has earned the right to set its own.
-        self.exit_policy = trained_policy or dataclasses_replace(
-            ExitPolicy.default(),
-            max_hold_seconds=float(self.global_config.get("max_hold_time_minutes", 60)) * 60,
-        )
-        self.exit_policy_status = "OK" if trained_policy else "DATA_BLOCKED"
-        self.exit_policy_detail = (
-            policy_report.get("model_path", "") if trained_policy
-            else "no chronologically validated exit policy; using default thresholds"
-        )
-        # Shadow mode runs a deliberately broader book: many small independent
-        # trials capture rare tails without touching the separately gated
-        # live-capital limits, which keep their unprefixed values.
-        prefix = "shadow_" if self.dry_run else ""
-        setting = lambda name, default: self.global_config.get(f"{prefix}{name}", self.global_config.get(name, default))
-        self.elogw_engine = ElogwEngine(
-            self.predictor,
-            max_position_pct=float(setting("max_position_pct", 0.05)),
-            max_position_usd=float(setting("max_position_size_usd", 500)),
-            max_portfolio_risk=float(setting("max_portfolio_risk", 0.10)),
-            max_total_exposure_pct=float(setting("max_total_exposure_pct", 0.30)),
-            max_concurrent_positions=int(setting("max_concurrent_positions", 10)),
-            max_daily_loss_usd=float(self.global_config.get("max_daily_loss_usd", 1_000)),
-            max_daily_loss_pct=(float(self.global_config["max_daily_loss_pct"])
-                                if self.global_config.get("max_daily_loss_pct") is not None else None),
-            daily_giveback_pct=(float(self.global_config["daily_giveback_pct"])
-                                if self.global_config.get("daily_giveback_pct") is not None else None),
-            daily_giveback_arm_pct=float(self.global_config.get("daily_giveback_arm_pct", 0.5)),
-            max_liquidity_fraction=float(self.global_config.get("max_liquidity_fraction", 0.01)),
-            harvest_trigger_ratio=float(setting("harvest_trigger_ratio", 1.5)),
-            harvest_slope=float(setting("harvest_slope", 0.5)),
-            small_account_mode=bool(setting("small_account_mode", False)),
-            small_account_negligible_share=float(setting("small_account_negligible_share", 0.002)),
-        )
-        self.monster_machine = MonsterStateMachine(
-            monster_probability_threshold=float(
-                self.global_config.get("monster_probability_threshold", 0.15)),
-            candidate_probability_threshold=float(
-                self.global_config.get("monster_candidate_threshold", 0.06)),
-            degrade_confirmations=int(self.global_config.get("monster_degrade_confirmations", 3)),
-            min_degrade_dimensions=int(self.global_config.get("monster_degrade_dimensions", 2)),
-            bank_fractions={
-                state: float(self.global_config.get(f"monster_bank_{state.value}", default))
-                for state, default in MonsterStateMachine.DEFAULT_BANK_FRACTIONS.items()
-            },
-        )
-        self.min_escape_probability = float(
-            self.global_config.get("min_escape_probability", 0.05))
-        self.mega_event_reserve = MegaEventReserve(
-            baseline_fraction=float(self.global_config.get("mega_event_baseline_reserve", 0.0)),
-            max_fraction=float(self.global_config.get("mega_event_max_reserve", 0.35)),
-            arm_probability=float(self.global_config.get("mega_event_arm_probability", 0.05)),
-        )
-        # None until an event detector supplies a measured probability. The
-        # reserve then holds only its baseline, which defaults to nothing --
-        # an unmeasured event must not silently withhold capital every week.
-        self.mega_event_probability: Optional[float] = None
-        self.mega_event_authenticated: bool = False
-        self.distribution_detector = DistributionDetector(
-            min_coverage=float(self.global_config.get("distribution_min_coverage", 0.3)))
-        self.opportunity_allocator = OpportunityAllocator(
-            replacement_cost_pct=float(self.global_config.get("replacement_cost_pct", 0.02)),
-            min_displacement_gain_ratio=float(
-                self.global_config.get("min_displacement_gain_ratio", 1.5)),
-            max_displacements_per_cycle=int(
-                self.global_config.get("max_displacements_per_cycle", 2)),
-        )
-        self.last_slate_report: Dict[str, Any] = {}
-        self.mega_event_reserve_state: Dict[str, Any] = {}
-        self.action_policy = ActionValuePolicy(
-            min_edge=float(self.global_config.get("action_min_edge", 1e-4)),
-            max_add_fraction=float(setting("max_position_pct", 0.05)),
-        )
-        # The Rust T0 core, wired into the canonical path rather than sitting
-        # beside it. It shadows the Python policy on every ordinary decision
-        # and takes over only after a run of measured agreement -- and a
-        # single disagreement while it is deciding demotes it for the rest of
-        # the session. Promotion by evidence, demotion by default, exactly as
-        # a model is promoted here.
-        self.t0_kernel = T0Kernel(
-            self.action_policy,
-            mode=str(self.global_config.get("t0_kernel_mode", "auto")),
-            promote_after=int(self.global_config.get("t0_kernel_promote_after", 500)))
-        logger.info("T0 kernel: mode=%s native=%s",
-                    self.t0_kernel.mode.value, self.t0_kernel.native_status)
 
-        # Re-entry is a post-exit candidate, not an action an open
-        # position can take: `Action.REENTER` is only scorable at zero held
-        # fraction, so the book lives outside the position loop and gates
-        # the ordinary entry path instead of running a parallel one.
-        # Whether a token is the entity it claims to be. The registry ships
-        # empty on purpose -- an entity entry asserts that an account or
-        # wallet canonically IS a named public figure, and a wrong one makes
-        # an impersonator look verified. Until entries are filled in from
-        # each entity's own published account, every verdict is DATA_BLOCKED,
-        # which is the honest reading of an empty registry: not "nothing is a
-        # copycat" but "we cannot tell".
-        self._watched_entities = load_entities(
-            # Schema and policy in the repository; verified entities on the
-            # node that could actually reach their pages.
-            self.global_config.get(
-                "entities_path", "config/entities.yaml,config/entities.verified.yaml"))
-        self.entity_registry = EntityRegistry(self._watched_entities)
-        self.authenticity = AuthenticityResolver(self.entity_registry)
-        # Which source spoke first, and whether its posts have historically
-        # been tradeable or merely a place distributors advertise.
-        self.source_genealogy = SourceGenealogy()
-        self._source_outcomes: Dict[str, List[Any]] = {}
-        # The fee actually charged, versioned by date and market cap, rather
-        # than a constant that stops being true on the first of September.
-        self.fee_schedule = PUMP_FEE_SCHEDULE
-        self.entry_coverage = CoverageTracker("entry")
-        self.position_coverage = CoverageTracker("position")
-        self.reentry_book = ReentryBook(ReentryPolicy(
-            cooldown_seconds=float(self.global_config.get("reentry_cooldown_seconds", 90.0)),
-            window_seconds=float(self.global_config.get("reentry_window_seconds", 1800.0)),
-            max_reentries=int(self.global_config.get("max_reentries_per_token", 2)),
-            min_hazard_improvement=float(
-                self.global_config.get("reentry_min_hazard_improvement", 0.25)),
-        ), action_policy=self.action_policy)
-        # The mesh is constructed from the declared universe. Sources without
-        # a production fetcher are reported NO_FETCHER by the registry rather
-        # than silently absent -- "we have adapters" is not "those signals
-        # reach T0 decisions", and the registry report is what says which.
-        declarations = load_declarations(
-            # Seed first, then the operator's verified overlay -- which
-            # tools/verify_sources.py writes and which wins on any id it
-            # names. Endpoints that answered on the trading node beat
-            # endpoints that looked plausible in a repository.
-            #
-            # sources.repaired.yaml comes last and is written by
-            # tools/feed_doctor.py: same-publisher URL corrections for feeds a
-            # publisher moved. It is absent until something breaks, and a
-            # missing overlay in a multi-file path is skipped rather than
-            # raising, so shipping without it is the normal case.
-            self.global_config.get(
-                "source_registry",
-                "config/sources.yaml,config/sources.verified.yaml,"
-                "config/sources.repaired.yaml"))
-        # The channels the operator already listed for the social collector.
-        # Asking for them twice -- once in an env var, once in YAML -- is
-        # asking for two lists that disagree.
-        declarations = expand_env_channels(declarations)
-        # Real transports, built from the declarations themselves. This map was
-        # empty, so build_sources ran from nothing and reported every source
-        # NO_FETCHER -- an adapter library rather than a source of signal.
-        # Anything an operator injected before construction is kept and wins,
-        # so a bespoke connection is still theirs to supply.
-        self.http_client = HttpClient(
-            timeout_s=float(self.global_config.get("source_http_timeout", 10.0)))
-        built, self.transport_report, self.http_client = build_transports(
-            declarations, self.http_client)
-        injected = dict(getattr(self, "source_fetchers", {}) or {})
-        self.transports: Dict[str, Any] = {**built, **injected}
-        shared_telegram = getattr(self.social_intel, "_telegram_client", None)
-        if shared_telegram is not None:
-            for transport in self.transports.values():
-                if isinstance(transport, TelegramChannelTransport):
-                    transport.attach_client(shared_telegram)
-        self.source_fetchers: Dict[str, Any] = dict(self.transports)
-        sources, self.source_registry_report = build_sources(
-            declarations, self.source_fetchers)
-        self.source_mesh = SourceMesh(
-            sources,
-            dedupe_window=float(self.global_config.get("source_dedupe_window", 300.0)),
-            poll_timeout=float(self.global_config.get("source_poll_timeout", 5.0)))
-        # token -> observations naming it, newest last.
-        self._source_events: Dict[str, List[Any]] = {}
-        # Set properly once the predictor is constructed; until then a
-        # decision records that it was priced by no validated model.
-        self.model_feature_hash = "untrained"
-        self.wallet_independence = WalletIndependence()
-        # The half of independence that behaviour cannot see. Wallets funded
-        # and deployed for one launch have no co-occurrence history, so every
-        # one reads as independent -- and a Sybil built for this launch is
-        # invisible at the moment it is used.
-        self.funder_ancestry = FunderAncestry(
-            self.genealogy,
-            max_hops=int(self.global_config.get("funder_max_hops", 4)),
-            hub_threshold=int(self.global_config.get("funder_hub_threshold", 50)))
-        self.buyer_dna = BuyerDNA(
-            depth=int(self.global_config.get("buyer_dna_depth", 25)),
-            min_corpus=int(self.global_config.get("buyer_dna_min_corpus", 50)))
-        self.swarm_predictor = SwarmPredictor(
-            skill_threshold=float(self.global_config.get("swarm_skill_threshold", 0.6)),
-            independence_threshold=float(
-                self.global_config.get("swarm_independence_threshold", 0.5)))
-        # Entries per token, kept only for tokens the hot state still holds.
-        self._actor_entries: Dict[str, List[Entry]] = {}
-        self.independence_report = IndependenceReport(status="DATA_BLOCKED")
-        self.ancestry_report: Optional[Any] = None
-        self._actor_seen: Dict[str, set] = {}
-        self._independence_computed_at = 0.0
-        self._independence_interval = 300.0
-        self.edge_decay = EdgeDecayMonitor(
-            min_trades=int(self.global_config.get("edge_decay_min_trades", 30)))
-        self._mechanism_growth: Dict[str, List[float]] = {}
-        self._attribution_published_at = 0.0
-        self._attribution_interval = 900.0
-        self.hot_state = HotState(
-            HotStateBudget(
-                max_active_tokens=int(self.global_config.get("max_active_tokens", 4_000)),
-                max_hot_wallets=int(self.global_config.get("max_hot_wallets", 20_000)),
-            ),
-            archive_root=Path(self.global_config.get("ops_state_dir", "data/state")) / "spool",
-        )
-        self.champion_challenger = ChampionChallengerFramework(
-            state_path=os.getenv("CHAMPION_STATE_PATH", "data/research/champion_state.json")
-        )
-        if not self.offline:
-            await self.champion_challenger.start()
-        feature_hash = hashlib.sha256(json.dumps({
-            "artifact_version": self.predictor.ARTIFACT_VERSION,
-            "features": list(self.predictor.feature_names),
-        }, sort_keys=True).encode()).hexdigest()
-        # Stamped onto every frozen decision, so a fill can be traced to the
-        # exact model that priced it rather than to whatever is loaded now.
-        self.model_feature_hash = feature_hash[:16]
-        hypothesis = HypothesisSpec(
-            hypothesis_id=MODEL_HYPOTHESIS_ID, mechanism="calibrated multi-head tail and rug probabilities",
-            target="net_elogw", features=list(self.predictor.feature_names), feature_hash=feature_hash,
-            model_type="gradient_boosting_calibrated", model_params={}, training_window="expanding_point_in_time",
-            threshold=0.0, sizing_rule={"objective": "max_net_elogw", "hard_limits": True},
-            exit_rule={"profit_ratchet": True, "rug_hazard": True}, execution_policy={"jupiter": True, "jito": True},
-            fakeability={}, cost_model={"slippage": "quote_observed"}, falsifier="chronological OOS net ElogW <= 0",
-            kill_thesis="forward decay or calibration failure", source_provenance="local validated model bundle",
-            trial_family="production_multihead", created_at=time.time(),
-        )
-        self.champion_challenger.submit_hypothesis(hypothesis)
-        self.champion_challenger.freeze_hypothesis(MODEL_HYPOTHESIS_ID)
-        if not model_loaded:
-            self.champion_challenger.mark_data_blocked(MODEL_HYPOTHESIS_ID, "no validated persisted multi-head model bundle")
-        else:
-            self._register_model_validation(self.predictor.validation_report)
-            self._model_artifact_mtime = self._latest_model_mtime()
 
-    def _register_model_validation(self, report: Dict[str, Any]):
-        if not report or report.get("status") != "PASSED":
-            return
-        net_elogw = float(report.get("net_elogw_proxy", 0) or 0)
-        self.champion_challenger.record_trial_result(TrialResult(
-            hypothesis_id=MODEL_HYPOTHESIS_ID, stage="CHRONOLOGICAL_OOS",
-            samples=int(report.get("oos_samples", 0) or 0), metrics={"brier_skill": float(report.get("mean_brier_skill", 0) or 0)},
-            oos_metrics={"elogw": net_elogw}, portfolio_impact=net_elogw,
-            passed=net_elogw > 0, timestamp=float(report.get("created_at", time.time()) or time.time()),
-            notes="route-feasible OOS proxy; forward shadow remains mandatory",
-        ))
-
-    @staticmethod
-    def _latest_model_mtime() -> float:
-        if not os.path.isdir("models"):
-            return 0.0
-        return max((os.path.getmtime(os.path.join("models", name)) for name in os.listdir("models")
-                    if name.endswith((".joblib", ".pkl"))), default=0.0)
-
-    async def _setup_execution(self):
-        self.jupiter = JupiterClient()
-        self.jito = JitoClient()
-        # Isolated when MEMECOIN_SIGNER_SOCKET names a socket, local otherwise.
-        # Chosen once, here, and reported on /status -- so "the key is in this
-        # process" is a stated configuration rather than an unexamined default.
-        builder = SolanaTransactionBuilder(
-            self.solana_rpc, signer_from_env(self.keypair))
-        # Nothing here is an operator secret any more: the program addresses
-        # come from the vendored IDLs and the fee recipients from Pump's own
-        # published list. What remains configurable is the pair of token
-        # programs, because whether a mint is Token-2022 depends on how it was
-        # created and getting that wrong changes every associated token
-        # address in the instruction.
-        self.pump_route = NativePumpRoute(PumpRouteConfig(
-            base_token_program=str(self.global_config.get(
-                "pump_base_token_program", TOKEN_2022_PROGRAM)),
-            quote_token_program=str(self.global_config.get(
-                "pump_quote_token_program", TOKEN_PROGRAM)),
-        ))
-        self.pumpswap_route = PumpSwapRoute(PumpSwapRouteConfig(
-            base_token_program=str(self.global_config.get(
-                "pump_base_token_program", TOKEN_2022_PROGRAM)),
-            quote_token_program=str(self.global_config.get(
-                "pump_quote_token_program", TOKEN_PROGRAM)),
-        ))
-        self.execution_engine = ExecutionEngine(self.solana_config, self.solana_rpc, self.jupiter, self.jito,
-                                                builder, self.counterfactual_lab, dry_run=self.dry_run,
-                                                pump_route=self.pump_route,
-                                                pumpswap_route=self.pumpswap_route)
-        # The landing corpus is the only dataset real fills produce, and it
-        # was held in memory alone -- so every restart destroyed it and a desk
-        # restarted a dozen times in a day had none. A landing attempt cannot
-        # be reconstructed after the fact by any means.
-        self.execution_engine.landing_model.path = (
-            Path(self.global_config.get("ops_state_dir", "data/state"))
-            / "landing_attempts.jsonl")
-        restored = self.execution_engine.landing_model.load()
-        if restored:
-            logger.info("landing model restored %d attempts from disk", restored)
-        # The desk owns the streamed curve state; the engine reads it through
-        # this rather than keeping its own, because two views of the price we
-        # are about to trade at is one view too many.
-        self.execution_engine.curve_state_provider = self._latest_curve_state.get
-        # Graduation should change the venue and nothing else. The same desk
-        # state, the same policy and the same signing path continue across it;
-        # only the pool these two providers describe is new.
-        self.execution_engine.pool_state_provider = self._latest_pool_state.get
-        self.execution_engine.pool_account_provider = self._pool_accounts.get
-        # Measured congestion for the bid and for the attempt record. Until
-        # this was supplied the landing model bucketed every attempt as
-        # "unknown", so it could never learn that a bid clearing in calm
-        # conditions misses in a rush.
-        self.execution_engine.congestion_provider = self._measured_congestion
-        self.fee_optimizer = PriorityFeeOptimizer()
-        if not self.offline:
-            await self.execution_engine.start()
-
-    async def _setup_detection_and_risk(self):
-        self.rug_detector = RugDetector(
-            self.solana_config, self.solana_rpc, self.jupiter,
-            # The streamed curve, so a mint the router has never indexed is
-            # still known to be sellable back to its own bonding curve.
-            curve_state_provider=self._latest_curve_state.get)
-        self.detection_engine = TokenDetectionEngine(self.chain_registry)
-
-    async def _setup_research(self):
-        self.dataset_builder = PointInTimeDatasetBuilder(
-            self.solana_config, self.solana_rpc, self.genealogy, self.wallet_intel, self.social_intel,
-            self.prelaunch, self.info_graph, self.rug_hazard, self.champion_challenger,
-            actor_provider=self.actor_intelligence,
-            memecoin_state_provider=self._memecoin_state_features,
-        )
-        self.info_graph.set_outcome_provider(self.dataset_builder.get_outcome)
-        if hasattr(self.genealogy, "set_outcome_provider"):
-            self.genealogy.set_outcome_provider(self.dataset_builder.get_outcome)
-        self.global_research = GlobalResearchMiner(self.champion_challenger)
-        # Market and chain context, each source on its own clock. The program
-        # stream is the fastest and most trustworthy data the desk has; what
-        # it does not carry is why a price path looks the way it does, and
-        # that is what a forward ledger needs to explain an outcome rather
-        # than only record it.
-        self.data_miners = DataMinerPool(
-            concurrency=int(self.global_config.get("data_miner_concurrency", 6)),
-            on_records=self._ingest_mined_records)
-        self.miner_registration = dict(register_solana_miners(
-            self.data_miners, rpc=self.solana_rpc, http=self.http_client,
-            watched_tokens=self._mineable_tokens))
-        # Chain facts the program stream does not carry: what landing costs
-        # right now, whether the chain is keeping up, whether the supply is
-        # still under someone's control, and what the deployer did before.
-        self.miner_registration.update(register_chain_miners(
-            self.data_miners, rpc=self.solana_rpc,
-            hot_accounts=self._contended_accounts,
-            lp_mints=self._known_lp_mints,
-            deployers=self._known_deployers,
-            watched_wallets=self._tracked_wallets))
-        # Public web: measured attention rather than mentions, and the corpus
-        # a name has to be compared against before it means anything.
-        self.miner_registration.update(register_web_miners(
-            self.data_miners, http=self.http_client,
-            search_terms=self._name_search_terms,
-            youtube_key=lambda: os.getenv("YOUTUBE_API_KEY", ""),
-            github_token=lambda: os.getenv("GITHUB_TOKEN", "")))
-        if not self.offline:
-            await self.dataset_builder.start()
-            await self.global_research.start()
-            started = await self.data_miners.start()
-            logger.info("DATA MINERS %d runnable of %d declared",
-                        started, len(self.miner_registration))
 
     async def start(self):
         if self.offline:
             return
         self._running = True
-        # Before any loop runs: an open follow is an unresolved measurement,
-        # and discarding it on restart is why no wallet ever reached the
-        # 12-outcome ranking threshold.
+        # An open follow is an unresolved measurement with a 300s horizon.
+        # Discarding it on restart is why no wallet ever reached the
+        # 12-outcome ranking bar: 56 open against 9 resolved.
         self.load_follow_candidates()
         await self._setup_health_server()
         # Four independent loops rather than one clocked sweep. The two that
@@ -1081,26 +512,25 @@ class MemecoinQuantDesk:
         # never sleep; the two that maintain are driven by the clock and never
         # sit in front of a decision.
         self._main_task = self._start_runtime_task(
-            "candidate_dispatch", self._candidate_dispatch_loop())
+            "dispatch", self._candidate_dispatch_loop())
         self._redecision_tasks = [
             self._start_runtime_task(f"redecision_{index}", self._redecision_loop())
             for index in range(int(self.global_config.get("redecision_workers", 4)))]
         self._safety_task = self._start_runtime_task(
-            "safety_sweep", self._safety_sweep_loop())
+            "safety", self._safety_sweep_loop())
         self._intelligence_task = self._start_runtime_task(
             "intelligence", self._intelligence_loop())
+        self._parity_task = self._start_runtime_task("parity", self._parity_loop())
         self._register_memory_reliefs()
-        self._health_task = self._start_runtime_task("health", self._health_loop())
+        self._health_task = self._start_runtime_task(
+            "health", self._health_loop())
         self._market_task = self._start_runtime_task(
-            "market_observer", self._market_observer_loop())
+            "market", self._market_observer_loop())
         self._source_task = self._start_runtime_task(
-            "source_consumer", self._source_consumer_loop())
-        self._refresh_readiness_cache()
-        _systemd_notify("READY=1\nSTATUS=DRY_RUN collectors active")
+            "sources", self._source_consumer_loop())
 
     async def stop(self):
         self._running = False
-        _systemd_notify("STOPPING=1\nSTATUS=flushing evidence and closing streams")
         # Producers first: they hold sockets, and cancelling the consumer
         # while producers keep publishing fills a queue nobody drains.
         try:
@@ -1108,7 +538,10 @@ class MemecoinQuantDesk:
         except Exception as exc:  # pragma: no cover - shutdown only
             logger.warning("source mesh shutdown: %s", exc)
         try:
-            await self.data_miners.stop()
+            if self.miner_offload is not None:
+                await self.miner_offload.stop()
+            else:
+                await self.data_miners.stop()
         except Exception as exc:  # pragma: no cover - shutdown only
             logger.warning("data miner shutdown: %s", exc)
         try:
@@ -1121,6 +554,7 @@ class MemecoinQuantDesk:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
         for task in (self._main_task, self._health_task, self._market_task,
                      self._safety_task, self._intelligence_task, self._source_task,
+                     self._parity_task,
                      *self._redecision_tasks):
             if task:
                 task.cancel()
@@ -1153,6 +587,12 @@ class MemecoinQuantDesk:
         Failures are logged and swallowed: a desk that cannot shut down
         because a disk is full is worse than one that loses a minute.
         """
+        # The corpus is append-only and buffered, so a shutdown that does not
+        # flush it loses decisions that cannot be reconstructed from anything.
+        try:
+            self.counterfactual_corpus.flush()
+        except Exception as exc:
+            logger.warning("could not flush the decision corpus: %s", exc)
         for name, ledger in (("forward evidence", self.forward_evidence),
                              ("launch census", self.launch_census),
                              ("calibration", self.calibration)):
@@ -1167,86 +607,9 @@ class MemecoinQuantDesk:
             except Exception as exc:
                 logger.warning("could not close the landing log: %s", exc)
 
-    def _spawn_background(self, coroutine):
-        task = asyncio.create_task(coroutine)
-        self._background_tasks.add(task)
 
-        def completed(done: asyncio.Task) -> None:
-            self._background_tasks.discard(done)
-            if done.cancelled():
-                return
-            try:
-                exc = done.exception()
-            except asyncio.CancelledError:
-                return
-            if exc is not None:
-                self._background_failures += 1
-                logger.error("background task failed", exc_info=(
-                    type(exc), exc, exc.__traceback__))
 
-        task.add_done_callback(completed)
 
-    def _start_runtime_task(self, name: str, coroutine) -> asyncio.Task:
-        """Start one indispensable loop and make an unexpected exit fatal.
-
-        A process with a living health loop and a dead source consumer looks
-        healthy to systemd while collecting nothing.  Failing the process is
-        the correct recovery boundary because systemd can restart the complete
-        graph from a consistent snapshot.
-        """
-        task = asyncio.create_task(coroutine, name=f"memecoin:{name}")
-        self._task_health[name] = {
-            "status": "RUNNING", "started_at": time.time(), "failures": 0}
-
-        def completed(done: asyncio.Task) -> None:
-            state = self._task_health.setdefault(name, {})
-            if done.cancelled() or not self._running:
-                state.update({"status": "STOPPED", "stopped_at": time.time()})
-                return
-            try:
-                exc = done.exception()
-            except asyncio.CancelledError:
-                exc = None
-            detail = (f"{type(exc).__name__}: {exc}" if exc is not None
-                      else "loop returned while the desk was running")
-            state.update({"status": "FAILED", "failed_at": time.time(),
-                          "detail": detail,
-                          "failures": int(state.get("failures", 0)) + 1})
-            self._fatal_task_detail = f"{name}: {detail}"
-            logger.critical("critical runtime task failed: %s", self._fatal_task_detail)
-            self._fatal_task_event.set()
-
-        task.add_done_callback(completed)
-        return task
-
-    def runtime_task_report(self) -> Dict[str, Any]:
-        states = {name: dict(value) for name, value in self._task_health.items()}
-        failed = [name for name, value in states.items()
-                  if value.get("status") == "FAILED"]
-        return {
-            "status": "CRITICAL" if failed else "OK" if states else "DATA_BLOCKED",
-            "failed": failed,
-            "fatal_detail": self._fatal_task_detail,
-            "background_failures": self._background_failures,
-            "tasks": states,
-        }
-
-    def watchdog_report(self) -> Dict[str, Any]:
-        path = Path(self.global_config.get("ops_state_dir", "data/state")) \
-            / "watchdog_state.json"
-        try:
-            payload = json.loads(path.read_text())
-            age = max(0.0, time.time() - float(payload.get("last_run_at", 0.0)))
-        except (OSError, ValueError, TypeError):
-            return {"status": "DATA_BLOCKED",
-                    "detail": "watchdog has not completed a run"}
-        return {
-            "status": "OK" if age <= 180.0 else "DEGRADED",
-            "seconds_since_run": round(age, 1),
-            "restart_count_window": len(payload.get("restart_times") or ()),
-            "last_plan": payload.get("last_plan") or {},
-            "last_failures": payload.get("last_failures") or [],
-        }
 
     async def _candidate_dispatch_loop(self):
         """Dispatch every candidate the instant it is detected.
@@ -1366,6 +729,25 @@ class MemecoinQuantDesk:
             except Exception as exc:
                 logger.exception("Intelligence loop error: %s", exc)
 
+    async def _parity_loop(self):
+        """Verify promoted Rust decisions against Python, off the money path.
+
+        Its own loop rather than a line in the intelligence sweep, and on a
+        much shorter clock: this is the only thing standing between a Rust
+        kernel that has quietly started disagreeing and a session of trades
+        nobody checked. The queue is bounded, so falling behind loses checks
+        rather than memory -- and `parity_dropped` in /status is what makes
+        that loss visible instead of silent.
+        """
+        while self._running:
+            await asyncio.sleep(float(self.global_config.get(
+                "parity_sweep_seconds", 0.5)))
+            try:
+                self.t0_kernel.drain_parity(
+                    budget=int(self.global_config.get("parity_budget", 64)))
+            except Exception as exc:
+                logger.exception("Parity loop error: %s", exc)
+
     async def _market_observer_loop(self):
         """Keep research quotes off the latency-sensitive decision loop."""
         while self._running:
@@ -1403,16 +785,9 @@ class MemecoinQuantDesk:
             self._record_blocked_decision(token, "DATA_BLOCKED_candidate_pipeline_saturated", {})
             self._candidate_drops += 1
             return False
+        self.latency.mark(token, "decode_to_dispatch")
         task = asyncio.create_task(self._candidate_pipeline(candidate))
         self._candidate_pipelines[token] = task
-        if self.predictor is not None and not self.predictor._is_trained:
-            # The absence of a validated action model is known immediately.
-            # Keep collecting native risk/outcome evidence in this task, but
-            # do not leave the launch looking lost behind enrichment RPCs.
-            self.launch_census.data_blocked(
-                token, "DATA_BLOCKED_prediction_model_enrichment_running")
-        else:
-            self.launch_census.awaiting_state(token, "candidate_pipeline_running")
         self._background_tasks.add(task)
 
         def completed(done: asyncio.Task):
@@ -1449,14 +824,7 @@ class MemecoinQuantDesk:
         if candidate.chain != "solana" or not candidate.address:
             return
         token = candidate.address
-        if self.trade_evidence:
-            self.trade_evidence.record("candidate_observed", {
-                "mint": token, "chain": candidate.chain,
-                "source": getattr(candidate.source, "value", str(candidate.source)),
-                "detected_at": candidate.timestamp, "factory": candidate.factory,
-                "deployer": candidate.deployer, "pair": candidate.pair,
-                "transaction": candidate.tx_hash,
-            }, timestamp=candidate.timestamp)
+        self.latency.mark(token, "dispatch_to_decide")
         if token in self.elogw_engine.open_positions:
             return
         # A token we have already exited is not an ordinary candidate. The
@@ -1477,64 +845,22 @@ class MemecoinQuantDesk:
             candidate.base_token or WSOL_MINT, detected_at=candidate.timestamp,
             prelaunch_context=self._prelaunch_context(candidate.deployer or "", candidate.timestamp),
         )
+        risk = await self.rug_detector.analyze(token, candidate.pair, candidate.base_token)
+        risk_data = _jsonable(risk)
+        self.dataset_builder.record_risk_report(token, risk_data)
         self.rug_hazard.register_token(token, {"deployer": candidate.deployer or "", "pair": candidate.pair or ""})
         self.public_coordination.record_creator(token, candidate.deployer or "")
-        # Shared launch funding is coordination evidence, not proof that the
-        # creator controls every recipient. Only the identified creator is
-        # placed in the developer set until the entity graph proves a link.
-        self.dev_wallet_monitor.register(token, candidate.deployer or "")
         # Wallets funded within the same atomic launch transaction as the pool
-        # creation. This is public coordination evidence, not proof that the
-        # creator controls every recipient.
+        # creation -- the only funding evidence available without an extra
+        # RPC call. record_funding keys on the *funded* wallet so that N
+        # different wallets sharing one funder inside this transaction (a
+        # common bundled-sniper-bot pattern) is what actually trips the
+        # shared_funder coordination signal.
         for item in candidate.metadata.get("funding_transfers", []):
             self.public_coordination.record_funding(
                 token, item.get("to", ""), item.get("from", ""),
                 float(item.get("lamports", 0) or 0) / 1e9, candidate.timestamp,
             )
-        risk = await self.rug_detector.analyze(
-            token, candidate.pair, candidate.base_token,
-            candidate.deployer or None)
-        self._enrich_holder_actor_concentration(
-            token, risk, candidate.deployer or "")
-        risk_data = _jsonable(risk)
-        self.dataset_builder.record_risk_report(token, risk_data)
-        self.holder_trajectory.record_mapping(
-            token, {
-                "top_10_pct": getattr(risk, "top_10_pct", None),
-                "top_20_pct": getattr(risk, "top_20_pct", None),
-                "dev_pct": getattr(risk, "deployer_balance_pct", None),
-                "insider_pct": getattr(risk, "insider_pct", None),
-                "bundler_pct": getattr(risk, "bundler_pct", None),
-                "fresh_wallet_pct": getattr(risk, "fresh_wallet_pct", None),
-                "whale_pct": getattr(risk, "whale_pct", None),
-                "cluster_pct": getattr(risk, "connected_cluster_pct", None),
-                "holder_count": getattr(risk, "holder_count", None),
-            },
-            timestamp=getattr(risk, "timestamp", time.time()),
-            source="native_spl_largest_accounts")
-        if getattr(risk, "deployer_balance_pct", None) is not None:
-            self.dev_wallet_monitor.record_balance(
-                token, risk.deployer_balance_pct,
-                timestamp=getattr(risk, "timestamp", time.time()),
-                source="native_spl")
-        hard_veto = self.risk_veto.evaluate(
-            risk, dev_state=self.dev_wallet_monitor.state(token),
-            connected_holder_pct=getattr(risk, "connected_cluster_pct", None))
-        if hard_veto.status == "VETO":
-            veto_reason = "safety_veto:" + ",".join(
-                hard_veto.reasons or ["unattributed"])
-            self._record_blocked_decision(
-                token, veto_reason,
-                {"risk": risk_data, "veto": hard_veto.to_dict()})
-            return
-        if ((risk.data_status == "DATA_BLOCKED"
-             or hard_veto.status == "DATA_BLOCKED")
-                and self.global_config.get(
-                    "reject_data_blocked_safety_checks", True)):
-            self._record_blocked_decision(
-                token, "DATA_BLOCKED_safety_checks",
-                {"risk": risk_data, "veto": hard_veto.to_dict()})
-            return
         # Safety is graded, not binary. HONEYPOT, RUGGED and CRITICAL are
         # untradeable at any size and stay vetoes; HIGH is a worse token, not
         # an impossible one, and a hard reject on it discards the launches
@@ -1555,7 +881,6 @@ class MemecoinQuantDesk:
         if prediction is None:
             self._record_blocked_decision(token, "DATA_BLOCKED_prediction_model", {})
             return
-        self.launch_census.decision_ready(token, "safety_liquidity_and_prediction_ready")
         if not self.dry_run and not self.champion_challenger.is_live(MODEL_HYPOTHESIS_ID):
             self._record_blocked_decision(token, "champion_not_promoted_for_live_authority", _jsonable(prediction))
             return
@@ -1592,21 +917,8 @@ class MemecoinQuantDesk:
                 trade_info = {**trade_info, **room}
                 should_trade = False
             else:
-                economic_veto = self.risk_veto.evaluate(
-                    risk, dev_state=self.dev_wallet_monitor.state(token),
-                    position_value_usd=float(
-                        trade_info.get("position_value_usd", 0) or 0),
-                    liquidity_usd=liquidity,
-                    connected_holder_pct=getattr(
-                        risk, "connected_cluster_pct", None))
-                if economic_veto.status == "VETO":
-                    trade_info = {
-                        **trade_info, "reason": "risk_veto",
-                        "risk_veto": economic_veto.to_dict()}
-                    should_trade = False
-                else:
-                    # Q owns the economic question from here.
-                    should_trade = True
+                # Q owns the economic question from here.
+                should_trade = True
         intelligence = self._entry_intelligence(
             token, candidate, risk, prediction, trade_info, liquidity)
         coverage = self.entry_coverage.record(intelligence)
@@ -1672,15 +984,24 @@ class MemecoinQuantDesk:
             should_trade = contested
             decision.update({"should_trade": should_trade, "trade_info": trade_info,
                              "contested_for_capital": True})
-        action = "ENTER" if should_trade else str(trade_info.get("reason", "IGNORE"))
-        self.launch_census.decide(token, action)
         decision_id = self.counterfactual_lab.record_decision(token, _jsonable(prediction), decision)
+        # Frozen BEFORE the action, with every alternative the policy priced.
+        # A row amended afterwards leaks the future into its own features, and
+        # a model trained on that looks extraordinary in backtest and fails
+        # forward.
+        self._record_corpus_decision(token, decision_id, decision, trade_info,
+                                     should_trade)
         self._record_trade_evidence_packet(
             token, candidate, risk, liquidity, trade_info, intelligence,
-            decision=action,
+            decision="ENTER" if should_trade else str(trade_info.get("reason", "IGNORE")),
             veto=hard_veto.to_dict())
         if not should_trade:
+            # A launch we screened is a closed trace, not an abandoned one.
+            # Screening is most of the funnel, and a ledger that only ever saw
+            # the trades would report the latency of the easy cases.
+            self.latency.close(token, "screened")
             return
+        self.latency.mark(token, "decide_to_build")
         result = await self.execution_engine.execute_swap(
             candidate.base_token or WSOL_MINT, token, int(trade_info["position_size_sol"] * 1e9),
             slippage_bps=100,
@@ -1700,6 +1021,13 @@ class MemecoinQuantDesk:
                            * max(self.wallet_equity_usd, 0.0))),
             sol_price_usd=float(self.sol_price_usd or 0.0),
         )
+        # Build, sign and submission happen inside the engine, which reports
+        # its own split; from here the whole call is one stage. Marked before
+        # the result is inspected so a rejected submission is timed the same
+        # as an accepted one -- the failure path is the one that has to be
+        # fast too, because a failed entry is a slot spent.
+        self.latency.mark(token, "sign_to_submit")
+        self.latency.close(token, "entered" if result.success else "submit_failed")
         self.dataset_builder.record_execution_attempt(token, _jsonable(result))
         self._record_ops_event("execution_attempts", {
             "token": token, "side": "buy", "success": bool(result.success),
@@ -1740,7 +1068,6 @@ class MemecoinQuantDesk:
             "ratchet_stages": [],
         }
         self.elogw_engine.update_position(token, position)
-        self.launch_census.enter(token)
         staged = self._stage_exits(token, position)
         if staged is not None:
             position["staged_exits"] = staged.detail
@@ -1817,94 +1144,76 @@ class MemecoinQuantDesk:
         # Recorded so the weekly audit can ask what the rejected launches went
         # on to do. A missed monster is invisible unless the rejection was
         # written down next to the outcome.
-        if str(reason).upper().startswith("DATA_BLOCKED"):
-            self.launch_census.data_blocked(token, reason)
-        elif str(reason).startswith("safety_veto:"):
-            self.launch_census.reject(token, reason)
-        else:
-            self.launch_census.screen(token, reason)
+        self.launch_census.screen(token, reason)
         self._record_ops_event("trade_outcomes", {
             "token": token, "entered": False, "attempted": False,
             "rejection_reason": reason,
         })
-        if self.trade_evidence:
-            self.trade_evidence.record("candidate_rejected", {
-                "mint": token, "reason": reason, "evidence": evidence})
-        self.counterfactual_lab.record_decision(token, evidence, {"should_trade": False, "reason": reason})
+        decision_id = self.counterfactual_lab.record_decision(
+            token, evidence, {"should_trade": False, "reason": reason})
+        # The row that makes the corpus a corpus. A rejection recorded here
+        # and resolved from the census later is the only way the desk can
+        # ever learn that a screen was wrong -- a missed hundred-x costs
+        # nothing that any other ledger records.
+        try:
+            self.counterfactual_corpus.record(
+                decision_id or f"blocked:{token}:{time.time():.6f}", token,
+                state=_jsonable(evidence), chosen_action="ignore",
+                screen_reason=reason, regime=str(self.current_regime or "unknown"),
+                options=[ActionOption(action="ignore", status="OK")])
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("corpus row for %s not recorded: %s", token, exc)
 
-    def _record_trade_evidence_packet(
-        self, token: str, candidate: Any, risk: Any, liquidity: float,
-        trade_info: Dict[str, Any], intelligence: Dict[str, Any], *,
-        decision: str, veto: Dict[str, Any],
-    ) -> None:
-        """Freeze the complete measured entry thesis before execution."""
-        if not self.trade_evidence:
+    def _record_corpus_decision(self, token: str, decision_id: str,
+                                decision: Dict[str, Any],
+                                trade_info: Optional[Dict[str, Any]],
+                                should_trade: bool) -> None:
+        """One frozen row: the state, every feasible action, and what was taken.
+
+        The action set is stored with each option's STATUS rather than with a
+        sentinel Q for the ones that were unavailable. An action the state
+        could not support -- ADD with no capital, REENTER on an open position
+        -- is infeasible, not terrible, and a large negative number would
+        teach the model the difference backwards.
+        """
+        corpus = getattr(self, "counterfactual_corpus", None)
+        if corpus is None:
             return
-        curve = self._latest_curve_state.get(token)
-        pool = self._latest_pool_state.get(token)
-        if curve is not None:
-            bonding = {
-                "status": "OK", "venue": "pump_fun",
-                "virtual_token_reserves": curve.virtual_token_reserves,
-                "virtual_sol_reserves": curve.virtual_sol_reserves,
-                "real_token_reserves": curve.real_token_reserves,
-                "real_sol_reserves": curve.real_sol_reserves,
-                "complete": curve.complete,
-            }
-        elif pool is not None:
-            bonding = {"status": "OK", "venue": "pump_swap", "pool": pool.pool,
-                       "base_reserves": pool.base_reserves,
-                       "quote_reserves": pool.quote_reserves}
-        else:
-            bonding = {"status": "DATA_BLOCKED", "detail": "no native venue state"}
-        checks = getattr(risk, "checks", {}) or {}
-        actors = intelligence.get("actors") or {
-            "status": "DATA_BLOCKED", "detail": "actor graph unavailable"}
-        packet = evidence_packet(
-            mint=token, timestamp=time.time(), bonding_curve=bonding,
-            liquidity={"status": "OK" if liquidity > 0 else "DATA_BLOCKED",
-                       "liquidity_usd": liquidity},
-            sellability=checks.get("sell_route") or {
-                "status": "DATA_BLOCKED", "detail": "sell route not measured"},
-            authorities={"status": getattr(risk, "data_status", "DATA_BLOCKED"),
-                         "mint_active": getattr(risk, "can_mint", None),
-                         "freeze_active": getattr(risk, "can_freeze", None),
-                         "extensions": getattr(risk, "token_extensions", ())},
-            holder_distribution=self.holder_trajectory.state(token),
-            wallet_clusters=actors,
-            dev_wallet=self.dev_wallet_monitor.state(token),
-            smart_wallet_flow=actors.get("smart_flow") or {
-                "status": "DATA_BLOCKED", "detail": "quality flow unavailable"},
-            social_velocity=intelligence.get("social") or {
-                "status": "DATA_BLOCKED", "detail": "social velocity unavailable"},
-            entry_cost=self._cost_model(token),
-            exit_liquidity={"status": "OK" if liquidity > 0 else "DATA_BLOCKED",
-                            "liquidity_usd": liquidity,
-                            "capacity_limit_fraction": self.risk_veto.max_liquidity_fraction},
-            risk_vetoes=veto.get("reasons", ()),
-            expected_edge=(float(trade_info["elogw"])
-                           if trade_info.get("elogw") is not None else None),
-            position_size=(float(trade_info["position_value_usd"])
-                           if trade_info.get("position_value_usd") is not None else None),
-            exit_plan={"status": self.exit_policy_status,
-                       "policy": _jsonable(self.exit_policy)},
-            decision=decision,
-        )
-        self.trade_evidence.record("candidate_decision", packet)
+        info = trade_info or {}
+        scores = (decision.get("action_scores") or decision.get("scores") or [])
+        options = []
+        for score in scores:
+            if isinstance(score, dict):
+                options.append(ActionOption(
+                    action=str(score.get("action", "")),
+                    q=score.get("q"),
+                    status=str(score.get("status", "OK"))))
+        routes = []
+        router = getattr(self.execution_engine, "landing_router", None)
+        if router is not None:
+            try:
+                for route in router.enabled_routes():
+                    routes.append(RouteOption(name=route.name, kind=route.kind))
+            except Exception:  # pragma: no cover - defensive
+                routes = []
+        try:
+            corpus.record(
+                decision_id or f"decision:{token}:{time.time():.6f}", token,
+                state=_jsonable(decision.get("prediction") or {}),
+                options=options,
+                chosen_action=str(decision.get("action")
+                                  or ("enter" if should_trade else "ignore")),
+                chosen_q=info.get("elogw"),
+                size_fraction=info.get("position_fraction"),
+                entry_price=info.get("entry_price"),
+                routes=routes,
+                screen_reason=("" if should_trade
+                               else str(decision.get("reason", ""))),
+                regime=str(self.current_regime or "unknown"))
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("corpus decision for %s not recorded: %s", token, exc)
 
-    def _prelaunch_context(self, deployer: str, detected_at: float) -> Optional[Dict[str, Any]]:
-        profile = self.prelaunch.get_entity_profile(deployer) if deployer else None
-        if not profile or profile.last_active > detected_at:
-            return None
-        return {
-            "as_of": profile.last_active,
-            "deployer_features": {"prior_launches": len(profile.prior_launches),
-                                  "prior_success_rate": profile.prior_success_rate,
-                                  "prior_rug_rate": profile.prior_rug_rate},
-            "wallet_features": {"cluster_id": profile.cluster_id or ""},
-            "social_features": {"social_creations": len(profile.social_creations)},
-            "entity_graph_features": {"intent_score": profile.intent_score},
-        }
+
 
     def _local_liquidity(self, token: str) -> float:
         """Tradeable depth from the streamed curve, in USD. Zero when unknown.
@@ -2014,13 +1323,6 @@ class MemecoinQuantDesk:
             "can_mint": bool(risk.can_mint),
             "can_freeze": bool(risk.can_freeze),
             "top_10_pct": float(risk.top_10_pct),
-            "top_20_pct": getattr(risk, "top_20_pct", None),
-            "dev_pct": getattr(risk, "deployer_balance_pct", None),
-            "insider_pct": getattr(risk, "insider_pct", None),
-            "bundler_pct": getattr(risk, "bundler_pct", None),
-            "fresh_wallet_pct": getattr(risk, "fresh_wallet_pct", None),
-            "whale_pct": getattr(risk, "whale_pct", None),
-            "connected_cluster_pct": getattr(risk, "connected_cluster_pct", None),
             "extension_risk": float(getattr(risk, "extension_risk", 0) or 0),
             "sell_route_feasible": risk.sell_route_feasible,
         }
@@ -2051,9 +1353,6 @@ class MemecoinQuantDesk:
             # reached yet -- which is the same false alarm as reporting a live
             # module missing, and would have trained an operator to ignore it.
             try:
-                refresh = getattr(self, "_refresh_open_safety", None)
-                if refresh is not None:
-                    await refresh(token, position)
                 await self._manage_one_position(token, position)
             finally:
                 try:
@@ -2067,70 +1366,14 @@ class MemecoinQuantDesk:
                     # far worse failure than a missing coverage row.
                     logger.warning("position coverage failed for %s: %s", token, exc)
 
-    async def _refresh_open_safety(self, token: str, position: Dict[str, Any]) -> None:
-        """Re-read mutable mint, route and holder facts off the event hot path."""
-        now = time.time()
-        interval = float(self.global_config.get("mutable_safety_refresh_seconds", 15.0))
-        if now - self._safety_refreshed_at.get(token, 0.0) < interval:
-            return
-        self._safety_refreshed_at[token] = now
-        candidate = position.get("candidate")
-        if candidate is None:
-            return
-        previous = position.get("risk_object")
-        current = await self.rug_detector.analyze(
-            token, getattr(candidate, "pair", None), getattr(candidate, "base_token", None),
-            getattr(candidate, "deployer", None))
-        self._enrich_holder_actor_concentration(
-            token, current, str(getattr(candidate, "deployer", "") or ""))
-        position["risk_object"] = current
-        position["risk_report"] = _jsonable(current)
-        self.dataset_builder.record_risk_report(token, _jsonable(current))
-        self.holder_trajectory.record_mapping(token, {
-            "top_10_pct": getattr(current, "top_10_pct", None),
-            "top_20_pct": getattr(current, "top_20_pct", None),
-            "dev_pct": getattr(current, "deployer_balance_pct", None),
-            "insider_pct": getattr(current, "insider_pct", None),
-            "bundler_pct": getattr(current, "bundler_pct", None),
-            "fresh_wallet_pct": getattr(current, "fresh_wallet_pct", None),
-            "whale_pct": getattr(current, "whale_pct", None),
-            "cluster_pct": getattr(current, "connected_cluster_pct", None),
-            "holder_count": getattr(current, "holder_count", None),
-        }, timestamp=getattr(current, "timestamp", now), source="native_spl_refresh")
-        trajectory = self.holder_trajectory.state(token)
-        position["holder_trajectory"] = trajectory
-        top10_change = trajectory.get("changes", {}).get("top_10_pct")
-        if top10_change is not None:
-            self.rug_hazard.record_observation(token, {
-                "type": "concentration", "top10_change_pct": float(top10_change) / 100.0,
-                "timestamp": now, "source": "native_spl_refresh"})
 
-        if previous is not None:
-            gained_authority = (
-                (not bool(getattr(previous, "can_mint", False))
-                 and bool(getattr(current, "can_mint", False)))
-                or (not bool(getattr(previous, "can_freeze", False))
-                    and bool(getattr(current, "can_freeze", False))))
-            if gained_authority:
-                self.dev_wallet_monitor.record(token, DevEvent(
-                    now, "authority_mutation",
-                    wallet=str(getattr(candidate, "deployer", "") or ""),
-                    severity="critical", evidence=_jsonable(current)))
-                self.rug_hazard.record_observation(token, {
-                    "type": "dev_wallet_activation", "strength": 1.0,
-                    "confidence": 1.0, "timestamp": now,
-                    "reason": "authority_mutation"})
-            if (getattr(previous, "sell_route_feasible", None) is not False
-                    and getattr(current, "sell_route_feasible", None) is False):
-                self.dev_wallet_monitor.record(token, DevEvent(
-                    now, "sell_route_failed", severity="critical",
-                    evidence=(getattr(current, "checks", {}) or {}).get("sell_route", {})))
-                self.rug_hazard.record_observation(token, {
-                    "type": "route", "feasible": False, "timestamp": now,
-                    "source": "native_safety_refresh"})
 
     async def _manage_one_position(self, token: str, position: Dict[str, Any]) -> None:
         """One position, one cycle. Returns early where the cycle is resolved."""
+        # Consult the safety modules before anything else, and RECORD what
+        # they said. A module that runs but never writes its finding into the
+        # position is an orphan: the decision cannot cite it and the audit
+        # cannot tell it apart from one that never ran.
         dev_monitor = getattr(self, "dev_wallet_monitor", None)
         holder_monitor = getattr(self, "holder_trajectory", None)
         dev_state = (dev_monitor.state(token) if dev_monitor else {
@@ -2145,6 +1388,9 @@ class MemecoinQuantDesk:
                 risk, dev_state=dev_state,
                 connected_holder_pct=getattr(risk, "connected_cluster_pct", None))
             position["risk_veto"] = veto.to_dict()
+            # A non-negotiable safety fact discovered while HOLDING is still
+            # non-negotiable. Exiting on it is the whole point of re-running
+            # the veto against an open position rather than only at entry.
             if veto.status == "VETO":
                 await self._execute_exit(
                     token, position, 1.0,
@@ -2466,129 +1712,6 @@ class MemecoinQuantDesk:
                                      "risk_contribution", "reason")}},
         }
 
-    def _memecoin_state_features(self, token: str,
-                                 as_of: Optional[float] = None) -> Dict[str, Any]:
-        """The same PIT memecoin state used by snapshots and live inference."""
-        holder = getattr(self, "holder_trajectory", None)
-        developer = getattr(self, "dev_wallet_monitor", None)
-        rotation = getattr(self, "rotation_tracker", None)
-        return {
-            "holder_trajectory": (holder.state(token, as_of) if holder else {
-                "status": "DATA_BLOCKED", "detail": "holder monitor unavailable"}),
-            "dev_wallet": (developer.state(token, as_of) if developer else {
-                "status": "DATA_BLOCKED", "detail": "developer monitor unavailable"}),
-            "capital_rotation": (rotation.report(as_of) if rotation else {
-                "status": "DATA_BLOCKED", "detail": "rotation tracker unavailable"}),
-        }
-
-    def _enrich_holder_actor_concentration(self, token: str, risk: Any,
-                                           deployer: str) -> Dict[str, Any]:
-        """Attach evidence-backed actor lower bounds to native holder data.
-
-        The RPC layer resolves token accounts to wallet owners.  This method
-        joins those public owners to the already-observed genealogy and
-        coordination graphs.  A graph that has not linked a wallet does not
-        prove independence, so unobserved labels remain ``None``; positive
-        matches are safe lower bounds and can still trigger a hard veto.
-        """
-        checks = getattr(risk, "checks", None)
-        holders = checks.get("holders") if isinstance(checks, dict) else None
-        accounts = holders.get("accounts", []) if isinstance(holders, dict) else []
-        by_owner: Dict[str, float] = {}
-        for account in accounts:
-            owner = str(account.get("owner", "") or "")
-            if not owner:
-                continue
-            try:
-                share = float(account.get("supply_pct"))
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(share) and share >= 0:
-                by_owner[owner] = by_owner.get(owner, 0.0) + share
-        if not by_owner:
-            result = {"status": "DATA_BLOCKED",
-                      "reason": "largest token-account owners unresolved"}
-            if isinstance(holders, dict):
-                holders["entity_enrichment"] = result
-            return result
-
-        evidence: Dict[str, Any] = {
-            "status": "PARTIAL", "semantics": "observed_lower_bounds",
-            "resolved_owners": len(by_owner),
-        }
-        whale_threshold = float(self.global_config.get(
-            "holder_whale_supply_pct", 1.0))
-        whale_owners = {owner for owner, pct in by_owner.items()
-                        if pct >= whale_threshold}
-        risk.whale_pct = sum(by_owner[owner] for owner in whale_owners)
-        evidence.update({
-            "whale_supply_threshold_pct": whale_threshold,
-            "whale_pct_lower_bound": risk.whale_pct,
-            "whale_owners": len(whale_owners),
-        })
-
-        coordination = getattr(self, "public_coordination", None)
-        coordinated_wallets = set()
-        kinds = set()
-        if coordination is not None:
-            for item in coordination.token_evidence.get(token, []):
-                if item.kind in {
-                    "same_slot_buy_cluster", "shared_funder",
-                    "near_identical_buy_sizes",
-                }:
-                    coordinated_wallets.update(item.wallets)
-                    kinds.add(item.kind)
-        if kinds:
-            risk.bundler_pct = sum(
-                pct for owner, pct in by_owner.items()
-                if owner in coordinated_wallets)
-            evidence.update({
-                "bundler_pct_lower_bound": risk.bundler_pct,
-                "bundler_evidence": sorted(kinds),
-                "coordinated_holders": len(set(by_owner) & coordinated_wallets),
-            })
-        else:
-            evidence["bundler_status"] = "DATA_BLOCKED: no qualifying public coordination evidence"
-
-        genealogy = getattr(self, "genealogy", None)
-        developer_cluster = (genealogy.find_cluster(deployer)
-                             if genealogy is not None and deployer else None)
-        if developer_cluster is not None:
-            cluster_wallets = set(developer_cluster.wallets)
-            risk.connected_cluster_pct = sum(
-                pct for owner, pct in by_owner.items()
-                if owner in cluster_wallets)
-            evidence.update({
-                "connected_cluster_pct_lower_bound": risk.connected_cluster_pct,
-                "connected_cluster_id": developer_cluster.cluster_id,
-                "connected_holders": len(set(by_owner) & cluster_wallets),
-            })
-        else:
-            evidence["connected_cluster_status"] = "DATA_BLOCKED: developer cluster unproven"
-
-        insider_wallets = set()
-        if genealogy is not None:
-            for owner in by_owner:
-                profile = genealogy.get_wallet_profile(owner)
-                if profile is not None and getattr(profile, "is_insider", False):
-                    insider_wallets.add(owner)
-        if insider_wallets:
-            risk.insider_pct = sum(by_owner[owner] for owner in insider_wallets)
-            evidence.update({
-                "insider_pct_lower_bound": risk.insider_pct,
-                "insider_holders": len(insider_wallets),
-            })
-        else:
-            evidence["insider_status"] = "DATA_BLOCKED: no evidence-labeled insider holder"
-
-        # Chain age is not derivable from a wallet's first local observation.
-        # Keep fresh-wallet concentration unavailable until an actual
-        # transaction-history timestamp is measured.
-        evidence["fresh_wallet_status"] = "DATA_BLOCKED: chain-age enrichment unavailable"
-        if isinstance(holders, dict):
-            holders["entity_enrichment"] = evidence
-        return evidence
-
     def _position_intelligence(self, token: str, position: Dict[str, Any]) -> Dict[str, Any]:
         """One slot per module that must be visible in an open-position decision."""
         hazard = self.rug_hazard.get_hazard(token)
@@ -2686,15 +1809,6 @@ class MemecoinQuantDesk:
         self.state_sequencer.bump(token)
         self._spawn_background(self._fetch_pool_account(token, pool))
 
-    # NOTE on `fee_schedule_unobserved`: seeding a fee-less pool from
-    # PumpFeeSchedule was tried on 2026-08-28 and reverted the same day. The
-    # schedule's legacy figure is the BONDING CURVE's published 100 bps; the
-    # first observed PumpSwap trade tail in the fixture suite charges 30 bps.
-    # A table-lookup seed would therefore have overstated every pool round
-    # trip by ~140 bps -- into research labels, not just entries. The pool
-    # becomes priceable the honest way within seconds of one readable trade
-    # tail; what actually starves `pools_priceable` is the RPC quota killing
-    # `_fetch_pool_account`, and the fix for that is quota, not fabrication.
     def _update_pool_state(self, token: str, event: Dict[str, Any]) -> None:
         """Adopt post-trade reserves and the fee bps that trade actually paid.
 
@@ -2773,35 +1887,12 @@ class MemecoinQuantDesk:
             if state is not None and not state.coin_creator:
                 state.coin_creator = decoded.coin_creator
             return True
-        except (ConnectionError, TimeoutError, RuntimeError,
-                ValueError, KeyError, TypeError) as exc:
+        except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError) as exc:
             logger.warning("pool account fetch failed for %s: %s", pool, exc)
             return False
         finally:
             self._pool_account_pending.discard(pool)
 
-    def pool_route_report(self) -> Dict[str, Any]:
-        """Whether graduation actually keeps native execution.
-
-        A route that exists, is wired, and answers DATA_BLOCKED on every
-        migrated coin is indistinguishable from one that was never wired --
-        except that it looks finished. This is what tells the two apart.
-        """
-        tracked = len(self._latest_pool_state)
-        decoded = len(self._pool_accounts)
-        priced = sum(1 for state in self._latest_pool_state.values()
-                     if state.blocked_reason() is None)
-        executable = sum(1 for token, state in self._latest_pool_state.items()
-                         if state.blocked_reason() is None and token in self._pool_accounts)
-        return {
-            "status": "OK" if executable else "DATA_BLOCKED",
-            "pools_tracked": tracked, "accounts_decoded": decoded,
-            "pools_priceable": priced, "pools_executable": executable,
-            "executable_share": (executable / tracked) if tracked else None,
-            "reasons": dict(collections.Counter(
-                state.blocked_reason() or "ok"
-                for state in self._latest_pool_state.values())),
-        }
 
     def _follow_quote(self, token: str, lamports: int):
         """What a buy of ``lamports`` would get us right now, on either venue.
@@ -2815,8 +1906,7 @@ class MemecoinQuantDesk:
             quote = quote_buy(curve, lamports)
             return quote if quote.data_status == "OK" else None
         pool = self._latest_pool_state.get(token)
-        if (pool is not None and pool.quote_mint == WSOL_MINT
-                and pool.blocked_reason() is None):
+        if pool is not None and pool.blocked_reason() is None:
             quote = pool_quote_buy(pool, lamports)
             return quote if quote.data_status == "OK" else None
         return None
@@ -2873,65 +1963,6 @@ class MemecoinQuantDesk:
             del pending[:-64]
         return True
 
-    def _follow_state_path(self) -> Path:
-        return (Path(self.global_config.get("ops_state_dir", "data/state"))
-                / "follow_candidates.json")
-
-    def save_follow_candidates(self) -> bool:
-        """Checkpoint open follows so a restart does not void them.
-
-        A follow is an unresolved measurement with a 300s horizon, and the
-        wallet model needs 12 resolved outcomes before it will rank a wallet
-        at all. Holding them only in memory meant every restart threw away
-        every follow still inside its horizon: measured 2026-08-29, 56 open
-        follows against 9 resolved outcomes across 7 wallets, so no wallet
-        could ever reach the threshold on a desk that restarts. The records
-        are plain JSON-safe dicts, so this is a straight dump.
-        """
-        try:
-            path = self._follow_state_path()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {"schema": "v1", "saved_at": time.time(),
-                       "candidates": self._follow_candidates}
-            tmp = path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(payload), encoding="utf-8")
-            tmp.replace(path)
-            return True
-        except (OSError, TypeError, ValueError) as exc:
-            logger.warning("follow checkpoint failed: %s: %s",
-                           type(exc).__name__, exc)
-            return False
-
-    def load_follow_candidates(self) -> int:
-        """Restore open follows. Returns how many were revived.
-
-        Follows already past their horizon are dropped rather than resolved
-        against a price hours later: the horizon defines what the
-        measurement MEANS, and closing one late would record a different
-        experiment under the same name.
-        """
-        path = self._follow_state_path()
-        if not path.exists():
-            return 0
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            logger.warning("follow checkpoint unreadable, discarded: %s", exc)
-            return 0
-        horizon = float(self.global_config.get("follow_horizon_seconds", 300.0))
-        cutoff = time.time() - horizon
-        revived = 0
-        for token, pending in (payload.get("candidates") or {}).items():
-            kept = [item for item in pending
-                    if isinstance(item, dict)
-                    and float(item.get("opened_at", 0) or 0) > cutoff]
-            if kept:
-                self._follow_candidates[token] = kept
-                revived += len(kept)
-        if revived:
-            logger.info("revived %d open follows from checkpoint", revived)
-        return revived
-
     def _resolve_follow_candidates(self, now: Optional[float] = None) -> int:
         """Close out follows that have reached their horizon.
 
@@ -2976,28 +2007,17 @@ class MemecoinQuantDesk:
                 self._follow_candidates.pop(token, None)
         return resolved
 
-    def follow_report(self) -> Dict[str, Any]:
-        """Whether wallet value is being measured or merely modelled."""
-        return {
-            "open_follows": sum(len(items) for items in self._follow_candidates.values()),
-            "tokens_with_follows": len(self._follow_candidates),
-            "resolved": self._follow_resolved,
-            "rejected": self._follow_unresolved,
-            "horizon_seconds": float(self.global_config.get("follow_horizon_seconds", 300.0)),
-            "reference_sol": float(self.global_config.get("follow_reference_sol", 0.5)),
-            "model": self.wallet_intel.wallet_value.report(),
-        }
 
     def _prune_curve_static(self) -> int:
         """Drop static facts for tokens the hot state no longer tracks.
 
         Also prunes the latest curve and pool state on the same rule. Those
-        two were unbounded dicts keyed by mint -- they grew with every
-        launch the stream reported and nothing ever removed an entry, which
-        is the same shape of leak that OOM-killed this service on
-        2026-08-29. hot_state.active_tokens is the right boundary because
-        it is itself hard-capped and age-expiring, so "still active there"
-        already means "recent enough to be worth pricing".
+        two were unbounded dicts keyed by mint -- they grew with every launch
+        the stream reported and nothing ever removed an entry, which is the
+        shape of leak that OOM-killed this service twelve times in one hour.
+        hot_state.active_tokens is the right boundary because it is itself
+        hard-capped and age-expiring, so "still active there" already means
+        "recent enough to be worth pricing".
 
         An open position is kept whatever the hot state says: a position we
         cannot quote an exit for is the one state we must never discard.
@@ -3368,101 +2388,6 @@ class MemecoinQuantDesk:
                 token, position, decision, state, add_fraction)
         return decision
 
-    @staticmethod
-    def _survival_levels(prediction: Any) -> List[float]:
-        return [float(getattr(prediction, name, 0.0) or 0.0) for name in (
-            "p_2x", "p_5x", "p_10x", "p_20x", "p_50x", "p_100x", "p_250x", "p_500x")]
-
-    def _native_reserves(self, token: str) -> Optional[Tuple[int, int]]:
-        curve = getattr(self, "_latest_curve_state", {}).get(token)
-        if curve is not None and getattr(curve, "tradeable", False):
-            return int(curve.virtual_sol_reserves), int(curve.virtual_token_reserves)
-        pool = getattr(self, "_latest_pool_state", {}).get(token)
-        if pool is not None and pool.blocked_reason() is None:
-            return int(pool.effective_quote_reserves), int(pool.base_reserves)
-        return None
-
-    def _token_age_seconds(self, token: str, position: Optional[Dict[str, Any]]) -> float:
-        if position is not None and position.get("entry_time") is not None:
-            return max(0.0, time.time() - float(position["entry_time"]))
-        episode = getattr(getattr(self, "dataset_builder", None), "active_episodes", {}).get(token)
-        created_at = getattr(episode, "created_at", None)
-        return max(0.0, time.time() - float(created_at)) if created_at is not None else 0.0
-
-    def _increment_native_stat(self, name: str) -> None:
-        setattr(self, name, int(getattr(self, name, 0)) + 1)
-
-    def _canonical_action_score(self, token: str, prediction: Any, state: ActionState,
-                                position: Optional[Dict[str, Any]] = None) -> ActionDecision:
-        """Rust owns the decision; Python runs continuously as a parity oracle.
-
-        A disagreement blocks entry/ordinary position action and is surfaced,
-        rather than quietly selecting whichever implementation is more
-        permissive. Catastrophic hazard exits run before this method and are
-        therefore never blocked by a parity fault.
-        """
-        shadow = self.action_policy.score(state)
-        reserves = self._native_reserves(token)
-        if native_t0_decide is None or reserves is None or self.action_policy.is_trained:
-            self._increment_native_stat("_native_decision_fallbacks")
-            return shadow
-        try:
-            raw = native_t0_decide(
-                self._token_age_seconds(token, position), reserves[0], reserves[1],
-                self._survival_levels(prediction),
-                float(getattr(prediction, "p_rug_30s", 0.0) or 0.0),
-                float(getattr(prediction, "p_rug_5m", 0.0) or 0.0),
-                float(getattr(prediction, "expected_feasible_multiple", 0.0) or 0.0),
-                float(state.held_fraction), float(state.current_multiple),
-                float(state.exit_cost), float(state.entry_cost),
-                state.exit_capacity_ratio, state.escape_probability,
-                state.alternative_growth_per_second, state.expected_remaining_seconds,
-                state.add_fraction, state.add_capacity_fraction, state.probe_fraction,
-                float(self.action_policy.min_edge), float(self.action_policy.max_add_fraction),
-                not self.dry_run, float(self.elogw_engine.max_position_pct),
-                float(getattr(self, "global_config", {}).get("max_single_commit_fraction",
-                                             self.elogw_engine.max_position_pct)),
-                float(getattr(self, "global_config", {}).get("min_commit_fraction", 0.0005)),
-                float(getattr(self, "global_config", {}).get("min_exit_capacity", 0.10)),
-                os.getenv("ALLOW_LIVE_TRADING", "").lower() == "yes-i-understand",
-            )
-        except Exception as exc:
-            self._increment_native_stat("_native_decision_fallbacks")
-            logger.error("native decision failed closed for %s: %s", token, exc)
-            return ActionDecision(status="DATA_BLOCKED", detail=f"native decision failed: {exc}")
-
-        self._increment_native_stat("_native_decisions")
-        action = ActionValue(raw[0])
-        scores = [ActionScore(ActionValue(name), float(q),
-                              status="OK" if feasible else "DATA_BLOCKED")
-                  for name, q, feasible in raw[7]]
-        status = "DATA_BLOCKED" if raw[4] else "OK"
-        native = ActionDecision(status=status, action=action, q=float(raw[1]),
-                                scores=scores, detail=str(raw[4] or raw[5] or "rust_t0"))
-        shadow_scores = {score.action: score for score in shadow.scores}
-        native_scores = {score.action: score for score in native.scores}
-        scores_match = shadow_scores.keys() == native_scores.keys() and all(
-            shadow_scores[key].feasible == native_scores[key].feasible
-            and (not shadow_scores[key].feasible
-                 or math.isclose(shadow_scores[key].q, native_scores[key].q,
-                                 rel_tol=1e-9, abs_tol=1e-9))
-            for key in shadow_scores)
-        same = (shadow.status == native.status
-                and (shadow.status != "OK" or (shadow.action is native.action
-                                                and math.isclose(shadow.q, native.q,
-                                                                 rel_tol=1e-9, abs_tol=1e-9)
-                                                and scores_match)))
-        if not same:
-            self._increment_native_stat("_native_parity_mismatches")
-            logger.error("RUST/PYTHON ACTION PARITY mismatch %s rust=%s/%.12f python=%s/%.12f",
-                         token, native.action.value, native.q, shadow.action.value, shadow.q)
-            return ActionDecision(status="DATA_BLOCKED", detail="rust_python_action_parity_mismatch")
-        self._increment_native_stat("_native_parity_matches")
-        if not raw[3]:
-            return ActionDecision(status="REFUSED", action=action, q=float(raw[1]), scores=scores,
-                                  detail=str(raw[5] or raw[4] or "native safety refused action"))
-        return native
-
     def _freeze_decision(self, token: str, position: Dict[str, Any], decision: Any,
                          state: Any, add_fraction: Optional[float]):
         """Turn a chosen action into an immutable, executable object.
@@ -3614,7 +2539,6 @@ class MemecoinQuantDesk:
         started = await self.source_mesh.start()
         logger.info("SOURCE_MESH started %d producers (%d transports, %d connected)",
                     started, len(self.transports), len(self.transports) - len(failures))
-        self._refresh_readiness_cache()
         while self._running:
             try:
                 event = await self.source_mesh.next_event()
@@ -3678,94 +2602,7 @@ class MemecoinQuantDesk:
             self._source_events.pop(stale, None)
         return len(events)
 
-    def source_intelligence(self, token: str) -> Dict[str, Any]:
-        """What public sources have said about this token, and how early.
 
-        Reports the first observation and its lag, because who was first and
-        how stale their information already was when it reached us is the
-        whole signal. A token nobody mentioned is DATA_BLOCKED, not silent
-        agreement that it is uninteresting.
-        """
-        observations = self._source_events.get(token) or []
-        if not observations:
-            return {"status": "DATA_BLOCKED",
-                    "detail": "no public source has named this token",
-                    "mesh_sources": len(self.source_mesh.sources)}
-        first = observations[0]
-        return {
-            "status": "OK",
-            "observations": len(observations),
-            "first_source": first.source_id,
-            "first_source_class": first.source_class.value,
-            "first_observation_lag_s": first.observation_lag,
-            "repeaters": self.source_mesh.repeaters_of(first.content_hash),
-            "languages": sorted({event.language for event in observations
-                                 if event.language}),
-        }
-
-    def actor_intelligence(self, token: str, as_of: Optional[float] = None) -> Dict[str, Any]:
-        """First25 DNA, actor-adjusted flow and forward swarm probability.
-
-        Built from the same entries the independence graph consumes, so the
-        three cannot disagree about who bought and in what order. Every field
-        is DATA_BLOCKED rather than defaulted: a launch with no scored buyers
-        must not read as a launch whose buyers scored zero.
-        """
-        as_of = time.time() if as_of is None else as_of
-        entries = [entry for entry in (self._actor_entries.get(token) or [])
-                   if entry.timestamp <= as_of]
-        report = self.independence_report
-        intelligence: Dict[str, Any] = {
-            "observed_buyers": len(entries),
-            "independence_status": report.status,
-        }
-
-        if not entries:
-            intelligence["status"] = "DATA_BLOCKED"
-            intelligence["detail"] = "no scored buyer observed for this token yet"
-            return intelligence
-
-        # Funding ancestry over the same ordered buyers. Traced once and used
-        # three ways -- to compress smart flow, to feed First25, and to report
-        # how many actors those wallets actually are.
-        ordered = []
-        for entry in sorted(entries, key=lambda item: item.timestamp):
-            if entry.wallet not in ordered:
-                ordered.append(entry.wallet)
-        creator = str((self.genealogy.tokens.get(token).deployer
-                       if getattr(self.genealogy, "tokens", {}).get(token) else "") or "")
-        ancestry = self.funder_ancestry.analyse(ordered[:self.buyer_dna.depth])
-        funding_features = self.funder_ancestry.buyer_features(
-            ordered[:self.buyer_dna.depth], creator)
-        intelligence["funder_ancestry"] = ancestry.to_dict()
-
-        fingerprint = build_fingerprint(token, entries, report,
-                                        depth=self.buyer_dna.depth,
-                                        funding_features=funding_features)
-        match = self.buyer_dna.match(fingerprint)
-        intelligence["buyer_dna"] = {
-            "status": match.status, "label": match.label,
-            "confidence": match.confidence, "detail": match.detail,
-            "depth": fingerprint.depth,
-        }
-
-        flow = aggregate_smart_flow(entries, report, ancestry=ancestry)
-        intelligence["smart_flow"] = {
-            "status": flow.status, "evidence": flow.evidence,
-            "naive_evidence": flow.naive_evidence, "discount": flow.discount,
-            "measured_wallets": flow.measured_wallets,
-            "unmeasured_wallets": flow.unmeasured_wallets,
-            "ancestry_compressed": flow.ancestry_compressed,
-        }
-
-        swarm = self.swarm_predictor.evaluate(entries, report, as_of)
-        intelligence["swarm"] = {
-            "status": swarm.status, "evidence": swarm.evidence,
-            "probability": swarm.probability,
-            "independent_skilled": swarm.independent_skilled_so_far,
-        }
-        intelligence["status"] = "OK"
-        return intelligence
 
     def _refresh_independence(self) -> None:
         """Recompute the independence matrix on a cadence, not per trade.
@@ -4141,27 +2978,6 @@ class MemecoinQuantDesk:
                     "router": router_multiple, "drift": drift,
                     "timestamp": time.time()})
 
-    def mark_report(self) -> Dict[str, Any]:
-        """Whether marking is actually local, and whether it is right.
-
-        Two different questions. A desk marking 100% locally and drifting 40%
-        from the router is fast and wrong, which is worse than slow.
-        """
-        total = self._marks_local + self._marks_router
-        return {
-            "marks_local": self._marks_local,
-            "marks_via_router": self._marks_router,
-            "local_share": (self._marks_local / total) if total else None,
-            "cross_checks": self._mark_checks,
-            "cross_checks_blocked": self._mark_checks_blocked,
-            "cross_checks_diverged": self._mark_checks_diverged,
-            "mean_drift": (self._mark_drift_total / self._mark_checks
-                           if self._mark_checks else None),
-            "divergence_tolerance": float(
-                self.global_config.get("mark_cross_check_tolerance", 0.10)),
-            "recent_divergences": list(self._mark_divergences),
-            "status": "OK" if self._marks_local else "DATA_BLOCKED",
-        }
 
     def _entry_slot_value(self, token: str, expected_edge_usd: float):
         """What one slot of delay costs a BUY of this token.
@@ -4224,297 +3040,38 @@ class MemecoinQuantDesk:
         ("REDDIT_CLIENT_SECRET", "approved Reddit application-only OAuth"),
     )
 
-    def _mineable_tokens(self) -> List[str]:
-        """Which mints are worth spending a miner pass on, most urgent first.
 
-        Open positions before candidates before merely-observed launches.
-        Mining the holder structure of every mint on Solana is impossible and
-        useless; the ones that matter are the ones a position is in or might
-        be taken in, and a miner pass spent elsewhere is a pass not spent
-        here.
+
+
+
+
+
+
+
+
+    def _resolve_corpus(self, token: str, **outcome: Any) -> None:
+        """Attach an outcome to every decision made about one launch.
+
+        Every decision, not only the entry: a launch is decided on repeatedly
+        and resolving only the first would throw away every hold the desk got
+        right or wrong. Defensive, because a corpus write must never be able
+        to take down the stream handler that feeds it.
         """
-        ordered: List[str] = []
-        seen = set()
-        for group in (self.elogw_engine.open_positions,
-                      self._latest_curve_state,
-                      self._latest_pool_state):
-            for token in group:
-                if token and token not in seen:
-                    seen.add(token)
-                    ordered.append(token)
-        return ordered
-
-    def stream_event_report(self) -> Dict[str, Any]:
-        """What the chain stream has delivered, by event type.
-
-        A connected stream that carries trades but no creations produces an
-        empty launch census while every other panel looks healthy, and nothing
-        else in the desk distinguishes that from a quiet market.
-        """
-        counts = dict(sorted(self._stream_events.items()))
-        creations = counts.get("token_created", 0)
-        total = sum(value for key, value in counts.items() if ":" not in key)
-        return {
-            "status": ("OK" if creations else
-                       "DEGRADED" if total else "DATA_BLOCKED"),
-            "detail": (
-                "" if creations else
-                f"{total} events delivered and not one token_created; the "
-                "launch census cannot fill and every rate over it is "
-                "undefined" if total else
-                "no chain event has been delivered at all"),
-            "total": total,
-            "token_created": creations,
-            "by_type": counts,
-        }
-
-    def signer_report(self) -> Dict[str, Any]:
-        """Where the private key actually lives, and what the signer has done.
-
-        Reported unconditionally, because "no signer configured" and "signer
-        holding the key in this process" are different states an operator must
-        be able to tell apart at a glance -- and the second one is the default,
-        which is exactly why it has to be visible rather than inferred from
-        the absence of the first.
-        """
-        engine = self.execution_engine
-        signer = getattr(getattr(engine, "tx_builder", None), "signer", None)
-        if signer is None:
-            return {
-                "status": "DATA_BLOCKED",
-                "mode": "none",
-                "isolated": False,
-                "detail": ("no execution engine is built yet; nothing can "
-                           "sign, which is correct before setup completes"),
-                "signed": 0, "refused": 0,
-            }
+        corpus = getattr(self, "counterfactual_corpus", None)
+        if corpus is None:
+            return
         try:
-            report = dict(signer.report())
-        except Exception as exc:
-            return {"status": "DATA_BLOCKED", "mode": "unknown",
-                    "isolated": False, "signed": 0, "refused": 0,
-                    "detail": f"signer report failed: {exc}"}
-        report.setdefault("status", "OK" if report.get("isolated") else "DEGRADED")
-        # A local signer is not an error, and it is not fine either. It is a
-        # deliberate configuration the operator should see stated.
-        report.setdefault("live_submission_locked",
-                          os.getenv("ALLOW_LIVE_TRADING", "").lower()
-                          != "yes-i-understand")
-        return report
+            corpus.resolve_by_mint(token, **outcome)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("corpus resolution for %s failed: %s", token, exc)
 
-    def execution_conditions_report(self) -> Dict[str, Any]:
-        """What the chain costs and whether it is keeping up.
 
-        Reported separately from the miner health because an operator asking
-        "why did that bid miss" wants the conditions, not the poll status of
-        the thing that measured them. DATA_BLOCKED here is honest: it means
-        every bid is being made against an unknown congestion bucket.
-        """
-        congestion = self._measured_congestion()
-        measured = bool(self._network_health or self._priority_fees)
-        return {
-            "status": "OK" if measured else "DATA_BLOCKED",
-            "detail": ("" if measured else
-                       "no execution-conditions pass has completed; bids are "
-                       "made against an unknown congestion bucket"),
-            "congestion": congestion,
-            "slot_time_ratio": self._network_health.get("slot_time_ratio"),
-            "tps": self._network_health.get("tps"),
-            "fee_p50_lamports": self._priority_fees.get("fee_p50_lamports"),
-            "fee_p90_lamports": self._priority_fees.get("fee_p90_lamports"),
-            "contested_share": self._priority_fees.get("contested_share"),
-            "accounts_sampled": self._priority_fees.get("accounts_sampled"),
-            "unattributed_wallet_readings": len(self._wallet_readings),
-        }
 
-    def _contended_accounts(self) -> List[str]:
-        """The accounts our next transaction will write to.
 
-        Prioritization fees are per-account: the fee that cleared on some
-        unrelated NFT mint says nothing about what it costs to land on THIS
-        curve. Asking about the pools and mints we are actually about to touch
-        is the difference between a measured bid and a chain-wide average
-        dressed up as one.
-        """
-        accounts: List[str] = []
-        seen = set()
-        for token in self._mineable_tokens()[:8]:
-            pool = self._latest_pool_state.get(token)
-            for address in (getattr(pool, "pool", ""), token):
-                if address and address not in seen:
-                    seen.add(address)
-                    accounts.append(address)
-        return accounts
 
-    def _known_lp_mints(self) -> List[str]:
-        """LP mints of pools we have actually decoded.
 
-        Only decoded pools appear here. Deriving the PDA and mining it for a
-        pool we have never read would produce a confident answer about an
-        account we cannot prove belongs to this token.
-        """
-        mints: List[str] = []
-        seen = set()
-        for account in self._pool_accounts.values():
-            lp_mint = getattr(account, "lp_mint", "")
-            if lp_mint and lp_mint not in seen:
-                seen.add(lp_mint)
-                mints.append(lp_mint)
-        return mints
 
-    def _known_deployers(self) -> List[str]:
-        """Deployers of the tokens currently worth spending a pass on.
 
-        Public chain addresses, read from the stream's own events. Their
-        history is mined from the public ledger and nowhere else.
-        """
-        addresses: List[str] = []
-        seen = set()
-        for token in self._mineable_tokens()[:12]:
-            curve = self._latest_curve_state.get(token)
-            pool = self._latest_pool_state.get(token)
-            for address in (getattr(curve, "creator", ""),
-                            getattr(pool, "coin_creator", "")):
-                if address and address not in seen:
-                    seen.add(address)
-                    addresses.append(address)
-        return addresses
-
-    def _tracked_wallets(self) -> List[str]:
-        """Wallets whose balance we want to watch move.
-
-        The elite set first, because a tracked wallet's balance dropping is it
-        deploying into something we have not seen yet -- which is the earliest
-        signal available that is not on the curve at all.
-        """
-        wallets: List[str] = []
-        seen = set()
-        for source in (getattr(self.wallet_intel, "elite_wallets", None) or {},
-                       getattr(self, "_recent_funders", None) or {}):
-            for address in source:
-                if address and address not in seen:
-                    seen.add(address)
-                    wallets.append(address)
-        return wallets[:100]
-
-    def _name_search_terms(self) -> List[str]:
-        """Names and symbols worth searching the wider venue set for.
-
-        A symbol is only meaningful against the corpus of everything else
-        called that. This supplies the queries; the corpus miner supplies the
-        comparison.
-        """
-        terms: List[str] = []
-        seen = set()
-        for token in self._mineable_tokens()[:8]:
-            curve = self._latest_curve_state.get(token)
-            for field in ("symbol", "name"):
-                value = str(getattr(curve, field, "") or "").strip()
-                if len(value) >= 2 and value.lower() not in seen:
-                    seen.add(value.lower())
-                    terms.append(value)
-        return terms
-
-    def _resolve_census_death(self, token: str) -> None:
-        """Classify how a token died and record it against the denominator.
-
-        Runs over the observations the hazard tracker already collects, so no
-        new stream is needed. A death with no mechanism evidence is recorded
-        as unclassified rather than being folded into slow bleed, because a
-        residual that absorbs every unexplained death is how a rug model
-        learns nothing while reporting full coverage.
-        """
-        # Cheapest test first, and without materialising anything: this runs
-        # for every resolved-but-unlabelled launch on every sweep, and the
-        # overwhelming majority are still trading. Asking the model for its
-        # O(1) last-touched beats scanning up to 750 observations per token
-        # across thousands of tokens on a box already CPU-stalled ~21%.
-        last_seen = self.rug_hazard.last_touched(token)
-        if last_seen is None:
-            return
-        if time.time() - last_seen < DEATH_CLASSIFICATION_QUIET_S:
-            return
-        observations = list(self.rug_hazard.observations.get(token, ()) or ())
-        if not observations:
-            return
-        priced = sum(1 for row in observations if row.get("price_multiple") is not None)
-        if priced < 2:
-            # classify() cannot compute a drawdown from fewer than two priced
-            # points and would report UNCLASSIFIED -- which reads identically
-            # to "died, cause unknown" below even though nothing here shows
-            # it died at all. A token we've barely priced is not evidence of
-            # a rug; it's evidence we weren't watching yet.
-            return
-        pool = self._latest_pool_state.get(token)
-        verdict = rug_mechanism.classify(
-            observations, migrated=(pool is not None))
-        if verdict.mechanism is rug_mechanism.RugMechanism.SURVIVED:
-            return
-        self.launch_census.resolve(
-            token, rugged=True, rug_mechanism=verdict.mechanism.value)
-        self._record_ops_event("rug_mechanisms", {
-            "token": token, **verdict.to_dict()})
-
-    def _prune_hazard_tracking(self) -> int:
-        """Bound the hazard model's per-token memory. Returns tokens evicted.
-
-        The model registers every launch the stream reports and never let
-        one go, which is what OOM-killed this service repeatedly under a
-        continuous pump.fun feed -- the growth is in the NUMBER of tokens,
-        so no per-token cap could have caught it.
-
-        Only open positions are protected by name, and that is deliberate.
-        A token being actively decided on is written to on every trade, so
-        recency already keeps it -- eviction takes the STALEST first. The
-        broader sets are the wrong tool here: hot_state.active_tokens is
-        capped at 4,000, which is above this cap and would defeat it
-        outright, and the curve/pool state dicts are themselves unbounded,
-        so protecting by them would mean one leak holding another open.
-
-        A token we hold must never be evicted at any staleness: the exit
-        policy reads its hazard, and a silently blinded exit is a far worse
-        failure than the memory it costs to keep.
-        """
-        # Classify on the way out. The sweep only reaches resident tokens,
-        # so without this a token evicted while still unlabelled has its
-        # question closed silently -- and eviction takes exactly the stale
-        # tokens that are most likely to be dead.
-        return self.rug_hazard.prune(
-            set(self.elogw_engine.open_positions),
-            on_evict=self._classify_before_eviction)
-
-    def _classify_before_eviction(self, token: str) -> None:
-        """Give a token one last chance at a death verdict.
-
-        The quiet-period guard is deliberately skipped: eviction already
-        means this token is among the stalest tracked, which is the same
-        evidence the guard exists to establish.
-        """
-        observations = list(self.rug_hazard.observations.get(token, ()) or ())
-        priced = sum(1 for row in observations
-                     if row.get("price_multiple") is not None)
-        if priced < 2:
-            return
-        pool = self._latest_pool_state.get(token)
-        verdict = rug_mechanism.classify(observations, migrated=(pool is not None))
-        if verdict.mechanism is rug_mechanism.RugMechanism.SURVIVED:
-            return
-        self.launch_census.resolve(
-            token, rugged=True, rug_mechanism=verdict.mechanism.value)
-        self._record_ops_event("rug_mechanisms", {
-            "token": token, "at": "eviction", **verdict.to_dict()})
-
-    def _sweep_rug_classification(self) -> None:
-        """Give every resolved-but-unlabeled launch a chance at a verdict.
-
-        _resolve_census_death above was written to do exactly this and had
-        no caller anywhere in the desk -- the reason rugs sat at 0 across
-        thousands of resolved launches was never that memecoins on this feed
-        don't rug, it was that nothing ever asked. Runs on the same 60s
-        cadence as the rest of the intelligence loop, off the decision path.
-        """
-        for token in self.launch_census.mints_pending_death_classification():
-            self._resolve_census_death(token)
 
     def _measured_congestion(self) -> Optional[float]:
         """Chain congestion in [0, 1], or None when unmeasured.
@@ -4536,240 +3093,18 @@ class MemecoinQuantDesk:
         # the bucket boundaries would be false.
         return max(0.0, min(1.0, (float(ratio) - 1.0)))
 
-    def _ingest_mined_records(self, miner_id: str,
-                              records: List[Dict[str, Any]]) -> None:
-        """Route mined records into the lake and the models that use them.
 
-        Written as observations rather than as state: a mined fact is
-        something we were told at a time, and the point-in-time builder is
-        what keeps it usable for training later. Overwriting live state from a
-        source polled every fifteen seconds would put a stale number in front
-        of a decision the stream had already updated.
-        """
-        for record in records:
-            # Chain-wide execution conditions belong to no episode: they are
-            # the state of the world every decision in this moment is made in.
-            if record.get("slot_time_ratio") is not None:
-                self._network_health = dict(record)
-                continue
-            if record.get("fee_p50_lamports") is not None:
-                self._priority_fees = dict(record)
-                continue
-            # Supply control on a migrated pool, keyed by LP mint rather than
-            # by the token's own mint.
-            lp_mint = str(record.get("lp_mint", "") or "")
-            if lp_mint:
-                self._ingest_lp_supply(lp_mint, record)
-                continue
-            # A wallet reading: the deployer's public history, or a tracked
-            # balance that moved.
-            address = str(record.get("address", "") or "")
-            if address:
-                self._ingest_wallet_record(address, record)
-                continue
-            mint = str(record.get("mint", "") or "")
-            if not mint:
-                # A market-wide row belongs to every episode, not to one.
-                self._market_context = dict(record)
-                continue
-            try:
-                self.dataset_builder.record_market_observation(
-                    mint, {"type": "mined", "measurement": miner_id,
-                           "timestamp": float(record.get("_fetched_at", time.time())),
-                           **record})
-            except Exception as exc:
-                logger.debug("mined record for %s not recorded: %s", mint, exc)
-            # Holder concentration is a hazard input, not a curiosity: a top
-            # holder at 40% of supply is a rug that has not happened yet.
-            if record.get("top1_share") is not None:
-                self.rug_hazard.record_observation(mint, {
-                    "type": "holder_structure",
-                    "timestamp": float(record.get("_fetched_at", time.time())),
-                    "top1_share": record.get("top1_share"),
-                    "top10_share": record.get("top10_share"),
-                    "concentration_hhi": record.get("concentration_hhi"),
-                    "data_status": "OK"})
-            # Retained mint or freeze authority is the difference between a
-            # coin that CAN be rugged by its creator and one that cannot.
-            if record.get("mint_renounced") is not None:
-                self.rug_hazard.record_observation(mint, {
-                    "type": "authority",
-                    "timestamp": float(record.get("_fetched_at", time.time())),
-                    "mint_renounced": record.get("mint_renounced"),
-                    "freeze_renounced": record.get("freeze_renounced"),
-                    "data_status": "OK"})
 
-    def _ingest_lp_supply(self, lp_mint: str, record: Dict[str, Any]) -> None:
-        """Route an LP reading onto the token whose pool it belongs to.
 
-        A rug after migration is an LP event: the pool is drained by whoever
-        holds the LP tokens. Burned LP means that cannot happen and the hazard
-        should fall; a live supply concentrated in one holder means it can
-        happen in one transaction and the hazard should rise. Neither is
-        visible on the curve until it has already happened.
-        """
-        token = ""
-        for mint, account in self._pool_accounts.items():
-            if getattr(account, "lp_mint", "") == lp_mint:
-                token = mint
-                break
-        if not token:
-            return
-        self.rug_hazard.record_observation(token, {
-            "type": "lp_supply",
-            "timestamp": float(record.get("_fetched_at", time.time())),
-            "lp_burned": record.get("lp_burned"),
-            "lp_supply": record.get("lp_supply"),
-            "lp_top1_share": record.get("lp_top1_share"),
-            "data_status": "OK"})
-        try:
-            self.dataset_builder.record_market_observation(
-                token, {"type": "mined", "measurement": "chain:lp_supply",
-                        "timestamp": float(record.get("_fetched_at", time.time())),
-                        **record})
-        except Exception as exc:
-            logger.debug("lp record for %s not recorded: %s", token, exc)
 
-    def _ingest_wallet_record(self, address: str, record: Dict[str, Any]) -> None:
-        """A wallet's public history, onto the tokens that wallet deployed.
 
-        Everything here is read from the open ledger: signature counts, their
-        timing, and a balance. It is behavioural inference over public chain
-        data and reaches nothing that is not already public.
 
-        The reading lands on the tokens this address deployed, because that is
-        where it changes a decision. A deployer account a few hours old whose
-        signature window is already saturated is the serial-launcher pattern,
-        and that is a hazard fact about every token it launched -- not a
-        curiosity filed against an address nobody looks up.
-        """
-        when = float(record.get("_fetched_at", time.time()))
-        observation = {
-            "type": "deployer_history",
-            "timestamp": when,
-            "deployer": address,
-            **{key: value for key, value in record.items()
-               if not key.startswith("_")},
-        }
-        touched = 0
-        for token in self._tokens_deployed_by(address):
-            self.rug_hazard.record_observation(token, dict(observation))
-            try:
-                self.dataset_builder.record_market_observation(
-                    token, {"measurement": "chain:deployer", **observation})
-            except Exception as exc:
-                logger.debug("deployer record for %s not recorded: %s", token, exc)
-            touched += 1
-        if not touched:
-            # A tracked wallet we hold no position against. Kept as a balance
-            # reading so a funder emptying itself is still visible later, but
-            # it changes no decision now and is not pretended to.
-            self._wallet_readings[address] = dict(record)
 
-    def _tokens_deployed_by(self, address: str) -> List[str]:
-        """Which watched tokens this address deployed, from stream state."""
-        tokens: List[str] = []
-        for token, curve in self._latest_curve_state.items():
-            if getattr(curve, "creator", "") == address:
-                tokens.append(token)
-        for token, pool in self._latest_pool_state.items():
-            if getattr(pool, "coin_creator", "") == address and token not in tokens:
-                tokens.append(token)
-        return tokens
 
-    def credential_report(self) -> Dict[str, Any]:
-        """Which credentials are present, by NAME.
 
-        No value is read, logged or returned. What an operator needs to know
-        is whether the desk can see the key they set -- an env file loaded by
-        the wrong unit, or a variable set in a shell the service never
-        inherited, both look exactly like a missing key from the outside and
-        this is what tells them apart.
-        """
-        present = [name for name, _ in self.CREDENTIALS if os.getenv(name)]
-        absent = [(name, unlocks) for name, unlocks in self.CREDENTIALS
-                  if not os.getenv(name)]
-        session = Path("data/telegram/collector.session")
-        telegram_ready = bool(os.getenv("TELEGRAM_API_ID")
-                              and os.getenv("TELEGRAM_API_HASH")
-                              and session.exists())
-        return {
-            "present": present,
-            "absent": [{"name": name, "unlocks": unlocks} for name, unlocks in absent],
-            "telegram": {
-                "keys_present": bool(os.getenv("TELEGRAM_API_ID")
-                                     and os.getenv("TELEGRAM_API_HASH")),
-                "channels_listed": len([item for item in
-                                        os.getenv("TELEGRAM_CHANNELS", "").split(",")
-                                        if item.strip()]),
-                # Telethon asks for a phone number when it finds no session,
-                # and under systemd there is no stdin to ask on. So the keys
-                # being set is not the same as Telegram being ready.
-                "session_authorised": session.exists(),
-                "ready": telegram_ready,
-                "authorise_with": (
-                    "" if telegram_ready
-                    else ".venv/bin/python -m src.research.telegram_authorize"),
-            },
-            # Which of the always-on miners each key actually feeds, and how
-            # often that miner runs. "The key is set" and "something is using
-            # it" are different facts, and only the second one produces data.
-            "miners": {
-                "chain_stream": {
-                    "keys": ["YELLOWSTONE_GRPC_URL", "YELLOWSTONE_GRPC_TOKEN"],
-                    "cadence": "push",
-                    "active": bool(os.getenv("YELLOWSTONE_GRPC_URL")),
-                    "detail": "gRPC program stream; falls back to RPC polling",
-                },
-                "rpc": {
-                    "keys": ["ALCHEMY_KEY", "HELIUS_API_KEY"],
-                    "cadence": "on demand",
-                    "active": bool(os.getenv("ALCHEMY_KEY") or os.getenv("HELIUS_API_KEY")),
-                    "detail": "account reads, wallet history, liquidity probes",
-                },
-                "social_watcher": {
-                    "keys": ["TELEGRAM_API_ID", "TELEGRAM_API_HASH", "YOUTUBE_API_KEY"],
-                    "cadence": "5s",
-                    "active": bool(os.getenv("TELEGRAM_API_ID")
-                                   or os.getenv("YOUTUBE_API_KEY")),
-                    "detail": "watched accounts and token mentions",
-                },
-                "source_mesh": {
-                    "keys": ["TELEGRAM_API_ID", "TELEGRAM_CHANNELS"],
-                    "cadence": "per source, 1s to 30m",
-                    "active": telegram_ready,
-                    "detail": "MTProto push for Telegram; needs the authorised session",
-                },
-                "global_research": {
-                    "keys": ["GITHUB_TOKEN"],
-                    "cadence": "hourly",
-                    "active": True,
-                    "detail": "public research mining; the token raises the quota",
-                },
-            },
-            "live_trading_acknowledged": (
-                os.getenv("ALLOW_LIVE_TRADING", "").lower() == "yes-i-understand"),
-        }
 
-    def ignition_census(self) -> Dict[str, Any]:
-        """How many tracked narratives are in each lifecycle state."""
-        counts: Dict[str, int] = {}
-        igniting: List[str] = []
-        for token in list(self._source_events)[:500]:
-            try:
-                reading = self._read_ignition(token)
-            except Exception:
-                continue
-            counts[reading.state.value] = counts.get(reading.state.value, 0) + 1
-            if reading.igniting and len(igniting) < 20:
-                igniting.append(token)
-        return {
-            "status": "OK" if counts else "DATA_BLOCKED",
-            "detail": ("" if counts else
-                       "no token has a source touch yet; every narrative is chain-only"),
-            "states": dict(sorted(counts.items())), "igniting": igniting,
-            "kol_reach_threshold": self.ignition.kol_reach,
-        }
+
+
 
     def _read_ignition(self, token: str):
         """Where this token's narrative is in its lifecycle.
@@ -4950,10 +3285,14 @@ class MemecoinQuantDesk:
         if quote is not None and self.sol_price_usd > 0:
             value_usd = (float(quote.output_amount) / LAMPORTS_PER_SOL) * self.sol_price_usd
             remaining = max(float(position.get("remaining_cost_usd", 0.0) or 0.0), 1e-9)
-            measurement = ("local_pump_executable_sell"
-                           if token in self._latest_curve_state
-                           else "local_pumpswap_executable_sell")
-            return (value_usd / remaining, value_usd, measurement,
+            # Labelled by the venue that actually priced it. A sell into a
+            # bonding curve and a sell into a migrated pool are different
+            # measurements with different impact behaviour, and pooling them
+            # under one name makes the two indistinguishable downstream.
+            venue = ("local_pumpswap_executable_sell"
+                     if self._latest_pool_state.get(token) is not None
+                     else "local_pump_executable_sell")
+            return (value_usd / remaining, value_usd, venue,
                     quote.price_impact_pct)
         # No local quote. A recent streamed price ratio is still a measurement
         # of this market, just not of this size -- so it is used, and labelled
@@ -4994,35 +3333,12 @@ class MemecoinQuantDesk:
         current_value = quote.output_amount / 1_000_000
         remaining_cost = max(float(position["remaining_cost_usd"]), 1e-9)
         multiple = current_value / remaining_cost
-        now = time.time()
-        impact = float(quote.price_impact_pct)
-        measurement = "jupiter_executable_sell"
-        observation = {"type": "route", "feasible": True, "price_impact_pct": impact,
-                       "value_usd": current_value, "price_multiple": multiple, "timestamp": now,
-                       "measurement": measurement, "data_status": "OK"}
+        observation = {"type": "route", "feasible": True, "price_impact_pct": quote.price_impact_pct,
+                       "value_usd": current_value, "price_multiple": multiple, "timestamp": time.time()}
         self.rug_hazard.record_observation(token, observation)
         self.dataset_builder.record_market_observation(token, observation)
         self.counterfactual_lab.record_market_observation(token, multiple, observation["timestamp"])
         return multiple, current_value
-
-    async def _crosscheck_router_mark(self, token: str, size_tokens: int) -> None:
-        try:
-            quote = await self.jupiter.get_quote(
-                token, USDC_MINT, size_tokens, slippage_bps=500)
-            if quote and quote.output_amount > 0:
-                self._router_mark_cache[token] = {
-                    "value_usd": quote.output_amount / 1_000_000,
-                    "price_impact_pct": float(quote.price_impact_pct),
-                    "timestamp": time.time(),
-                }
-            else:
-                self.rug_hazard.record_observation(
-                    token, {"type": "route", "feasible": False, "timestamp": time.time(),
-                            "measurement": "async_jupiter_crosscheck"})
-        except Exception as exc:
-            logger.debug("async Jupiter mark crosscheck failed for %s: %s", token, exc)
-        finally:
-            self._router_mark_inflight.discard(token)
 
     async def _observe_active_markets(self):
         """Collect outcome paths independently of prediction/trade authority.
@@ -5037,24 +3353,11 @@ class MemecoinQuantDesk:
         tokens = list(self._market_observation_cohort)
         if not tokens:
             return
-        # Two budgets, because the two marks do not cost the same thing.
-        #
-        # A router mark takes a slot on the single shared Jupiter gate, which
-        # without an API key admits one request every 2.05s -- and a mark is
-        # TWO quotes. Ten of those in one pass is a twenty-second pass, which
-        # is why this loop could never deliver the 2s interval its own age
-        # rule asks for. A local mark is arithmetic over streamed state: no
-        # await, no quota, no gate. Charging them to the same budget rationed
-        # the free one at the price of the scarce one.
-        probe_lamports = int(self.global_config.get("market_probe_lamports", 10_000_000))
-        router_budget = min(int(self.global_config.get("market_observation_budget", 5)),
-                            len(tokens))
-        local_budget = min(int(self.global_config.get(
-            "market_local_observation_budget", 64)), len(tokens))
+        budget = min(int(self.global_config.get("market_observation_budget", 5)), len(tokens))
         now = time.time()
         inspected = 0
         due = []
-        while inspected < len(tokens) and (router_budget > 0 or local_budget > 0):
+        while inspected < len(tokens) and budget > 0:
             token = tokens[self._market_cursor % len(tokens)]
             self._market_cursor = (self._market_cursor + 1) % max(len(tokens), 1)
             inspected += 1
@@ -5065,16 +3368,8 @@ class MemecoinQuantDesk:
             interval = 2.0 if age < 60 else 10.0 if age < 300 else 60.0
             if now - self._market_observed_at.get(token, 0) < interval:
                 continue
-            priceable_locally = self._local_round_trip_probe(token, probe_lamports) is not None
-            if priceable_locally:
-                if local_budget <= 0:
-                    continue
-                local_budget -= 1
-            else:
-                if router_budget <= 0:
-                    continue
-                router_budget -= 1
             self._market_observed_at[token] = now
+            budget -= 1
             due.append(token)
         all_active = set(self.dataset_builder.active_episodes)
         for stale in set(self._market_observed_at) - all_active:
@@ -5104,80 +3399,8 @@ class MemecoinQuantDesk:
         for episode in newest[:limit - len(self._market_observation_cohort)]:
             self._market_observation_cohort.add(episode.token)
 
-    def _local_round_trip_probe(self, token: str, probe_lamports: int):
-        """The Jupiter round trip, priced from streamed state, with no await.
-
-        Research observation was the desk's slowest sense and its most
-        rate-limited: two router quotes per mark, through the ONE shared
-        Jupiter gate, which without an API key admits a request every 2.05s.
-        That is 0.245 observations a second for the whole cohort -- about 408
-        seconds between marks on a token whose decisive window is sixty. The
-        outcome labels are built from those marks, so 18.1% of launches that
-        actually traded up were recorded as never having been exitable: not a
-        venue fact, a sampling artifact.
-
-        The bonding curve and the pool both price their own impact locally --
-        `_follow_exit_quote` has relied on that for positions since the same
-        bug was fixed on the decision path. Buying `probe_lamports` and
-        selling the proceeds straight back is the identical measurement the
-        router was being asked for, at stream speed and no quota.
-
-        Returns None when the token has no streamed state, which is the honest
-        answer and sends the caller to the router.
-        """
-        if probe_lamports <= 0:
-            return None
-        curve = self._latest_curve_state.get(token)
-        if curve is not None:
-            bought = quote_buy(curve, probe_lamports)
-            if bought.data_status != "OK" or bought.output_amount <= 0:
-                return None
-            returned = quote_sell(curve, int(bought.output_amount))
-            if returned.data_status != "OK" or returned.output_amount <= 0:
-                return None
-            return (int(bought.output_amount), int(returned.output_amount),
-                    "local_pump_round_trip")
-        pool = self._latest_pool_state.get(token)
-        if pool is not None and pool.blocked_reason() is None:
-            bought = pool_quote_buy(pool, probe_lamports)
-            if bought.data_status != "OK" or bought.output_amount <= 0:
-                return None
-            returned = pool_quote_sell(pool, int(bought.output_amount))
-            if returned.data_status != "OK" or returned.output_amount <= 0:
-                return None
-            return (int(bought.output_amount), int(returned.output_amount),
-                    "local_pumpswap_round_trip")
-        return None
-
     async def _observe_token_market(self, token: str, observed_at: float):
         probe_lamports = int(self.global_config.get("market_probe_lamports", 10_000_000))
-
-        # Streamed state first. This is the same round trip the router would
-        # price, so it carries the same route_feasible meaning -- the sell leg
-        # is an executable quote against real reserves, not a price ratio.
-        local = self._local_round_trip_probe(token, probe_lamports)
-        if local is not None and self.sol_price_usd > 0:
-            token_amount, lamports_back, measurement = local
-            value_usd = (lamports_back / LAMPORTS_PER_SOL) * self.sol_price_usd
-            unit_price = value_usd / max(token_amount, 1)
-            entry_price = self._market_entry_price.setdefault(token, unit_price)
-            multiple = unit_price / max(entry_price, 1e-18)
-            # Round-trip loss IS the impact: what a buy and an immediate sell
-            # of this size gives back, against what it cost.
-            spent_usd = (probe_lamports / LAMPORTS_PER_SOL) * self.sol_price_usd
-            impact = max(0.0, 1.0 - (value_usd / max(spent_usd, 1e-18)))
-            self._marks_local += 1
-            observation = {
-                "type": "market_mark", "timestamp": observed_at, "data_status": "OK",
-                "price_usd": unit_price, "price_multiple": multiple, "value_usd": value_usd,
-                "route_feasible": True, "feasible": True, "price_impact_pct": impact,
-                "sol_price_usd": self.sol_price_usd, "measurement": measurement,
-            }
-            self.dataset_builder.record_market_observation(token, observation)
-            self.rug_hazard.record_observation(token, {**observation, "type": "route"})
-            self.counterfactual_lab.record_market_observation(token, multiple, observed_at)
-            return
-
         buy_quote = await self.jupiter.get_quote(WSOL_MINT, token, probe_lamports, slippage_bps=300)
         if not buy_quote or buy_quote.output_amount <= 0:
             observation = {"type": "route", "feasible": False, "timestamp": observed_at,
@@ -5415,14 +3638,14 @@ class MemecoinQuantDesk:
         await self._refresh_portfolio_state()
         await self.genealogy.build_clusters()
         self._prune_curve_static()
+        self._sweep_rug_classification()
+        self._prune_hazard_tracking()
+        # Checkpointed on the cadence follows are resolved on, so a restart
+        # costs one cycle of measurement rather than every open follow.
+        self.save_follow_candidates()
         self._resolve_follow_candidates()
         self._refresh_independence()
         self._publish_attribution()
-        self._sweep_rug_classification()
-        self._prune_hazard_tracking()
-        # Checkpointed on the same cadence the follows are resolved on, so a
-        # restart costs at most one cycle of measurement rather than all of it.
-        self.save_follow_candidates()
         if self.dry_run:
             latest_mtime = self._latest_model_mtime()
             if latest_mtime > self._model_artifact_mtime:
@@ -5446,6 +3669,15 @@ class MemecoinQuantDesk:
         kind = str(event.get("type", "") or "unknown")
         self._stream_events[kind] = self._stream_events.get(kind, 0) + 1
         token = event.get("token", "")
+        if kind == "token_created" and token:
+            # Opened on the first line the handler owns, so `receive_to_decode`
+            # measures the monitor's decode and hand-off and nothing of ours.
+            # `block_time` is the cluster's, so chain_to_receive carries this
+            # box's NTP skew -- the ledger reports that caveat rather than
+            # quoting the number as though it were exact.
+            self.latency.open(token, block_time=event.get("timestamp"),
+                              slot=event.get("slot"))
+            self.latency.mark(token, "receive_to_decode")
         if not token:
             self._stream_events[f"{kind}:no_token"] = (
                 self._stream_events.get(f"{kind}:no_token", 0) + 1)
@@ -5457,28 +3689,26 @@ class MemecoinQuantDesk:
                 at=float(event.get("timestamp", time.time())),
                 regime=str(self.current_regime or "unknown"))
             self.wallet_intel.record_token_lifecycle(token, launch_at=event.get("timestamp", time.time()))
-            self.dev_wallet_monitor.register(token, event.get("creator", ""))
+            self._assess_identity(token, event)
             # Seed the curve at its protocol-defined starting depth. The
             # CreateEvent carries no reserves, so without this the desk is
-            # blind at exactly T0 -- _local_liquidity returns 0, liquidity
-            # is DATA_BLOCKED, and the launch cannot be priced at the one
-            # instant a sniper has to price it. Measured across 400 live
-            # episodes, liquidity_features was 0% populated at T0.
+            # blind at exactly T0 -- _local_liquidity returns 0 and liquidity
+            # is DATA_BLOCKED at the one instant a launch has to be priced.
+            # Measured across 400 live episodes, liquidity_features was 0%
+            # populated at T0.
             #
-            # These are program constants, not a claim about this token, and
-            # they are verified continuously: pump_curve_invariant_holds
-            # checks the constant product against every curve later observed
-            # on the stream. The seed is replaced by the real reserves on the
-            # first trade event, so it is only ever the pre-first-trade
-            # answer -- and it is an UPPER BOUND, since real reserves are
-            # not knowable here.
+            # Program constants, not a claim about this token, and verified
+            # continuously against the constant product by
+            # pump_curve_invariant_holds. Replaced by real reserves on the
+            # first trade, so it is only ever the pre-first-trade answer --
+            # and an UPPER BOUND, since real reserves are unknowable here.
+            #
+            # Ordered before start_episode deliberately: that call captures
+            # the t0 snapshot, so seeding after it leaves t0 blind.
             if token not in self._latest_curve_state:
                 self._latest_curve_state[token] = BondingCurveState(
                     virtual_token_reserves=PUMP_INITIAL_VIRTUAL_TOKEN,
                     virtual_sol_reserves=PUMP_INITIAL_VIRTUAL_SOL,
-                    # Real reserves are genuinely unknown before any trade.
-                    # Zero keeps every frontier built on this labelled as the
-                    # upper bound it is rather than as a measurement.
                     real_token_reserves=0, real_sol_reserves=0,
                     token_total_supply=int(event.get("token_total_supply", 0) or 0),
                     complete=False, creator=str(event.get("creator", "") or ""),
@@ -5500,7 +3730,6 @@ class MemecoinQuantDesk:
                     "creator": str(event["creator"]),
                     "token_total_supply": int(event.get("token_total_supply", 0) or 0),
                 }
-
             # Derive the twenty-seven accounts now, while nothing is waiting.
             # They are derivations of constants for this (mint, creator,
             # wallet) and never change, so paying for them at execution time
@@ -5571,6 +3800,10 @@ class MemecoinQuantDesk:
                 # screen threw away.
                 self.launch_census.resolve(
                     token, peak_multiple=curve_multiple, at=stamp)
+                # The same peak, attached to every decision made about this
+                # launch. This is the counterfactual: what was available,
+                # measured on a token the desk may never have touched.
+                self._resolve_corpus(token, peak_multiple=curve_multiple)
             observation = {"type": "trade", "side": event.get("side"), "wallet": event.get("wallet"),
                            "amount": event.get("actual_token_amount_ui"),
                            "amount_raw": event.get("actual_token_delta_raw"),
@@ -5583,30 +3816,24 @@ class MemecoinQuantDesk:
                            "quote_limit_amount": event.get("quote_limit_amount", 0),
                            "timestamp": event.get("timestamp", time.time()), "slot": event.get("slot"),
                            "signature": event.get("signature"), "program": event.get("program"),
-                           # Curve depth, carried on the event we already
-                           # decoded. Recorded here because liquidity_features
-                           # was measured 0% populated at t0 across 400 live
-                           # episodes: it waited for a DexScreener quote, and
-                           # a pre-migration launch CANNOT be on DexScreener
-                           # at t0. The reserves are the liquidity for a
-                           # bonding curve, they arrive free with the trade,
-                           # and storing them keeps the derivation
-                           # point-in-time -- a snapshot reads only the
-                           # observations at or before its own as_of.
+                           # Curve depth, free on the event already decoded.
+                           # liquidity_features measured 0% populated at t0
+                           # because it waited for a DexScreener quote a
+                           # pre-migration launch cannot have. Storing the
+                           # reserves keeps the derivation point-in-time.
                            "virtual_sol_reserves": virtual_sol or None,
                            "virtual_token_reserves": virtual_token or None}
-            # Reconstruct the holder set from fills we watched. Free, exact
+            # Reconstruct the holder set from fills we watched: free, exact
             # for a launch this young, and available at stream latency
             # rather than behind an RPC method nothing will serve.
-            delta = event.get("actual_token_delta_raw")
-            if event.get("wallet") and delta:
+            _delta = event.get("actual_token_delta_raw")
+            if event.get("wallet") and _delta:
                 self.observed_holders.record_trade(
-                    token, str(event["wallet"]), float(delta))
-                observed = self.observed_holders.snapshot(token)
-                if observed:
+                    token, str(event["wallet"]), float(_delta))
+                _observed = self.observed_holders.snapshot(token)
+                if _observed:
                     self.holder_trajectory.record_mapping(
-                        token, observed,
-                        timestamp=observation["timestamp"],
+                        token, _observed, timestamp=observation["timestamp"],
                         source="observed_trades")
             # Our own transactions come back on this same stream. Telling the
             # execution engine the moment one appears is what turns fill
@@ -5627,22 +3854,6 @@ class MemecoinQuantDesk:
                 self.wallet_intel.record_live_trade(token, observation)
             self._open_follow_candidate(token, event)
             score = self.wallet_intel.get_wallet_score(event.get("wallet", ""))
-            wallet = str(event.get("wallet", "") or "")
-            timestamp = float(event.get("timestamp", time.time()))
-            self.dev_wallet_monitor.record_trade(
-                token, wallet=wallet, side=str(event.get("side", "")),
-                timestamp=timestamp,
-                token_amount=event.get("actual_token_amount_ui"), evidence=observation)
-            notional_sol = event.get("notional_sol")
-            self.rotation_tracker.record(RotationTrade(
-                token=token, wallet=wallet, side=str(event.get("side", "")),
-                timestamp=timestamp,
-                wallet_quality=(float(score.overall_score) if score is not None else None),
-                independence_weight=self.independence_report.scores.get(wallet),
-                notional_usd=((float(notional_sol) * self.sol_price_usd)
-                              if notional_sol is not None and self.sol_price_usd > 0 else None),
-                narrative=str(event.get("narrative", "") or ""),
-            ))
             if score and score.overall_score >= 0.7:
                 event_type = LeadEventType.ELITE_WALLET_BUY if event.get("side") == "buy" else LeadEventType.SMART_WALLET_EXIT
                 self.info_graph.record_event(token, event_type, event.get("wallet", ""), "wallet",
@@ -5654,7 +3865,6 @@ class MemecoinQuantDesk:
             self.dataset_builder.record_market_observation(token, {"type": "migration", **event})
         elif event.get("type") == "pool_created":
             self._seed_pool_state(token, event)
-            self.dev_wallet_monitor.register(token, event.get("creator", ""))
             self.wallet_intel.record_token_lifecycle(token, migration_at=event.get("timestamp", time.time()))
             self.dataset_builder.start_episode(
                 token, event.get("creator", ""), event.get("program", PumpSwapMonitor.PUMP_AMM_PROGRAM),
@@ -5762,184 +3972,7 @@ class MemecoinQuantDesk:
         except Exception as exc:
             logger.debug("Social candidate mint verification blocked for %s: %s", token, exc)
 
-    def readiness(self) -> Dict[str, Any]:
-        return {
-            "mode": "DRY_RUN" if self.dry_run else "LIVE",
-            "uptime_seconds": max(0.0, time.time() - self.start_time),
-            "live_submission_locked": os.getenv("ALLOW_LIVE_TRADING", "").lower() != "yes-i-understand",
-            "offline": self.offline, "rpc": self.chain_registry.get_all_stats() if self.chain_registry else {},
-            "yellowstone": self.yellowstone.get_status() if self.yellowstone else {"status": "NOT_STARTED"},
-            "rpc_program_stream": self.rpc_program_stream.get_status() if self.rpc_program_stream else None,
-            "prediction": "OK" if self.predictor and self.predictor._is_trained else "DATA_BLOCKED",
-            "age_bands": self.predictor.report() if self.predictor else {"status": "DATA_BLOCKED"},
-            "exit_policy": {"status": self.exit_policy_status, "detail": self.exit_policy_detail,
-                            "policy": asdict(self.exit_policy)},
-            "equity": {"status": self.equity_status, "wallet_equity_usd": self.wallet_equity_usd,
-                       "sol_price_usd": self.sol_price_usd},
-            "execution": {"dry_run": self.execution_engine.dry_run if self.execution_engine else True},
-            "native_fastpath": NATIVE_FASTPATH_STATUS,
-            "native_route": (self.execution_engine.native_route_report()
-                             if self.execution_engine else {"status": "DATA_BLOCKED"}),
-            "pumpswap_route": self.pumpswap_route.report(),
-            "pumpswap_execution": self.pool_route_report(),
-            "idl": idl_report(),
-            "action_policy": {"trained": self.action_policy.is_trained,
-                              "min_edge": self.action_policy.min_edge},
-            # Whether the canonical decision path is on Rust yet, and the
-            # measured agreement that put it there. A kernel that exists and
-            # is never called is the same defect as one never written.
-            "t0_kernel": self.t0_kernel.report(),
-            # An empty registry is not "nothing is a copycat". It is "we
-            # cannot tell", and a status page that stays silent about it lets
-            # an operator read silence as safety.
-            # Presence only, never a value. An env file loaded by the wrong
-            # unit and a missing key look identical from outside.
-            "credentials": self.credential_report(),
-            # What is being mined, what is dark, and why. A miner that has
-            # never returned a record reads differently from one that is
-            # failing, and the two need different fixes.
-            "data_miners": self.data_miners.report(),
-            "execution_conditions": self.execution_conditions_report(),
-            "stream_events": self.stream_event_report(),
-            "pump_decoder": (self.pump_monitor.decoder_report()
-                             if self.pump_monitor is not None
-                             else {"status": "DATA_BLOCKED",
-                                   "detail": "no Pump monitor is wired"}),
-            "launch_census": self.launch_census.report(),
-            "screen_policy": self.screen_policy.report(),
-            "memory": self.memory.report(),
-            "signer": self.signer_report(),
-            "fact_ladder": self.facts.report(),
-            "calibration": self.calibration.report(),
-            "entity_registry": self.entity_registry.report(),
-            # What following the wallets we watch has actually returned, at
-            # fills we could have got. A watch list nobody has scored is a
-            # list of wallets, not intelligence.
-            "wallet_follow": self.follow_report(),
-            # Local marking versus the router, and whether the two agree.
-            "marking": self.mark_report(),
-            # Whether exits are actually served from the prepared ladder. One
-            # built for every position and used for none is pure cost.
-            "staged_exits": self.staged_exits.report(),
-            # The narrative lifecycle across tracked tokens. Reported as a
-            # census rather than per token: what an operator needs is whether
-            # anything is igniting, not a row per launch.
-            "ignition": self.ignition_census(),
-            "source_mesh": {**self.source_mesh.health(),
-                            "registry": self.source_registry_report.to_dict(),
-                            # What is wired, what answered, and what could not
-                            # be built and why. A declaration with no transport
-                            # is a coverage hole; one with a transport that has
-                            # never returned a record is a different hole, and
-                            # the two need telling apart.
-                            "transports": {**self.transport_report.to_dict(),
-                                           **transport_report(self.transports)},
-                            "transport_start_failures": dict(
-                                getattr(self, "transport_start_failures", {}))},
-            "actor_graph": {"independence_status": self.independence_report.status,
-                            "measured_pairs": self.independence_report.observed_pairs,
-                            "scored_wallets": len(self.independence_report.scores),
-                            # How many actors the tracked wallets actually are.
-                            "funder_ancestry": (self.ancestry_report.to_dict()
-                                                if self.ancestry_report is not None
-                                                else {"status": "DATA_BLOCKED"})},
-            "reentry": self.reentry_book.report(),
-            # Distance to the next promotion stage, as ratios. A gate that
-            # says FAIL cannot distinguish a week away from a year away, and
-            # that difference decides whether to keep running or change
-            # something.
-            "forward_evidence": self.forward_evidence.report(),
-            "regime": self.current_regime,
-            # A queue silently shedding work looks exactly like a quiet market,
-            # so both drop counters are surfaced rather than only logged.
-            "event_loop": {
-                "redecision_queued": self._redecide.qsize(),
-                "redecision_drops": self._redecision_drops,
-                "candidate_drops": self._candidate_drops,
-                "candidate_pipelines": len(self._candidate_pipelines),
-                "redecision_workers": len(self._redecision_tasks),
-            },
-            # A process is not healthy merely because its HTTP loop is alive.
-            # Every indispensable coroutine is supervised and reported here;
-            # an unexpected return terminates the process so systemd can
-            # rebuild the whole graph rather than leaving a partial desk.
-            "runtime_tasks": self.runtime_task_report(),
-            "watchdog": self.watchdog_report(),
-            # Whether the objective actually owns the decisions. A fallback
-            # that quietly becomes the main path is the failure this catches.
-            "action_authority": {
-                "priced_holds": self._priced_holds,
-                "unpriced_cycles": self._unpriced_cycles,
-                "suppressed_monster_banks": self._suppressed_monster_banks,
-            },
-            "exit_latency": self.landing_latency.estimate().report(),
-            "decision_contribution": self.contribution_ledger.report(),
-            "trade_evidence": (self.trade_evidence.report()
-                               if self.trade_evidence else {"status": "DATA_BLOCKED"}),
-            "holder_trajectory": {"tracked_tokens": len(
-                getattr(getattr(self, "holder_trajectory", None), "_history", {}))},
-            "developer_monitor": {
-                "tracked_tokens": len(getattr(
-                    getattr(self, "dev_wallet_monitor", None), "_developers", {})),
-                "tokens_with_events": len(getattr(
-                    getattr(self, "dev_wallet_monitor", None), "_events", {}))},
-            "capital_rotation": (self.rotation_tracker.report()
-                                 if getattr(self, "rotation_tracker", None) else {
-                                     "status": "DATA_BLOCKED"}),
-            "profit_isolation": (self.profit_isolation.plan(
-                equity_usd=(self.wallet_equity_usd
-                            if self.equity_status == "OK" else None),
-                cold_destination=os.getenv("PROFIT_COLD_WALLET", ""),
-                dry_run=self.dry_run) if self.profit_isolation else {
-                    "status": "DATA_BLOCKED"}),
-            "wallet_coverage": (self.wallet_intel.coverage_report()
-                                if self.wallet_intel else {"status": "DATA_BLOCKED"}),
-            # Which declared modules actually reached a decision. A rate that
-            # falls to zero between two audit packs means a component was
-            # disconnected, and no test will say so.
-            "intelligence_coverage": {"entry": self.entry_coverage.report(),
-                                      "position": self.position_coverage.report()},
-            "authenticity": {"watched_entities": len(self._watched_entities)},
-            "hot_state": self.hot_state.report(),
-            "mega_event_reserve": self.mega_event_reserve_state,
-            "portfolio": self.elogw_engine.get_portfolio_state() if self.elogw_engine else {},
-            "rug_hazard": self.rug_hazard.get_stats() if self.rug_hazard else {},
-            "dataset": self.dataset_builder.get_stats() if self.dataset_builder else {},
-            "research": self.global_research.get_stats() if self.global_research else {},
-            "social": self.social_intel.get_stats() if self.social_intel else {},
-            "public_coordination": self.public_coordination.get_stats() if self.public_coordination else {},
-            "champions": self.champion_challenger.get_stats() if self.champion_challenger else {},
-        }
 
-    async def _health_loop(self):
-        while self._running:
-            # Checked far more often than health is logged: an allocation
-            # spike that kills the process does not wait for the minute mark.
-            for _ in range(6):
-                if not self._running:
-                    break
-                try:
-                    self.memory.observe()
-                except Exception as exc:  # pragma: no cover - defensive
-                    logger.debug("memory governor read failed: %s", exc)
-                _systemd_notify("WATCHDOG=1\nSTATUS=DRY_RUN collectors active")
-                await asyncio.sleep(10)
-            snapshot = self._refresh_readiness_cache()
-            stream = snapshot.get("stream_events") or {}
-            miners = snapshot.get("data_miners") or {}
-            tasks = snapshot.get("runtime_tasks") or {}
-            logger.info(
-                "HEALTH mode=%s stream_events=%s miners=%s/%s prediction=%s tasks=%s",
-                snapshot.get("mode"), stream.get("events_total", 0),
-                miners.get("producing", 0), miners.get("registered", 0),
-                snapshot.get("prediction"), tasks.get("status", "UNKNOWN"))
-
-    def _refresh_readiness_cache(self) -> Dict[str, Any]:
-        snapshot = _jsonable(self.readiness())
-        self._readiness_cache = snapshot
-        self._readiness_cached_at = time.time()
-        self._persist_readiness(snapshot)
-        return snapshot
 
     def _register_memory_reliefs(self) -> None:
         """What the desk gives up under pressure, in order of cheapness.
@@ -6073,187 +4106,6 @@ class MemecoinQuantDesk:
             self.launch_census.save()
             self.calibration.save()
 
-    def _record_calibration(self, payload: Dict[str, Any]) -> None:
-        """Score every stated probability against what actually happened.
-
-        Without this the calibration harness is inert -- it can measure, and
-        nothing feeds it. Each pair is stamped with where it came from, so a
-        model validated on shadow decisions is never mistaken for one proven
-        on real fills.
-
-        Probabilities the desk did not state are skipped rather than defaulted.
-        A model that was never consulted has no prediction to score, and
-        scoring it against a default would manufacture calibration evidence
-        out of the model's absence.
-        """
-        provenance = (Provenance.FORWARD_REAL.value
-                      if payload.get("entered") and not self.dry_run
-                      else Provenance.SHADOW.value)
-        when = float(payload.get("timestamp", time.time()))
-        rugged = payload.get("rugged")
-        stated = payload.get("stated_probabilities") or {}
-
-        # Rug hazards, at each horizon the desk states one for.
-        for model, key in (("rug_30s", "p_rug_30s"), ("rug_5m", "p_rug_5m")):
-            probability = stated.get(key)
-            if probability is None or rugged is None:
-                continue
-            self.calibration.record(model, float(probability), bool(rugged),
-                                    at=when, provenance=provenance)
-
-        # Monster: did the token reach the multiple the desk said it might?
-        monster_p = stated.get("p_monster")
-        multiple = payload.get("max_feasible_multiple")
-        if monster_p is not None and multiple is not None:
-            self.calibration.record(
-                "monster_p", float(monster_p),
-                float(multiple) >= rug_mechanism_monster_threshold(),
-                at=when, provenance=provenance)
-
-        # Landing: only scoreable on an attempt, and only real when the
-        # attempt spent real money.
-        landing_p = stated.get("p_land")
-        if landing_p is not None and payload.get("attempted"):
-            self.calibration.record(
-                "landing_p", float(landing_p), bool(payload.get("entered")),
-                at=when,
-                provenance=(Provenance.FORWARD_REAL.value if not self.dry_run
-                            else Provenance.SHADOW.value))
-
-        # Escape: stated when a hazard exit was chosen, scored on whether the
-        # position actually got out before the catastrophe.
-        escape_p = stated.get("p_escape")
-        if escape_p is not None and payload.get("escape_attempted"):
-            self.calibration.record(
-                "escape_p", float(escape_p), bool(payload.get("escaped")),
-                at=when, provenance=provenance)
-
-    def _record_ops_event(self, stream: str, payload: Dict[str, Any]) -> None:
-        """Append one operational telemetry row for the monitor and audit pack.
-
-        Deliberately separate from the research lake. The lake is optimised for
-        point-in-time correctness and completeness; this is optimised for a
-        monitor being able to answer "what is the recent failure rate" in one
-        cheap pass without loading episodes. Failures are swallowed for the
-        same reason readiness persistence is: telemetry must never be able to
-        halt the desk it describes.
-        """
-        # Trade outcomes are the promotion ledger's only input, and this is
-        # the one place every outcome passes through -- entered or declined.
-        if stream == "trade_outcomes":
-            token = str(payload.get("token", "") or "")
-            if token and not payload.get("rejection_reason"):
-                # Screens are recorded by _record_blocked_decision; anything
-                # arriving here without one reached the decision path.
-                self.launch_census.decide(
-                    token, str(payload.get("action", "") or ""))
-                if payload.get("entered"):
-                    self.launch_census.enter(token)
-            self._record_forward_evidence(payload)
-            # Every stated probability, scored against what happened. The
-            # harness measures; this is what gives it something to measure.
-            try:
-                self._record_calibration(payload)
-            except (TypeError, ValueError) as exc:
-                logger.debug("calibration record failed: %s", exc)
-        try:
-            root = Path(self.global_config.get("ops_state_dir", "data/state"))
-            root.mkdir(parents=True, exist_ok=True)
-            row = {"timestamp": time.time(), **payload}
-            with (root / f"{stream}.jsonl").open("a") as handle:
-                handle.write(json.dumps(row, default=str) + "\n")
-        except OSError as exc:
-            logger.debug("ops telemetry write failed for %s: %s", stream, exc)
-
-    def _persist_readiness(self, snapshot: Dict[str, Any]) -> None:
-        """Write the snapshot the out-of-process monitor reads.
-
-        Logging health is not the same as exposing it. A monitor that has to
-        parse the log stream cannot tell "the desk is fine and quiet" from "the
-        desk stopped writing", whereas the mtime of this file answers that
-        directly and is the first thing the monitor checks.
-
-        Written to a temporary file and renamed, so a reader never catches a
-        half-written snapshot and concludes the node is broken. Failures here
-        are logged and swallowed: a monitor that cannot be updated must never
-        be able to take down the desk it monitors.
-        """
-        path = Path(self.global_config.get("readiness_path", "data/state/readiness.json"))
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text(json.dumps(snapshot, default=str))
-            tmp.replace(path)
-        except OSError as exc:
-            logger.warning("could not persist readiness snapshot to %s: %s", path, exc)
-
-    #: Read once at first request and cached. The file ships with the repo,
-    #: so a missing one is a broken install rather than a runtime condition,
-    #: and it says so instead of serving a blank page.
-    _dashboard_cache: Optional[str] = None
-
-    async def _dashboard_endpoint(self, _request):
-        """Serve the operator terminal from the desk itself.
-
-        Bound to the same loopback interface as /status, and carrying the same
-        exposure: this page renders the desk's whole interior, so it must not
-        reach a public interface any more than /status may.
-        """
-        if MemecoinQuantDesk._dashboard_cache is None:
-            path = Path(__file__).resolve().parent / "runtime" / "assets" / "dashboard.html"
-            try:
-                MemecoinQuantDesk._dashboard_cache = path.read_text(encoding="utf-8")
-            except OSError as exc:
-                return web.Response(
-                    status=500, content_type="text/plain",
-                    text=(f"dashboard asset missing at {path}: {exc}\n"
-                          "This ships with the repository; a missing file means "
-                          "an incomplete install rather than a runtime fault."))
-        return web.Response(text=MemecoinQuantDesk._dashboard_cache,
-                            content_type="text/html")
-
-    async def _setup_health_server(self):
-        app = web.Application()
-        app.router.add_get("/health", self._health_endpoint)
-        app.router.add_get("/metrics", self._metrics_endpoint)
-        app.router.add_get("/status", self._status_endpoint)
-        # The desk's own terminal. Same origin as /status, so it polls the
-        # live desk directly instead of asking anyone to paste JSON around.
-        app.router.add_get("/", self._dashboard_endpoint)
-        app.router.add_get("/dashboard", self._dashboard_endpoint)
-        self._web_runner = web.AppRunner(app)
-        await self._web_runner.setup()
-        # Loopback by default. /status serves the desk's whole interior --
-        # open positions, watched wallets, model reports, the wallet the
-        # keypair belongs to -- and binding that to every interface publishes
-        # it to whatever else can reach the box. An operator who wants it
-        # remote sets HEALTH_HOST deliberately and puts something in front.
-        host = os.getenv("HEALTH_HOST", "127.0.0.1")
-        await web.TCPSite(self._web_runner, host,
-                          int(os.getenv("HEALTH_PORT", "8080"))).start()
-        logger.info("health server on %s:%s", host, os.getenv("HEALTH_PORT", "8080"))
-
-    async def _health_endpoint(self, request):
-        return web.json_response({"status": "healthy" if self._running else "stopping", "dry_run": self.dry_run,
-                                  "uptime_seconds": time.time() - self.start_time,
-                                  "live_submission_locked": os.getenv("ALLOW_LIVE_TRADING", "").lower() != "yes-i-understand"})
-
-    async def _metrics_endpoint(self, request):
-        return web.json_response(_jsonable({"portfolio": self.elogw_engine.get_portfolio_state(),
-                                            "total_pnl": self.total_pnl, "trade_count": self.trade_count,
-                                            "successful_exits": self.successful_exits}))
-
-    async def _status_endpoint(self, request):
-        snapshot = self._readiness_cache or self._refresh_readiness_cache()
-        payload = dict(snapshot)
-        payload["status_snapshot_age_seconds"] = max(
-            0.0, time.time() - self._readiness_cached_at)
-        return web.json_response(payload)
-
-    async def _close_health_server(self):
-        if self._web_runner:
-            await self._web_runner.cleanup()
-            self._web_runner = None
 
 
 async def _run(args: argparse.Namespace):
@@ -6293,6 +4145,12 @@ def main():
     args = parser.parse_args()
     logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # Before the loop exists, not after: a policy set once the loop is running
+    # changes nothing, which is the quiet way this optimisation gets applied
+    # and has no effect.
+    loop_status = install_fast_event_loop()
+    logging.getLogger(__name__).info("EVENT LOOP %s", loop_status)
+    os.environ.setdefault("MEMECOIN_EVENT_LOOP", loop_status)
     asyncio.run(_run(args))
 
 

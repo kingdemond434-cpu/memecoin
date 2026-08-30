@@ -1,0 +1,27 @@
+[Unit]
+Description=Memecoin supervisor: verify deploys, correct faults, escalate
+Documentation=file:%h/.local/opt/memecoin-shadow/RUNBOOK.md
+After=memecoin-shadow.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/opt/memecoin-shadow
+EnvironmentFile=-%h/.config/memecoin-shadow/env
+# The supervisor restarts processes and moves files. It must never be able to
+# trade, so the acknowledgement and the key are cleared outright rather than
+# merely unused.
+Environment=ALLOW_LIVE_TRADING=
+Environment=SOLANA_PRIVATE_KEY=
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m ops.supervisor \
+    --root %h/.local/opt/memecoin-shadow
+# 0 healthy, 1 degraded or acted, 2 escalated. All three are successful RUNS
+# of the supervisor; treating 1 or 2 as a unit failure would rate-limit the
+# timer exactly when it is most needed.
+SuccessExitStatus=0 1 2
+NoNewPrivileges=true
+PrivateTmp=true
+MemoryMax=512M
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=memecoin-supervisor

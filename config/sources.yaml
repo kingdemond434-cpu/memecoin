@@ -36,18 +36,57 @@ sources:
     tier: 1
     region: global
   - id: code:pump-public-docs
-    kind: rss
+    kind: code_repo
     tier: 2
+    region: global
+    options: {repo: pump-fun/pump-public-docs}
+
+  # ---- Telegram: crypto-native, where a CA usually appears first -----------
+  # These declare which LANGUAGES are worth covering, not which channels. A
+  # placeholder channel name would read as a chosen channel and report
+  # UNCONFIGURED, which an operator reads as "needs a key" rather than as
+  # "nobody has picked one". Add `options: {channel: <public channel>}` per
+  # entry; until then each is reported as pending an endpoint, by name.
+  #
+  # These are the MTProto path: lowest latency, needs an authorised session.
+  # They are no longer the only Telegram coverage. src/research/telegram_miners
+  # reads public t.me/s/<channel> previews with no account at all, discovers
+  # handles from t.me links the desk already mines, and verifies each one by
+  # fetching its own preview before reading it. That path needs no
+  # configuration and fills itself; these entries are worth naming when you
+  # want a specific channel at MTProto speed rather than preview speed.
+  - id: telegram:calls-en-1
+    kind: telegram
+    tier: 1
+    degraded_after_seconds: 60
+    dead_after_seconds: 300
     language: en
     region: global
-    poll_interval_seconds: 300
-    # Public Atom carries the commit chronology without consuming the broken
-    # or expired GitHub token quota.
-    options: {url: "https://github.com/pump-fun/pump-public-docs/commits/main.atom"}
-
-  # Telegram declarations are expanded directly from TELEGRAM_CHANNELS at
-  # runtime.  This keeps the joined watchlist in one place and avoids fake
-  # placeholder usernames that can only report NO_FETCHER.
+    requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
+  - id: telegram:calls-zh-1
+    kind: telegram
+    tier: 1
+    language: zh
+    region: cn
+    requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
+  - id: telegram:calls-ru-1
+    kind: telegram
+    tier: 1
+    language: ru
+    region: cis
+    requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
+  - id: telegram:calls-tr-1
+    kind: telegram
+    tier: 1
+    language: tr
+    region: tr
+    requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
+  - id: telegram:calls-ko-1
+    kind: telegram
+    tier: 1
+    language: ko
+    region: kr
+    requires_env: [TELEGRAM_API_ID, TELEGRAM_API_HASH]
 
   # ---- open social firehoses: free, filtered locally -----------------------
   - id: bluesky:jetstream
@@ -65,6 +104,12 @@ sources:
     tier: 2
     region: global
     requires_env: [NEYNAR_API_KEY]
+  - id: mastodon:mastodon-social
+    kind: mastodon
+    tier: 3
+    region: global
+    options: {instance: "https://mastodon.social"}
+
   # ---- live video and audio: spoken before written ------------------------
   - id: youtube:websub-watchlist
     kind: youtube
@@ -209,6 +254,21 @@ sources:
   # catching, and it is served by exactly the same RSS parser. Cadences are
   # matched to how each outlet actually publishes: polling a daily every
   # second is four thousand pointless requests an hour and an eventual block.
+  # Japanese crypto-native coverage. Verified from this node 2026-08-30:
+  # HTTP 200 with 10 parseable items. Cointelegraph's Japanese feed is 410
+  # Gone, which is why this outlet rather than that one.
+  - id: rss:jp-neweconomy
+    kind: rss
+    url: "https://www.neweconomy.jp/feed"
+    tier: 2
+    language: ja
+    region: jp
+    poll_interval_seconds: 600
+    # Distance, not ill health: every poll exceeded the mesh's 5s default
+    # while the endpoint answered fine to curl.
+    poll_timeout_seconds: 20
+    degraded_after_seconds: 7200
+    dead_after_seconds: 43200
   - id: rss:jp-nhk
     kind: rss
     tier: 2
@@ -277,14 +337,12 @@ sources:
     poll_interval_seconds: 600
     degraded_after_seconds: 7200
     dead_after_seconds: 43200
-
   - id: rss:cn-local
     kind: rss
     tier: 2
     language: zh
     region: cn
     poll_interval_seconds: 600
-
   - id: rss:ru-local
     kind: rss
     tier: 2
@@ -431,7 +489,7 @@ sources:
     poll_interval_seconds: 120
     degraded_after_seconds: 7200
     dead_after_seconds: 172800
-    options: {url: "https://rss.odaily.news/rss/newsflash", language: zh}
+    options: {url: "https://www.odaily.news/feed", language: zh}
   - id: rss:cn-panews
     kind: rss
     tier: 1
@@ -440,69 +498,26 @@ sources:
     poll_interval_seconds: 120
     degraded_after_seconds: 7200
     dead_after_seconds: 172800
-    options: {url: "https://www.panewslab.com/rss.xml", language: zh}
-  # TechFlow (techflowpost.com) retired its feed: /rss.xml, /rss/rss.xml and
-  # /rss/newsflash all answer 404, and nothing on the domain autodiscovers.
-  # Replaced by publishers verified live rather than left declared and dark,
-  # which is a coverage hole that reports as a dead source forever.
-  - id: rss:zh-blocktempo
+    options: {url: "https://www.panewslab.com/zh/rss", language: zh}
+  - id: rss:cn-techflow
     kind: rss
     tier: 2
     language: zh
-    region: tw
+    region: cn
     poll_interval_seconds: 300
     degraded_after_seconds: 21600
     dead_after_seconds: 259200
-    options: {url: "https://www.blocktempo.com/feed/", language: zh}
-  - id: rss:zh-abmedia
-    kind: rss
-    tier: 3
-    language: zh
-    region: tw
-    poll_interval_seconds: 300
-    degraded_after_seconds: 21600
-    dead_after_seconds: 259200
-    options: {url: "https://www.abmedia.io/feed", language: zh}
-  - id: rss:zh-zombit
-    kind: rss
-    tier: 3
-    language: zh
-    region: tw
-    poll_interval_seconds: 600
-    degraded_after_seconds: 43200
-    dead_after_seconds: 259200
-    options: {url: "https://zombit.info/feed/", language: zh}
-  # Odaily's long-form feed is already declared as odaily-post-rss in the
-  # verified overlay; it is not repeated here.
-  - id: rss:jp-neweconomy
-    kind: rss
-    # Distance, not ill health: every poll exceeded the mesh's 5s
-    # default while the endpoint answered fine to curl.
-    poll_timeout_seconds: 20
-    url: "https://www.neweconomy.jp/feed"
-    tier: 2
-    language: ja
-    region: jp
-    poll_interval_seconds: 300
-    degraded_after_seconds: 21600
-    dead_after_seconds: 259200
-    options: {url: "https://www.neweconomy.jp/feed", language: ja}
-  - id: rss:jp-bittimes
-    kind: rss
-    tier: 3
-    language: ja
-    region: jp
-    poll_interval_seconds: 300
-    degraded_after_seconds: 21600
-    dead_after_seconds: 259200
-    options: {url: "https://bittimes.net/feed", language: ja}
-  # TokenPost KR is already declared below as rss:kr-tokenpost.
+    options: {url: "https://www.techflowpost.com/rss.xml", language: zh}
   - id: rss:cn-chaincatcher
     kind: rss
+    # Verified from this node 2026-08-30: HTTP 200, 50 items. Verified
+    # rather than guessed -- PANews and Odaily answer 200 with ZERO
+    # items and Cointelegraph's regional feeds are 410 Gone, so a URL
+    # returning an empty document would report healthy and cover nothing.
+    url: "https://www.chaincatcher.com/rss.xml"
     # Distance, not ill health: every poll exceeded the mesh's 5s
     # default while the endpoint answered fine to curl.
     poll_timeout_seconds: 20
-    url: "https://www.chaincatcher.com/rss.xml"
     tier: 2
     language: zh
     region: cn
@@ -527,14 +542,17 @@ sources:
     poll_interval_seconds: 300
     degraded_after_seconds: 21600
     dead_after_seconds: 259200
-    options: {url: "https://cointelegraph.com/rss/tag/japan", language: ja}
+    options: {url: "https://jp.cointelegraph.com/rss", language: ja}
   - id: rss:kr-blockmedia
     kind: rss
+    # Verified from this node 2026-08-30: HTTP 200, 10 items. Verified
+    # rather than guessed -- PANews and Odaily answer 200 with ZERO
+    # items and Cointelegraph's regional feeds are 410 Gone, so a URL
+    # returning an empty document would report healthy and cover nothing.
+    url: "https://www.blockmedia.co.kr/feed"
     # Distance, not ill health: every poll exceeded the mesh's 5s
     # default while the endpoint answered fine to curl.
     poll_timeout_seconds: 20
-    # verified 2026-08-30: HTTP 200, 10 items
-    url: "https://www.blockmedia.co.kr/feed"
     tier: 2
     language: ko
     region: kr
@@ -544,11 +562,14 @@ sources:
     options: {url: "https://www.blockmedia.co.kr/feed", language: ko}
   - id: rss:kr-tokenpost
     kind: rss
+    # Verified from this node 2026-08-30: HTTP 200, 50 items. Verified
+    # rather than guessed -- PANews and Odaily answer 200 with ZERO
+    # items and Cointelegraph's regional feeds are 410 Gone, so a URL
+    # returning an empty document would report healthy and cover nothing.
+    url: "https://www.tokenpost.kr/rss"
     # Distance, not ill health: every poll exceeded the mesh's 5s
     # default while the endpoint answered fine to curl.
     poll_timeout_seconds: 20
-    # verified 2026-08-30: HTTP 200, 50 items
-    url: "https://www.tokenpost.kr/rss"
     tier: 2
     language: ko
     region: kr

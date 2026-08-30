@@ -61,16 +61,25 @@ impl T0Decision {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct Inputs {
+pub struct Inputs<'a> {
     pub position: Position,
     pub survival: Survival,
     pub min_edge: f64,
     pub max_add_fraction: f64,
     pub live: bool,
+    /// Distributions for REENTER and REPLACE. Absent for most decisions,
+    /// which is why they are here rather than inside `Position`: a launch
+    /// nobody has exited has no re-entry candidate.
+    pub alternatives: policy::Alternatives<'a>,
 }
 
 /// One decision for one token, from state and a forward view.
-pub fn decide(state: &TokenState, now: f64, inputs: &Inputs, limits: &Limits) -> T0Decision {
+pub fn decide(
+    state: &TokenState,
+    now: f64,
+    inputs: &Inputs<'_>,
+    limits: &Limits,
+) -> T0Decision {
     let age_seconds = state.age_seconds(now);
     let band = policy::age_band(age_seconds);
 
@@ -92,11 +101,12 @@ pub fn decide(state: &TokenState, now: f64, inputs: &Inputs, limits: &Limits) ->
         };
     }
 
-    let scored: PolicyDecision = policy::score(
+    let scored: PolicyDecision = policy::score_with(
         &inputs.position,
         &inputs.survival,
         inputs.min_edge,
         inputs.max_add_fraction,
+        &inputs.alternatives,
     );
     if let Some(reason) = scored.blocked {
         return T0Decision {
@@ -170,7 +180,7 @@ mod tests {
         state
     }
 
-    fn inputs() -> Inputs {
+    fn inputs() -> Inputs<'static> {
         Inputs {
             position: Position {
                 held_fraction: 0.0,
@@ -185,6 +195,7 @@ mod tests {
                 add_capacity_fraction: None,
                 probe_fraction: Some(0.02),
             },
+            alternatives: policy::Alternatives::default(),
             survival: Survival {
                 levels: [0.45, 0.3, 0.2, 0.12, 0.05, 0.0, 0.0, 0.0],
                 p_rug_30s: 0.0,

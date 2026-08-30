@@ -26,6 +26,8 @@ from solders.signature import Signature
 from solders.transaction import VersionedTransaction
 
 from src.chains.pump_curve import quote_buy, quote_sell
+from src.execution.landing_router import LandingRouter, Route
+from src.execution.tx_kernel import TxKernel
 from src.execution.landing_model import Attempt, LandingModel
 from src.chains.blockhash import BlockhashCache
 from src.execution.slot_value import urgency_adjusted_edge
@@ -510,6 +512,12 @@ class SolanaTransactionBuilder:
         # put an RPC round trip inside the window the system exists to win,
         # and did it after the decision while the opportunity aged.
         self.blockhash_cache = blockhash_cache or BlockhashCache(rpc)
+        # Which implementation compiles and assembles. Defaults to the
+        # evidence ladder rather than to Rust: the extension is proven against
+        # solders in tests, and a test is not two hundred consecutive
+        # agreements on this node against this node's own account lists.
+        self.tx_kernel = TxKernel(
+            mode=os.getenv("TX_KERNEL_MODE", "auto"))
         # How often the cache could not vouch for its hash and the synchronous
         # fetch was paid anyway. Counted rather than hidden: a cache that
         # refuses on every trade has removed nothing.
@@ -545,14 +553,37 @@ class SolanaTransactionBuilder:
             program_instructions.append(
                 set_compute_unit_price(int(compute_unit_price_micro_lamports)))
         program_instructions.extend(instructions)
-        message = MessageV0.try_compile(payer, program_instructions, [], blockhash)
+
+        # Compiled through the kernel, which is solders until Rust has
+        # produced two hundred consecutive byte-identical messages and is
+        # solders again permanently the first time it does not. The signing
+        # step below is untouched by any of this: the key stays in the signer,
+        # which may be another process, and both implementations produce the
+        # same bytes for it to sign.
+        def compile_with_solders() -> bytes:
+            return bytes(to_bytes_versioned(
+                MessageV0.try_compile(payer, program_instructions, [], blockhash)))
+
+        message_bytes = self.tx_kernel.compile_message(
+            bytes(payer), program_instructions, bytes(blockhash),
+            compile_with_solders)
+
         # Signed by the signer, which may refuse. A refusal propagates: an
         # unsigned transaction continuing as though it were signed is the
         # failure the whole isolation exists to prevent, and a local fallback
         # here would quietly undo it.
-        signature = await self.signer.sign_message(bytes(to_bytes_versioned(message)))
-        signed = VersionedTransaction.populate(message, [Signature.from_bytes(signature)])
-        return base64.b64encode(bytes(signed)).decode("ascii")
+        signature = await self.signer.sign_message(message_bytes)
+
+        def assemble_with_solders() -> str:
+            message = MessageV0.from_bytes(message_bytes[1:]
+                                           if message_bytes[:1] == b"\x80"
+                                           else message_bytes)
+            signed = VersionedTransaction.populate(
+                message, [Signature.from_bytes(signature)])
+            return base64.b64encode(bytes(signed)).decode("ascii")
+
+        return self.tx_kernel.assemble(message_bytes, [signature],
+                                       assemble_with_solders)
 
     async def _recent_blockhash(self) -> Hash:
         """A blockhash fresh enough to land, from cache when it can be vouched for.
@@ -677,6 +708,13 @@ class ExecutionEngine:
         # landed or not: a model fed only successes learns that everything
         # lands.
         self.landing_model = LandingModel()
+        # Independent landing MECHANISMS, not regions. Jito already races
+        # seven regions of one auction; when that auction is the problem, all
+        # seven fail together. Registered here so the set is visible in
+        # /status even before any of it has been measured.
+        self.landing_router = LandingRouter()
+        self.last_race: Any = None
+        self._register_landing_routes()
         # What the last bid decision was, and whether it was measured
         # or fell back. Surfaced so a desk running on the ladder knows.
         self.last_bid: Dict[str, Any] = {}
@@ -690,6 +728,9 @@ class ExecutionEngine:
         # operator, because a landing curve fitted across Helsinki and
         # Frankfurt is a curve describing neither.
         self.region: str = os.getenv("MEMECOIN_REGION", "").strip()
+        # Why a dry-run build failed, by message. The population that would
+        # otherwise only be discovered with capital at risk.
+        self.dry_build_failures: Dict[str, int] = {}
         self.execution_history: deque = deque(maxlen=10_000)
         self.route_performance: Dict[RouteType, Dict[str, float]] = defaultdict(
             lambda: {"total": 0, "landed": 0, "filled": 0, "failed": 0, "avg_latency": 0}
@@ -888,12 +929,44 @@ class ExecutionEngine:
         route_type = (RouteType.PUMPSWAP_NATIVE if native.venue == "pumpswap"
                       else RouteType.PUMP_NATIVE)
         if self.dry_run:
+            # BUILD AND SIGN ANYWAY. This used to return here, which left the
+            # whole build path -- account derivation, compute budget, the
+            # blockhash cache, the signer -- as dead code for the entire
+            # shadow stage. Every defect in it would have surfaced on the
+            # first canary trade, with real money on the table, and that is
+            # the most expensive place to discover a missing account meta.
+            #
+            # Building costs a few milliseconds off the hot path and nothing
+            # else: no submission, no network call, no capital. What it buys
+            # is that the execution path is exercised thousands of times
+            # before it is ever trusted with a fill.
+            build_error = ""
+            try:
+                await self._build_native_signed(native, use_jito, priority_fee)
+                self.native_route_attempts["dry_built"] += 1
+            except Exception as exc:
+                build_error = f"{type(exc).__name__}: {exc}"
+                self.native_route_attempts["dry_build_failed"] += 1
+                # Defensive: an error handler that can itself raise turns a
+                # recoverable build failure into a crashed decision loop, and
+                # the whole reason this block exists is to survive bad builds.
+                failures = getattr(self, "dry_build_failures", None)
+                if failures is None:
+                    failures = {}
+                    self.dry_build_failures = failures
+                failures[build_error] = failures.get(build_error, 0) + 1
+                logger.warning("dry-run build failed for %s: %s",
+                               native.venue, build_error)
             result = ExecutionResult(
                 success=True, status=TransactionStatus.SIMULATED,
                 input_amount=amount, actual_input_amount=amount,
                 quoted_output_amount=quote.output_amount, slippage_bps=slippage_bps,
                 latency_ms=int((time.time() - started) * 1000),
                 route_type=route_type, simulated=True,
+                # A simulated fill whose transaction could not even be built
+                # is not a fill. Recorded so the shadow ledger cannot count a
+                # trade the desk was never capable of making.
+                error=build_error,
             )
             self.native_route_attempts["simulated"] += 1
             self.native_route_attempts[f"simulated:{native.venue}"] += 1
@@ -906,20 +979,7 @@ class ExecutionEngine:
                 error="live submission is locked; ALLOW_LIVE_TRADING acknowledgement absent")
 
         try:
-            instruction = Instruction(
-                Pubkey.from_string(native.program_id),
-                bytes(native.data),
-                [SoldersAccountMeta(Pubkey.from_string(meta.pubkey),
-                                    meta.is_signer, meta.is_writable)
-                 for meta in native.accounts],
-            )
-            signed = await self.tx_builder.build_and_sign(
-                [instruction],
-                compute_unit_limit=self.native_compute_unit_limit,
-                # Jito bids through the tip account rather than the fee market,
-                # so paying both would be paying twice for one race.
-                compute_unit_price_micro_lamports=0 if use_jito else priority_fee,
-            )
+            signed = await self._build_native_signed(native, use_jito, priority_fee)
         except Exception as exc:
             self.native_route_attempts["build_failed"] += 1
             return ExecutionResult(False, TransactionStatus.REJECTED,
@@ -938,6 +998,55 @@ class ExecutionEngine:
         result.quoted_output_amount = quote.output_amount
         self._record(result, decision_id)
         return result
+
+    async def _build_native_signed(self, native: Any, use_jito: bool,
+                                   priority_fee: int) -> str:
+        """Assemble and sign the native instruction.
+
+        One implementation, used by both the dry-run and live paths. Two would
+        mean the thing exercised in shadow is not the thing that runs live,
+        which is worse than not exercising it at all.
+        """
+        instruction = Instruction(
+            Pubkey.from_string(native.program_id),
+            bytes(native.data),
+            [SoldersAccountMeta(Pubkey.from_string(meta.pubkey),
+                                meta.is_signer, meta.is_writable)
+             for meta in native.accounts],
+        )
+        return await self.tx_builder.build_and_sign(
+            [instruction],
+            compute_unit_limit=self.native_compute_unit_limit,
+            # Jito bids through the tip account rather than the fee market, so
+            # paying both would be paying twice for one race.
+            compute_unit_price_micro_lamports=0 if use_jito else priority_fee,
+        )
+
+    def dry_build_report(self) -> Dict[str, Any]:
+        """Whether the execution path actually works, measured in shadow.
+
+        The point of building in dry run is this number. A desk about to take
+        its first real trade should already know that it has assembled and
+        signed thousands of valid transactions, and exactly which ones it
+        could not.
+        """
+        built = self.native_route_attempts.get("dry_built", 0)
+        failed = self.native_route_attempts.get("dry_build_failed", 0)
+        total = built + failed
+        return {
+            "status": ("DATA_BLOCKED" if not total else
+                       "OK" if not failed else "DEGRADED"),
+            "detail": ("the execution path has not been exercised yet"
+                       if not total else
+                       "" if not failed else
+                       f"{failed} of {total} builds failed; these would be "
+                       "rejected trades with real capital"),
+            "built": built,
+            "failed": failed,
+            "success_rate": (built / total) if total else None,
+            "failures": dict(sorted(self.dry_build_failures.items(),
+                                    key=lambda item: item[1], reverse=True)[:10]),
+        }
 
     async def execute_swap(
         self,
@@ -1128,14 +1237,28 @@ class ExecutionEngine:
         """
         signature: Optional[str] = None
         bundle_id: Optional[str] = None
-        if use_jito:
-            bundle_id = await self.jito.send_bundle([signed_tx])
-            if not bundle_id:
-                return ExecutionResult(False, TransactionStatus.FAILED,
-                                       error="Jito bundle rejected")
+        # One signed string, fanned across every enabled mechanism. The
+        # runtime executes a signature at most once, so this is redundancy
+        # rather than duplication -- and the bundle lane is only offered the
+        # payload when the caller built one for it.
+        race = await self.landing_router.race(signed_tx, bundle_capable=use_jito)
+        self.last_race = race
+        if not race.submitted:
+            return ExecutionResult(
+                False, TransactionStatus.FAILED,
+                error="every landing route refused: "
+                      + "; ".join(f"{name}: {why}" for name, why in race.errors.items())
+                      or "no landing route accepted the transaction")
+        bundle_id = race.accepted.get("jito_bundle")
+        if bundle_id:
+            # A bundle id is not a signature. Resolve it to one where we can;
+            # if the auction never reports, the ordinary lanes carried the
+            # same bytes and confirmation below still finds them.
             signature = await self._wait_for_bundle(bundle_id)
-        else:
-            signature = await self._send_raw_transaction(signed_tx)
+        if not signature:
+            signature = next((identifier for name, identifier
+                              in race.accepted.items() if name != "jito_bundle"),
+                             None)
         if not signature:
             return ExecutionResult(
                 False, TransactionStatus.TIMEOUT, bundle_id=bundle_id,
@@ -1148,6 +1271,12 @@ class ExecutionEngine:
             else TransactionStatus.LANDED if fill.get("landed")
             else TransactionStatus.TIMEOUT
         )
+        # The router learns from LANDING, not from acceptance. A route that
+        # acknowledges instantly and never lands is worse than one that is
+        # slow and always does, and an accept count ranks them backwards.
+        if race.identifier:
+            self.landing_router.record_landing(
+                race.identifier, landed=bool(fill.get("landed")))
         self.landing_model.record(Attempt(
             bid_lamports=int(jito_tip if use_jito else 0),
             landed=bool(fill.get("landed")),
@@ -1191,6 +1320,82 @@ class ExecutionEngine:
             error=None if fill.get("filled")
             else "landed transaction had no verified output balance delta",
         )
+
+    def _register_landing_routes(self) -> None:
+        """Declare every mechanism that can carry a signed transaction.
+
+        All of them receive the SAME base64 string. That is what makes this
+        safe: one signature, executed at most once by the runtime, delivered
+        by whoever gets there first. A route needing different transaction
+        contents would be a second transaction and a second position, and it
+        does not belong in a race.
+
+        `SOLANA_STAKED_RPC_URL` and `SOLANA_SENDER_URL` are declared whether or
+        not they are set. An unset one registers disabled and says so, because
+        a landing mechanism that is silently absent is exactly the redundancy
+        an operator believes they have and does not.
+        """
+        # Bound through the client rather than to a method object, and only
+        # when the client actually carries that lane. A relay missing a lane
+        # registers DISABLED with the reason, which is what an operator needs
+        # to see; binding a missing method would instead raise mid-race, on
+        # the one path where an exception costs a slot.
+        self.landing_router.register(Route(
+            name="jito_bundle", kind="jito_bundle", requires_bundle=True,
+            enabled=hasattr(self.jito, "send_bundle"),
+            submit=lambda tx: self.jito.send_bundle([tx]),
+            detail=("bundle auction across every configured Jito region"
+                    if hasattr(self.jito, "send_bundle")
+                    else "this relay client has no send_bundle")))
+        self.landing_router.register(Route(
+            name="jito_tx", kind="jito_tx",
+            enabled=hasattr(self.jito, "send_transaction"),
+            submit=lambda tx: self.jito.send_transaction(tx),
+            detail=("Jito's single-transaction lane; different path, same relay"
+                    if hasattr(self.jito, "send_transaction")
+                    else "this relay client has no send_transaction")))
+        self.landing_router.register(Route(
+            name="rpc", kind="rpc",
+            submit=self._send_raw_transaction,
+            detail="our ordinary RPC; slowest, and it fails for its own reasons"))
+        for name, kind, variable, detail in (
+            ("staked_rpc", "staked_rpc", "SOLANA_STAKED_RPC_URL",
+             "a staked or SWQoS-prioritised endpoint; the closest thing to a "
+             "direct TPU path available without running a validator"),
+            ("sender", "sender", "SOLANA_SENDER_URL",
+             "a multi-path forwarder that fans out across its own regions"),
+        ):
+            url = os.getenv(variable, "").strip()
+            self.landing_router.register(Route(
+                name=name, kind=kind, enabled=bool(url),
+                submit=self._forwarder(url),
+                detail=detail if url else f"{variable} is not set"))
+
+    def _forwarder(self, url: str) -> Any:
+        """A sendTransaction poster against one specific endpoint."""
+        async def submit(signed_tx: str) -> Optional[str]:
+            if not url:
+                return None
+            session = await self._landing_session()
+            payload = {"jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
+                       "params": [signed_tx, {"encoding": "base64",
+                                              "skipPreflight": True,
+                                              "maxRetries": 0}]}
+            async with session.post(url, json=payload) as response:
+                body = await response.json(content_type=None)
+            if isinstance(body, dict) and body.get("error"):
+                raise RuntimeError(str(body["error"])[:200])
+            return (body or {}).get("result") if isinstance(body, dict) else None
+
+        return submit
+
+    async def _landing_session(self):
+        session = getattr(self, "_landing_http", None)
+        if session is None or session.closed:
+            session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=5))
+            self._landing_http = session
+        return session
 
     async def _send_raw_transaction(self, signed_tx: str) -> Optional[str]:
         try:

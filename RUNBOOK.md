@@ -74,6 +74,120 @@ The entity registry stays empty until entries are verified from the entity's
 own published pages (`tools/verify_entities.py`). Empty is not "nothing is a
 copycat" -- it is "we cannot tell", and the desk sizes accordingly.
 
+Landing redundancy is mechanisms, not regions. Jito's seven regions are one
+auction; when that auction is the problem all seven fail together. Two more
+mechanisms register automatically when their variables are set, and register
+DISABLED with the reason when they are not:
+
+```bash
+export SOLANA_STAKED_RPC_URL=...     # a staked / SWQoS-prioritised endpoint
+export SOLANA_SENDER_URL=...         # a multi-path forwarder
+```
+
+Every route receives the SAME signed base64 string. That is what makes racing
+safe: one signature, executed at most once by the runtime, delivered by
+whoever arrives first. Racing two differently-signed variants of one intent
+would be two transactions and a double-size position, and the router refuses
+it by construction -- it fans out a string, not a decision.
+
+```bash
+curl -s http://127.0.0.1:18080/status | python3 -c "
+import json,sys; d=json.load(sys.stdin)['landing_router']
+print(d['status'], '|', d['detail'])
+print('mechanisms :', d['mechanisms'])
+print('measured   :', d['measured_routes'])"
+```
+
+`mechanisms` under two is reported DEGRADED. A route's landing rate stays
+DATA_BLOCKED until thirty resolved attempts, because three landings out of
+three is three attempts and not a perfect route.
+
+After promotion the Rust kernel decides ALONE and Python verifies afterwards.
+`/status.t0_kernel.python_on_hot_path` is the line that says which shape is
+running; `parity_dropped` counts promoted decisions nobody will ever check,
+and unverified is never reported as agreement.
+
+Measure the wire before arguing about geography. Run it ON THE NODE, never
+from a laptop or a sandbox -- a proxy in the path makes Tokyo look 5ms away
+and the tool refuses to draw a conclusion when it detects that:
+
+```bash
+.venv/bin/python tools/measure_wire.py --samples 12
+.venv/bin/python tools/measure_wire.py --json data/state/wire.json
+```
+
+It times every Jito block engine the submitter already races, plus the RPC
+set, and quotes each as a fraction of a 400ms slot. Under 15ms to the nearest
+engine is colocated-tier and geography is not your problem; over 90ms and
+moving the box is worth more than every code change combined.
+
+Build the Rust hot path on the node. It is optional -- the desk falls back to
+Python and says so -- but the fallback costs about 40 microseconds per entry
+on build-and-sign, and more importantly the Rust build is what unblocks the
+kernel parity ladder:
+
+```bash
+cd native/solana_fastpath && cargo build --release
+cp target/release/libsolana_fastpath.so ../../.venv/lib/python3.11/site-packages/solana_fastpath.so
+cd ../.. && .venv/bin/python -c "import solana_fastpath; print(solana_fastpath.IMPLEMENTATION)"
+```
+
+Then check `/status.latency`. This is the only page that can tell you whether
+the next hour belongs to code or to money: `dominant_controllable_stage` names
+the slowest stage we own, and if the detail line says the wire dominates, stop
+writing code and move the box.
+
+```bash
+curl -s http://127.0.0.1:18080/status | python3 -c "
+import json,sys; d=json.load(sys.stdin)['latency']
+print(d['status'], '|', d['detail'])
+print('slowest ours:', d['dominant_controllable_stage'])
+print('unmeasured  :', d['unmeasured_stages'])"
+```
+
+The substitution catalogue -- sixty public endpoints across eleven regions,
+each a rung the desk falls back to when the one above it refuses this address
+-- is a claim until it is probed from the node that will use it:
+
+```bash
+.venv/bin/python tools/verify_substitution.py                 # all ten domains
+.venv/bin/python tools/verify_substitution.py --domain regional_venues
+.venv/bin/python tools/verify_substitution.py --json data/state/substitution_probe.json
+```
+
+It exits non-zero only when a DOMAIN has no working endpoint at all. A few
+dead rungs is what the ladder is for; a domain with none is a question the
+desk asks continuously and cannot answer, and `/status.substitution.dark`
+names it. A completely dark domain is usually one shared cause rather than
+every operator dying at once, so the fixer for it lifts every quarantine
+rather than restarting anything:
+
+```bash
+curl -s -X POST http://127.0.0.1:18080/release-sources | python3 -m json.tool
+```
+
+Public Telegram needs no configuration at all. The desk reads
+`t.me/s/<channel>` previews with no account, harvests handles from the t.me
+links it already mines (a Pump token's own profile links its own channel),
+and verifies each candidate by fetching its preview before reading it. To run
+a verification pass immediately rather than waiting for its hourly slot:
+
+```bash
+curl -s -X POST http://127.0.0.1:18080/verify-channels | python3 -m json.tool
+curl -s http://127.0.0.1:18080/status | python3 -c "
+import json,sys; d=json.load(sys.stdin)['telegram_channels']
+print('verified :', d['verified'], '| candidates:', d['candidates'],
+      '| addresses seen:', d['mints_seen'])"
+```
+
+`config/figures.yaml` ships 68 public figures, projects and brands with names
+and NO channels, deliberately. Name matching, serial-impersonator detection
+and contradiction all work without a single channel; what does not work is
+saying ANNOUNCED. Filling a figure's `channels` from their own verified
+profile is what lets the desk distinguish a real celebrity launch from the
+very many that only claim one, and `/status.identity_watch` reports the
+registry as DEGRADED with exactly that reason until you do.
+
 ## 2a. Confirm the desk sees your keys, and authorise Telegram
 
 Setting a key and the desk seeing it are different facts. An env file loaded
@@ -393,3 +507,64 @@ with Tailscale, which runs without root in userspace mode, and browse to the
 VPS's Tailscale address. Do NOT set `HEALTH_HOST=0.0.0.0` to achieve this:
 that publishes the desk's whole interior to anything that can route to the
 box.
+
+
+## Running itself
+
+Three units, on timers, so the node needs no laptop.
+
+```bash
+cp deploy/systemd/memecoin-supervisor.* deploy/systemd/memecoin-liveness.* \
+   ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now memecoin-liveness.timer memecoin-supervisor.timer
+systemctl --user list-timers | grep memecoin
+```
+
+Two cadences, because they cost different amounts. The liveness probe is one
+HTTP call and runs every **30 seconds**, so a wedged desk is restarted within
+half a minute. The full pass reads the whole status document, evaluates thirty
+checks and may run the test suite, so it runs every **60 seconds**. Splitting
+them is what makes the fast cadence affordable.
+
+Every two minutes the supervisor does three things in order:
+
+**Deploys.** Fetches `main`, and if there are new commits, runs the full test
+suite ON THIS NODE against the new code before restarting anything. If the
+suite fails, the checkout returns to the exact commit that was running and the
+service is untouched. It refuses to deploy over a dirty tree, and it refuses
+anything that is not a fast-forward.
+
+**Corrects.** A fixed repertoire of remedies -- restart the desk when it stops
+writing readiness, when the stream is connected and silent, when the
+denominator freezes, when the feed is dead. Each is capped at three attempts
+an hour with a four-minute cooldown; past that it stops acting and escalates,
+because a service restarting for ever while nobody is told is worse than one
+that stays down.
+
+**Escalates.** Anything critical, and any fault the fixer gave up on, goes to
+your Telegram Saved Messages using the session the collector already holds.
+One message per distinct fault per hour, one line when it recovers, and the
+full trail written to `data/state/escalations.jsonl` whether or not delivery
+worked.
+
+Check what it has been doing:
+
+```bash
+journalctl --user -u memecoin-supervisor.service -n 50 --no-pager
+```
+
+```bash
+tail -20 ~/.local/opt/memecoin-shadow/data/state/escalations.jsonl
+```
+
+To watch without acting -- useful the first day:
+
+```bash
+.venv/bin/python -m ops.supervisor --root ~/.local/opt/memecoin-shadow --no-fix --no-deploy
+```
+
+What it deliberately cannot do: trade, sign, or touch capital. The unit clears
+`ALLOW_LIVE_TRADING` and `SOLANA_PRIVATE_KEY` outright rather than merely not
+using them. It restarts processes and moves files, and that boundary is what
+makes it safe to run unattended.

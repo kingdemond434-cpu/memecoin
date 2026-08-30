@@ -322,6 +322,23 @@ def solana_chain():
     )
 
 
+
+def _desk_source() -> str:
+    """The desk's source across every module its class is assembled from.
+
+    A number of tests below grep source text as a proxy for "the desk serves
+    this key" or "this call site exists". That proxy was written when the desk
+    was one file. It is now a class assembled from several, so reading only
+    `main.py` would silently stop checking whatever moved -- which is the
+    worst possible failure mode for an assertion of this shape, because it
+    keeps passing.
+    """
+    root = Path(__file__).resolve().parents[1] / "src"
+    return "\n".join((root / name).read_text(encoding="utf-8")
+                     for name in ("main.py", "runtime/reporting.py",
+                                  "runtime/ingestion.py", "runtime/wiring.py"))
+
+
 class TestProviderCredentials(unittest.TestCase):
     def test_extracts_helius_key_from_rpc_url(self):
         self.assertEqual(
@@ -2557,6 +2574,16 @@ class FakeTelegramClient:
     async def iter_messages(self, entity, limit=100):
         for message in self.messages_by_entity.get(entity, [])[:limit]:
             yield message
+
+
+async def _stub_build_and_sign(instructions, **kwargs):
+    """Stands in for the real builder in fixtures that only assert routing.
+
+    Returns a plausible encoded transaction. It is deliberately not a valid
+    one: these tests assert which route was taken, and a fixture that produced
+    a signable transaction would be quietly testing the builder too.
+    """
+    return base64.b64encode(b"stub-signed-transaction").decode("ascii")
 
 
 class TestExecution(unittest.IsolatedAsyncioTestCase):
@@ -6922,7 +6949,7 @@ class TestDeskWiringIsComplete(unittest.TestCase):
 
     def test_every_wired_component_is_constructed_on_the_real_desk(self):
         """The fakes prove the logic; this proves the desk actually has them."""
-        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        source = _desk_source()
         # Each of these was reported as wired at some point; each is only
         # reachable if it is both imported and assigned in __init__.
         for attribute in (
@@ -6935,7 +6962,7 @@ class TestDeskWiringIsComplete(unittest.TestCase):
 
     def test_the_readiness_surface_exposes_the_new_components(self):
         """A component absent from readiness is invisible to the monitor."""
-        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        source = _desk_source()
         for key in ("action_policy", "actor_graph", "hot_state", "mega_event_reserve"):
             self.assertIn(f'"{key}":', source,
                           f"{key} is not reported in readiness, so nothing can monitor it")
@@ -8354,7 +8381,7 @@ class TestActorIntelligenceIsLiveWired(unittest.TestCase):
                      skill=skill, capital_usd=capital)
 
     def test_main_imports_the_full_actor_surface(self):
-        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        source = _desk_source()
         for name in ("BuyerDNA", "SwarmPredictor", "aggregate_smart_flow",
                      "build_fingerprint"):
             self.assertIn(name, source, f"{name} is built but never reaches main")
@@ -8431,7 +8458,7 @@ class TestSourceIntelligenceIsLiveWired(unittest.IsolatedAsyncioTestCase):
         return desk
 
     def test_main_imports_the_collectors(self):
-        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        source = _desk_source()
         self.assertIn("src.collectors.event_source", source)
         self.assertIn("src.collectors.registry", source)
 
@@ -8700,7 +8727,7 @@ class TestReentryIsLiveWired(unittest.TestCase):
         self.assertIn("still open", reenter.detail)
 
     def test_desk_constructs_a_reentry_book_and_reports_it(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         assigned = {
             node.targets[0].attr
@@ -8712,7 +8739,7 @@ class TestReentryIsLiveWired(unittest.TestCase):
         self.assertIn('"reentry": self.reentry_book.report()', source)
 
     def test_full_exits_are_recorded_and_partial_ones_are_not(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         exit_fn = next(node for node in ast.walk(tree)
                        if isinstance(node, ast.AsyncFunctionDef)
@@ -8739,7 +8766,7 @@ class TestReentryIsLiveWired(unittest.TestCase):
         self.assertTrue(any(call in ast.walk(closed_branch) for call in calls))
 
     def test_the_entry_path_gates_and_prices_reentries(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         evaluate = next(node for node in ast.walk(tree)
                         if isinstance(node, ast.AsyncFunctionDef)
@@ -9897,7 +9924,7 @@ class TestDecisionContribution(unittest.TestCase):
             ledger.report()["components"]["escape_probability"]["observations"], 10)
 
     def test_it_is_wired_into_the_position_decision(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         scorer = next(node for node in ast.walk(tree)
                       if isinstance(node, ast.FunctionDef) and node.name == "_score_actions")
@@ -10081,7 +10108,12 @@ class TestNativeRouteIsTheCanonicalPath(unittest.TestCase):
         engine.pumpswap_route = None
         engine.pool_state_provider = None
         engine.pool_account_provider = None
-        engine.tx_builder = SimpleNamespace(public_key=self.OTHER)
+        engine.tx_builder = SimpleNamespace(
+            public_key=self.OTHER,
+            # Shadow now builds on every decision, so a stub builder has
+            # to be able to build. A fixture that cannot is a fixture
+            # asserting about an execution path it never reached.
+            build_and_sign=_stub_build_and_sign)
         engine.native_route_attempts = defaultdict(int)
         engine.stream_confirmations = 0
         engine.poll_confirmations = 0
@@ -10499,7 +10531,12 @@ class TestGraduationKeepsNativeExecution(unittest.IsolatedAsyncioTestCase):
         engine.curve_state_provider = (lambda token: curve) if curve else None
         engine.pool_state_provider = (lambda token: reserves) if reserves else None
         engine.pool_account_provider = (lambda token: account) if account else None
-        engine.tx_builder = SimpleNamespace(public_key=self.OTHER)
+        engine.tx_builder = SimpleNamespace(
+            public_key=self.OTHER,
+            # Shadow now builds on every decision, so a stub builder has
+            # to be able to build. A fixture that cannot is a fixture
+            # asserting about an execution path it never reached.
+            build_and_sign=_stub_build_and_sign)
         engine.native_route_attempts = defaultdict(int)
         engine.native_compute_unit_limit = 400_000
         engine.dry_run = True
@@ -11843,7 +11880,7 @@ class TestTheRunbookMatchesTheSystem(unittest.TestCase):
         for key in ("source_mesh", "entity_registry", "forward_evidence",
                     "native_route"):
             self.assertIn(f"['{key}']", text, key)
-        source = (self.ROOT / "src" / "main.py").read_text(encoding="utf-8")
+        source = _desk_source()
         for key in ("source_mesh", "entity_registry", "forward_evidence",
                     "native_route"):
             self.assertIn(f'"{key}":', source, key)
@@ -11872,7 +11909,7 @@ class TestTheRunbookMatchesTheSystem(unittest.TestCase):
         engine.poll_confirmations = 0
         engine._signature_waiters = {}
         engine.reconcile_min_interval = 0.01
-        engine.tx_builder = SimpleNamespace()
+        engine.tx_builder = SimpleNamespace(build_and_sign=_stub_build_and_sign)
         report = engine.native_route_report()
         for key in ("prepared_share", "blockhash", "outcomes",
                     "pool_state_wired", "pool_account_wired"):
@@ -11888,7 +11925,7 @@ class TestTheRunbookMatchesTheSystem(unittest.TestCase):
 
     def test_the_status_endpoint_binds_loopback_by_default(self):
         """/status serves the desk's interior; 0.0.0.0 publishes all of it."""
-        source = (self.ROOT / "src" / "main.py").read_text(encoding="utf-8")
+        source = _desk_source()
         self.assertIn('os.getenv("HEALTH_HOST", "127.0.0.1")', source)
         self.assertNotIn('web.TCPSite(self._web_runner, "0.0.0.0"', source)
         unit = (self.ROOT / "deploy" / "systemd" / "memecoin-shadow.service").read_text()
@@ -12120,7 +12157,17 @@ class TestKernelParityWithTheNativeExtension(unittest.TestCase):
                 return Decision(status="OK", action=ActionValue.EXIT, q=99.0)
 
         kernel.policy = Contrarian()
-        kernel.score(self._state(survival), survival=survival, **self.RESERVES)
+        decision = kernel.score(self._state(survival), survival=survival, **self.RESERVES)
+        # Promoted: Rust decided alone and Python was never called, so the
+        # disagreement is not visible yet. This is the acknowledged cost of
+        # taking Python off the hot path -- the trade has already gone.
+        self.assertEqual(decision.kernel["source"], "rust")
+        self.assertFalse(kernel.demoted_reason)
+        self.assertTrue(kernel.rust_authoritative)
+
+        # The deferred check is what finds it, off the decision path. Every
+        # promoted decision since promotion is queued, not only this one.
+        self.assertGreaterEqual(kernel.drain_parity(), 1)
         self.assertTrue(kernel.demoted_reason)
         self.assertFalse(kernel.rust_authoritative)
         # And it stays demoted however many agreements follow.
@@ -12344,7 +12391,7 @@ class TestEveryRaceBidsOnItsOwnEconomics(unittest.TestCase):
 
     def test_the_scale_in_passes_its_marginal_elogw_to_the_bid(self):
         """An ADD fell back to the fixed ladder while the entry beside it bid."""
-        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        source = _desk_source()
         block = source[source.index("attempt = {**_jsonable(result), \"scale_in\": True")
                        - 2_000:source.index("attempt = {**_jsonable(result), \"scale_in\": True")]
         self.assertIn("expected_edge_usd=max(0.0, gain * max(self.wallet_equity_usd, 0.0))",
@@ -12665,7 +12712,7 @@ class TestExitsArePreparedBeforeTheyAreNeeded(unittest.TestCase):
         self.assertEqual(staged.report()["staged_positions"], 3)
 
     def test_the_desk_stages_on_open_reprices_on_events_and_releases_on_close(self):
-        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        source = _desk_source()
         self.assertIn("staged = self._stage_exits(token, position)", source)
         self.assertIn("self._reprice_staged_exits(token)", source)
         self.assertIn("self.staged_exits.release(token)", source)
@@ -12967,7 +13014,7 @@ class TestKolRolesDecideTheAction(unittest.TestCase):
         self.assertEqual(touches[0].timestamp, 0.0)
 
     def test_the_desk_reports_the_lifecycle_census(self):
-        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        source = _desk_source()
         self.assertIn('"ignition": self.ignition_census()', source)
         self.assertIn("self._read_ignition(token)", source)
 
@@ -13109,7 +13156,7 @@ class TestOneSlotOfDelayIsPricedPerOpportunity(unittest.TestCase):
         self.assertIsNone(plain["slot_value"])
 
     def test_every_race_on_the_desk_prices_its_own_slot(self):
-        source = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+        source = _desk_source()
         self.assertEqual(source.count("slot_value=self._entry_slot_value("), 2)
         self.assertIn("slot_value=self._exit_slot_value(", source)
 
@@ -14009,7 +14056,7 @@ class TestEventDrivenRuntime(unittest.IsolatedAsyncioTestCase):
         return desk
 
     def test_the_dispatcher_never_sleeps_between_candidates(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         loop = next(node for node in ast.walk(tree)
                     if isinstance(node, ast.AsyncFunctionDef)
@@ -14023,7 +14070,7 @@ class TestEventDrivenRuntime(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("wait_for", ast.dump(loop))
 
     def test_the_old_clocked_loop_is_gone(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         self.assertNotIn("await self._process_new_tokens()\n                await self._manage_positions()",
                          source)
         tree = ast.parse(source)
@@ -14035,7 +14082,7 @@ class TestEventDrivenRuntime(unittest.IsolatedAsyncioTestCase):
         self.assertIn("_safety_sweep_loop", names)
 
     def test_a_trade_on_an_open_position_requests_an_immediate_redecision(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         handler = next(node for node in ast.walk(tree)
                        if isinstance(node, ast.AsyncFunctionDef)
@@ -14112,7 +14159,7 @@ class TestEventDrivenRuntime(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(desk.managed, [])
 
     def test_dispatch_is_synchronous_so_it_cannot_block_the_queue(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         dispatch = next(node for node in ast.walk(tree)
                         if isinstance(node, ast.FunctionDef)
@@ -14191,7 +14238,7 @@ class TestActionValueIsAuthoritative(unittest.TestCase):
 
     def test_a_priced_hold_ends_the_cycle(self):
         """The ratchet and scale-in used to run after a chosen HOLD."""
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         body = next(node for node in ast.walk(tree)
                     if isinstance(node, ast.AsyncFunctionDef)
@@ -14204,7 +14251,7 @@ class TestActionValueIsAuthoritative(unittest.TestCase):
         self.assertLess(hold_index, ratchet_index)
 
     def test_only_a_catastrophic_reading_bypasses_the_objective(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         body = next(node for node in ast.walk(tree)
                     if isinstance(node, ast.AsyncFunctionDef)
@@ -14219,7 +14266,7 @@ class TestActionValueIsAuthoritative(unittest.TestCase):
         self.assertNotIn("_execute_exit", after_bank)
 
     def test_the_entry_path_prices_ignore_against_probe(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         evaluate = next(node for node in ast.walk(tree)
                         if isinstance(node, ast.AsyncFunctionDef)
@@ -14240,7 +14287,7 @@ class TestActionValueIsAuthoritative(unittest.TestCase):
         self.assertEqual(policy.score(blocked).status, "DATA_BLOCKED")
 
     def test_authority_counters_reach_readiness(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         for key in ("priced_holds", "unpriced_cycles", "suppressed_monster_banks"):
             self.assertIn(f'"{key}"', source)
         self.assertIn('"action_authority"', source)
@@ -14275,7 +14322,12 @@ class TestNativeRouteIsActuallyTaken(unittest.IsolatedAsyncioTestCase):
         engine.pumpswap_route = None
         engine.pool_state_provider = None
         engine.pool_account_provider = None
-        engine.tx_builder = SimpleNamespace(public_key=self.OTHER)
+        engine.tx_builder = SimpleNamespace(
+            public_key=self.OTHER,
+            # Shadow now builds on every decision, so a stub builder has
+            # to be able to build. A fixture that cannot is a fixture
+            # asserting about an execution path it never reached.
+            build_and_sign=_stub_build_and_sign)
         engine.native_route_attempts = defaultdict(int)
         engine.native_compute_unit_limit = 400_000
         engine.stream_confirmations = 0
@@ -14350,7 +14402,7 @@ class TestStreamedCurveStateIsBuildable(unittest.TestCase):
     """
 
     def test_the_creation_event_records_what_trade_events_lack(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         self.assertIn("_curve_static[token]", source)
         tree = ast.parse(source)
         handler = next(node for node in ast.walk(tree)
@@ -14364,7 +14416,7 @@ class TestStreamedCurveStateIsBuildable(unittest.TestCase):
     def test_an_account_update_replaces_rather_than_merges(self):
         """Mixing a measured field into a reconstructed record produces a row
         that is neither, and nothing downstream can tell which parts to trust."""
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         ingest = next(node for node in ast.walk(tree)
                       if isinstance(node, ast.FunctionDef)
@@ -14514,7 +14566,7 @@ class TestSourceMeshStreams(unittest.IsolatedAsyncioTestCase):
 
     def test_the_runtime_consumes_the_mesh(self):
         """The architecture existed and the runtime never called it."""
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         names = {node.name for node in ast.walk(tree)
                  if isinstance(node, ast.AsyncFunctionDef)}
@@ -14596,7 +14648,7 @@ class TestStreamFillReconciliation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.stream_confirmations, 0)
 
     def test_the_decode_path_reports_our_signatures(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         handler = next(node for node in ast.walk(tree)
                        if isinstance(node, ast.AsyncFunctionDef)
@@ -14804,7 +14856,7 @@ class TestLocalLiquidity(unittest.TestCase):
             MemecoinQuantDesk._local_liquidity(self._desk(done), "mint"), 0.0)
 
     def test_the_local_read_is_tried_before_any_network_call(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         resolve = next(node for node in ast.walk(tree)
                        if isinstance(node, ast.AsyncFunctionDef)
@@ -14912,7 +14964,7 @@ class TestAccountPrewarming(unittest.TestCase):
         self.assertEqual(route.report()["prewarm"]["hit_rate"], 1.0)
 
     def test_detection_warms_the_accounts(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         handler = next(node for node in ast.walk(tree)
                        if isinstance(node, ast.AsyncFunctionDef)
@@ -15073,7 +15125,7 @@ class TestForwardEvidence(unittest.TestCase):
         self.assertIn("NamedTemporaryFile", source)
 
     def test_the_desk_feeds_it_from_trade_outcomes(self):
-        source = Path("src/main.py").read_text()
+        source = _desk_source()
         tree = ast.parse(source)
         recorder = next(node for node in ast.walk(tree)
                         if isinstance(node, ast.FunctionDef)
@@ -16380,6 +16432,9 @@ class TestRugDeathClassificationIsActuallyWired(unittest.TestCase):
             _record_ops_event=lambda stream, payload: ops_events.append(
                 (stream, payload)),
             _resolved_calls=resolved_calls, _ops_events=ops_events)
+        # main resolves the decision corpus alongside the census, so the
+        # stub desk has to answer for it too.
+        desk._resolve_corpus = lambda *a, **k: None
         desk._resolve_census_death = (
             lambda token: MemecoinQuantDesk._resolve_census_death(desk, token))
         return desk
@@ -18174,6 +18229,12 @@ class TestSubmitSignedActuallyRecordsALanding(unittest.IsolatedAsyncioTestCase):
         engine.dry_run = False
         engine.region = "test"
         engine.landing_model = LandingModel()
+        # main races the same signed payload through independent mechanisms.
+        # A stub that lands directly keeps this test about _submit_signed
+        # rather than about route selection.
+        engine.landing_router = SimpleNamespace(
+            race=lambda *a, **k: self._raced(),
+            record_landing=lambda *a, **k: None)
         engine.native_compute_unit_limit = 400_000
         engine.tx_builder = SimpleNamespace(public_key="P", last_blockhash_age_slots=3)
         engine.jito = SimpleNamespace(
@@ -18182,6 +18243,11 @@ class TestSubmitSignedActuallyRecordsALanding(unittest.IsolatedAsyncioTestCase):
         engine._send_raw_transaction = lambda signed: self._ok("SIG")
         engine._wait_for_fill = lambda sig, i, o: self._fill()
         return engine
+
+    async def _raced(self):
+        # Shaped like LandingRouter.race: one ordinary lane accepted it.
+        return SimpleNamespace(submitted=True, accepted={"rpc": "SIG"},
+                               errors={}, identifier="rpc")
 
     async def _fail_if_called(self, *a, **k):
         raise AssertionError("jito path must not be taken in this test")
@@ -19181,3 +19247,2458 @@ class TestPollTimeoutsFitTheTransportKind(unittest.TestCase):
         source = inspect.getsource(build_sources)
         self.assertIn("declaration.poll_timeout_seconds", source)
         self.assertIn("DEFAULT_POLL_TIMEOUTS.get(declaration.kind)", source)
+class TestShadowExercisesTheExecutionPath(unittest.IsolatedAsyncioTestCase):
+    """Dry run used to return before building, leaving the whole build path
+    dead until the first canary trade."""
+
+    def test_the_dry_run_branch_builds_before_it_returns(self):
+        source = inspect.getsource(ExecutionEngine._execute_native)
+        built = source.index("self._build_native_signed")
+        simulated = source.index("TransactionStatus.SIMULATED")
+        self.assertLess(built, simulated,
+                        "dry run still returns before building")
+
+    def test_both_paths_use_one_builder(self):
+        # Two implementations would mean the thing exercised in shadow is not
+        # the thing that runs live.
+        source = inspect.getsource(ExecutionEngine._execute_native)
+        self.assertEqual(source.count("await self._build_native_signed("), 2)
+        self.assertNotIn("await self.tx_builder.build_and_sign(", source)
+
+    def test_dry_run_never_submits(self):
+        source = inspect.getsource(ExecutionEngine._execute_native)
+        dry = source[source.index("if self.dry_run:"):
+                     source.index("TransactionStatus.SIMULATED")]
+        for forbidden in ("_submit_signed", "send_transaction", "self.jito."):
+            self.assertNotIn(forbidden, dry)
+
+    def test_an_unexercised_path_reports_blocked(self):
+        engine = ExecutionEngine.__new__(ExecutionEngine)
+        engine.native_route_attempts = defaultdict(int)
+        engine.dry_build_failures = {}
+        report = engine.dry_build_report()
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertIn("has not been exercised", report["detail"])
+
+    def test_clean_builds_read_ok_with_a_count(self):
+        engine = ExecutionEngine.__new__(ExecutionEngine)
+        engine.native_route_attempts = defaultdict(int, {"dry_built": 4_000})
+        engine.dry_build_failures = {}
+        report = engine.dry_build_report()
+        self.assertEqual(report["status"], "OK")
+        self.assertEqual(report["built"], 4_000)
+        self.assertEqual(report["success_rate"], 1.0)
+
+    def test_failed_builds_are_named_as_rejected_trades(self):
+        engine = ExecutionEngine.__new__(ExecutionEngine)
+        engine.native_route_attempts = defaultdict(
+            int, {"dry_built": 90, "dry_build_failed": 10})
+        engine.dry_build_failures = {"ValueError: missing creator vault": 10}
+        report = engine.dry_build_report()
+        self.assertEqual(report["status"], "DEGRADED")
+        self.assertIn("rejected trades with real capital", report["detail"])
+        self.assertEqual(report["success_rate"], 0.9)
+        self.assertIn("ValueError: missing creator vault", report["failures"])
+
+    def test_a_simulated_fill_that_could_not_be_built_carries_the_error(self):
+        # Otherwise the shadow ledger counts a trade the desk could never have
+        # made, and the forward evidence is inflated by its own bugs.
+        source = inspect.getsource(ExecutionEngine._execute_native)
+        self.assertIn("error=build_error", source)
+
+    def test_status_exposes_it(self):
+        self.assertIn("dry_build_report()",
+                      inspect.getsource(MemecoinQuantDesk.readiness))
+
+
+class TestTheAutoFixerCannotHideAFault(unittest.TestCase):
+    """A supervisor that restarts forever and tells nobody is worse than none."""
+
+    def _fixer(self, **kw):
+        from ops.autofix import AutoFixer
+        return AutoFixer(**kw)
+
+    def _remedy(self, calls, name="restart", budget=3, cooldown=0.0):
+        from ops.autofix import Remedy
+        return Remedy(name=name,
+                      applies=lambda health: True,
+                      act=lambda: (calls.append(1), True)[1],
+                      why="test", budget=budget, cooldown_s=cooldown)
+
+    def test_it_acts_on_a_fault_it_recognises(self):
+        from ops.autofix import Outcome
+        calls = []
+        fixer = self._fixer()
+        fixer.register(self._remedy(calls))
+        acted = fixer.run({"checks": []}, now=100.0)
+        self.assertEqual(acted[0].outcome, Outcome.ACTED.value)
+        self.assertEqual(len(calls), 1)
+
+    def test_it_stops_and_escalates_when_the_fault_persists(self):
+        from ops.autofix import Outcome
+        calls = []
+        fixer = self._fixer()
+        fixer.register(self._remedy(calls, budget=3))
+        for tick in range(6):
+            fixer.run({"checks": []}, now=100.0 + tick)
+        # Three attempts, then it stops rather than flapping for ever.
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(fixer.escalations)
+        self.assertIn("no longer a fix", fixer.escalations[0])
+        self.assertEqual(fixer.report(now=110.0)["status"], "CRITICAL")
+
+    def test_a_cooldown_stops_it_judging_a_starting_service(self):
+        from ops.autofix import Outcome
+        calls = []
+        fixer = self._fixer()
+        fixer.register(self._remedy(calls, cooldown=240.0))
+        fixer.run({"checks": []}, now=100.0)
+        second = fixer.run({"checks": []}, now=200.0)
+        self.assertEqual(second[0].outcome, Outcome.COOLING.value)
+        self.assertEqual(len(calls), 1)
+
+    def test_only_one_remedy_acts_per_pass(self):
+        calls = []
+        fixer = self._fixer()
+        fixer.register(self._remedy(calls, name="a"))
+        fixer.register(self._remedy(calls, name="b"))
+        fixer.run({"checks": []}, now=100.0)
+        # Two faults are usually one fault seen twice.
+        self.assertEqual(len(calls), 1)
+
+    def test_the_budget_window_expires_so_it_can_recover(self):
+        calls = []
+        fixer = self._fixer(window_s=3600.0)
+        fixer.register(self._remedy(calls, budget=2))
+        fixer.run({"checks": []}, now=100.0)
+        fixer.run({"checks": []}, now=200.0)
+        fixer.run({"checks": []}, now=300.0)
+        self.assertEqual(len(calls), 2)
+        # An hour later the window has rolled and it may act again.
+        fixer.run({"checks": []}, now=100.0 + 7200.0)
+        self.assertEqual(len(calls), 3)
+
+    def test_it_never_acts_on_a_fault_it_does_not_recognise(self):
+        from ops.autofix import standard_remedies
+        fixer = self._fixer()
+        for remedy in standard_remedies():
+            fixer.register(remedy)
+        health = {"checks": [{"name": "something_nobody_wrote_a_remedy_for",
+                              "state": "CRITICAL", "detail": ""}]}
+        self.assertEqual(fixer.run(health, now=100.0), [])
+
+    def test_a_remedy_that_throws_does_not_stop_the_pass(self):
+        from ops.autofix import Outcome, Remedy
+        fixer = self._fixer()
+        fixer.register(Remedy(
+            name="broken", applies=lambda h: True,
+            act=lambda: (_ for _ in ()).throw(RuntimeError("x")), why="test"))
+        acted = fixer.run({"checks": []}, now=100.0)
+        self.assertEqual(acted[0].outcome, Outcome.FAILED.value)
+
+    def test_the_repertoire_only_restarts_and_never_trades(self):
+        from ops import autofix
+        source = inspect.getsource(autofix)
+        for forbidden in ("execute_swap", "sign_message", "SOLANA_PRIVATE_KEY",
+                          "ALLOW_LIVE_TRADING"):
+            self.assertNotIn(forbidden, source)
+
+    def test_it_survives_a_restart_of_itself(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "autofix.json"
+            calls = []
+            first = self._fixer(state_path=path)
+            first.register(self._remedy(calls, budget=2))
+            first.run({"checks": []}, now=100.0)
+            second = self._fixer(state_path=path)
+            second.register(self._remedy(calls, budget=2, cooldown=0.0))
+            second.run({"checks": []}, now=200.0)
+            second.run({"checks": []}, now=300.0)
+            # Budget is not reset by restarting the supervisor, or the budget
+            # means nothing.
+            self.assertEqual(len(calls), 2)
+
+
+class TestDeploysAreVerifiedBeforeTheyAreTrusted(unittest.TestCase):
+
+    def _deployer(self, tmp, **kw):
+        from ops.autodeploy import AutoDeployer
+        return AutoDeployer(Path(tmp), **kw)
+
+    def test_a_dirty_tree_is_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            deployer = self._deployer(tmp)
+            deployer.dirty = lambda: [" M src/main.py"]
+            deployer.head = lambda: "abc123"
+            result = deployer.run()
+            self.assertEqual(result.status, "SKIPPED")
+            self.assertIn("operator mid-repair", result.detail)
+
+    def test_being_current_does_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            deployer = self._deployer(tmp)
+            deployer.dirty = lambda: []
+            deployer.head = lambda: "abc123"
+            deployer.behind = lambda: 0
+            self.assertEqual(deployer.run().status, "CURRENT")
+
+    def test_a_failing_suite_rolls_back_to_the_recorded_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reset_to = []
+            deployer = self._deployer(tmp)
+            heads = iter(["was_commit", "new_commit"])
+            deployer.head = lambda: next(heads)
+            deployer.dirty = lambda: []
+            deployer.behind = lambda: 3
+            deployer.verify = lambda: (False, "2 failures")
+            with mock.patch("ops.autodeploy._git",
+                            side_effect=lambda root, *a, **k: (
+                                reset_to.append(a) or (0, ""))):
+                result = deployer.run()
+            self.assertEqual(result.status, "ROLLED_BACK")
+            self.assertTrue(result.rolled_back)
+            # Back to the commit recorded BEFORE the pull, not "the previous
+            # one", which is ambiguous when a pull brings several.
+            self.assertIn(("reset", "--hard", "was_commit"), reset_to)
+
+    def test_a_passing_suite_restarts_the_service(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            deployer = self._deployer(tmp)
+            heads = iter(["was", "new"])
+            deployer.head = lambda: next(heads)
+            deployer.dirty = lambda: []
+            deployer.behind = lambda: 1
+            deployer.verify = lambda: (True, "OK")
+            with mock.patch("ops.autodeploy._git", return_value=(0, "")), \
+                 mock.patch("subprocess.run") as run:
+                run.return_value = SimpleNamespace(returncode=0)
+                result = deployer.run()
+            self.assertEqual(result.status, "DEPLOYED")
+            self.assertTrue(result.tests_ran)
+
+    def test_verification_runs_before_the_restart_never_after(self):
+        source = inspect.getsource(
+            __import__("ops.autodeploy", fromlist=["x"]).AutoDeployer.run)
+        self.assertLess(source.index("self.verify()"),
+                        source.index("systemctl"))
+
+    def test_a_non_fast_forward_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            deployer = self._deployer(tmp)
+            deployer.dirty = lambda: []
+            deployer.head = lambda: "abc"
+            deployer.behind = lambda: 2
+            with mock.patch("ops.autodeploy._git", return_value=(1, "diverged")):
+                result = deployer.run()
+            self.assertEqual(result.status, "SKIPPED")
+            self.assertIn("not a fast-forward", result.detail)
+
+    def test_a_deploy_that_did_not_restart_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            deployer = self._deployer(tmp)
+            heads = iter(["was", "new"])
+            deployer.head = lambda: next(heads)
+            deployer.dirty = lambda: []
+            deployer.behind = lambda: 1
+            deployer.verify = lambda: (True, "OK")
+            with mock.patch("ops.autodeploy._git", return_value=(0, "")), \
+                 mock.patch("subprocess.run") as run:
+                run.return_value = SimpleNamespace(returncode=1)
+                result = deployer.run()
+            self.assertEqual(result.status, "DEPLOYED_NOT_RESTARTED")
+            self.assertIn("running the old code", result.detail)
+
+
+class TestEscalationReachesAPersonOrSaysItCouldNot(unittest.TestCase):
+    """A fault that wakes nobody is indistinguishable from no fault."""
+
+    def _alerter(self, tmp, **kw):
+        from ops.alert import Alerter
+        # A session path inside the temp dir, so what this asserts is the
+        # alerter's behaviour and not whether this box is authorised.
+        kw.setdefault("session_path", Path(tmp) / "collector")
+        return Alerter(log_path=Path(tmp) / "esc.jsonl",
+                       state_path=Path(tmp) / "state.json", **kw)
+
+    def test_the_same_fault_is_not_repeated_every_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            alerter = self._alerter(tmp, dedupe_s=3600.0)
+            self.assertIsNotNone(alerter.escalate("stream", "silent", now=100.0))
+            # The alert becoming the fault is how people learn to ignore it.
+            self.assertIsNone(alerter.escalate("stream", "silent", now=200.0))
+            self.assertIsNone(alerter.escalate("stream", "silent", now=3000.0))
+            self.assertIsNotNone(alerter.escalate("stream", "silent", now=4000.0))
+
+    def test_distinct_faults_are_not_deduplicated_against_each_other(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            alerter = self._alerter(tmp)
+            self.assertIsNotNone(alerter.escalate("stream", "a", now=100.0))
+            self.assertIsNotNone(alerter.escalate("census", "b", now=100.0))
+
+    def test_the_paper_trail_is_written_even_when_delivery_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            alerter = self._alerter(tmp)
+            alerter.escalate("stream", "silent", now=100.0)
+            rows = [json.loads(line) for line in
+                    (Path(tmp) / "esc.jsonl").read_text().splitlines()]
+            self.assertEqual(rows[0]["key"], "stream")
+            # Delivery failed in this environment; the log is what an audit
+            # reads and must not depend on a person having been reachable.
+            self.assertFalse(alerter.deliveries[0].sent)
+
+    def test_an_undelivered_escalation_is_reported_as_degraded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            alerter = self._alerter(tmp)
+            alerter.escalate("stream", "silent", now=100.0)
+            report = alerter.report()
+            self.assertEqual(report["status"], "DEGRADED")
+            self.assertIn("nobody has been told", report["detail"])
+
+    def test_a_missing_session_says_exactly_what_to_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            delivery = self._alerter(tmp).escalate("x", "y", now=1.0)
+            self.assertIn("telegram_authorize", delivery.detail)
+
+    def test_recovery_closes_the_loop_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            alerter = self._alerter(tmp)
+            alerter.escalate("stream", "silent", now=100.0)
+            alerter.clear("stream", now=200.0)
+            self.assertNotIn("stream", alerter.sent)
+            alerter.clear("stream", now=300.0)  # already cleared, no-op
+            keys = [json.loads(line)["message"] for line in
+                    (Path(tmp) / "esc.jsonl").read_text().splitlines()]
+            self.assertEqual(keys.count("resolved"), 1)
+
+    def test_open_faults_survive_a_supervisor_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._alerter(tmp).escalate("stream", "silent", now=100.0)
+            revived = self._alerter(tmp)
+            # Otherwise every restart re-notifies every open fault.
+            self.assertIsNone(revived.escalate("stream", "silent", now=200.0))
+
+    def test_alerting_never_blocks_the_corrective_action(self):
+        source = inspect.getsource(
+            __import__("ops.supervisor", fromlist=["x"]).main)
+        self.assertLess(source.index("fixer.run("), source.index("Alerter("))
+
+
+class TestTheSupervisorWatchesEverySubsystem(unittest.TestCase):
+
+    def _health(self, status, root=None):
+        from ops.supervisor import build_health
+        return build_health(status, None, time.time(), Path(root or "/tmp"))
+
+    def test_a_desk_that_does_not_answer_is_the_loudest_finding(self):
+        checks = self._health(None)["checks"]
+        self.assertEqual(checks[0]["state"], "CRITICAL")
+        self.assertTrue(checks[0]["escalate"])
+
+    def test_every_subsystem_that_can_degrade_silently_is_checked(self):
+        checks = self._health({
+            "stream_events": {"total": 100, "token_created": 5},
+            "yellowstone": {"status": "STREAMING", "seconds_since_response": 1},
+            "pump_decoder": {"status": "OK", "matched": {"token_created": 5}},
+            "launch_census": {"funnel": {"seen": 500}},
+            "dry_build": {"success_rate": 1.0, "built": 500},
+            "data_miners": {"producing": 9},
+            "memory": {"band": "calm", "fraction": 0.1},
+            "signer": {"mode": "isolated", "isolated": True, "halted": False},
+            "fact_ladder": {"degraded_facts": []},
+            "calibration": {"models_miscalibrated": 0},
+            "execution_conditions": {"status": "OK"},
+        })["checks"]
+        names = {check["name"] for check in checks}
+        for expected in ("pipeline_stream_events", "pipeline_stream_delivery",
+                         "pipeline_decoder", "pipeline_census",
+                         "pipeline_execution_build", "subsystem_miners",
+                         "subsystem_memory", "subsystem_signer",
+                         "persistence_evidence", "persistence_census"):
+            self.assertIn(expected, names)
+        # A fully healthy desk raises nothing critical.
+        self.assertEqual([c for c in checks if c["state"] == "CRITICAL"], [])
+
+    def test_shedding_memory_escalates_as_an_undersized_host(self):
+        checks = self._health({"memory": {"band": "shed", "fraction": 0.9}})["checks"]
+        memory = next(c for c in checks if c["name"] == "subsystem_memory")
+        self.assertEqual(memory["state"], "CRITICAL")
+        self.assertIn("undersized", memory["detail"])
+
+    def test_a_local_key_warns_without_blocking_shadow(self):
+        checks = self._health({"signer": {"mode": "local"}})["checks"]
+        signer = next(c for c in checks if c["name"] == "subsystem_signer")
+        self.assertEqual(signer["state"], "WARN")
+        self.assertIn("wrong for capital", signer["detail"])
+
+    def test_stale_persistence_escalates_because_a_restart_would_lose_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "data" / "state"
+            state.mkdir(parents=True)
+            old = state / "forward_evidence.json"
+            old.write_text("{}")
+            os.utime(old, (time.time() - 99_999, time.time() - 99_999))
+            checks = self._health({}, root=tmp)["checks"]
+            found = next(c for c in checks if c["name"] == "persistence_evidence")
+            self.assertEqual(found["state"], "CRITICAL")
+            self.assertIn("would lose everything", found["detail"])
+
+
+class TestEveryFixerIsMatchedToADetectorItCanSafelyFix(unittest.TestCase):
+    """Coverage is not the goal; safe coverage is. Some detectors must never
+    have a fixer at all."""
+
+    def _health(self, name, state="CRITICAL"):
+        return {"checks": [{"name": name, "state": state, "detail": ""}]}
+
+    def _fixer(self, tmp=None):
+        from ops.autofix import AutoFixer, standard_remedies
+        fixer = AutoFixer()
+        for remedy in standard_remedies(root=Path(tmp or "/tmp")):
+            fixer.register(remedy)
+        return fixer
+
+    def test_stale_persistence_flushes_rather_than_restarting(self):
+        # A restart here loses exactly what the check is worried about.
+        from ops.autofix import standard_remedies
+        remedy = next(r for r in standard_remedies()
+                      if r.name == "flush_stale_ledgers")
+        self.assertTrue(remedy.applies(self._health("persistence_evidence")))
+        self.assertIn("would lose exactly what the check", remedy.why)
+        restarts = [r for r in standard_remedies()
+                    if "restart" in r.name
+                    and r.applies(self._health("persistence_evidence"))]
+        self.assertEqual(restarts, [])
+
+    def test_a_full_disk_trims_spill_logs_and_nothing_else(self):
+        from ops.autofix import prune_spill
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "data" / "state"
+            state.mkdir(parents=True)
+            spill = state / "launch_census.jsonl"
+            spill.write_text("\n".join(f'{{"row":{i}}}' for i in range(1000)) + "\n")
+            evidence = state / "forward_evidence.json"
+            evidence.write_text('{"decisions": 5000}')
+            model = state / "rug-hazard.joblib"
+            model.write_text("x" * 100)
+
+            prune_spill(Path(tmp), keep_bytes=100)
+            self.assertLess(len(spill.read_text().splitlines()), 1000)
+            # The newest rows are what a model would train on, so they survive.
+            self.assertIn('{"row":999}', spill.read_text())
+            # Evidence and artefacts are never touched to free space.
+            self.assertEqual(evidence.read_text(), '{"decisions": 5000}')
+            self.assertTrue(model.exists())
+
+    def test_a_quiet_miner_pool_is_treated_as_a_warning_not_a_crisis(self):
+        from ops.autofix import standard_remedies
+        remedy = next(r for r in standard_remedies()
+                      if r.name == "restart_on_silent_miners")
+        self.assertTrue(remedy.applies(self._health("subsystem_miners", "WARN")))
+        # Once an hour at most: a briefly rate-limited miner must never cause
+        # a restart loop.
+        self.assertEqual(remedy.budget, 1)
+        self.assertGreaterEqual(remedy.cooldown_s, 3_600.0)
+
+    def test_stale_models_trigger_the_trainer_not_a_restart(self):
+        from ops.autofix import standard_remedies
+        remedy = next(r for r in standard_remedies()
+                      if r.name == "retrain_stale_models")
+        self.assertTrue(remedy.applies(self._health("model_rug_hazard", "WARN")))
+
+    def test_the_kill_switch_is_never_auto_cleared(self):
+        # It is a safety stop. A supervisor that clears it has removed the
+        # one thing standing between a losing day and a worse one.
+        fixer = self._fixer()
+        self.assertEqual(fixer.run(self._health("safety_kill_switch"), now=1.0), [])
+
+    def test_a_high_execution_failure_rate_is_never_auto_fixed(self):
+        # That is a real signal about the market or the route, not a fault to
+        # restart away.
+        fixer = self._fixer()
+        self.assertEqual(
+            fixer.run(self._health("execution_failure_rate", "WARN"), now=1.0), [])
+
+    def test_miscalibration_is_never_auto_fixed(self):
+        # A miscalibrated model needs data, not a restart. Restarting would
+        # hide the finding without changing it.
+        fixer = self._fixer()
+        self.assertEqual(
+            fixer.run(self._health("subsystem_calibration", "WARN"), now=1.0), [])
+
+    def test_a_missing_credential_is_never_auto_fixed(self):
+        fixer = self._fixer()
+        for name in ("source_social", "subsystem_signer"):
+            self.assertEqual(fixer.run(self._health(name, "WARN"), now=1.0), [],
+                             name)
+
+    def test_warnings_and_criticals_are_kept_distinct(self):
+        from ops.autofix import _critical, _warn
+        health = self._health("x", "WARN")
+        self.assertFalse(_critical(health, "x"))
+        self.assertTrue(_warn(health, "x"))
+
+
+class TestTheFastLaneIsCheapEnoughToRunConstantly(unittest.IsolatedAsyncioTestCase):
+
+    def test_the_fast_pass_only_probes_liveness(self):
+        source = inspect.getsource(
+            __import__("ops.supervisor", fromlist=["x"])._fast_pass)
+        self.assertIn("/health", source)
+        # It must not read the full status document, evaluate every check, or
+        # deploy -- none of that should stand between a wedged desk and a
+        # restart.
+        for expensive in ("build_health", "AutoDeployer", "check_subsystems"):
+            self.assertNotIn(expensive, source)
+
+    def test_a_live_desk_costs_one_call_and_exits(self):
+        from ops import supervisor
+        args = SimpleNamespace(status_url="http://x/status", service="s",
+                               no_fix=True, root="/tmp")
+        with mock.patch.object(supervisor, "read_status", return_value={"ok": 1}):
+            code = supervisor._fast_pass(args, Path("/tmp"), Path("/tmp"), 1.0)
+        self.assertEqual(code, 0)
+
+    def test_a_dead_desk_is_actionable_from_the_fast_pass(self):
+        from ops import supervisor
+        args = SimpleNamespace(status_url="http://x/status", service="s",
+                               no_fix=False, root="/tmp")
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(supervisor, "read_status", return_value=None), \
+             mock.patch("ops.autofix.systemctl", return_value=True) as restart:
+            code = supervisor._fast_pass(args, Path(tmp), Path(tmp), 1.0)
+        self.assertEqual(code, 1)
+        restart.assert_called_once()
+
+    def test_the_timers_are_as_frequent_as_each_probe_can_afford(self):
+        root = Path(__file__).resolve().parents[1] / "deploy" / "systemd"
+        liveness = (root / "memecoin-liveness.timer").read_text()
+        supervisor = (root / "memecoin-supervisor.timer").read_text()
+        self.assertIn("OnUnitActiveSec=30s", liveness)
+        self.assertIn("OnUnitActiveSec=60s", supervisor)
+
+
+class TestSourceSubstitution(unittest.TestCase):
+    """A dead endpoint must cost one pass, not a whole domain."""
+
+    def _registry(self):
+        from src.research.source_substitution import Endpoint, SubstitutionRegistry
+        registry = SubstitutionRegistry(failures_before_rotate=2,
+                                        quarantine_base_s=100.0)
+        registry.declare("prices", [
+            Endpoint("primary", "https://a/{mint}", region="global"),
+            Endpoint("secondary", "https://b/{mint}", region="asia"),
+            Endpoint("tertiary", "https://c/{mint}", region="kr"),
+        ])
+        return registry
+
+    def test_one_failure_does_not_rotate(self):
+        registry = self._registry()
+        registry.note_failure("prices", "primary", "timeout", now=0.0)
+        self.assertEqual(registry.current("prices", now=0.0).name, "primary")
+
+    def test_repeated_failure_rotates_to_a_different_operator(self):
+        registry = self._registry()
+        for _ in range(2):
+            registry.note_failure("prices", "primary", "HTTP 403", now=0.0)
+        self.assertEqual(registry.current("prices", now=0.0).name, "secondary")
+        self.assertEqual(registry.substitutions, 1)
+
+    def test_recovery_is_automatic_once_the_quarantine_lapses(self):
+        registry = self._registry()
+        for _ in range(2):
+            registry.note_failure("prices", "primary", "down", now=0.0)
+        self.assertEqual(registry.current("prices", now=50.0).name, "secondary")
+        # Nothing has to notice it came back: current() always re-evaluates
+        # from the top of the ladder.
+        self.assertEqual(registry.current("prices", now=200.0).name, "primary")
+
+    def test_a_success_clears_the_penalty_rather_than_decaying_it(self):
+        registry = self._registry()
+        registry.note_failure("prices", "primary", "blip", now=0.0)
+        registry.note_success("prices", "primary", now=1.0)
+        registry.note_failure("prices", "primary", "blip", now=2.0)
+        self.assertEqual(registry.current("prices", now=2.0).name, "primary")
+
+    def test_quarantine_doubles_so_a_dead_rung_is_not_retried_for_ever(self):
+        registry = self._registry()
+        for _ in range(2):
+            registry.note_failure("prices", "primary", "dead", now=0.0)
+        for _ in range(2):
+            registry.note_failure("prices", "primary", "dead", now=200.0)
+        # Second quarantine is 200s from t=200, so still dark at t=300.
+        self.assertEqual(registry.current("prices", now=300.0).name, "secondary")
+
+    def test_an_exhausted_ladder_is_reported_as_dark_not_as_healthy(self):
+        registry = self._registry()
+        for name in ("primary", "secondary", "tertiary"):
+            for _ in range(2):
+                registry.note_failure("prices", name, "down", now=0.0)
+        self.assertIsNone(registry.current("prices", now=0.0))
+        report = registry.report(now=0.0)
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertIn("prices", report["dark"])
+
+    def test_release_lifts_a_shared_cause_without_deleting_history(self):
+        registry = self._registry()
+        for name in ("primary", "secondary", "tertiary"):
+            for _ in range(2):
+                registry.note_failure("prices", name, "proxy blip", now=0.0)
+        released = registry.release(now=0.0)
+        self.assertEqual(len(released), 3)
+        self.assertEqual(registry.current("prices", now=0.0).name, "primary")
+        # Failure counts survive: the release is about timers, not amnesia.
+        row = registry.report(now=0.0)["ladders"][0]["rungs"][0]
+        self.assertEqual(row["failures"], 2)
+
+    def test_a_missing_credential_is_skipped_rather_than_tried_and_failed(self):
+        from src.research.source_substitution import Endpoint, SubstitutionRegistry
+        registry = SubstitutionRegistry()
+        registry.declare("rpc", [
+            Endpoint("paid", "https://x", requires_env=("DEFINITELY_UNSET_KEY_XYZ",)),
+            Endpoint("free", "https://y"),
+        ])
+        self.assertEqual(registry.current("rpc").name, "free")
+
+    def test_coverage_separates_declared_regions_from_proven_ones(self):
+        registry = self._registry()
+        registry.note_success("prices", "secondary", now=1.0)
+        coverage = registry.coverage(now=1.0)
+        self.assertEqual(coverage["regions_declared"], 3)
+        self.assertEqual(coverage["regions_proven"], 1)
+        self.assertIn("kr", coverage["unproven_regions"])
+
+    def test_the_shipped_catalogue_carries_real_regional_breadth(self):
+        from src.research.source_catalogue import DOMAINS, regions
+        counts = regions()
+        # Not a vanity number: these are the regions whose flow leads the US
+        # session, and a catalogue without them is blind for those hours.
+        for region in ("kr", "jp", "asia", "in", "tr"):
+            self.assertGreater(counts.get(region, 0), 0, region)
+        for domain, endpoints in DOMAINS.items():
+            self.assertGreaterEqual(len(endpoints), 1, domain)
+            names = [endpoint.name for endpoint in endpoints]
+            self.assertEqual(len(names), len(set(names)), domain)
+
+
+class TestLadderFetcherRotatesInPractice(unittest.IsolatedAsyncioTestCase):
+
+    def _fetcher(self, responses):
+        from src.research.regional_miners import LadderFetcher
+        from src.research.source_substitution import Endpoint, SubstitutionRegistry
+
+        registry = SubstitutionRegistry(failures_before_rotate=1)
+        registry.declare("thing", [
+            Endpoint("first", "https://first", shape="s1"),
+            Endpoint("second", "https://second", shape="s2"),
+        ])
+
+        class Client:
+            def __init__(self):
+                self.urls = []
+
+            async def get(self, url, headers=None):
+                self.urls.append(url)
+                return responses.pop(0)
+
+        client = Client()
+        return LadderFetcher(client, registry), registry, client
+
+    async def test_a_failing_rung_is_replaced_within_the_same_pass(self):
+        fetcher, registry, client = self._fetcher(
+            [(500, "boom", {}), (200, '{"ok": true}', {})])
+        payload, endpoint = await fetcher.get("thing")
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(endpoint.name, "second")
+        self.assertEqual(len(client.urls), 2)
+
+    async def test_a_rate_limit_does_not_quarantine_a_healthy_endpoint(self):
+        from src.research.data_miners import RateLimited
+        fetcher, registry, _client = self._fetcher([(429, "slow down", {})])
+        with self.assertRaises(RateLimited):
+            await fetcher.get("thing")
+        # Still the preferred rung: being asked to wait is the endpoint
+        # working, and rotating away from it spends the ladder on nothing.
+        self.assertEqual(registry.current("thing").name, "first")
+
+    async def test_an_exhausted_ladder_raises_rather_than_returning_empty(self):
+        fetcher, _registry, _client = self._fetcher(
+            [(500, "a", {}), (500, "b", {})])
+        with self.assertRaises(RuntimeError):
+            await fetcher.get("thing")
+
+
+class TestRegionalParsers(unittest.TestCase):
+    """Every venue dialect must land in one row shape, or none of it composes."""
+
+    def _endpoint(self, shape):
+        from src.research.source_substitution import Endpoint
+        return Endpoint("venue", "https://x", region="kr", shape=shape)
+
+    def test_korean_and_japanese_venues_parse_into_the_same_shape(self):
+        from src.research.regional_miners import _parse_tickers
+        rows = _parse_tickers(
+            {"data": {"BTC": {"closing_price": "100", "acc_trade_value_24H": "5"}}},
+            self._endpoint("bithumb_ticker"))
+        self.assertEqual(rows[0]["symbol"], "BTC")
+        self.assertEqual(rows[0]["last"], 100.0)
+        self.assertEqual(rows[0]["quote"], "KRW")
+        rows = _parse_tickers(
+            {"data": [{"symbol": "BTC_JPY", "last": "42", "volume": "1"}]},
+            self._endpoint("gmo_ticker"))
+        self.assertEqual(rows[0]["last"], 42.0)
+
+    def test_an_unparseable_price_is_dropped_rather_than_recorded_as_zero(self):
+        from src.research.regional_miners import _parse_tickers
+        rows = _parse_tickers(
+            [{"symbol": "SOLUSDT", "lastPrice": "not a number"}],
+            self._endpoint("binance_ticker"))
+        self.assertEqual(rows, [])
+
+    def test_a_new_regional_market_is_a_listing_not_a_price(self):
+        from src.research.regional_miners import _parse_tickers
+        rows = _parse_tickers([{"market": "KRW-SOL", "korean_name": "솔라나"}],
+                              self._endpoint("upbit_markets"))
+        self.assertEqual(rows[0]["kind"], "market_listed")
+        self.assertIsNone(rows[0]["last"])
+
+    def test_pool_discovery_keeps_the_operator_that_answered(self):
+        from src.research.regional_miners import _parse_pools
+        from src.research.source_substitution import Endpoint
+        endpoint = Endpoint("geckoterminal_new", "https://x",
+                            shape="geckoterminal_pools")
+        rows = _parse_pools({"data": [{
+            "attributes": {"address": "POOL1", "name": "AAA/SOL",
+                           "reserve_in_usd": "1234.5"},
+            "relationships": {"base_token": {"data": {"id": "solana_MINT1"}}},
+        }]}, endpoint)
+        self.assertEqual(rows[0]["mint"], "MINT1")
+        self.assertEqual(rows[0]["liquidity_usd"], 1234.5)
+        self.assertEqual(rows[0]["_source"], "geckoterminal_new")
+
+    def test_missing_liquidity_is_none_not_zero(self):
+        from src.research.regional_miners import _parse_pools
+        from src.research.source_substitution import Endpoint
+        rows = _parse_pools({"data": [{
+            "attributes": {"address": "POOL1"},
+            "relationships": {"base_token": {"data": {"id": "solana_MINT1"}}},
+        }]}, Endpoint("g", "https://x", shape="geckoterminal_pools"))
+        self.assertIsNone(rows[0]["liquidity_usd"])
+
+
+class TestPublicTelegram(unittest.TestCase):
+    """Public previews only, and a broken parser must never read as calm."""
+
+    PAGE = ('<div data-post="alpha/10">'
+            '<div class="tgme_widget_message_text js-message_text">'
+            'CA So11111111111111111111111111111111111111112 also t.me/secondchan'
+            '</div><time datetime="2026-08-27T10:00:00+00:00"></time>'
+            '<span class="tgme_widget_message_views">4.2K</span></div>')
+
+    def test_a_preview_yields_text_address_views_and_linked_handles(self):
+        from src.research.telegram_miners import parse_preview
+        rows = parse_preview(self.PAGE, "alpha")
+        self.assertEqual(rows[0]["message_id"], 10)
+        self.assertEqual(rows[0]["views"], 4200.0)
+        self.assertIn("So11111111111111111111111111111111111111112", rows[0]["mints"])
+        self.assertEqual(rows[0]["handles"], ["secondchan"])
+
+    def test_telegrams_own_surfaces_are_not_treated_as_channels(self):
+        from src.research.telegram_miners import extract_handles
+        self.assertEqual(extract_handles("see t.me/telegram and t.me/share/url"), [])
+
+    def test_a_discovered_handle_is_a_candidate_and_never_read_unverified(self):
+        from src.research.telegram_miners import ChannelBook
+        with tempfile.TemporaryDirectory() as tmp:
+            book = ChannelBook(path=str(Path(tmp) / "book.json"))
+            book.harvest("join us at https://t.me/somecaller", source="test")
+            self.assertIn("somecaller", book.pending())
+            self.assertEqual(book.verified(), [])
+            self.assertEqual(book.next_batch(5), [])
+
+    def test_verification_promotes_a_real_channel_and_records_a_dead_one(self):
+        from src.research.telegram_miners import ChannelBook
+        with tempfile.TemporaryDirectory() as tmp:
+            book = ChannelBook(path=str(Path(tmp) / "book.json"))
+            book.observe("realone", "test")
+            book.observe("deadone", "test")
+            book.mark_verified("realone", 12)
+            book.mark_rejected("deadone", "404")
+            self.assertEqual(book.verified(), ["realone"])
+            self.assertNotIn("deadone", book.pending())
+
+    def test_a_rejected_handle_is_remembered_so_discovery_converges(self):
+        from src.research.telegram_miners import ChannelBook
+        with tempfile.TemporaryDirectory() as tmp:
+            book = ChannelBook(path=str(Path(tmp) / "book.json"))
+            book.observe("deadone", "test")
+            book.mark_rejected("deadone", "404")
+            book.harvest("t.me/deadone again", source="test")
+            self.assertNotIn("deadone", book.pending())
+
+    def test_the_book_survives_a_restart(self):
+        from src.research.telegram_miners import ChannelBook
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "book.json")
+            book = ChannelBook(path=path)
+            book.observe("keepme", "test")
+            book.mark_verified("keepme", 3)
+            self.assertTrue(book.save())
+            self.assertEqual(ChannelBook(path=path).verified(), ["keepme"])
+
+    def test_no_verified_channel_reads_as_blocked_not_as_healthy(self):
+        from src.research.telegram_miners import ChannelBook
+        with tempfile.TemporaryDirectory() as tmp:
+            book = ChannelBook(path=str(Path(tmp) / "book.json"))
+            self.assertEqual(book.report()["status"], "DATA_BLOCKED")
+
+
+class TestPublicTelegramMiner(unittest.IsolatedAsyncioTestCase):
+
+    async def test_a_layout_change_is_reported_as_a_parser_fault(self):
+        from src.research.telegram_miners import ChannelBook, preview_miner
+
+        class Client:
+            async def get(self, url, headers=None):
+                return 200, "<html>nothing we recognise</html>", {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            book = ChannelBook(path=str(Path(tmp) / "book.json"))
+            book.observe("alpha", "test")
+            book.mark_verified("alpha", 1)
+            records = await preview_miner(Client(), book)()
+        self.assertEqual(records, [])
+        # The distinction that matters: our parser, not an empty channel.
+        self.assertIn("parser", book.channels["alpha"].last_error)
+
+    async def test_reading_a_channel_discovers_the_channels_it_links(self):
+        from src.research.telegram_miners import ChannelBook, preview_miner
+        page = TestPublicTelegram.PAGE
+
+        class Client:
+            async def get(self, url, headers=None):
+                return 200, page, {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            book = ChannelBook(path=str(Path(tmp) / "book.json"))
+            book.observe("alpha", "test")
+            book.mark_verified("alpha", 1)
+            records = await preview_miner(Client(), book)()
+        self.assertEqual(len(records), 1)
+        self.assertIn("secondchan", book.pending())
+
+
+class TestIdentityWatch(unittest.TestCase):
+    """A claim and a confirmation are opposite trades and must never merge."""
+
+    def _watch(self):
+        from src.research.identity_watch import Category, Figure, IdentityWatch
+        watch = IdentityWatch()
+        watch.register(Figure(key="nova", display="Nova Star",
+                              category=Category.CELEBRITY, aliases=("nova",),
+                              channels=("novaofficial",)))
+        return watch
+
+    def test_an_unclaimed_launch_is_not_dressed_up_as_one(self):
+        from src.research.identity_watch import Verdict
+        watch = self._watch()
+        assessment = watch.assess("M1", symbol="WIF", name="dogwifhat")
+        self.assertIs(assessment.verdict, Verdict.NO_CLAIM)
+        self.assertFalse(assessment.claimed)
+
+    def test_a_claim_with_nothing_confirming_it_is_uncorroborated(self):
+        from src.research.identity_watch import Verdict
+        assessment = self._watch().assess("M2", symbol="NOVA")
+        self.assertIs(assessment.verdict, Verdict.UNCORROBORATED)
+
+    def test_the_figures_own_channel_inside_the_window_is_an_announcement(self):
+        from src.research.identity_watch import Verdict
+        watch = self._watch()
+        watch.note_channel_message("novaofficial", ["M3"], at=100.0)
+        assessment = watch.assess("M3", symbol="NOVA", created_at=90.0, now=110.0)
+        self.assertIs(assessment.verdict, Verdict.ANNOUNCED)
+        self.assertEqual(assessment.corroboration_lag_s, 10.0)
+
+    def test_the_same_mention_hours_later_is_a_reaction_not_an_announcement(self):
+        from src.research.identity_watch import Verdict
+        watch = self._watch()
+        watch.note_channel_message("novaofficial", ["M4"], at=100_000.0)
+        assessment = watch.assess("M4", symbol="NOVA", created_at=1.0, now=100_001.0)
+        self.assertIs(assessment.verdict, Verdict.UNCORROBORATED)
+
+    def test_a_channel_we_never_registered_cannot_confirm_anything(self):
+        from src.research.identity_watch import Verdict
+        watch = self._watch()
+        # This is the whole defence against a launch supplying its own
+        # corroboration through a channel it controls.
+        self.assertEqual(watch.note_channel_message("randomcaller", ["M5"]), 0)
+        assessment = watch.assess("M5", symbol="NOVA", created_at=1.0, now=2.0)
+        self.assertIs(assessment.verdict, Verdict.UNCORROBORATED)
+
+    def test_a_repeat_deployer_is_named_as_a_serial_impersonator(self):
+        from src.research.identity_watch import Verdict
+        watch = self._watch()
+        for index in range(3):
+            assessment = watch.assess(f"S{index}", symbol="NOVA", deployer="D1")
+        self.assertIs(assessment.verdict, Verdict.SERIAL_IMPERSONATOR)
+        self.assertEqual(assessment.prior_impersonations, 2)
+
+    def test_a_declared_canonical_token_contradicts_every_later_claim(self):
+        from src.research.identity_watch import Verdict
+        watch = self._watch()
+        watch.declare_canonical("nova", "REALMINT")
+        assessment = watch.assess("FAKEMINT", symbol="NOVA")
+        self.assertIs(assessment.verdict, Verdict.CONTRADICTED)
+
+    def test_a_linked_owned_channel_is_a_claim_on_that_figure(self):
+        watch = self._watch()
+        claims = watch.match(links=["https://t.me/novaofficial"])
+        self.assertEqual(claims[0].figure_key, "nova")
+        self.assertEqual(claims[0].evidence, "channel_link")
+
+    def test_a_two_character_alias_is_refused_as_unidentifiable(self):
+        from src.research.identity_watch import Category, Figure, IdentityWatch
+        watch = IdentityWatch()
+        watch.register(Figure(key="x", display="X", category=Category.BRAND,
+                              aliases=("ab",)))
+        self.assertEqual(watch.match(symbol="AB"), [])
+
+    def test_an_unmeasured_verdict_class_reports_blocked_not_zero(self):
+        watch = self._watch()
+        watch.assess("M6", symbol="NOVA")
+        report = watch.report()
+        row = report["outcomes"]["uncorroborated"]
+        self.assertEqual(row["data_status"], "DATA_BLOCKED")
+        self.assertIsNone(row["hit_rate"])
+        self.assertIn("uncorroborated", report["unmeasured_classes"])
+
+    def test_a_registry_with_no_channels_says_it_cannot_corroborate(self):
+        from src.research.identity_watch import Category, Figure, IdentityWatch
+        watch = IdentityWatch()
+        watch.register(Figure(key="a", display="Someone",
+                              category=Category.POLITICIAN, aliases=("someone",)))
+        report = watch.report()
+        self.assertEqual(report["status"], "DEGRADED")
+        self.assertIn("corroborated", report["detail"])
+
+    def test_the_shipped_registry_loads_and_indexes(self):
+        from src.research.identity_watch import IdentityWatch
+        watch = IdentityWatch()
+        root = Path(__file__).resolve().parents[1]
+        loaded = watch.load_yaml(str(root / "config" / "figures.yaml"))
+        self.assertGreater(loaded, 40)
+        self.assertGreater(len(watch._terms), loaded)
+
+
+class TestBreadthHealthAndRemedies(unittest.TestCase):
+
+    def test_a_substituted_domain_is_healthy_and_a_dark_one_is_not(self):
+        from ops.health import State, check_breadth
+        healthy = check_breadth({"substitution": {
+            "dark": [], "substituted": ["prices -> secondary"], "domains": 10,
+            "coverage": {"regions_declared": 5, "regions_proven": 3}}})
+        by_name = {check.name: check for check in healthy}
+        self.assertIs(by_name["breadth_substitution"].state, State.OK)
+
+        dark = check_breadth({"substitution": {
+            "dark": ["prices"], "substituted": [], "domains": 10,
+            "coverage": {"regions_declared": 5, "regions_proven": 3}}})
+        by_name = {check.name: check for check in dark}
+        self.assertIs(by_name["breadth_substitution"].state, State.CRITICAL)
+        self.assertTrue(by_name["breadth_substitution"].escalate)
+
+    def test_declared_regions_that_never_answered_are_a_warning(self):
+        from ops.health import State, check_breadth
+        checks = {check.name: check for check in check_breadth({"substitution": {
+            "dark": [], "substituted": [], "domains": 10,
+            "coverage": {"regions_declared": 11, "regions_proven": 0,
+                         "unproven_regions": ["kr", "jp"]}}})}
+        self.assertIs(checks["breadth_regions"].state, State.WARN)
+
+    def test_a_decoder_gap_is_reported_as_a_gap_not_as_a_quiet_market(self):
+        from ops.health import State, check_breadth
+        checks = {check.name: check for check in check_breadth({
+            "discovery": {"status": "DEGRADED", "detail": "gap",
+                          "missed_by_our_stream": 40,
+                          "external_pools_seen": 100}})}
+        self.assertIs(checks["breadth_discovery"].state, State.WARN)
+
+    def test_a_dark_domain_has_a_fixer_that_is_not_a_restart(self):
+        from ops.autofix import standard_remedies
+        remedies = {remedy.name: remedy for remedy in standard_remedies()}
+        self.assertIn("substitute_blocked_sources", remedies)
+        remedy = remedies["substitute_blocked_sources"]
+        health = {"checks": [{"name": "breadth_substitution", "state": "CRITICAL"}]}
+        self.assertTrue(remedy.applies(health))
+        with mock.patch("ops.autofix.post", return_value=True) as posted, \
+             mock.patch("ops.autofix.systemctl") as restarted:
+            remedy.act()
+        posted.assert_called_once()
+        self.assertIn("release-sources", posted.call_args[0][0])
+        restarted.assert_not_called()
+
+    def test_a_silent_telegram_side_has_its_own_fixer(self):
+        from ops.autofix import standard_remedies
+        remedies = {remedy.name: remedy for remedy in standard_remedies()}
+        remedy = remedies["reseed_channel_discovery"]
+        health = {"checks": [{"name": "breadth_telegram", "state": "WARN"}]}
+        self.assertTrue(remedy.applies(health))
+
+    def test_a_healthy_substitution_fires_nothing(self):
+        from ops.autofix import standard_remedies
+        health = {"checks": [{"name": "breadth_substitution", "state": "OK"},
+                             {"name": "breadth_telegram", "state": "OK"}]}
+        fired = [remedy.name for remedy in standard_remedies()
+                 if remedy.applies(health)]
+        self.assertEqual(fired, [])
+
+
+class TestRustTransactionParity(unittest.TestCase):
+    """Byte-identical to solders, or it does not go near real capital.
+
+    A message that groups accounts correctly but orders them differently
+    inside a group is VALID -- the runtime does not care -- and is not the
+    same bytes anyone else produces. Only a diff catches that, and the first
+    time this ran it caught exactly that bug.
+    """
+
+    def setUp(self):
+        try:
+            import solana_fastpath  # noqa: F401
+        except ImportError:
+            self.skipTest("solana_fastpath is not built on this host")
+
+    @staticmethod
+    def _case(seed, accounts=27, data_len=24):
+        import random
+        from solders.keypair import Keypair
+        from solders.pubkey import Pubkey
+        from solders.instruction import AccountMeta, Instruction
+        from solders.hash import Hash
+        random.seed(seed)
+        kp = Keypair.from_seed(bytes(random.randrange(256) for _ in range(32)))
+        payer = kp.pubkey()
+        bh = Hash(bytes(random.randrange(256) for _ in range(32)))
+        prog = Pubkey(bytes(random.randrange(256) for _ in range(32)))
+        metas = [AccountMeta(Pubkey(bytes(random.randrange(256) for _ in range(32))),
+                             False, index % 3 == 0) for index in range(accounts - 1)]
+        metas.append(AccountMeta(payer, True, True))
+        data = bytes(random.randrange(256) for _ in range(data_len))
+        return kp, payer, bh, Instruction(prog, data, metas), prog, metas, data
+
+    def test_the_compiled_message_is_byte_identical_to_solders(self):
+        import solana_fastpath as fp
+        from solders.message import MessageV0, to_bytes_versioned
+        for seed in range(25):
+            kp, payer, bh, ix, prog, metas, data = self._case(seed)
+            expected = bytes(to_bytes_versioned(
+                MessageV0.try_compile(payer, [ix], [], bh)))
+            raw = [(bytes(prog),
+                    [(bytes(m.pubkey), m.is_signer, m.is_writable) for m in metas],
+                    data)]
+            actual = bytes(fp.compile_v0_message(bytes(payer), raw, bytes(bh)))
+            self.assertEqual(expected, actual, f"seed {seed}")
+
+    def test_the_signed_transaction_is_byte_identical_to_solders(self):
+        import base64
+        import solana_fastpath as fp
+        from solders.message import MessageV0
+        from solders.transaction import VersionedTransaction
+        for seed in range(25):
+            kp, payer, bh, ix, prog, metas, data = self._case(seed)
+            message = MessageV0.try_compile(payer, [ix], [], bh)
+            expected = base64.b64encode(bytes(VersionedTransaction(message, [kp]))).decode()
+            raw = [(bytes(prog),
+                    [(bytes(m.pubkey), m.is_signer, m.is_writable) for m in metas],
+                    data)]
+            actual, signature = fp.build_signed_transaction(
+                bytes(payer), raw, bytes(bh), [bytes(kp)])
+            self.assertEqual(expected, actual, f"seed {seed}")
+            self.assertEqual(
+                str(VersionedTransaction(message, [kp]).signatures[0]), signature)
+
+    def test_program_derived_addresses_match_solders(self):
+        import solana_fastpath as fp
+        from solders.pubkey import Pubkey
+        program = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+        for seed in (b"global", b"bonding-curve", b"creator-vault", b"fee_config"):
+            expected, expected_bump = Pubkey.find_program_address([seed], program)
+            address, bump = fp.find_program_address([seed], bytes(program))
+            self.assertEqual(bytes(expected), bytes(address))
+            self.assertEqual(expected_bump, bump)
+
+    def test_associated_token_addresses_match_solders(self):
+        import solana_fastpath as fp
+        from solders.pubkey import Pubkey
+        ata_program = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+        token_program = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+        mint = Pubkey.from_string("So11111111111111111111111111111111111111112")
+        owner = Pubkey.from_string("11111111111111111111111111111111")
+        expected, _ = Pubkey.find_program_address(
+            [bytes(owner), bytes(token_program), bytes(mint)], ata_program)
+        actual = fp.associated_token_address(
+            bytes(owner), bytes(token_program), bytes(mint), bytes(ata_program))
+        self.assertEqual(bytes(expected), bytes(actual))
+
+    def test_a_mismatched_keypair_is_refused_rather_than_signing_as_someone_else(self):
+        import solana_fastpath as fp
+        bad = bytes([7] * 32) + bytes([9] * 32)
+        with self.assertRaises(ValueError):
+            fp.public_key_of(bad)
+
+    def test_a_wrong_length_key_is_refused(self):
+        import solana_fastpath as fp
+        with self.assertRaises(ValueError):
+            fp.public_key_of(bytes([1, 2, 3]))
+
+    def test_the_public_key_derived_here_matches_solders(self):
+        import solana_fastpath as fp
+        from solders.keypair import Keypair
+        kp = Keypair.from_seed(bytes([5] * 32))
+        self.assertEqual(bytes(kp.pubkey()), bytes(fp.public_key_of(bytes(kp))))
+
+
+class TestLatencyLedger(unittest.TestCase):
+    """The first end-to-end timing this desk has ever had."""
+
+    def test_an_empty_ledger_says_nothing_is_verified(self):
+        from src.runtime.latency import LatencyLedger
+        report = LatencyLedger().report()
+        self.assertEqual(report["status"], "DATA_BLOCKED")
+        self.assertIn("unverified", report["detail"])
+
+    def test_an_unmarked_stage_is_blocked_not_zero(self):
+        from src.runtime.latency import LatencyLedger
+        ledger = LatencyLedger()
+        ledger.open("m1")
+        ledger.mark("m1", "receive_to_decode")
+        ledger.close("m1", "screened")
+        stages = ledger.report()["stages"]
+        self.assertEqual(stages["receive_to_decode"]["data_status"], "OK")
+        # A stage that never ran must not read as the fastest one.
+        self.assertEqual(stages["build_to_sign"]["data_status"], "DATA_BLOCKED")
+        self.assertIsNone(stages["build_to_sign"]["p50_us"])
+
+    def test_the_first_mark_wins_so_a_retry_cannot_flatter_the_path(self):
+        from src.runtime.latency import LatencyLedger, now_ns
+        ledger = LatencyLedger()
+        trace = ledger.open("m1")
+        ledger.mark("m1", "receive_to_decode", at_ns=trace.started_ns + 5_000_000)
+        ledger.mark("m1", "receive_to_decode", at_ns=trace.started_ns + 1_000)
+        closed = ledger.close("m1")
+        self.assertAlmostEqual(closed.elapsed_us("receive_to_decode",
+                                                 "receive_to_decode") or 0.0, 0.0)
+        self.assertGreater(ledger.report()["stages"]["receive_to_decode"]["p50_us"], 4_000)
+
+    def test_it_names_the_slowest_stage_we_control(self):
+        from src.runtime.latency import LatencyLedger
+        ledger = LatencyLedger()
+        for index in range(20):
+            trace = ledger.open(f"m{index}")
+            base = trace.started_ns
+            ledger.mark(f"m{index}", "receive_to_decode", at_ns=base + 100_000)
+            ledger.mark(f"m{index}", "dispatch_to_decide", at_ns=base + 9_000_000)
+            ledger.mark(f"m{index}", "sign_to_submit", at_ns=base + 9_500_000)
+            ledger.close(f"m{index}", "entered")
+        report = ledger.report()
+        self.assertEqual(report["dominant_controllable_stage"], "dispatch_to_decide")
+
+    def test_a_dominant_wire_is_called_a_money_problem_not_a_code_one(self):
+        from src.runtime.latency import LatencyLedger
+        ledger = LatencyLedger()
+        for index in range(10):
+            # 250ms behind the block: a provider and geography term.
+            trace = ledger.open(f"m{index}", block_time=time.time() - 0.25)
+            ledger.mark(f"m{index}", "receive_to_decode",
+                        at_ns=trace.started_ns + 200_000)
+            ledger.close(f"m{index}", "entered")
+        detail = ledger.report()["detail"]
+        self.assertIn("wire dominates", detail)
+        self.assertIn("not a code one", detail)
+
+    def test_the_chain_term_carries_its_clock_caveat(self):
+        from src.runtime.latency import LatencyLedger
+        caveat = LatencyLedger().report()["chain_to_receive_caveat"]
+        self.assertIn("NTP skew", caveat)
+
+    def test_open_traces_are_bounded_so_screened_launches_cannot_leak(self):
+        from src.runtime.latency import LatencyLedger
+        ledger = LatencyLedger(max_open=10)
+        for index in range(100):
+            ledger.open(f"m{index}")
+        self.assertLessEqual(len(ledger._open), 10)
+        self.assertEqual(ledger.abandoned, 90)
+
+    def test_a_mark_on_an_unknown_trace_cannot_raise_on_the_hot_path(self):
+        from src.runtime.latency import LatencyLedger
+        ledger = LatencyLedger()
+        ledger.mark("never-opened", "decide_to_build")
+        self.assertIsNone(ledger.close("never-opened"))
+
+    def test_a_budget_breach_is_named(self):
+        from src.runtime.latency import LatencyLedger
+        ledger = LatencyLedger()
+        for index in range(10):
+            trace = ledger.open(f"m{index}")
+            ledger.mark(f"m{index}", "dispatch_to_decide",
+                        at_ns=trace.started_ns + 20_000_000)
+            ledger.close(f"m{index}")
+        report = ledger.budget_report({"dispatch_to_decide": 5_000.0})
+        self.assertEqual(report["status"], "DEGRADED")
+        self.assertIn("dispatch_to_decide", report["breaching"])
+
+
+class TestMinerOffload(unittest.IsolatedAsyncioTestCase):
+    """Miners must not be able to stop the decision path."""
+
+    class _Pool:
+        def __init__(self):
+            self.on_records = None
+            self.started = False
+            self.stopped = False
+
+        async def start(self):
+            self.started = True
+            return 1
+
+        async def stop(self):
+            self.stopped = True
+
+    def test_records_reach_the_sink_only_through_the_drain(self):
+        from src.runtime.offload import OffloadedPool
+        seen = []
+        pool = self._Pool()
+        offload = OffloadedPool(pool, sink=lambda mid, rows: seen.append((mid, rows)))
+        offload._publish("web:x", [{"a": 1}])
+        # Published from the miner side; nothing has touched desk state yet.
+        self.assertEqual(seen, [])
+        self.assertEqual(offload.drain(), 1)
+        self.assertEqual(seen, [("web:x", [{"a": 1}])])
+
+    def test_a_full_queue_drops_the_oldest_and_counts_it(self):
+        from src.runtime.offload import OffloadedPool
+        offload = OffloadedPool(self._Pool(), sink=lambda mid, rows: None,
+                                queue_depth=3)
+        for index in range(6):
+            offload._publish("m", [{"i": index}])
+        self.assertGreater(offload.dropped, 0)
+        self.assertEqual(offload._queue.qsize(), 3)
+        report = offload.report()
+        # Loss is reported, never absorbed.
+        self.assertEqual(report["dropped"], offload.dropped)
+
+    def test_draining_is_bounded_so_a_burst_does_not_become_the_stall(self):
+        from src.runtime.offload import OffloadedPool
+        offload = OffloadedPool(self._Pool(), sink=lambda mid, rows: None,
+                                queue_depth=500)
+        for index in range(200):
+            offload._publish("m", [{"i": index}])
+        self.assertEqual(offload.drain(budget=10), 10)
+        self.assertEqual(offload._queue.qsize(), 190)
+
+    def test_a_raising_sink_does_not_stop_the_drain(self):
+        from src.runtime.offload import OffloadedPool
+        def bad(mid, rows):
+            raise RuntimeError("consumer exploded")
+        offload = OffloadedPool(self._Pool(), sink=bad)
+        offload._publish("m", [{"a": 1}])
+        offload._publish("m", [{"a": 2}])
+        self.assertEqual(offload.drain(), 2)
+        self.assertEqual(offload.sink_errors, 2)
+
+    def test_not_started_reports_off_rather_than_healthy(self):
+        from src.runtime.offload import OffloadedPool
+        report = OffloadedPool(self._Pool(), sink=lambda mid, rows: None).report()
+        self.assertEqual(report["status"], "OFF")
+
+    async def test_the_pool_actually_starts_on_another_thread(self):
+        from src.runtime.offload import OffloadedPool
+        import threading
+        pool = self._Pool()
+        where = {}
+        original = pool.start
+        async def start():
+            where["thread"] = threading.current_thread().name
+            return await original()
+        pool.start = start
+        offload = OffloadedPool(pool, sink=lambda mid, rows: None)
+        await offload.start()
+        for _ in range(50):
+            if "thread" in where:
+                break
+            await asyncio.sleep(0.02)
+        await offload.stop()
+        self.assertIn("offload-miners", where.get("thread", ""))
+
+    def test_the_fast_event_loop_reports_what_actually_happened(self):
+        from src.runtime.offload import install_fast_event_loop
+        status = install_fast_event_loop()
+        self.assertTrue(status.startswith("OK:") or status.startswith("DEGRADED:"))
+
+
+class TestPromotedRustKeepsPythonOffTheHotPath(unittest.TestCase):
+    """After promotion Rust decides alone. Python verifies afterwards.
+
+    A kernel that is "authoritative" while Python is still computed
+    synchronously in front of it has not removed one microsecond of Python
+    from the trade. That was the shape until now.
+    """
+
+    RESERVES = {"virtual_sol": 30_000_000_000, "virtual_token": 1_073_000_000_000_000}
+
+    def setUp(self):
+        try:
+            import solana_fastpath  # noqa: F401
+        except ImportError:
+            self.skipTest("solana_fastpath is not built on this host")
+
+    def _kernel(self, **kwargs):
+        from src.strategies.action_value import ActionValuePolicy
+        from src.strategies.t0_kernel import T0Kernel
+        return T0Kernel(ActionValuePolicy(min_edge=1e-4, max_add_fraction=0.5), **kwargs)
+
+    @staticmethod
+    def _survival():
+        from src.strategies.t0_kernel import SurvivalInputs
+        return SurvivalInputs(levels=[0.62, 0.41, 0.24, 0.13, 0.06, 0.03, 0.012, 0.004],
+                              p_rug_30s=0.09, p_rug_5m=0.31,
+                              expected_feasible_multiple=2.4)
+
+    @staticmethod
+    def _state():
+        from src.strategies.action_value import PositionState
+        return PositionState(held_fraction=0.5, current_multiple=1.8,
+                             exit_cost=0.01, entry_cost=0.01,
+                             exit_capacity_ratio=0.9, escape_probability=0.8,
+                             expected_remaining_seconds=90.0,
+                             alternative_growth_per_second=0.0,
+                             add_fraction=0.1, probe_fraction=0.05)
+
+    class _CountingPolicy:
+        min_edge = 1e-4
+        max_add_fraction = 0.5
+
+        def __init__(self, inner):
+            self.inner = inner
+            self.calls = 0
+
+        def score(self, state):
+            self.calls += 1
+            return self.inner.score(state)
+
+    def test_python_is_not_called_once_rust_is_authoritative(self):
+        from src.strategies.action_value import ActionValuePolicy
+        kernel = self._kernel(mode="auto", promote_after=2)
+        survival = self._survival()
+        for _ in range(2):
+            kernel.score(self._state(), survival=survival, **self.RESERVES)
+        self.assertTrue(kernel.rust_authoritative)
+
+        counting = self._CountingPolicy(ActionValuePolicy(min_edge=1e-4,
+                                                          max_add_fraction=0.5))
+        kernel.policy = counting
+        decision = kernel.score(self._state(), survival=survival, **self.RESERVES)
+        self.assertEqual(decision.kernel["source"], "rust")
+        # The whole point: zero Python policy calls on the decision path.
+        self.assertEqual(counting.calls, 0)
+        # And the check is not skipped, only deferred.
+        self.assertEqual(kernel.report()["parity_pending"], 1)
+        kernel.drain_parity()
+        self.assertEqual(counting.calls, 1)
+
+    def test_before_promotion_python_still_decides_and_is_called(self):
+        from src.strategies.action_value import ActionValuePolicy
+        kernel = self._kernel(mode="auto", promote_after=1000)
+        counting = self._CountingPolicy(ActionValuePolicy(min_edge=1e-4,
+                                                          max_add_fraction=0.5))
+        kernel.policy = counting
+        decision = kernel.score(self._state(), survival=self._survival(),
+                                **self.RESERVES)
+        self.assertEqual(decision.kernel["source"], "python")
+        self.assertEqual(counting.calls, 1)
+        self.assertEqual(kernel.report()["parity_pending"], 0)
+
+    def test_the_snapshot_survives_the_caller_mutating_state_afterwards(self):
+        kernel = self._kernel(mode="rust")
+        survival = self._survival()
+        state = self._state()
+        kernel.score(state, survival=survival, **self.RESERVES)
+        # The caller keeps trading: the position is banked down after the
+        # decision. A parity check against the mutated state would report a
+        # disagreement nobody made.
+        state.held_fraction = 0.01
+        state.current_multiple = 40.0
+        kernel.drain_parity()
+        self.assertFalse(kernel.demoted_reason)
+
+    def test_a_full_parity_queue_is_reported_as_unverified_not_as_agreement(self):
+        kernel = self._kernel(mode="rust", parity_queue=4)
+        survival = self._survival()
+        for _ in range(12):
+            kernel.score(self._state(), survival=survival, **self.RESERVES)
+        report = kernel.report()
+        self.assertGreater(report["parity_dropped"], 0)
+        # Dropped snapshots are decisions nobody will ever check. They must
+        # never be folded into the agreement count.
+        self.assertEqual(report["parity_unverified"], report["parity_dropped"])
+        self.assertLessEqual(report["parity_pending"], 4)
+
+    def test_the_report_says_whether_python_is_on_the_hot_path(self):
+        kernel = self._kernel(mode="auto", promote_after=2)
+        survival = self._survival()
+        self.assertTrue(kernel.report()["python_on_hot_path"])
+        for _ in range(2):
+            kernel.score(self._state(), survival=survival, **self.RESERVES)
+        self.assertFalse(kernel.report()["python_on_hot_path"])
+
+    def test_a_deferred_divergence_still_latches_the_demotion(self):
+        from src.strategies.action_value import Action as ActionValue, Decision
+        kernel = self._kernel(mode="rust")
+        survival = self._survival()
+        kernel.score(self._state(), survival=survival, **self.RESERVES)
+
+        class Contrarian:
+            min_edge = 1e-4
+            max_add_fraction = 0.5
+
+            def score(self, state):
+                return Decision(status="OK", action=ActionValue.EXIT, q=99.0)
+
+        kernel.policy = Contrarian()
+        kernel.drain_parity()
+        self.assertTrue(kernel.demoted_reason)
+        self.assertFalse(kernel.rust_authoritative)
+
+    def test_draining_an_empty_queue_is_free(self):
+        kernel = self._kernel(mode="auto")
+        self.assertEqual(kernel.drain_parity(), 0)
+
+    def test_a_rust_exception_on_the_promoted_path_still_falls_back(self):
+        kernel = self._kernel(mode="rust")
+
+        class Exploding:
+            def t0_decide(self, *args, **kwargs):
+                raise RuntimeError("boom")
+
+        kernel.native = Exploding()
+        decision = kernel.score(self._state(), survival=self._survival(),
+                                **self.RESERVES)
+        # Whatever Python answers -- including DATA_BLOCKED, which is the
+        # honest answer for a state carrying no forward distribution -- the
+        # desk gets an answer rather than an exception.
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.kernel["source"], "python")
+        self.assertEqual(kernel.report()["rust_errors"], 1)
+        self.assertIn("rust raised", decision.kernel["reason"])
+        # A raised kernel must not queue a parity snapshot for a decision it
+        # never made.
+        self.assertEqual(kernel.report()["parity_pending"], 0)
+
+
+class TestLandingRouter(unittest.IsolatedAsyncioTestCase):
+    """One signature, many carriers. Never two transactions."""
+
+    @staticmethod
+    def _route(name, kind, result, delay=0.0, raises=None):
+        from src.execution.landing_router import Route
+
+        async def submit(signed_tx):
+            if delay:
+                await asyncio.sleep(delay)
+            if raises is not None:
+                raise raises
+            return result
+
+        return Route(name=name, kind=kind, submit=submit)
+
+    def _router(self, *routes, **kwargs):
+        from src.execution.landing_router import LandingRouter
+        router = LandingRouter(**kwargs)
+        for route in routes:
+            router.register(route)
+        return router
+
+    async def test_the_first_acknowledgement_wins_and_is_named(self):
+        router = self._router(
+            self._route("slow", "rpc", "SIG", delay=0.05),
+            self._route("fast", "jito_bundle", "BUNDLE"))
+        outcome = await router.race("SIGNEDBYTES")
+        self.assertEqual(outcome.winner, "fast")
+        self.assertEqual(outcome.identifier, "BUNDLE")
+        self.assertIsNotNone(outcome.ack_ms)
+
+    async def test_every_route_receives_the_identical_payload(self):
+        from src.execution.landing_router import Route
+        seen = []
+
+        def make(name):
+            async def submit(signed_tx):
+                seen.append((name, signed_tx))
+                return name
+            return Route(name=name, kind=name, submit=submit)
+
+        router = self._router(make("a"), make("b"), make("c"))
+        await router.race("EXACTBYTES")
+        await asyncio.sleep(0.05)
+        # Same signature everywhere is what makes racing redundancy rather
+        # than a double-size position.
+        self.assertEqual({payload for _name, payload in seen}, {"EXACTBYTES"})
+
+    async def test_a_route_that_raises_is_counted_not_propagated(self):
+        router = self._router(
+            self._route("bad", "rpc", None, raises=RuntimeError("relay down")),
+            self._route("good", "jito_tx", "SIG"))
+        outcome = await router.race("TX")
+        self.assertEqual(outcome.winner, "good")
+        self.assertIn("bad", outcome.errors)
+        self.assertIn("relay down", outcome.errors["bad"])
+
+    async def test_every_route_refusing_is_reported_as_a_failed_submission(self):
+        router = self._router(
+            self._route("a", "rpc", None),
+            self._route("b", "jito_tx", None))
+        outcome = await router.race("TX")
+        self.assertFalse(outcome.submitted)
+        self.assertEqual(outcome.winner, "")
+        self.assertEqual(router.report()["races_with_no_acceptance"], 1)
+
+    async def test_a_bundle_only_route_is_skipped_when_no_bundle_was_built(self):
+        from src.execution.landing_router import Route
+        called = []
+
+        async def bundle(tx):
+            called.append("bundle")
+            return "B"
+
+        router = self._router(self._route("rpc", "rpc", "SIG"))
+        router.register(Route(name="jito_bundle", kind="jito_bundle",
+                              requires_bundle=True, submit=bundle))
+        outcome = await router.race("TX", bundle_capable=False)
+        self.assertNotIn("jito_bundle", outcome.attempted)
+        self.assertEqual(called, [])
+
+    async def test_landing_is_credited_to_every_route_that_carried_it(self):
+        router = self._router(
+            self._route("a", "rpc", "SIG"),
+            self._route("b", "jito_tx", "SIG"))
+        outcome = await router.race("TX")
+        await asyncio.sleep(0.05)
+        router.record_landing(outcome.identifier, landed=True, net_usd=12.0)
+        rows = router.report()["by_route"]
+        # Which relay the leader took it from is not observable from here.
+        # Inventing an attribution would build the routing table on a guess.
+        self.assertEqual(rows["a"]["landed"], 1)
+        self.assertEqual(rows["b"]["landed"], 1)
+
+    async def test_a_rate_is_blocked_until_there_are_enough_attempts(self):
+        router = self._router(self._route("a", "rpc", "SIG"), min_attempts=30)
+        for _ in range(3):
+            outcome = await router.race("TX")
+            router.record_landing(outcome.identifier, landed=True)
+        row = router.report()["by_route"]["a"]
+        # Three landings out of three is three attempts, not a 100% route.
+        self.assertEqual(row["data_status"], "DATA_BLOCKED")
+        self.assertIsNone(row["land_rate"])
+
+    async def test_ranking_does_not_starve_an_unmeasured_route(self):
+        from src.execution.landing_router import MIN_ATTEMPTS_FOR_RATE
+        router = self._router(self._route("measured", "rpc", "SIG"),
+                              self._route("fresh", "sender", "SIG2"))
+        for index in range(MIN_ATTEMPTS_FOR_RATE):
+            router._stats["measured"].resolved += 1
+            if index < 2:
+                router._stats["measured"].landed += 1
+        ranked = router.ranked()
+        # A route ranked worst is never attempted, so it is never measured,
+        # so it stays worst. Unmeasured keeps its declared position.
+        self.assertIn("fresh", ranked)
+        self.assertEqual(len(ranked), 2)
+
+    def test_one_mechanism_is_reported_as_degraded_redundancy(self):
+        router = self._router(self._route("a", "jito_bundle", "S"),
+                              self._route("b", "jito_bundle", "S"))
+        report = router.report()
+        self.assertEqual(report["status"], "DEGRADED")
+        self.assertIn("fail together", report["detail"])
+
+    def test_no_enabled_route_is_blocked_not_healthy(self):
+        from src.execution.landing_router import LandingRouter, Route
+        router = LandingRouter()
+        router.register(Route(name="off", kind="rpc", enabled=False,
+                              submit=lambda tx: None))
+        self.assertEqual(router.report()["status"], "DATA_BLOCKED")
+
+    def test_the_engine_registers_more_than_one_mechanism(self):
+        from src.execution.jupiter_jito import ExecutionEngine
+        engine = ExecutionEngine.__new__(ExecutionEngine)
+        from src.execution.landing_router import LandingRouter
+        engine.landing_router = LandingRouter()
+        engine.jito = SimpleNamespace(
+            send_bundle=lambda txs: None, send_transaction=lambda tx: None)
+        engine._send_raw_transaction = lambda tx: None
+        engine._forwarder = lambda url: (lambda tx: None)
+        ExecutionEngine._register_landing_routes(engine)
+        report = engine.landing_router.report()
+        self.assertGreaterEqual(len(report["mechanisms"]), 3)
+        # Unset providers register disabled WITH a reason, so an operator can
+        # see the redundancy they do not have.
+        rows = engine.landing_router._routes
+        self.assertIn("staked_rpc", rows)
+        self.assertIn("sender", rows)
+
+    def test_a_dark_router_has_a_health_check_that_escalates(self):
+        from ops.health import State, check_breadth
+        checks = {check.name: check for check in check_breadth({
+            "landing_router": {"status": "DATA_BLOCKED",
+                               "detail": "no landing route is enabled"}})}
+        self.assertIs(checks["breadth_landing_routes"].state, State.CRITICAL)
+        self.assertTrue(checks["breadth_landing_routes"].escalate)
+
+
+class TestTxKernelPromotion(unittest.TestCase):
+    """The build path moves to Rust on byte parity, and never on a test alone."""
+
+    def setUp(self):
+        try:
+            import solana_fastpath  # noqa: F401
+        except ImportError:
+            self.skipTest("solana_fastpath is not built on this host")
+        import random as _random
+        _random.seed(17)
+
+    @staticmethod
+    def _fixture(accounts=26):
+        import random
+        from solders.keypair import Keypair
+        from solders.pubkey import Pubkey
+        from solders.instruction import AccountMeta, Instruction
+        from solders.hash import Hash
+        kp = Keypair.from_seed(bytes(random.randrange(256) for _ in range(32)))
+        payer = kp.pubkey()
+        bh = Hash(bytes(random.randrange(256) for _ in range(32)))
+        prog = Pubkey(bytes(random.randrange(256) for _ in range(32)))
+        metas = [AccountMeta(Pubkey(bytes(random.randrange(256) for _ in range(32))),
+                             False, index % 3 == 0) for index in range(accounts)]
+        metas.append(AccountMeta(payer, True, True))
+        return kp, payer, bh, [Instruction(prog, bytes(range(24)), metas)]
+
+    @staticmethod
+    def _solders_message(payer, instructions, blockhash):
+        from solders.message import MessageV0, to_bytes_versioned
+        return bytes(to_bytes_versioned(
+            MessageV0.try_compile(payer, instructions, [], blockhash)))
+
+    def test_shadow_never_lets_rust_build_the_transaction(self):
+        from src.execution.tx_kernel import TxKernel
+        kernel = TxKernel(mode="shadow")
+        for _ in range(10):
+            _kp, payer, bh, ixs = self._fixture()
+            kernel.compile_message(bytes(payer), ixs, bytes(bh),
+                                   lambda: self._solders_message(payer, ixs, bh))
+        report = kernel.report()
+        self.assertEqual(report["builds_by_rust"], 0)
+        self.assertGreater(report["agreements"], 0)
+        self.assertFalse(report["rust_authoritative"])
+
+    def test_auto_promotes_only_after_a_run_of_identical_bytes(self):
+        from src.execution.tx_kernel import TxKernel
+        kernel = TxKernel(mode="auto", promote_after=5, audit_rate=0.0)
+        for index in range(5):
+            _kp, payer, bh, ixs = self._fixture()
+            self.assertFalse(kernel.rust_authoritative, f"promoted early at {index}")
+            kernel.compile_message(bytes(payer), ixs, bytes(bh),
+                                   lambda: self._solders_message(payer, ixs, bh))
+        self.assertTrue(kernel.rust_authoritative)
+
+    def test_a_promoted_build_does_not_call_solders(self):
+        from src.execution.tx_kernel import TxKernel
+        kernel = TxKernel(mode="rust", audit_rate=0.0)
+        _kp, payer, bh, ixs = self._fixture()
+        calls = []
+
+        def solders():
+            calls.append(1)
+            return self._solders_message(payer, ixs, bh)
+
+        message = kernel.compile_message(bytes(payer), ixs, bytes(bh), solders)
+        self.assertEqual(calls, [])
+        self.assertEqual(message, self._solders_message(payer, ixs, bh))
+
+    def test_a_sample_of_promoted_builds_is_still_audited(self):
+        from src.execution.tx_kernel import TxKernel
+        # Audit everything, so the sampling path is exercised deterministically.
+        kernel = TxKernel(mode="rust", audit_rate=1.0)
+        for _ in range(5):
+            _kp, payer, bh, ixs = self._fixture()
+            kernel.compile_message(bytes(payer), ixs, bytes(bh),
+                                   lambda: self._solders_message(payer, ixs, bh))
+        report = kernel.report()
+        # A build path that stops being checked the moment it is trusted is a
+        # build path that drifts silently through a dependency upgrade.
+        self.assertEqual(report["audits_since_promotion"], 5)
+        self.assertEqual(report["agreements"], 5)
+
+    def test_one_byte_mismatch_demotes_it_permanently(self):
+        from src.execution.tx_kernel import TxKernel
+        kernel = TxKernel(mode="rust")
+
+        class Wrong:
+            def compile_v0_message(self, payer, instructions, blockhash):
+                return b"\x80" + b"\x00" * 40
+
+            def assemble_transaction(self, message, signatures):
+                return ""
+
+        kernel.native = Wrong()
+        _kp, payer, bh, ixs = self._fixture()
+        expected = self._solders_message(payer, ixs, bh)
+        got = kernel.compile_message(bytes(payer), ixs, bytes(bh), lambda: expected)
+        self.assertEqual(got, expected)
+        self.assertTrue(kernel.demoted_reason)
+        self.assertFalse(kernel.rust_authoritative)
+        # Structurally invalid, so the invariant catches it before any byte
+        # comparison does -- which is the point of having the invariant.
+        self.assertIn("invariant", kernel.demoted_reason)
+
+    def test_a_structurally_valid_but_different_message_is_caught_by_bytes(self):
+        """The case the invariant cannot see: right shape, wrong contents."""
+        from src.execution.tx_kernel import TxKernel
+        _kp, payer, bh, ixs = self._fixture()
+        expected = self._solders_message(payer, ixs, bh)
+        # Flip a byte inside the instruction data, past every field the
+        # invariant checks. Same length, same header, same payer, same
+        # blockhash, same instruction count -- and not the same transaction.
+        corrupted = bytearray(expected)
+        corrupted[-3] ^= 0xFF
+        corrupted = bytes(corrupted)
+
+        class Subtle:
+            def compile_v0_message(self, *args):
+                return corrupted
+
+            def assemble_transaction(self, *args):
+                return ""
+
+        kernel = TxKernel(mode="rust", audit_rate=1.0)
+        kernel.native = Subtle()
+        got = kernel.compile_message(bytes(payer), ixs, bytes(bh), lambda: expected)
+        self.assertEqual(got, expected)
+        self.assertTrue(kernel.demoted_reason)
+        self.assertIn("python_prefix", kernel.report()["divergence_example"])
+
+    def test_a_message_naming_the_wrong_fee_payer_is_refused(self):
+        """Account zero is debited by the runtime. Wrong here spends the wrong wallet."""
+        from src.execution.tx_kernel import TxKernel
+        _kp, payer, bh, ixs = self._fixture()
+        expected = self._solders_message(payer, ixs, bh)
+        swapped = bytearray(expected)
+        swapped[5:37] = b"\x77" * 32
+        swapped = bytes(swapped)
+
+        class WrongPayer:
+            def compile_v0_message(self, *args):
+                return swapped
+
+            def assemble_transaction(self, *args):
+                return ""
+
+        kernel = TxKernel(mode="rust", audit_rate=0.0)
+        kernel.native = WrongPayer()
+        got = kernel.compile_message(bytes(payer), ixs, bytes(bh), lambda: expected)
+        self.assertEqual(got, expected)
+        self.assertIn("fee payer", kernel.demoted_reason)
+
+    def test_a_message_carrying_a_stale_blockhash_is_refused(self):
+        from src.execution.tx_kernel import TxKernel
+        _kp, payer, bh, ixs = self._fixture()
+        expected = self._solders_message(payer, ixs, bh)
+        count = expected[4]
+        keys_end = 5 + count * 32
+        stale = bytearray(expected)
+        stale[keys_end:keys_end + 32] = b"\x55" * 32
+        stale = bytes(stale)
+
+        class StaleHash:
+            def compile_v0_message(self, *args):
+                return stale
+
+            def assemble_transaction(self, *args):
+                return ""
+
+        kernel = TxKernel(mode="rust", audit_rate=0.0)
+        kernel.native = StaleHash()
+        got = kernel.compile_message(bytes(payer), ixs, bytes(bh), lambda: expected)
+        self.assertEqual(got, expected)
+        self.assertIn("blockhash", kernel.demoted_reason)
+
+    def test_the_invariant_runs_on_promoted_builds_not_only_audited_ones(self):
+        """A sampled check means most wrong messages are signed before anyone looks."""
+        from src.execution.tx_kernel import TxKernel
+        _kp, payer, bh, ixs = self._fixture()
+        expected = self._solders_message(payer, ixs, bh)
+
+        class Garbage:
+            def compile_v0_message(self, *args):
+                return b"\x80" + b"\x00" * 40
+
+            def assemble_transaction(self, *args):
+                return ""
+
+        # Audit rate zero: nothing is compared. The invariant is the only
+        # thing standing between this and a submitted transaction.
+        kernel = TxKernel(mode="rust", audit_rate=0.0)
+        kernel.native = Garbage()
+        got = kernel.compile_message(bytes(payer), ixs, bytes(bh), lambda: expected)
+        self.assertEqual(got, expected)
+        self.assertEqual(kernel.report()["invariant_failures"], 1)
+
+    def test_the_assembled_transaction_matches_solders_byte_for_byte(self):
+        import base64
+        from solders.message import MessageV0
+        from solders.signature import Signature
+        from solders.transaction import VersionedTransaction
+        from src.execution.tx_kernel import TxKernel
+        kernel = TxKernel(mode="rust")
+        kp, payer, bh, ixs = self._fixture()
+        message = MessageV0.try_compile(payer, ixs, [], bh)
+        message_bytes = self._solders_message(payer, ixs, bh)
+        signature = bytes(kp.sign_message(message_bytes))
+        expected = base64.b64encode(bytes(VersionedTransaction.populate(
+            message, [Signature.from_bytes(signature)]))).decode()
+        self.assertEqual(
+            kernel.assemble(message_bytes, [signature], lambda: expected), expected)
+
+    def test_an_assembler_that_drops_the_message_is_caught_not_submitted(self):
+        import base64
+        from src.execution.tx_kernel import TxKernel
+        kernel = TxKernel(mode="rust")
+
+        class Corrupt:
+            def compile_v0_message(self, *args):
+                return b""
+
+            def assemble_transaction(self, message, signatures):
+                # Right shape, wrong body. This is the failure that signs
+                # cleanly and fails against accounts that do not exist.
+                return base64.b64encode(b"\x01" + b"\x00" * 64 + b"NOTTHEMESSAGE").decode()
+
+        kernel.native = Corrupt()
+        got = kernel.assemble(b"\x80" + b"\x11" * 40, [b"\x00" * 64],
+                              lambda: "SOLDERS")
+        self.assertEqual(got, "SOLDERS")
+        self.assertEqual(kernel.report()["invariant_failures"], 1)
+        self.assertIn("expected", kernel.report()["demoted_reason"])
+
+    def test_a_wrong_signature_count_is_caught(self):
+        import base64
+        from src.execution.tx_kernel import TxKernel
+        kernel = TxKernel(mode="rust")
+        message = b"\x80" + b"\x22" * 40
+
+        class TwoSigs:
+            def assemble_transaction(self, msg, signatures):
+                return base64.b64encode(b"\x02" + b"\x00" * 128 + message).decode()
+            def compile_v0_message(self, *args):
+                return message
+
+        kernel.native = TwoSigs()
+        got = kernel.assemble(message, [b"\x00" * 64], lambda: "SOLDERS")
+        self.assertEqual(got, "SOLDERS")
+        self.assertIn("signature count", kernel.report()["demoted_reason"])
+
+    def test_a_raising_extension_falls_back_rather_than_failing_the_trade(self):
+        from src.execution.tx_kernel import TxKernel
+        kernel = TxKernel(mode="rust")
+
+        class Exploding:
+            def compile_v0_message(self, *args):
+                raise RuntimeError("boom")
+
+            def assemble_transaction(self, *args):
+                raise RuntimeError("boom")
+
+        kernel.native = Exploding()
+        _kp, payer, bh, ixs = self._fixture()
+        expected = self._solders_message(payer, ixs, bh)
+        self.assertEqual(
+            kernel.compile_message(bytes(payer), ixs, bytes(bh), lambda: expected),
+            expected)
+        self.assertEqual(kernel.assemble(expected, [b"\x00" * 64], lambda: "S"), "S")
+        self.assertEqual(kernel.report()["rust_errors"], 2)
+
+    def test_the_extension_being_absent_is_reported_not_fatal(self):
+        from src.execution.tx_kernel import TxKernel
+        kernel = TxKernel(mode="auto")
+        kernel.native, kernel.native_status = None, "native extension unavailable"
+        _kp, payer, bh, ixs = self._fixture()
+        expected = self._solders_message(payer, ixs, bh)
+        self.assertEqual(
+            kernel.compile_message(bytes(payer), ixs, bytes(bh), lambda: expected),
+            expected)
+        self.assertEqual(kernel.report()["status"], "DATA_BLOCKED")
+
+    def test_the_key_never_reaches_the_extension(self):
+        import inspect
+        from src.execution import tx_kernel
+        source = inspect.getsource(tx_kernel)
+        # build_signed_transaction takes a secret key. Using it here would
+        # undo the signer isolation to save a few microseconds.
+        self.assertNotIn("build_signed_transaction(", source)
+        self.assertIn("assemble_transaction", source)
+
+
+class TestReentryAndReplacementAreRustExpressible(unittest.TestCase):
+    """No latency-sensitive state falls back to Python any more.
+
+    Re-entry is decided in the same seconds-old window as the original entry,
+    so routing it to Python meant the fast path covered the easy half of the
+    problem and handed the hard half back.
+    """
+
+    RESERVES = {"virtual_sol": 30_000_000_000, "virtual_token": 1_073_000_000_000_000}
+
+    def setUp(self):
+        try:
+            import solana_fastpath  # noqa: F401
+        except ImportError:
+            self.skipTest("solana_fastpath is not built on this host")
+
+    @staticmethod
+    def _survival():
+        from src.strategies.t0_kernel import SurvivalInputs
+        return SurvivalInputs(levels=[0.62, 0.41, 0.24, 0.13, 0.06, 0.03, 0.012, 0.004],
+                              p_rug_30s=0.09, p_rug_5m=0.31,
+                              expected_feasible_multiple=2.4)
+
+    @classmethod
+    def _forward(cls):
+        import solana_fastpath as fp
+        survival = cls._survival()
+        # Both sides must price HOLD off the same bins or every comparison is
+        # about the bins rather than about the policy.
+        return tuple(fp.survival_bins(list(survival.levels), survival.p_rug_30s,
+                                      survival.p_rug_5m,
+                                      survival.expected_feasible_multiple))
+
+    def _kernel(self, **kwargs):
+        from src.strategies.action_value import ActionValuePolicy
+        from src.strategies.t0_kernel import T0Kernel
+        return T0Kernel(ActionValuePolicy(min_edge=1e-4, max_add_fraction=0.5),
+                        **kwargs)
+
+    def test_a_reentry_state_is_no_longer_refused_by_the_kernel(self):
+        from src.strategies.action_value import PositionState
+        kernel = self._kernel(mode="shadow")
+        state = PositionState(
+            held_fraction=0.0, current_multiple=1.0, forward_bins=self._forward(),
+            exit_cost=0.01, entry_cost=0.01, exit_capacity_ratio=0.9,
+            escape_probability=0.85, expected_remaining_seconds=60.0,
+            alternative_growth_per_second=0.0, add_fraction=0.1,
+            probe_fraction=0.02,
+            reentry_bins=((0.5, 0.8), (0.3, 1.9), (0.2, 3.5)))
+        decision = kernel.score(state, survival=self._survival(), **self.RESERVES)
+        self.assertTrue(decision.kernel["compared"])
+        self.assertEqual(kernel.report()["not_expressible_in_kernel"], 0)
+
+    def test_a_replacement_state_is_no_longer_refused_by_the_kernel(self):
+        from src.strategies.action_value import PositionState
+        kernel = self._kernel(mode="shadow")
+        state = PositionState(
+            held_fraction=0.4, current_multiple=2.2, forward_bins=self._forward(),
+            exit_cost=0.01, entry_cost=0.01, exit_capacity_ratio=0.8,
+            escape_probability=0.8, expected_remaining_seconds=60.0,
+            alternative_growth_per_second=0.0, add_fraction=0.1,
+            probe_fraction=0.02,
+            replacement_bins=((0.4, 0.7), (0.4, 2.1), (0.2, 5.0)),
+            replacement_fraction=0.2)
+        decision = kernel.score(state, survival=self._survival(), **self.RESERVES)
+        self.assertTrue(decision.kernel["compared"])
+        self.assertEqual(kernel.report()["not_expressible_in_kernel"], 0)
+
+    def test_the_two_implementations_agree_across_randomised_states(self):
+        import collections
+        import random
+        from src.strategies.action_value import PositionState
+        random.seed(21)
+        kernel = self._kernel(mode="shadow")
+        survival, forward = self._survival(), self._forward()
+
+        def bins(count=4):
+            weights = [random.uniform(0.05, 0.4) for _ in range(count)]
+            total = sum(weights)
+            return tuple((weight / total, random.uniform(0.2, 4.0))
+                         for weight in weights)
+
+        chosen = collections.Counter()
+        for _ in range(300):
+            flat = random.random() < 0.5
+            state = PositionState(
+                held_fraction=0.0 if flat else random.uniform(0.05, 0.9),
+                current_multiple=random.uniform(0.4, 8.0),
+                forward_bins=forward,
+                exit_cost=random.uniform(0.005, 0.03),
+                entry_cost=random.uniform(0.005, 0.03),
+                exit_capacity_ratio=random.uniform(0.2, 1.0),
+                escape_probability=random.uniform(0.2, 1.0),
+                expected_remaining_seconds=random.uniform(10, 300),
+                alternative_growth_per_second=random.uniform(0, 0.002),
+                add_fraction=random.uniform(0.01, 0.3),
+                probe_fraction=random.uniform(0.005, 0.05),
+                reentry_bins=bins() if flat else None,
+                replacement_bins=bins() if not flat else None,
+                replacement_fraction=(random.uniform(0.01, 0.3)
+                                      if not flat else None))
+            decision = kernel.score(state, survival=survival, **self.RESERVES)
+            self.assertTrue(decision.kernel["compared"])
+            chosen[decision.action.value] += 1
+        report = kernel.report()
+        self.assertEqual(report["divergences"], 0)
+        self.assertEqual(report["compared"], 300)
+        # Both new actions must actually be CHOSEN somewhere in the sweep,
+        # or this only proves they never fire.
+        self.assertGreater(chosen["reenter"], 0)
+        self.assertGreater(chosen["replace"], 0)
+
+    def test_a_missing_candidate_is_infeasible_rather_than_a_certain_loss(self):
+        from src.strategies.action_value import PositionState
+        kernel = self._kernel(mode="rust")
+        state = PositionState(
+            held_fraction=0.0, current_multiple=1.0, forward_bins=self._forward(),
+            exit_cost=0.01, entry_cost=0.01, exit_capacity_ratio=0.9,
+            escape_probability=0.85, expected_remaining_seconds=60.0,
+            alternative_growth_per_second=0.0, add_fraction=0.1,
+            probe_fraction=0.02)
+        decision = kernel.score(state, survival=self._survival(), **self.RESERVES)
+        by_action = {score.action.value: score for score in decision.scores}
+        for name in ("reenter", "replace"):
+            self.assertIn(name, by_action)
+            # None supplied, so infeasible. Not a bad score -- an absent one.
+            self.assertEqual(by_action[name].status, "INFEASIBLE")
+
+    def test_reentry_is_refused_while_the_position_is_still_open(self):
+        from src.strategies.action_value import PositionState
+        kernel = self._kernel(mode="rust")
+        state = PositionState(
+            held_fraction=0.5, current_multiple=2.0, forward_bins=self._forward(),
+            exit_cost=0.01, entry_cost=0.01, exit_capacity_ratio=0.9,
+            escape_probability=0.85, expected_remaining_seconds=60.0,
+            alternative_growth_per_second=0.0, add_fraction=0.1,
+            probe_fraction=0.02,
+            reentry_bins=((0.5, 0.8), (0.5, 4.0)))
+        decision = kernel.score(state, survival=self._survival(), **self.RESERVES)
+        by_action = {score.action.value: score for score in decision.scores}
+        # Re-entry is not the question being asked of an open position.
+        self.assertEqual(by_action["reenter"].status, "INFEASIBLE")
+
+
+class TestLatencyRegressionBenchmarks(unittest.TestCase):
+    """A latency regression should fail a build the way a wrong answer does."""
+
+    def setUp(self):
+        try:
+            import solana_fastpath  # noqa: F401
+        except ImportError:
+            self.skipTest("solana_fastpath is not built on this host")
+
+    def test_every_baseline_case_can_actually_be_built(self):
+        from tools.bench_hotpath import build_cases
+        cases = build_cases()
+        problems = {name: case for name, case in cases.items()
+                    if name.startswith("_")}
+        self.assertEqual(problems, {}, f"benchmark cases failed to build: {problems}")
+        for name in ("native_decode", "native_quote", "t0_decide",
+                     "compile_message", "assemble_tx", "python_policy"):
+            self.assertIn(name, cases)
+
+    def test_the_committed_baseline_covers_every_case(self):
+        from tools.bench_hotpath import build_cases, load_baseline
+        baseline = load_baseline()
+        missing = [name for name in build_cases() if not name.startswith("_")
+                   and name not in baseline]
+        # A case with no baseline is a case CI cannot fail on, which is the
+        # same as not having it.
+        self.assertEqual(missing, [], f"no committed baseline for: {missing}")
+
+    def test_the_rust_kernel_is_dramatically_faster_than_the_python_policy(self):
+        """The measurement that justifies the whole promotion ladder."""
+        from tools.bench_hotpath import load_baseline
+        baseline = load_baseline()
+        # Two orders of magnitude, not two percent. If this ever stops being
+        # true the ladder is carrying risk for nothing.
+        self.assertGreater(baseline["python_policy"] / baseline["t0_decide"], 20.0)
+
+    def test_a_slowdown_beyond_tolerance_is_reported_as_a_regression(self):
+        import io
+        import json
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest import mock
+        from tools import bench_hotpath
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "baseline.json"
+            # A baseline a hundred times faster than anything real.
+            path.write_text(json.dumps({"microseconds": {
+                "native_decode": 0.001, "native_quote": 0.001,
+                "t0_decide": 0.001, "compile_message": 0.001,
+                "assemble_tx": 0.001, "python_policy": 0.001}}))
+            with mock.patch.object(bench_hotpath, "BASELINE_PATH", str(path)), \
+                 mock.patch.object(sys, "argv", ["bench"]), \
+                 redirect_stdout(io.StringIO()) as output:
+                code = bench_hotpath.main()
+        self.assertEqual(code, 1)
+        self.assertIn("LATENCY REGRESSION", output.getvalue())
+
+    def test_measuring_nothing_is_a_failure_not_a_pass(self):
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+        from tools import bench_hotpath
+
+        with mock.patch.object(bench_hotpath, "build_cases", return_value={}), \
+             mock.patch.object(sys, "argv", ["bench"]), \
+             redirect_stdout(io.StringIO()):
+            code = bench_hotpath.main()
+        # A suite that measured nothing has not shown anything is fast, and
+        # reporting success would be a lie CI repeats on every build.
+        self.assertEqual(code, 2)
+
+    def test_ci_runs_the_benchmark(self):
+        workflow = (Path(__file__).resolve().parents[1]
+                    / ".github" / "workflows" / "ci.yml").read_text()
+        self.assertIn("tools/bench_hotpath.py", workflow)
+
+
+class TestTheDeskIsSplitIntoModules(unittest.TestCase):
+    """main.py was 5,570 lines. One file holding the trading path, the
+    reporting surface and the HTTP server means a change to any of them risks
+    all of them, and a merge conflict in one is a merge conflict in every one.
+    """
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    #: A ceiling, not a target. It exists so the file cannot quietly grow back
+    #: to where it was: the next thing that belongs in a service module gets
+    #: put in one, because the alternative is a failing test.
+    MAX_MAIN_LINES = 4_200
+
+    def test_main_stays_under_its_line_budget(self):
+        lines = (self.ROOT / "src" / "main.py").read_text(encoding="utf-8").count("\n")
+        self.assertLess(lines, self.MAX_MAIN_LINES,
+                        f"src/main.py is {lines} lines; extract a service rather "
+                        "than raising this ceiling")
+
+    def test_the_desk_is_assembled_from_the_service_modules(self):
+        from src.main import MemecoinQuantDesk
+        from src.runtime.ingestion import MinedRecordIngestion
+        from src.runtime.reporting import ReportingSurface
+        from src.runtime.wiring import SubsystemWiring
+        for base in (ReportingSurface, MinedRecordIngestion, SubsystemWiring):
+            self.assertTrue(issubclass(MemecoinQuantDesk, base), base.__name__)
+
+    def test_no_service_module_imports_the_desk_back(self):
+        """A mixin that imported its own host would be a circular import, and
+        the reason `_jsonable` moved to its own module."""
+        for name in ("reporting", "ingestion", "wiring"):
+            source = (self.ROOT / "src" / "runtime" / f"{name}.py").read_text(
+                encoding="utf-8")
+            self.assertNotIn("from src.main import", source, name)
+            self.assertNotIn("import src.main", source, name)
+
+    def test_the_dashboard_asset_path_survived_the_move(self):
+        """`__file__` now resolves inside src/runtime/, so a naive move would
+        look for the asset one directory too deep and 404."""
+        from src.runtime import reporting
+        path = (Path(reporting.__file__).resolve().parents[1]
+                / "runtime" / "assets" / "dashboard.html")
+        self.assertTrue(path.exists(), path)
+
+    def test_the_dashboard_cache_belongs_to_the_module_that_uses_it(self):
+        from src.runtime.reporting import ReportingSurface
+        # A mixin assigning to SomeOtherClass.attr reaches across the boundary
+        # the split exists to draw.
+        self.assertIn("_dashboard_cache", vars(ReportingSurface))
+
+    def test_serialisation_behaviour_is_unchanged_by_the_move(self):
+        """A refactor that quietly improves a helper is a behaviour change
+        wearing a tidy commit message."""
+        from dataclasses import dataclass
+        from enum import Enum
+        from src.runtime.serialisation import jsonable
+
+        class Colour(Enum):
+            RED = "red"
+
+        @dataclass
+        class Row:
+            name: str
+            colour: Colour
+
+        self.assertEqual(jsonable(Colour.RED), "red")
+        self.assertEqual(jsonable(Row("a", Colour.RED)),
+                         {"name": "a", "colour": "red"})
+        self.assertEqual(jsonable([Colour.RED, {"k": Colour.RED}]),
+                         ["red", {"k": "red"}])
+        # Unrecognised values pass through rather than raising: a status page
+        # that fails on one unexpected field reports nothing about the rest.
+        sentinel = object()
+        self.assertIs(jsonable(sentinel), sentinel)
+
+    def test_the_extracted_methods_are_gone_from_main(self):
+        import ast
+        source = (self.ROOT / "src" / "main.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        desk = next(node for node in tree.body
+                    if isinstance(node, ast.ClassDef)
+                    and node.name == "MemecoinQuantDesk")
+        defined = {node.name for node in desk.body
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        # Still resolvable on the class, and no longer defined in this file --
+        # which is what "moved" means as opposed to "copied".
+        for name in ("readiness", "_status_endpoint", "_ingest_mined_records",
+                     "_setup_execution"):
+            self.assertNotIn(name, defined, f"{name} is still defined in main.py")
+            self.assertTrue(hasattr(__import__(
+                "src.main", fromlist=["MemecoinQuantDesk"]).MemecoinQuantDesk, name))
+
+
+class TestTheDashboardShowsWhatTheDeskReports(unittest.TestCase):
+    """A panel reading a key the desk does not serve renders an em-dash for
+    ever and looks like a quiet subsystem rather than a broken page."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def _html(self):
+        return (self.ROOT / "src" / "runtime" / "assets"
+                / "dashboard.html").read_text(encoding="utf-8")
+
+    def test_every_new_subsystem_has_a_panel(self):
+        html = self._html()
+        for section in ("latency", "t0_kernel", "tx_kernel", "landing_router",
+                        "substitution"):
+            self.assertIn(f"d.{section}", html, f"no panel reads {section}")
+
+    def test_every_declared_element_is_actually_rendered(self):
+        import re
+        html = self._html()
+        declared = set(re.findall(r'id="([a-z0-9-]+)"', html))
+        # The loader's own controls are wired by addEventListener, not by the
+        # render pass, so they are excluded rather than asserted.
+        wired = {"input", "load", "reset", "msg", "clock", "src", "samplewarn"}
+        for element in declared - wired:
+            self.assertIn(f'$("{element}")', html,
+                          f'#{element} is declared and never rendered')
+
+    def test_the_latency_stage_names_match_the_ledger(self):
+        from src.runtime.latency import STAGES
+        html = self._html()
+        for stage in STAGES:
+            self.assertIn(stage, html, f"the dashboard cannot show {stage}")
+
+    def test_substitution_is_not_coloured_as_a_fault(self):
+        """A domain on its third operator is the ladder working. Colouring it
+        as a warning trains the reader to ignore the colour that matters."""
+        html = self._html()
+        self.assertIn('s==="OK"||s==="SUBSTITUTED"?"s-ok"', html)
+
+    def test_the_empty_state_still_invents_no_numbers(self):
+        html = self._html()
+        start = html.index("const EMPTY")
+        empty = html[start:html.index("};", start)]
+        for section in ("latency", "t0_kernel", "tx_kernel", "landing_router",
+                        "substitution"):
+            self.assertIn(section, empty, f"{section} has no honest empty state")
+        # Every new section must start blocked rather than showing a plausible
+        # figure nobody measured.
+        self.assertGreaterEqual(empty.count('status:"DATA_BLOCKED"'), 9)
+
+    def test_the_mode_pill_is_read_from_the_desk_not_asserted(self):
+        """It was static markup reading DRY RUN whether or not that was true.
+        A dashboard that cannot tell you capital is live is worse than one
+        that says nothing."""
+        html = self._html()
+        self.assertIn('pill($("mode")', html)
+        self.assertIn("LIVE \u00b7 CAPITAL AT RISK", html)
+        self.assertIn("MODE UNREPORTED", html)
+
+    def test_the_panels_read_fields_the_desk_actually_serves(self):
+        """The keys below are read by the render pass; each must exist on the
+        report its subsystem produces."""
+        from src.execution.landing_router import LandingRouter, Route
+        from src.execution.tx_kernel import TxKernel
+        from src.research.source_catalogue import default_registry
+        from src.runtime.latency import LatencyLedger
+
+        latency = LatencyLedger().report()
+        for field in ("status", "detail", "dominant_controllable_stage",
+                      "unmeasured_stages", "stages"):
+            self.assertIn(field, latency)
+        for row in latency["stages"].values():
+            for field in ("p50_us", "p90_us", "p99_us", "samples", "data_status"):
+                self.assertIn(field, row)
+
+        router = LandingRouter()
+        router.register(Route(name="rpc", kind="rpc", submit=lambda tx: None))
+        report = router.report()
+        for field in ("status", "detail", "mechanisms", "by_route"):
+            self.assertIn(field, report)
+        for row in report["by_route"].values():
+            for field in ("first_receipts", "landed", "land_rate", "data_status"):
+                self.assertIn(field, row)
+
+        substitution = default_registry().report()
+        for field in ("status", "detail", "coverage", "ladders"):
+            self.assertIn(field, substitution)
+        for row in substitution["ladders"]:
+            for field in ("domain", "active", "on_primary", "eligible_rungs",
+                          "declared_rungs"):
+                self.assertIn(field, row)
+
+        transactions = TxKernel(mode="off").report()
+        for field in ("rust_authoritative", "consecutive_agreements",
+                      "promote_after", "divergences", "demoted_reason"):
+            self.assertIn(field, transactions)
+
+
+class TestCounterfactualCorpus(unittest.TestCase):
+    """A corpus of trades taken can answer 'did we make money'. It cannot
+    answer 'should we have been there', and that is where the returns are."""
+
+    def _corpus(self, **kwargs):
+        from src.research.counterfactual_corpus import CounterfactualCorpus
+        return CounterfactualCorpus(**kwargs)
+
+    def test_an_ignored_launch_is_a_row(self):
+        from src.research.counterfactual_corpus import ActionOption
+        corpus = self._corpus()
+        corpus.record("d1", "MINT", chosen_action="ignore",
+                      screen_reason="holder_concentration",
+                      options=[ActionOption("ignore", q=0.0),
+                               ActionOption("enter", q=-0.02)])
+        report = corpus.report()
+        self.assertEqual(report["recorded"], 1)
+        self.assertEqual(report["by_chosen_action"], {"ignore": 1})
+
+    def test_the_corpus_says_when_it_is_still_only_recording_trades(self):
+        corpus = self._corpus()
+        for index in range(10):
+            corpus.record(f"d{index}", f"M{index}", chosen_action="enter")
+        report = corpus.report()
+        self.assertEqual(report["status"], "DEGRADED")
+        self.assertIn("still recording trades", report["detail"])
+
+    def test_an_unresolved_decision_is_not_a_loss(self):
+        corpus = self._corpus()
+        corpus.record("d1", "MINT", chosen_action="enter")
+        report = corpus.report()
+        self.assertEqual(report["resolved"], 0)
+        self.assertEqual(report["unresolved_in_flight"], 1)
+        # A launch still in flight has no payoff, and treating that as a loss
+        # manufactures one out of impatience.
+        self.assertEqual(report["outcomes_by_action"], {})
+
+    def test_the_foregone_return_is_none_when_the_peak_is_unknown(self):
+        corpus = self._corpus()
+        corpus.record("d1", "MINT", chosen_action="enter")
+        row = corpus.resolve("d1", realised_multiple=1.4)
+        self.assertIsNone(row.resolution["foregone_multiple"])
+        corpus.record("d2", "MINT2", chosen_action="enter")
+        row = corpus.resolve("d2", realised_multiple=1.4, peak_multiple=9.0)
+        self.assertAlmostEqual(row.resolution["foregone_multiple"], 7.6)
+
+    def test_every_decision_about_one_launch_shares_its_outcome(self):
+        corpus = self._corpus()
+        corpus.record("entry", "MINT", chosen_action="enter")
+        corpus.record("hold", "MINT", chosen_action="hold")
+        corpus.record("bank", "MINT", chosen_action="bank_25")
+        corpus.record("other", "OTHER", chosen_action="ignore")
+        rows = corpus.resolve_by_mint("MINT", peak_multiple=12.0)
+        # Resolving only the entry would throw away every hold the desk got
+        # right or wrong.
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(corpus.report()["unresolved_in_flight"], 1)
+
+    def test_a_frozen_row_is_not_amended_by_its_resolution(self):
+        corpus = self._corpus()
+        corpus.record("d1", "MINT", chosen_action="enter",
+                      state={"holder_top1": 0.11})
+        row = corpus.resolve("d1", realised_multiple=2.0, peak_multiple=5.0)
+        # The state is what the decision saw. A row updated with anything
+        # learned afterwards leaks the future into its own features.
+        self.assertEqual(row.state, {"holder_top1": 0.11})
+        self.assertIn("realised_multiple", row.resolution)
+        self.assertNotIn("realised_multiple", row.state)
+
+    def test_infeasible_actions_keep_their_status_rather_than_a_sentinel(self):
+        from src.research.counterfactual_corpus import ActionOption
+        corpus = self._corpus()
+        row = corpus.record("d1", "MINT", chosen_action="hold", options=[
+            ActionOption("hold", q=0.0),
+            ActionOption("reenter", q=None, status="INFEASIBLE")])
+        payload = row.to_dict()
+        reenter = next(o for o in payload["options"] if o["action"] == "reenter")
+        # Infeasible is not terrible. A large negative Q would teach the model
+        # the difference backwards.
+        self.assertEqual(reenter["status"], "INFEASIBLE")
+        self.assertIsNone(reenter["q"])
+
+    def test_rows_survive_a_round_trip_to_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "corpus.jsonl")
+            corpus = self._corpus(path=path, flush_every=1)
+            corpus.record("d1", "MINT", chosen_action="ignore",
+                          screen_reason="too_concentrated")
+            corpus.resolve("d1", peak_multiple=30.0)
+            rows = self._corpus(path=path).load()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["chosen_action"], "ignore")
+        self.assertEqual(rows[0]["resolution"]["peak_multiple"], 30.0)
+        self.assertEqual(rows[0]["screen_reason"], "too_concentrated")
+
+    def test_close_writes_decisions_still_in_flight(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "corpus.jsonl")
+            corpus = self._corpus(path=path)
+            corpus.record("d1", "MINT", chosen_action="enter")
+            corpus.close()
+            rows = self._corpus(path=path).load()
+        # Written with a null resolution rather than discarded: the desk
+        # decided, and what happened next was never observed.
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["resolution"])
+
+    def test_a_full_pending_set_writes_the_oldest_rather_than_dropping_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "corpus.jsonl")
+            corpus = self._corpus(path=path, max_pending=3, flush_every=1)
+            for index in range(6):
+                corpus.record(f"d{index}", f"M{index}", chosen_action="ignore")
+            rows = self._corpus(path=path).load()
+        self.assertEqual(corpus.dropped_unresolved, 3)
+        # Dropping silently would bias the corpus toward launches that
+        # resolved quickly.
+        self.assertEqual(len(rows), 3)
+
+    def test_a_write_failure_is_counted_rather_than_raised(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # A FILE where a directory has to be. Root can create almost any
+            # path, so an unwritable location has to be one that cannot exist
+            # rather than one that merely does not.
+            blocker = Path(tmp) / "blocker"
+            blocker.write_text("not a directory")
+            corpus = self._corpus(path=str(blocker / "corpus.jsonl"),
+                                  flush_every=1)
+            corpus.record("d1", "MINT", chosen_action="ignore")
+            corpus.resolve("d1", peak_multiple=2.0)
+        report = corpus.report()
+        self.assertGreaterEqual(report["write_failures"], 1)
+        self.assertTrue(report["last_error"])
+
+    def test_the_desk_records_a_row_for_a_screened_launch(self):
+        source = _desk_source()
+        # The whole corpus rests on this call site existing.
+        self.assertIn("counterfactual_corpus.record(", source)
+        self.assertIn('chosen_action="ignore"', source)
+        self.assertIn("_resolve_corpus(", source)
+
+    def test_the_desk_reports_the_corpus(self):
+        self.assertIn('"decision_corpus"', _desk_source())
