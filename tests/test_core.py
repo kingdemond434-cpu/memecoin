@@ -18875,3 +18875,245 @@ class TestTheVetoReplayJudgesRealisableNotPeak(unittest.TestCase):
         """The lake and live state overlap; double counting would inflate."""
         rows = [self._rejected("dup", "safety_veto:x", peak=2.0)] * 40
         self.assertEqual(replay(rows)["causes"][0]["status"], "DATA_BLOCKED")
+
+
+class TestWalletDnaSeedsTheWatchList(unittest.TestCase):
+    """56,636 wallets had been observed and none of that history informed
+    which wallets the desk chose to watch: it rediscovered everything from
+    scratch on each restart."""
+
+    def _desk(self, tmp):
+        desk = SimpleNamespace(global_config={"ops_state_dir": tmp})
+        desk._wallet_dna_seeds = MemecoinQuantDesk._wallet_dna_seeds.__get__(desk)
+        return desk
+
+    def _write(self, tmp, records, resolved=5000):
+        (Path(tmp) / "wallet_dna.json").write_text(json.dumps({
+            "universe_resolved": resolved, "records": records}), encoding="utf-8")
+
+    def _row(self, wallet, resolved=20, enrichment=5.0):
+        return {"wallet": wallet, "resolved_tokens": resolved,
+                "monster_enrichment": enrichment}
+
+    def test_enriched_wallets_with_a_real_sample_are_seeded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write(tmp, [self._row("good")])
+            self.assertEqual(self._desk(tmp)._wallet_dna_seeds(), ["good"])
+
+    def test_a_thin_sample_is_not_seeded_however_enriched(self):
+        """One resolved token that mooned is not evidence of skill."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write(tmp, [self._row("lucky", resolved=1, enrichment=99.0)])
+            self.assertEqual(self._desk(tmp)._wallet_dna_seeds(), [])
+
+    def test_an_unenriched_wallet_is_not_seeded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write(tmp, [self._row("average", enrichment=0.9)])
+            self.assertEqual(self._desk(tmp)._wallet_dna_seeds(), [])
+
+    def test_a_missing_artifact_is_not_an_error(self):
+        """A seed list accelerates the desk; it must never gate it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self._desk(tmp)._wallet_dna_seeds(), [])
+
+    def test_a_corrupt_artifact_is_discarded_not_trusted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "wallet_dna.json").write_text("{not json", encoding="utf-8")
+            self.assertEqual(self._desk(tmp)._wallet_dna_seeds(), [])
+
+    def test_the_seed_list_is_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write(tmp, [self._row(f"w{i}") for i in range(900)])
+            desk = self._desk(tmp)
+            desk.global_config["wallet_dna_seed_limit"] = 100
+            self.assertEqual(len(desk._wallet_dna_seeds()), 100)
+
+    def test_the_desk_passes_seeds_to_the_engine(self):
+        source = inspect.getsource(MemecoinQuantDesk._setup_intelligence)
+        self.assertIn("_wallet_dna_seeds", source)
+        self.assertIn("initial_wallets=seeds", source)
+
+
+class TestNativeHazardInferenceMatchesTheArtifact(unittest.TestCase):
+    """decide.rs kept inference out of Rust for a good reason: a second
+    implementation can disagree with the model the promotion gate validated.
+    That objection is answered by proof, not by assertion -- the native
+    evaluator replays the promoted parameters and must agree with the Python
+    artifact across the feature space before it may be trusted at T0.
+
+    Only the hazard heads are ported. The return model's last report reads
+    REJECTED with no artifact, so there is nothing to port and a native
+    evaluator for it would be inventing one."""
+
+    EPSILON = 1e-9
+
+    def setUp(self):
+        self.export = Path("models/hazard_native.json")
+        if not self.export.exists():
+            self.skipTest("hazard model not exported; run tools.export_hazard_model")
+        try:
+            import solana_fastpath
+        except ImportError:
+            self.skipTest("native extension not built")
+        self.sf = solana_fastpath
+        if not hasattr(self.sf, "hazard_predict"):
+            self.skipTest("native extension predates hazard_predict")
+        self.doc = json.loads(self.export.read_text())
+
+    def _head(self, name):
+        h = self.doc["heads"][name]
+        cal = h.get("calibrator") or {}
+        return h["intercept"], h["coef"], cal.get("x"), cal.get("y")
+
+    def test_the_export_records_the_feature_ordering(self):
+        """Rust indexes by position, so a reordering is a silent wrong
+        answer rather than an error unless the order is written down."""
+        self.assertEqual(len(self.doc["feature_names"]),
+                         len(next(iter(self.doc["heads"].values()))["coef"]))
+
+    def test_every_head_agrees_with_the_python_artifact(self):
+        import glob
+        import joblib
+        import numpy as np
+        candidates = sorted(glob.glob("models/rug-hazard-*.joblib"))
+        if not candidates:
+            self.skipTest("no hazard artifact on disk")
+        artifact = joblib.load(candidates[-1])
+        rng = np.random.default_rng(11)
+        worst = 0.0
+        for name, model in artifact["models"].items():
+            if name not in self.doc["heads"]:
+                continue
+            calibrator = (artifact.get("calibrators") or {}).get(name)
+            intercept, coef, cx, cy = self._head(name)
+            cases = [np.zeros(8), np.ones(8), -np.ones(8)]
+            cases += [rng.uniform(-3, 3, 8) for _ in range(300)]
+            for features in cases:
+                raw = model.predict_proba(features.reshape(1, -1))[0][1]
+                expected = (float(calibrator.predict([raw])[0])
+                            if calibrator is not None else float(raw))
+                got = self.sf.hazard_predict(
+                    features.tolist(), intercept, coef, cx, cy)
+                worst = max(worst, abs(got - expected))
+        self.assertLessEqual(worst, self.EPSILON,
+                             f"native inference diverged by {worst:.3e}")
+
+    def test_a_wrong_feature_count_raises_rather_than_guessing(self):
+        intercept, coef, cx, cy = self._head(next(iter(self.doc["heads"])))
+        with self.assertRaises(ValueError):
+            self.sf.hazard_predict([0.0, 0.0], intercept, coef, cx, cy)
+
+    def test_a_non_finite_feature_is_refused(self):
+        """Propagating NaN would produce a confident-looking probability
+        from a meaningless input."""
+        intercept, coef, cx, cy = self._head(next(iter(self.doc["heads"])))
+        features = [0.0] * len(coef)
+        features[0] = float("nan")
+        with self.assertRaises(ValueError):
+            self.sf.hazard_predict(features, intercept, coef, cx, cy)
+
+    def test_the_exporter_refuses_an_unvalidated_artifact(self):
+        """Native inference must replay the PROMOTED model, not any model."""
+        from tools.export_hazard_model import export
+        with self.assertRaises(ValueError) as caught:
+            export({"schema_version": 1, "validation": {"status": "REJECTED"},
+                    "feature_names": (), "models": {}, "calibrators": {}})
+        self.assertIn("did not pass validation", str(caught.exception))
+
+    def test_the_exporter_refuses_an_unknown_schema(self):
+        from tools.export_hazard_model import export
+        with self.assertRaises(ValueError):
+            export({"schema_version": 99, "validation": {"status": "PASSED"}})
+
+
+class TestNativeEventDecodingMatchesPython(unittest.TestCase):
+    """The per-event half of the T0 receive path. Every trade and creation
+    the stream carries was parsed in Python -- an unpack per field, a slice
+    per pubkey, a dict per event -- on the path where an event arrives and
+    something has to be done about it.
+
+    Owning the socket is a different job needing an async runtime and a
+    protobuf stack; decoding is pure computation that can be PROVED
+    identical to what it replaces, and a decoder that disagrees with the one
+    the desk was built on is worse than a slow decoder."""
+
+    def setUp(self):
+        try:
+            import solana_fastpath
+        except ImportError:
+            self.skipTest("native extension not built")
+        if not hasattr(solana_fastpath, "decode_pump_event"):
+            self.skipTest("native extension predates decode_pump_event")
+        self.sf = solana_fastpath
+        self.monitor = PumpFunMonitor.__new__(PumpFunMonitor)
+        self.rng = random.Random(29)
+
+    def _trade(self, reserves=True, is_buy=True):
+        data = bytes(PumpFunMonitor.TRADE_EVENT)
+        data += bytes(self.rng.randrange(256) for _ in range(32))
+        data += struct.pack("<QQ", self.rng.randrange(2**40), self.rng.randrange(2**40))
+        data += bytes([1 if is_buy else 0])
+        data += bytes(self.rng.randrange(256) for _ in range(32))
+        data += struct.pack("<q", self.rng.randrange(2**31))
+        if reserves:
+            data += struct.pack("<QQ", self.rng.randrange(2**50), self.rng.randrange(2**50))
+        return data
+
+    def _create(self, name="Dog", symbol="DOG", uri="https://x/y"):
+        data = bytes(PumpFunMonitor.CREATE_EVENT)
+        for text in (name, symbol, uri):
+            raw = text.encode()
+            data += struct.pack("<I", len(raw)) + raw
+        data += bytes(self.rng.randrange(256) for _ in range(128))
+        data += struct.pack("<q", self.rng.randrange(2**31))
+        return data
+
+    def _assert_agrees(self, data):
+        expected = self.monitor._decode_program_event(data, "sig", 1)
+        got = self.sf.decode_pump_event(data)
+        self.assertIsNotNone(expected)
+        self.assertIsNotNone(got)
+        for field in ("type", "token", "wallet", "side", "creator",
+                      "bonding_curve", "name", "symbol", "uri",
+                      "virtual_sol_reserves", "virtual_token_reserves"):
+            if field in expected and field in got:
+                self.assertEqual(expected[field], got[field], f"field {field}")
+        self.assertEqual(int(expected["timestamp"]), got["timestamp"])
+
+    def test_buys_agree_field_for_field(self):
+        for _ in range(60):
+            self._assert_agrees(self._trade(is_buy=True))
+
+    def test_sells_agree_field_for_field(self):
+        for _ in range(60):
+            self._assert_agrees(self._trade(is_buy=False))
+
+    def test_creations_agree_field_for_field(self):
+        for _ in range(40):
+            self._assert_agrees(self._create())
+
+    def test_a_payload_without_reserves_agrees_on_none(self):
+        """Absent reserves must be None in both, never zero: an unknown
+        reserve and an empty curve are different facts."""
+        data = self._trade(reserves=False)
+        self.assertIsNone(self.sf.decode_pump_event(data)["virtual_sol_reserves"])
+        self._assert_agrees(data)
+
+    def test_an_unknown_discriminator_is_none_in_both(self):
+        data = bytes(32)
+        self.assertIsNone(self.monitor._decode_program_event(data, "sig", 1))
+        self.assertIsNone(self.sf.decode_pump_event(data))
+
+    def test_a_truncated_trade_raises_in_both(self):
+        data = self._trade()[:90]
+        with self.assertRaises(ValueError):
+            self.monitor._decode_program_event(data, "sig", 1)
+        with self.assertRaises(ValueError):
+            self.sf.decode_pump_event(data)
+
+    def test_a_hostile_string_length_raises_in_both(self):
+        data = bytes(PumpFunMonitor.CREATE_EVENT) + struct.pack("<I", 2**31)
+        with self.assertRaises(ValueError):
+            self.monitor._decode_program_event(data, "sig", 1)
+        with self.assertRaises(ValueError):
+            self.sf.decode_pump_event(data)

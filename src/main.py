@@ -639,9 +639,50 @@ class MemecoinQuantDesk:
         self.public_coordination = PublicCoordinationMiner(self.genealogy, self.wallet_intel)
         self.social_intel.on_mention(self._on_social_mention)
         if not self.offline:
+            # Seed the watch list from distilled DNA before the engine
+            # starts. Without it the desk rediscovers every wallet from
+            # scratch on each restart and its own accumulated history --
+            # 56,636 observed wallets as of 2026-08-29 -- contributes
+            # nothing to what it chooses to watch.
+            seeds = self._wallet_dna_seeds()
             for component in (self.genealogy, self.wallet_intel, self.social_intel, self.prelaunch,
                               self.info_graph, self.rug_hazard):
-                await component.start()
+                if component is self.wallet_intel and seeds:
+                    await component.start(initial_wallets=seeds)
+                else:
+                    await component.start()
+
+    def _wallet_dna_seeds(self) -> List[str]:
+        """Wallets worth watching, from distilled history. Never invented.
+
+        Ranked on the SHRUNK enrichment, so a wallet cannot earn a seat by
+        touching one token that happened to moon -- the raw rate put
+        one-resolved-token wallets at the top when this was first built,
+        which is noise wearing the costume of a ranking.
+
+        A missing or unreadable artifact yields nothing rather than an
+        error: the desk must start without it, and a seed list is an
+        accelerator, not a dependency.
+        """
+        path = Path(self.global_config.get("ops_state_dir", "data/state")) / "wallet_dna.json"
+        minimum = int(self.global_config.get("wallet_dna_min_resolved", 10))
+        limit = int(self.global_config.get("wallet_dna_seed_limit", 500))
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        seeds = [
+            str(row.get("wallet"))
+            for row in (payload.get("records") or [])
+            if row.get("wallet")
+            and int(row.get("resolved_tokens") or 0) >= minimum
+            and (row.get("monster_enrichment") or 0.0) > 1.0
+        ]
+        if seeds:
+            logger.info("seeding wallet watch list with %d wallets distilled "
+                        "from %s observed launches", len(seeds[:limit]),
+                        payload.get("universe_resolved"))
+        return seeds[:limit]
 
     async def _setup_prediction(self):
         # One brain per launch age. A pooled model trained across every horizon

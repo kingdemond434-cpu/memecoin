@@ -6,6 +6,7 @@ use crate::instruction;
 use crate::pumpswap::{Pool, PoolReserves};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 #[pyfunction]
 fn b58encode(raw: &[u8]) -> String {
@@ -16,6 +17,80 @@ fn b58encode(raw: &[u8]) -> String {
 fn b58decode(value: &str) -> PyResult<Vec<u8>> {
     crate::helpers::b58decode(value)
         .map_err(|err| PyValueError::new_err(format!("invalid base58: {err}")))
+}
+
+/// Evaluate one promoted hazard head natively.
+///
+/// Exposed so the parity gate can compare THIS code against the Python
+/// artifact through the same interface production calls, rather than
+/// against a second harness that might diverge from both. Native inference
+/// may only be trusted on the hot path once that comparison holds.
+#[pyfunction]
+#[pyo3(signature = (features, intercept, coef, calibrator_x=None, calibrator_y=None))]
+fn hazard_predict(
+    features: Vec<f64>,
+    intercept: f64,
+    coef: Vec<f64>,
+    calibrator_x: Option<Vec<f64>>,
+    calibrator_y: Option<Vec<f64>>,
+) -> PyResult<f64> {
+    let head = crate::inference::Head {
+        intercept,
+        coef,
+        calibrator_x: calibrator_x.unwrap_or_default(),
+        calibrator_y: calibrator_y.unwrap_or_default(),
+    };
+    head.predict(&features)
+        .map_err(|err| PyValueError::new_err(format!("{err:?}")))
+}
+
+/// Decode one Pump CPI event payload natively.
+///
+/// Returns a dict shaped like the Python decoder's output so the parity
+/// gate can compare them field for field. A decoder that disagrees with
+/// the one the desk was built on is worse than a slow decoder, so the
+/// comparison is the point of exposing this at all.
+#[pyfunction]
+fn decode_pump_event(py: Python<'_>, data: &[u8]) -> PyResult<Option<PyObject>> {
+    use crate::event::{decode, DecodeError, PumpEvent};
+    let out = PyDict::new(py);
+    match decode(data) {
+        Ok(PumpEvent::Trade { mint, user, is_buy, sol_amount, token_amount,
+                              timestamp, virtual_sol_reserves, virtual_token_reserves }) => {
+            out.set_item("type", "token_trade")?;
+            out.set_item("token", mint)?;
+            out.set_item("wallet", user)?;
+            out.set_item("side", if is_buy { "buy" } else { "sell" })?;
+            out.set_item("sol_amount", sol_amount)?;
+            out.set_item("token_amount", token_amount)?;
+            out.set_item("timestamp", timestamp)?;
+            out.set_item("virtual_sol_reserves", virtual_sol_reserves)?;
+            out.set_item("virtual_token_reserves", virtual_token_reserves)?;
+        }
+        Ok(PumpEvent::Create { mint, bonding_curve, user, creator, name, symbol, uri, timestamp }) => {
+            out.set_item("type", "token_created")?;
+            out.set_item("token", mint)?;
+            out.set_item("bonding_curve", bonding_curve)?;
+            out.set_item("wallet", user)?;
+            out.set_item("creator", creator)?;
+            out.set_item("name", name)?;
+            out.set_item("symbol", symbol)?;
+            out.set_item("uri", uri)?;
+            out.set_item("timestamp", timestamp)?;
+        }
+        Ok(PumpEvent::Complete { mint, user, bonding_curve, timestamp }) => {
+            out.set_item("type", "token_migrated")?;
+            out.set_item("token", mint)?;
+            out.set_item("wallet", user)?;
+            out.set_item("bonding_curve", bonding_curve)?;
+            out.set_item("timestamp", timestamp)?;
+        }
+        // Not one of ours: the stream carries plenty of other events and
+        // skipping them is normal, so this is None rather than an error.
+        Err(DecodeError::UnknownDiscriminator) => return Ok(None),
+        Err(err) => return Err(PyValueError::new_err(format!("{err:?}"))),
+    }
+    Ok(Some(out.into()))
 }
 
 #[pyfunction]
@@ -555,6 +630,8 @@ fn solana_fastpath(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(b58encode, module)?)?;
     module.add_function(wrap_pyfunction!(b58decode, module)?)?;
     module.add_function(wrap_pyfunction!(anchor_discriminator, module)?)?;
+    module.add_function(wrap_pyfunction!(hazard_predict, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_pump_event, module)?)?;
     module.add_function(wrap_pyfunction!(looks_like_pool_creation, module)?)?;
     module.add_function(wrap_pyfunction!(t0_decide, module)?)?;
     module.add_function(wrap_pyfunction!(survival_bins, module)?)?;

@@ -6,9 +6,11 @@
 
 pub mod curve;
 pub mod decide;
+pub mod event;
 pub mod filter;
 pub mod generated_flags;
 pub mod helpers;
+pub mod inference;
 pub mod instruction;
 pub mod policy;
 pub mod pumpswap;
