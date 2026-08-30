@@ -111,6 +111,7 @@ pub struct Position {
     pub alternative_growth_per_second: Option<f64>,
     pub expected_remaining_seconds: Option<f64>,
     pub add_fraction: Option<f64>,
+    pub add_capacity_fraction: Option<f64>,
     pub probe_fraction: Option<f64>,
 }
 
@@ -171,8 +172,10 @@ pub fn probability_bins(survival: &Survival) -> Vec<Bin> {
     }
 
     if survival.expected_feasible_multiple > 0.0 {
-        let ceiling = (survival.expected_feasible_multiple - 1.0)
-            .clamp(-0.98, SURVIVAL_MULTIPLES[SURVIVAL_MULTIPLES.len() - 1] - 1.0);
+        let ceiling = (survival.expected_feasible_multiple - 1.0).clamp(
+            -0.98,
+            SURVIVAL_MULTIPLES[SURVIVAL_MULTIPLES.len() - 1] - 1.0,
+        );
         for bin in raw.iter_mut() {
             if bin.gross > 0.0 {
                 bin.gross = bin.gross.min(ceiling);
@@ -268,7 +271,8 @@ fn add_value(position: &Position, bins: &[Bin], max_add: f64) -> f64 {
         Some(value) if value > 0.0 => value,
         _ => return f64::NEG_INFINITY,
     };
-    if added > max_add {
+    let capacity_ceiling = position.add_capacity_fraction.unwrap_or(max_add);
+    if added > max_add.min(capacity_ceiling) {
         return f64::NEG_INFINITY;
     }
     let held = position.held_fraction;
@@ -453,14 +457,15 @@ pub fn score_with(
     push(Action::Replace, replace_value(position, alternatives));
     push(Action::Reenter, reenter_value(position, alternatives));
 
-    let best = scores
-        .iter()
-        .filter(|score| score.feasible)
-        .copied()
-        .fold(None::<Score>, |best, score| match best {
-            Some(current) if current.q >= score.q => Some(current),
-            _ => Some(score),
-        });
+    let best =
+        scores
+            .iter()
+            .filter(|score| score.feasible)
+            .copied()
+            .fold(None::<Score>, |best, score| match best {
+                Some(current) if current.q >= score.q => Some(current),
+                _ => Some(score),
+            });
 
     // Doing nothing wins ties and wins anything inside the noise margin.
     // Which "nothing" it is depends on whether anything is held: recording
@@ -545,6 +550,7 @@ mod tests {
             alternative_growth_per_second: None,
             expected_remaining_seconds: None,
             add_fraction: None,
+            add_capacity_fraction: None,
             probe_fraction: None,
         }
     }
@@ -590,6 +596,25 @@ mod tests {
         assert!(score(&other, &survival([0.5; 8]), 1e-4, 0.05)
             .blocked
             .is_some());
+    }
+
+    #[test]
+    fn add_respects_the_live_liquidity_capacity_ceiling() {
+        let mut capped = position();
+        capped.add_fraction = Some(0.04);
+        capped.add_capacity_fraction = Some(0.02);
+        let decision = score(
+            &capped,
+            &survival([0.9, 0.7, 0.5, 0.3, 0.1, 0.03, 0.01, 0.004]),
+            1e-4,
+            0.05,
+        );
+        let add = decision
+            .scores
+            .iter()
+            .find(|score| score.action == Action::Add)
+            .expect("ADD score exists");
+        assert!(!add.feasible);
     }
 
     #[test]
@@ -662,7 +687,12 @@ mod tests {
     fn probing_is_unavailable_once_a_position_is_open() {
         let mut open = position();
         open.probe_fraction = Some(0.02);
-        let decision = score(&open, &survival([0.5, 0.3, 0.2, 0.1, 0.0, 0.0, 0.0, 0.0]), 1e-4, 0.05);
+        let decision = score(
+            &open,
+            &survival([0.5, 0.3, 0.2, 0.1, 0.0, 0.0, 0.0, 0.0]),
+            1e-4,
+            0.05,
+        );
         let probe = decision
             .scores
             .iter()
@@ -689,7 +719,12 @@ mod tests {
     fn an_add_beyond_the_ceiling_is_infeasible() {
         let mut adding = position();
         adding.add_fraction = Some(0.5);
-        let decision = score(&adding, &survival([0.6, 0.4, 0.2, 0.1, 0.0, 0.0, 0.0, 0.0]), 1e-4, 0.05);
+        let decision = score(
+            &adding,
+            &survival([0.6, 0.4, 0.2, 0.1, 0.0, 0.0, 0.0, 0.0]),
+            1e-4,
+            0.05,
+        );
         let add = decision
             .scores
             .iter()

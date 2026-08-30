@@ -3,6 +3,7 @@ Description=Memecoin shadow desk (DRY RUN, no live capital)
 Documentation=file:%h/.local/opt/memecoin-shadow/RUNBOOK.md
 After=network-online.target
 Wants=network-online.target
+OnFailure=memecoin-health-escalate.service
 # Not a crash loop. Five failures inside a minute means something restarting
 # will not fix, and hammering it buries the reason. These are [Unit]
 # directives -- under [Service] systemd silently ignores them, which is the
@@ -11,7 +12,21 @@ StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+# 90s measured 62 process kills in 7 days (2026-08-28's own MemoryMax
+# post-mortem) and, once that unrelated bug was fixed, 7 MORE kills in the
+# following 6 hours alone (2026-08-29) -- all "Failed with result 'watchdog'",
+# not an in-process hang. The ping loop that misses its deadline
+# (_health_loop in src/main.py) does nothing but sleep(10) and notify; if
+# even that starves for 90s, the OS is not scheduling this PROCESS at all,
+# which is what a shared box at load average ~4 on 2 vCPUs actually does
+# under real contention from other projects' timers. Raised to give that
+# real, measured contention room without making a genuine hang undetectable
+# for an unreasonable time -- this is DRY_RUN, so a slower kill costs
+# continuity, not capital.
+WatchdogSec=240s
+TimeoutStartSec=120s
 WorkingDirectory=%h/.local/opt/memecoin-shadow
 EnvironmentFile=-%h/.config/memecoin-shadow/env
 
@@ -47,8 +62,11 @@ UMask=0077
 MemoryMax=4G
 CPUQuota=200%
 
-StandardOutput=append:%h/.local/opt/memecoin-shadow/data/state/shadow.log
-StandardError=append:%h/.local/opt/memecoin-shadow/data/state/shadow.log
+# Journald provides bounded rotation.  An append-only shadow.log grows without
+# limit and eventually stops the very evidence writes this service exists for.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=memecoin-shadow
 
 [Install]
 WantedBy=default.target

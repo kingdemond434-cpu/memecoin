@@ -32,6 +32,7 @@ from src.execution.jupiter_jito import (
     SolanaTransactionBuilder,
     USDC_MINT,
 )
+from src.research.trade_evidence import TradeEvidenceLedger
 from src.research.dataset_builder import PointInTimeDatasetBuilder
 from src.research.global_research_miner import GlobalResearchMiner
 from src.research.chain_miners import register_chain_miners
@@ -220,9 +221,17 @@ class SubsystemWiring:
         self.public_coordination = PublicCoordinationMiner(self.genealogy, self.wallet_intel)
         self.social_intel.on_mention(self._on_social_mention)
         if not self.offline:
+            # Seed the watch list from distilled DNA before the engine
+            # starts, so the desk does not rediscover every wallet from
+            # scratch on each restart while 56,636 observed wallets sit
+            # unread in its own spill.
+            seeds = self._wallet_dna_seeds()
             for component in (self.genealogy, self.wallet_intel, self.social_intel, self.prelaunch,
                               self.info_graph, self.rug_hazard):
-                await component.start()
+                if component is self.wallet_intel and seeds:
+                    await component.start(initial_wallets=seeds)
+                else:
+                    await component.start()
 
     async def _setup_prediction(self):
         # One brain per launch age. A pooled model trained across every horizon
@@ -275,6 +284,10 @@ class SubsystemWiring:
             small_account_mode=bool(setting("small_account_mode", False)),
             small_account_negligible_share=float(setting("small_account_negligible_share", 0.002)),
         )
+        # The entry thesis, frozen before the action it justifies.
+        self.trade_evidence = TradeEvidenceLedger(
+            Path(self.global_config.get("ops_state_dir", "data/state"))
+            / "trade_evidence.jsonl")
         self.monster_machine = MonsterStateMachine(
             monster_probability_threshold=float(
                 self.global_config.get("monster_probability_threshold", 0.15)),
@@ -543,7 +556,14 @@ class SubsystemWiring:
             await self.execution_engine.start()
 
     async def _setup_detection_and_risk(self):
-        self.rug_detector = RugDetector(self.solana_config, self.solana_rpc, self.jupiter)
+        self.rug_detector = RugDetector(
+            self.solana_config, self.solana_rpc, self.jupiter,
+            # The streamed curve, so a mint the router has never indexed is
+            # still known to be sellable back to its own bonding curve. The
+            # router was asked about mints seconds old and its ignorance was
+            # recorded as a confident "no route", which hard-vetoed 100% of
+            # decided launches.
+            curve_state_provider=self._latest_curve_state.get)
         self.detection_engine = TokenDetectionEngine(self.chain_registry)
 
     async def _setup_research(self):

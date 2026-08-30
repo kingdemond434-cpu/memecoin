@@ -19,7 +19,15 @@ or safe operating assumption.
   pool-reserve price multiples, and immediate PIT episodes without per-trade
   HTTP requests. Jupiter marks remain the independent executable-route check.
 - Native SPL and Token-2022 mint-authority, freeze-authority, extension,
-  concentration, and Jupiter sell-route checks.
+  top-10/top-20 account concentration, and Jupiter sell-route checks. Owner-
+  enriched developer/insider/bundler/fresh-wallet/whale/cluster shares remain
+  explicitly blocked until account owners are resolved.
+- A centralized hard safety veto sits outside alpha ranking; active authorities,
+  dangerous Token-2022 controls, an unavailable sell route, catastrophic exit
+  impact, and observed developer emergencies cannot be voted away by a model.
+- Point-in-time holder trajectories, creator-wallet event monitoring,
+  quality/independence/notional-weighted cross-token rotation, and social-price
+  disagreement feed the research schema with missingness indicators.
 - Point-in-time launch episodes, immutable snapshot timestamps, observed price
   paths, route-feasible outcomes, P50X labels, crash-safe active checkpoints,
   and persistent outcome indices.
@@ -43,6 +51,10 @@ or safe operating assumption.
   instruction limits—drive token amounts and cost/PnL accounting.
 - Block/receipt/decode timestamps and measured balance deltas are retained for
   latency, flow, and transaction-economics research.
+- Every candidate, rejection, submission, fill and outcome is mirrored into a
+  hash-chained evidence ledger. Profit isolation is planning-only: it can
+  describe a surplus transfer to a configured public cold address but cannot
+  construct, sign, or submit one.
 
 Missing data is reported as `DATA_BLOCKED`; it is not replaced with a zero or a
 made-up value. Discovery never grants execution authority. A model must first
@@ -138,7 +150,16 @@ root is one whose blast radius is the machine):
 ```bash
 bash deploy/install_shadow.sh
 systemctl --user is-active memecoin-shadow.service
+systemctl --user is-active memecoin-watchdog.timer
 ```
+
+The user deployment has two independent recovery layers. Systemd's
+90-second watchdog restarts a process whose event loop stops heartbeating. A
+separate one-minute watchdog repairs a stopped service, stale readiness,
+failed critical loop, or fully stopped source mesh. Repairs are limited to
+three per hour and cannot unlock trading, invent credentials, promote a
+model, or delete evidence. Set `TELEGRAM_ALERT_CHAT_ID` plus
+`TELEGRAM_ALERT_BOT_TOKEN` (or `TELEGRAM_BOT_TOKEN`) for alerts.
 
 `RUNBOOK.md` is the operational path end to end: install, credentials and
 coverage, accumulating the forward ledger, reading the distance to the next
@@ -280,11 +301,15 @@ mainnet slot `441417557` exercises the same Pump.fun inner-instruction decoder
 used live.
 
 On a Dockerless VPS, `memecoin-shadow-user.service` runs the collector as an
-isolated user service. `memecoin-shadow-train.timer` invokes the strict
-chronological multi-head trainer and the rug-hazard calibration trainer every
-six hours. Insufficient samples, class coverage, or OOS E[log W] remain
+isolated user service. `memecoin-shadow-trainer.timer` invokes the strict
+chronological multi-head, rug-hazard calibration, and learned exit-policy
+trainers hourly. Insufficient samples, class coverage, or OOS E[log W] remain
 `DATA_BLOCKED`/`REJECTED`; only passed artifacts are loaded into forward
-dry-run shadow evaluation. The hazard calibration trainer only fits on the
+dry-run shadow evaluation. An hourly cycle is skipped when the VPS has less
+than 1,400 MiB of currently available memory, protecting uninterrupted data
+collection and retrying automatically on the next tick. This schedule does
+not depend on an interactive Codex or Claude session. The hazard calibration
+trainer only fits on the
 leakage-free half of the hazard signal set (trade flow, liquidity, route,
 concentration, social velocity, and explicit event tags) -- wallet-reputation
 signals are excluded from replay because they are live state, never

@@ -1,0 +1,43 @@
+[Unit]
+Description=Verify the trade-evidence hash chain is actually intact
+After=memecoin-shadow.service
+Documentation=file:%h/.local/opt/memecoin-shadow/RUNBOOK.md
+
+[Service]
+Type=oneshot
+# 1 means "ran fine, found the chain broken and alerted" -- informational,
+# not a service defect. Same reasoning as memecoin-feed-doctor.service and
+# memecoin-credential-doctor.service.
+SuccessExitStatus=1
+WorkingDirectory=%h/.local/opt/memecoin-shadow
+Environment=ALLOW_LIVE_TRADING=
+Environment=SOLANA_PRIVATE_KEY=
+
+# TradeEvidenceLedger.verify() -- a complete, correct hash-chain walk that
+# existed only in the test suite until 2026-08-29. The live status endpoint's
+# "hash_chain": true means only "this process holds a hash in memory right
+# now"; it says nothing about whether the file ON DISK is actually intact.
+# This is the proprietary moat: 70,000+ append-only, tamper-evident records
+# of every candidate and decision this desk has ever made. An auditor that
+# has never run is not evidence the audit would pass.
+ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m tools.ledger_doctor --alert
+
+# Measured 2026-08-29 on the same file, minutes apart: 4s at load ~4, 42s at
+# load ~11. This shared box's contention varies by nearly an order of
+# magnitude; sized for the worse case with real headroom rather than the
+# lucky one.
+TimeoutStartSec=300
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+# Read-only: this tool verifies the ledger, it never writes to it. Writing
+# it here would be a permission the tampering-detector does not need.
+UMask=0077
+MemoryMax=256M
+CPUQuota=100%
+Nice=15
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=memecoin-ledger-doctor

@@ -333,7 +333,31 @@ class DataMinerPool:
         fixes.
         """
         now = time.time() if now is None else now
-        rows = [health.to_dict(now) for health in self._health.values()]
+        rows = []
+        for miner_id, health in self._health.items():
+            row = health.to_dict(now)
+            spec = self._specs[miner_id]
+            if miner_id not in self._callables:
+                state = "DATA_BLOCKED"
+            elif row["backing_off_for"] is not None:
+                state = "RATE_LIMITED"
+            elif row["failures"] > 0 and not row["passes"]:
+                state = "ERROR"
+            elif row["records"] > 0:
+                state = "PRODUCING"
+            elif row["passes"] > 0:
+                state = "IDLE"
+            else:
+                state = "IDLE"
+            row.update({
+                "state": state,
+                "cadence_seconds": spec.cadence_seconds,
+                "enriches": spec.enriches.value,
+                "endpoint": spec.endpoint,
+                "last_success_seconds_ago": row["seconds_since_ok"],
+                "records_total": row["records"],
+            })
+            rows.append(row)
         producing = [row for row in rows if row["records"] > 0]
         silent = [row for row in rows
                   if row["records"] == 0 and row["failures"] == 0

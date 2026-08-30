@@ -1,0 +1,16 @@
+[Unit]
+Description=Periodically extend the historical launch corpus
+
+[Timer]
+# 15 minutes after boot -- after the collector's own streams are established
+# (feed-doctor starts at 10min), since this is the lower-priority consumer of
+# the two on the shared free RPC pool.
+OnBootSec=15min
+OnUnitActiveSec=6h
+# Jitter so a reboot fleet (or this timer and any other periodic RPC user)
+# does not walk the signature list in lockstep.
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

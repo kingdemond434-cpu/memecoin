@@ -64,9 +64,13 @@ class Alerter:
     def __init__(self, log_path: Optional[Path] = None, *,
                  state_path: Optional[Path] = None,
                  dedupe_s: float = DEFAULT_DEDUPE_S,
-                 timeout_s: float = DEFAULT_TIMEOUT_S):
+                 timeout_s: float = DEFAULT_TIMEOUT_S,
+                 session_path: Optional[Path] = None):
         self.log_path = Path(log_path) if log_path else None
         self.state_path = Path(state_path) if state_path else None
+        # Injectable so a test can assert the no-session message without
+        # depending on whether the box it runs on happens to be authorised.
+        self.session_path = Path(session_path) if session_path else SESSION_PATH
         self.dedupe_s = float(dedupe_s)
         self.timeout_s = float(timeout_s)
         self.sent: Dict[str, float] = {}
@@ -99,7 +103,7 @@ class Alerter:
     # --- delivery --------------------------------------------------------
 
     def _deliver(self, text: str) -> Delivery:
-        session = SESSION_PATH.with_suffix(".session")
+        session = self.session_path.with_suffix(".session")
         if not session.exists():
             return Delivery(False, "telegram",
                             "no authorised session; run "
@@ -121,7 +125,7 @@ class Alerter:
     async def _send(self, api_id: str, api_hash: str, text: str) -> Delivery:
         from telethon import TelegramClient
 
-        client = TelegramClient(str(SESSION_PATH), int(api_id), api_hash,
+        client = TelegramClient(str(self.session_path), int(api_id), api_hash,
                                 receive_updates=False)
         await client.connect()
         try:

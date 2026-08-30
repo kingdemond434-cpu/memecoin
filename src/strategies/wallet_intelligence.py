@@ -1,10 +1,12 @@
 import asyncio
+import dataclasses
 import logging
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 import json
 import numpy as np
@@ -73,7 +75,8 @@ class WalletIntelligenceEngine:
         genealogy: GenealogyGraph,
         helius_key: str,
         min_trades_for_ranking: int = 20,
-        recalc_interval_hours: int = 1
+        recalc_interval_hours: int = 1,
+        state_path: "str | Path | None" = None,
     ):
         self.chain_config = chain_config
         self.rpc = rpc
@@ -129,21 +132,104 @@ class WalletIntelligenceEngine:
         
         self._helius_base = "https://api.helius.xyz/v0"
 
+        # Every restart wiped this pipeline back to zero -- measured
+        # 2026-08-29: the desk restarted twice in 20 minutes under this
+        # shared box's contention, and the wallet pipeline needs roughly
+        # 20-40 minutes of UNBROKEN uptime (20+ classified trades per
+        # wallet, a 5-minute recalc cycle, a 300s follow-resolution
+        # horizon) to produce its first signal. A pipeline that never gets
+        # an unbroken window that long never proves anything, however
+        # correctly it is now throttled. regime_performances is the source
+        # of truth wallet_scores is recomputed FROM every 5 minutes, so
+        # that (plus genealogy.wallets, its trade-count backing) is what
+        # gets persisted -- not wallet_scores itself, which is a derived
+        # cache the next recalc would silently overwrite with a fresh,
+        # empty one anyway if the source data were not also restored.
+        self._state_path = Path(state_path) if state_path else Path(
+            "data/state/wallet_intelligence.json")
+
+    def _save_state(self) -> None:
+        try:
+            regime_performances = {
+                wallet: {
+                    regime.value: dataclasses.asdict(perf)
+                    for regime, perf in regimes.items()
+                }
+                for wallet, regimes in self.regime_performances.items()
+            }
+            for wallet, regimes in regime_performances.items():
+                for regime_value, perf in regimes.items():
+                    perf["regime"] = perf["regime"].value if isinstance(
+                        perf["regime"], WalletRegime) else perf["regime"]
+            wallets = {}
+            for address, profile in self.genealogy.wallets.items():
+                row = dataclasses.asdict(profile)
+                row["entity_type"] = profile.entity_type.value
+                row["funding_sources"] = sorted(profile.funding_sources)
+                row["cashout_destinations"] = sorted(profile.cashout_destinations)
+                row["related_wallets"] = sorted(profile.related_wallets)
+                wallets[address] = row
+            payload = {
+                "schema": "v1", "saved_at": time.time(),
+                "regime_performances": regime_performances,
+                "wallets": wallets,
+            }
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._state_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            tmp.replace(self._state_path)
+        except Exception as exc:  # a failed checkpoint must not crash the recalc loop
+            logger.warning("Wallet-intelligence state save failed: %s: %s",
+                           type(exc).__name__, exc)
+
+    def _load_state(self) -> None:
+        if not self._state_path.exists():
+            return
+        try:
+            payload = json.loads(self._state_path.read_text(encoding="utf-8"))
+            for wallet, regimes in (payload.get("regime_performances") or {}).items():
+                restored: Dict[WalletRegime, WalletRegimePerformance] = {}
+                for regime_value, row in regimes.items():
+                    row = dict(row)
+                    row["regime"] = WalletRegime(row["regime"])
+                    restored[WalletRegime(regime_value)] = WalletRegimePerformance(**row)
+                self.regime_performances[wallet] = restored
+            for address, row in (payload.get("wallets") or {}).items():
+                row = dict(row)
+                row["entity_type"] = EntityType(row["entity_type"])
+                row["funding_sources"] = set(row.get("funding_sources") or ())
+                row["cashout_destinations"] = set(row.get("cashout_destinations") or ())
+                row["related_wallets"] = set(row.get("related_wallets") or ())
+                self.genealogy.wallets[address] = WalletProfile(**row)
+            age_s = time.time() - float(payload.get("saved_at", 0.0) or 0.0)
+            logger.info("Wallet-intelligence state restored: %d wallets, "
+                       "%d regime-performance rows, saved %.0fs ago",
+                       len(payload.get("wallets") or {}),
+                       sum(len(v) for v in (payload.get("regime_performances") or {}).values()),
+                       age_s)
+        except Exception as exc:
+            # A checkpoint that cannot be trusted is not loaded. Rebuilding
+            # from zero costs uptime; loading corrupted regime history into
+            # a wallet's score costs correctness, which is worse.
+            logger.warning("Wallet-intelligence state discarded, unreadable: "
+                           "%s: %s", type(exc).__name__, exc)
+
     async def start(self, initial_wallets: List[str] = None):
+        self._load_state()
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30),
             connector=aiohttp.TCPConnector(limit=50)
         )
         self._running = True
-        
+
         if initial_wallets:
             self._live_watch_wallets.update(initial_wallets)
-        
+
         self._hunter_task = asyncio.create_task(self._hunter_loop())
         self._watcher_task = asyncio.create_task(self._watcher_loop())
         self._recalc_task = asyncio.create_task(self._recalc_loop())
         self._history_task = asyncio.create_task(self._history_worker_loop())
-        
+
         await self._initial_discovery()
 
     async def stop(self):
@@ -185,6 +271,11 @@ class WalletIntelligenceEngine:
             try:
                 await self._recalculate_all_scores()
                 await self._update_live_watch_list()
+                # Checkpointed on the same 5-minute cadence recalc already
+                # runs on, not a separate timer: this is exactly how often
+                # the source data (regime_performances) actually changes, so
+                # a more frequent save would just rewrite the same bytes.
+                self._save_state()
             except Exception as e:
                 logger.error(f"Recalc loop error: {e}")
             await asyncio.sleep(300)
@@ -232,11 +323,31 @@ class WalletIntelligenceEngine:
             for item in (account_data or {}).get("value", []):
                 owner = (((item or {}).get("data") or {}).get("parsed") or {}).get("info", {}).get("owner")
                 if owner and owner not in self.genealogy.wallets:
-                    await self._evaluate_new_wallet(owner, token)
+                    # Queued through the throttled worker (_history_worker_loop,
+                    # ~1.1s/wallet with dedup and a 1h re-evaluation cooldown),
+                    # not awaited directly here. This method fires on EVERY
+                    # token_created event and each one can name up to 20
+                    # holders -- awaiting _evaluate_new_wallet inline meant up
+                    # to 20 concurrent getSignaturesForAddress + getTransaction
+                    # bursts per single launch, which is what was actually
+                    # exhausting the free RPC pool: every call this produced
+                    # failed with "No healthy RPC endpoint serves ..." once
+                    # the failures stopped being silent (2026-08-29) and could
+                    # finally be seen. The lookups were correct; the volume
+                    # was the bug.
+                    self._queue_wallet_history(owner, token)
             self.data_status[f"holders:{token}"] = "OK"
         except Exception as e:
             self.data_status[f"holders:{token}"] = f"DATA_BLOCKED: {e}"
-            logger.debug("Token holder analysis error: %s", e)
+            # This was logged at debug, which the desk never enables by
+            # default (LOG_LEVEL defaults to INFO) -- so every failure on
+            # this path, for as long as it has existed, was invisible. It is
+            # the entry point for the entire wallet-intelligence pipeline
+            # (actor_graph, wallet_follow, capital_rotation all read zero
+            # downstream of it), which is a strange thing to have been
+            # debugging blind.
+            logger.warning("Token holder analysis failed for %s: %s: %s",
+                           token, type(e).__name__, e)
 
     async def analyze_token_early_buyers(self, token: str):
         """Public entrypoint used by the canonical launch stream."""
@@ -260,27 +371,81 @@ class WalletIntelligenceEngine:
             await self._build_wallet_history(wallet, txs)
         except Exception as e:
             self.data_status[wallet] = f"DATA_BLOCKED: wallet history unavailable: {e}"
-            logger.debug(f"Wallet eval error: {e}")
+            # Also silent at debug before now -- see the identical note on
+            # _analyze_token_early_buyers's except block. This is the step
+            # that actually fetches a wallet's trade history (Helius, then
+            # the free RPC pool); a session/attribute error here (e.g. a
+            # None self._session before start() has completed) would have
+            # failed every single call and never shown once.
+            logger.warning("Wallet history evaluation failed for %s: %s: %s",
+                           wallet, type(e).__name__, e)
+
+    #: Signatures per JSON-RPC batch. Providers cap batch size and oversized
+    #: batches are rejected whole, so this stays well inside the common limit.
+    RPC_HISTORY_BATCH = 25
 
     async def _rpc_wallet_history(self, wallet: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Provider-independent fallback using standard Solana transaction balance deltas."""
+        """Provider-independent fallback using standard Solana transaction balance deltas.
+
+        Batched, because this is the desk's single largest RPC consumer and it
+        runs when the cheap path is already gone. `_analyze_token_early_buyers`
+        calls it for up to twenty holders, so one token cost 20 x (1 + 50) =
+        ~1,020 requests. Worse, it is a FALLBACK: it runs precisely when the
+        Helius enhanced endpoint returned nothing, so the moment that provider
+        hits its quota this path multiplies the same work by fifty and spends
+        the remaining endpoints' quota too. That is the shape of the outage
+        observed on 2026-08-28 -- all three Solana endpoints at 429, with
+        getTransaction 75% of the refusals.
+
+        One batch of 25 replaces 25 round trips. Same data, same commitment,
+        ~50x fewer requests and one connection setup instead of fifty, which
+        is latency the hot path was paying for as well as quota.
+        """
         signatures = await self.rpc.request(
             "getSignaturesForAddress", [wallet, {"limit": limit, "commitment": "confirmed"}],
         )
-        semaphore = asyncio.Semaphore(5)
+        usable = [row for row in (signatures or [])
+                  if row.get("signature") and not row.get("err")]
+        if not usable:
+            return []
 
-        async def fetch(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            if not row.get("signature") or row.get("err"):
-                return None
-            async with semaphore:
-                tx = await self.rpc.request("getTransaction", [row["signature"], {
-                    "encoding": "jsonParsed", "commitment": "confirmed",
-                    "maxSupportedTransactionVersion": 0,
-                }])
-            return self._standard_tx_to_enhanced(wallet, row, tx)
+        options = {"encoding": "jsonParsed", "commitment": "confirmed",
+                   "maxSupportedTransactionVersion": 0}
+        rows: List[Dict[str, Any]] = []
+        for start in range(0, len(usable), self.RPC_HISTORY_BATCH):
+            chunk = usable[start:start + self.RPC_HISTORY_BATCH]
+            payload = [{"jsonrpc": "2.0", "id": index, "method": "getTransaction",
+                        "params": [row["signature"], options]}
+                       for index, row in enumerate(chunk)]
+            try:
+                results = await self.rpc.batch_request(payload)
+            except Exception as exc:
+                # Some free providers refuse batches outright -- publicnode
+                # answers 403 to a JSON-RPC array while serving the same
+                # method fine one call at a time. A refused batch therefore
+                # degrades to bounded sequential singles through the
+                # method-aware router (which knows who serves getTransaction)
+                # instead of becoming a hole in this wallet's history that
+                # reads downstream as "no trades".
+                logger.debug("batched wallet history failed for %s (%s); "
+                             "falling back to singles", wallet, exc)
+                semaphore = asyncio.Semaphore(3)
 
-        rows = await asyncio.gather(*(fetch(row) for row in (signatures or [])), return_exceptions=True)
-        return [row for row in rows if isinstance(row, dict)]
+                async def fetch_one(row):
+                    async with semaphore:
+                        try:
+                            return await self.rpc.request(
+                                "getTransaction", [row["signature"], options])
+                        except Exception:
+                            return None
+
+                results = await asyncio.gather(
+                    *(fetch_one(row) for row in chunk))
+            for row, transaction in zip(chunk, results or []):
+                converted = self._standard_tx_to_enhanced(wallet, row, transaction)
+                if converted:
+                    rows.append(converted)
+        return rows
 
     @staticmethod
     def _standard_tx_to_enhanced(wallet: str, signature_row: Dict[str, Any], tx: Any) -> Optional[Dict[str, Any]]:
@@ -643,7 +808,11 @@ class WalletIntelligenceEngine:
                             for tx in txs:
                                 await self._process_live_transaction(wallet, tx)
                 except Exception as e:
-                    logger.debug(f"Live watch error for {wallet}: {e}")
+                    # Also promoted from debug: a wallet on the live watch
+                    # list going silently unpolled has the same downstream
+                    # effect as never having been watched at all.
+                    logger.warning("Live watch poll failed for %s: %s: %s",
+                                   wallet, type(e).__name__, e)
 
         # Concurrently, because one slow wallet used to delay every wallet
         # behind it, and the delay was invisible.

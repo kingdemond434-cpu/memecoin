@@ -1,9 +1,19 @@
 [Unit]
-Description=Run chronological memecoin training hourly
+Description=Check for a viable training window every 15 minutes
 
 [Timer]
-OnCalendar=hourly
-RandomizedDelaySec=5m
+# A skip used to cost a full hour, not just the memory: OnCalendar=hourly
+# tried once, and a skip meant the next chance was 60 minutes away even if
+# memory freed up 5 minutes later. Checking every 15 minutes quadruples the
+# chances of catching a viable window. This does NOT mean training four
+# times as often once memory is available: training_guard.py's own
+# --min-minutes-since-last-success gate (2026-08-29) refuses to train again
+# within 50 minutes of the last successful report regardless of how often
+# this timer asks, so the effective training cadence stays roughly hourly
+# and only the RETRY frequency increased.
+OnBootSec=5min
+OnUnitActiveSec=15min
+RandomizedDelaySec=2m
 Persistent=true
 Unit=memecoin-shadow-trainer.service
 

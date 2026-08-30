@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically verify the trade-evidence hash chain
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=30min
+RandomizedDelaySec=120
+Persistent=true
+
+[Install]
+WantedBy=timers.target
