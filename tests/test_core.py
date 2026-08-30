@@ -64,7 +64,8 @@ from src.strategies.multihead_predictor import (
     MultiHeadPredictor, PredictionFeatures, band_for,
 )
 from src.collectors.registry import (
-    ADAPTER_KINDS, DEFAULT_POLL_INTERVALS, SourceDeclaration, SourceDiscovery, build_sources,
+    ADAPTER_KINDS, DEFAULT_POLL_INTERVALS, DEFAULT_POLL_TIMEOUTS,
+    SourceDeclaration, SourceDiscovery, build_sources,
     expand_env_channels, load_declarations,
 )
 from src.collectors.adapters import (
@@ -19117,3 +19118,66 @@ class TestNativeEventDecodingMatchesPython(unittest.TestCase):
             self.monitor._decode_program_event(data, "sig", 1)
         with self.assertRaises(ValueError):
             self.sf.decode_pump_event(data)
+
+
+class TestASourceMayDeclareItsOwnPollTimeout(unittest.TestCase):
+    """A feed served from the other side of the world is not slow because
+    it is broken. Measured 2026-08-30: the Korean, Chinese and Japanese
+    outlets exceeded the mesh's 5s default on EVERY poll and produced
+    nothing, while answering fine to curl. One number dropped a region."""
+
+    class _Stub(EventSource):
+        async def poll(self, now):
+            return []
+
+    def _source(self, timeout=None):
+        return self._Stub("s", SourceClass.NEWS, poll_timeout_seconds=timeout)
+
+    def test_a_source_without_a_budget_uses_the_mesh_default(self):
+        self.assertIsNone(self._source().poll_timeout_seconds)
+
+    def test_a_declared_budget_is_kept(self):
+        self.assertEqual(self._source(20).poll_timeout_seconds, 20.0)
+
+    def test_a_nonsensical_budget_is_floored_not_accepted(self):
+        self.assertGreaterEqual(self._source(0.0).poll_timeout_seconds, 0.1)
+
+    def test_the_mesh_honours_the_source_budget_over_its_own(self):
+        source = inspect.getsource(SourceMesh._collect_one)
+        self.assertIn("poll_timeout_seconds", source)
+        self.assertIn("or self.poll_timeout", source)
+
+    def test_the_regional_feeds_declare_one(self):
+        """Otherwise they build, poll, time out and report healthy."""
+        import yaml
+        declared = yaml.safe_load(Path("config/sources.yaml").read_text())
+        by_id = {s["id"]: s for s in declared.get("sources", [])}
+        for ident in ("rss:kr-tokenpost", "rss:kr-blockmedia",
+                      "rss:cn-chaincatcher", "rss:jp-neweconomy"):
+            with self.subTest(ident):
+                self.assertIn("url", by_id[ident], f"{ident} has no endpoint")
+                self.assertGreater(by_id[ident].get("poll_timeout_seconds", 0), 5.0)
+
+
+class TestPollTimeoutsFitTheTransportKind(unittest.TestCase):
+    """Twelve sources -- coinpost, NHK, PANews in three languages,
+    Blockworks, europa-rapid and more -- exceeded the mesh's 5s default on
+    every poll and produced nothing while answering fine to curl. That is
+    not twelve unhealthy sources; it is one number too small."""
+
+    def test_http_kinds_get_room_to_answer(self):
+        for kind in ("rss", "official_site", "code_repo"):
+            with self.subTest(kind):
+                self.assertGreater(DEFAULT_POLL_TIMEOUTS[kind], 5.0)
+
+    def test_push_transports_keep_a_short_budget(self):
+        """A socket silent for seconds IS unhealthy, and waiting longer on
+        it only delays noticing."""
+        for kind in ("telegram", "bluesky", "nostr"):
+            with self.subTest(kind):
+                self.assertNotIn(kind, DEFAULT_POLL_TIMEOUTS)
+
+    def test_a_declaration_still_wins_over_the_kind_default(self):
+        source = inspect.getsource(build_sources)
+        self.assertIn("declaration.poll_timeout_seconds", source)
+        self.assertIn("DEFAULT_POLL_TIMEOUTS.get(declaration.kind)", source)

@@ -47,6 +47,27 @@ REGISTRY_SCHEMA_VERSION = "v1"
 # Successful-poll cadence by transport. Push/stream adapters merely drain a
 # local queue and stay sub-second; remote HTTP/RSS endpoints are not hammered
 # once per second. Per-source YAML can override these measurements.
+#: How long a source of each kind may take to ANSWER, as distinct from how
+#: often it is asked. The mesh's own 5s default is right for a local queue
+#: and wrong for an HTTP fetch of a feed on another continent: measured
+#: 2026-08-30, twelve sources -- coinpost, NHK, PANews in three languages,
+#: Blockworks, europa-rapid and others -- exceeded it on every poll and
+#: produced nothing, while answering fine to curl. That is not twelve
+#: unhealthy sources, it is one number too small.
+#:
+#: Push-style transports keep a short budget on purpose: a socket that has
+#: not produced in seconds IS unhealthy, and waiting longer on it delays
+#: noticing. Only the poll-and-parse kinds get room.
+DEFAULT_POLL_TIMEOUTS: Dict[str, float] = {
+    "rss": 20.0,
+    "official_site": 20.0,
+    "code_repo": 20.0,
+    "metadata": 15.0,
+    "mastodon": 15.0,
+    "farcaster": 15.0,
+    "youtube": 15.0,
+}
+
 DEFAULT_POLL_INTERVALS: Dict[str, float] = {
     "telegram": 0.10,
     "bluesky": 0.05,
@@ -138,6 +159,13 @@ class SourceDeclaration:
     # reading. Declared per source because only the declaration knows which
     # this is.
     poll_interval_seconds: Optional[float] = None
+    #: How long this source may take to ANSWER, as opposed to how often it
+    #: is asked. Declared here for the same reason cadence is: a feed served
+    #: from the other side of the world is not slow because it is broken.
+    #: The Korean, Chinese and Japanese outlets exceeded the mesh's 5s
+    #: default on every poll and produced nothing while answering fine to
+    #: curl, which is a whole region dropped by one number.
+    poll_timeout_seconds: Optional[float] = None
 
     def missing_credentials(self) -> List[str]:
         """Which required environment variables are absent.
@@ -355,6 +383,9 @@ def load_declarations(path: str) -> List[SourceDeclaration]:
                 poll_interval_seconds=(float(entry["poll_interval_seconds"])
                                        if entry.get("poll_interval_seconds") is not None
                                        else None),
+                poll_timeout_seconds=(float(entry["poll_timeout_seconds"])
+                                      if entry.get("poll_timeout_seconds") is not None
+                                      else None),
             ))
         except (KeyError, TypeError, ValueError) as exc:
             logger.error("skipping malformed source declaration %r: %s", entry, exc)
@@ -425,6 +456,14 @@ def build_sources(
                     declaration.poll_interval_seconds
                     if declaration.poll_interval_seconds is not None
                     else DEFAULT_POLL_INTERVALS.get(declaration.kind, 30.0)))
+            # Declaration first, then the per-kind default. A source that
+            # says nothing about its own latency still should not be held to
+            # a socket's budget when it is an HTTP fetch.
+            timeout = (declaration.poll_timeout_seconds
+                       if declaration.poll_timeout_seconds is not None
+                       else DEFAULT_POLL_TIMEOUTS.get(declaration.kind))
+            if timeout is not None:
+                source.poll_timeout_seconds = max(0.1, float(timeout))
             sources.append(source)
         except TypeError as exc:
             mark(DeclarationState.NO_FETCHER, f"adapter rejected its options: {exc}")

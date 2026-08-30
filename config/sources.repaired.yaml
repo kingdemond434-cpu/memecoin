@@ -3,6 +3,11 @@
 # source_id, language and region, and changes nothing but a path the
 # publisher moved. Regenerate rather than editing.
 sources:
+  # was: https://livecoins.com.br/feed
+  - id: rss:br-livecoins
+    kind: rss
+    language: pt
+    options: {url: "https://livecoins.com.br/rss", language: pt}
   # was: https://status.jup.ag/history.rss
   - id: jupiter-status
     kind: rss

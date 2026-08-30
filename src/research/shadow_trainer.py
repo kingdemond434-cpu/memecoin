@@ -153,11 +153,49 @@ def load_samples(storage: Path) -> List[Tuple[PredictionFeatures, Dict[Predictio
             snapshot = snapshots.get(name)
             if not snapshot or (snapshot.get("labels") or {}).get("label_2x") is None:
                 continue
+            if not _carries_features(snapshot):
+                continue
             if (outcome.get("rugged") and outcome.get("rug_time") is not None
                     and _number(snapshot, "timestamp") >= _number(episode, "created_at") + float(outcome["rug_time"])):
                 continue
             samples.append((snapshot_to_features(episode, snapshot), snapshot_labels(snapshot, episode, outcome), outcome))
     return sorted(samples, key=lambda item: item[0].timestamp)
+
+
+#: Feature groups that must carry a real reading for a row to be worth
+#: training on. Liquidity is the one that decides: it is what prices the
+#: launch, and until 2026-08-30 it was DATA_BLOCKED on every snapshot the
+#: desk had ever written.
+REQUIRED_FEATURE_GROUPS = ("liquidity_features",)
+
+
+def _carries_features(snapshot: Dict[str, Any]) -> bool:
+    """Whether this row actually observed the facts it claims to describe.
+
+    A snapshot whose feature groups are all DATA_BLOCKED is not a training
+    example. It is a row asserting that nothing was known, and fitting to it
+    teaches the model that the features are absent rather than what they
+    mean.
+
+    This matters more than it sounds. Measured 2026-08-30, the corpus held
+    11,883 pre-fix episodes with 0% liquidity coverage and 3,024 post-fix
+    episodes with 87%. Because the split is CHRONOLOGICAL, that arrangement
+    trained on the featureless rows and validated on the ones carrying
+    signal -- the worst possible pairing, and enough on its own to make a
+    working head lose to a constant baseline. It did: feasible_log_mse
+    0.0624 against a 0.0589 baseline, the single gate that failed while the
+    other five passed.
+
+    Dropping them is not throwing data away. A row with no features has
+    nothing to teach; keeping it only dilutes the rows that do.
+    """
+    for group in REQUIRED_FEATURE_GROUPS:
+        values = snapshot.get(group)
+        if not isinstance(values, dict) or not values:
+            return False
+        if values.get("status") == "DATA_BLOCKED":
+            return False
+    return True
 
 
 def _brier(y_true: Iterable[float], y_prob: Iterable[float]) -> float:

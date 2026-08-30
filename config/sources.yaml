@@ -277,12 +277,14 @@ sources:
     poll_interval_seconds: 600
     degraded_after_seconds: 7200
     dead_after_seconds: 43200
+
   - id: rss:cn-local
     kind: rss
     tier: 2
     language: zh
     region: cn
     poll_interval_seconds: 600
+
   - id: rss:ru-local
     kind: rss
     tier: 2
@@ -474,6 +476,10 @@ sources:
   # verified overlay; it is not repeated here.
   - id: rss:jp-neweconomy
     kind: rss
+    # Distance, not ill health: every poll exceeded the mesh's 5s
+    # default while the endpoint answered fine to curl.
+    poll_timeout_seconds: 20
+    url: "https://www.neweconomy.jp/feed"
     tier: 2
     language: ja
     region: jp
@@ -493,6 +499,10 @@ sources:
   # TokenPost KR is already declared below as rss:kr-tokenpost.
   - id: rss:cn-chaincatcher
     kind: rss
+    # Distance, not ill health: every poll exceeded the mesh's 5s
+    # default while the endpoint answered fine to curl.
+    poll_timeout_seconds: 20
+    url: "https://www.chaincatcher.com/rss.xml"
     tier: 2
     language: zh
     region: cn
@@ -520,6 +530,11 @@ sources:
     options: {url: "https://cointelegraph.com/rss/tag/japan", language: ja}
   - id: rss:kr-blockmedia
     kind: rss
+    # Distance, not ill health: every poll exceeded the mesh's 5s
+    # default while the endpoint answered fine to curl.
+    poll_timeout_seconds: 20
+    # verified 2026-08-30: HTTP 200, 10 items
+    url: "https://www.blockmedia.co.kr/feed"
     tier: 2
     language: ko
     region: kr
@@ -529,6 +544,11 @@ sources:
     options: {url: "https://www.blockmedia.co.kr/feed", language: ko}
   - id: rss:kr-tokenpost
     kind: rss
+    # Distance, not ill health: every poll exceeded the mesh's 5s
+    # default while the endpoint answered fine to curl.
+    poll_timeout_seconds: 20
+    # verified 2026-08-30: HTTP 200, 50 items
+    url: "https://www.tokenpost.kr/rss"
     tier: 2
     language: ko
     region: kr

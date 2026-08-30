@@ -137,11 +137,19 @@ class EventSource(ABC):
     #: belong on one shared cadence, and a single polling loop forces exactly
     #: that.
     poll_interval_seconds: float = 1.0
+    #: How long this source may take to answer. A property of the source for
+    #: the same reason cadence is: a feed served from the other side of the
+    #: world is not slow because it is broken. Measured 2026-08-30, the
+    #: Korean, Chinese and Japanese outlets all exceeded the mesh's 5s
+    #: default on every poll and produced nothing, while answering fine to
+    #: curl. None means "use the mesh default".
+    poll_timeout_seconds: Optional[float] = None
 
     def __init__(self, source_id: str, source_class: SourceClass,
                  degraded_after_seconds: Optional[float] = None,
                  dead_after_seconds: Optional[float] = None,
-                 poll_interval_seconds: Optional[float] = None):
+                 poll_interval_seconds: Optional[float] = None,
+                 poll_timeout_seconds: Optional[float] = None):
         self.source_id = source_id
         self.source_class = source_class
         # How often this source is worth asking, which is a property of the
@@ -150,6 +158,8 @@ class EventSource(ABC):
         # them on one is what a single polling loop forces.
         if poll_interval_seconds is not None:
             self.poll_interval_seconds = max(0.01, float(poll_interval_seconds))
+        if poll_timeout_seconds is not None:
+            self.poll_timeout_seconds = max(0.1, float(poll_timeout_seconds))
         if degraded_after_seconds is not None:
             self.degraded_after_seconds = float(degraded_after_seconds)
         if dead_after_seconds is not None:
@@ -287,12 +297,18 @@ class SourceMesh:
             self._seen.pop(key, None)
 
     async def _collect_one(self, source: "EventSource", now: float) -> List[Event]:
-        """Poll one source under a timeout, never propagating its failure."""
+        """Poll one source under a timeout, never propagating its failure.
+
+        The source's own budget wins where it declares one. A distant feed
+        that needs eight seconds is not unhealthy, and holding every source
+        to the nearest one's latency silently drops whole regions.
+        """
+        timeout = getattr(source, "poll_timeout_seconds", None) or self.poll_timeout
         try:
-            return await asyncio.wait_for(source.collect(now), timeout=self.poll_timeout)
+            return await asyncio.wait_for(source.collect(now), timeout=timeout)
         except asyncio.TimeoutError:
             logger.warning("source %s exceeded the %.1fs poll timeout",
-                           source.source_id, self.poll_timeout)
+                           source.source_id, timeout)
             source.note_timeout()
             return []
         except Exception as exc:  # pragma: no cover - collect already guards
