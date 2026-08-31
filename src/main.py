@@ -568,9 +568,17 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         # the unit reports `activating` for its whole life, and anything
         # ordered After= this unit waits on a readiness that never arrives.
         self._starting_phase = ""
-        self.systemd.ready(
+        announced = self.systemd.ready(
             f"desk running: {'DRY_RUN' if self.dry_run else 'LIVE'}, "
             f"{len(self.transports)} transports")
+        # Logged either way. Whether systemd ACCEPTED the readiness is the
+        # difference between a unit that reaches `active` and one that sits
+        # in `activating` until its start timeout, and inferring that from
+        # the absence of a symptom is how the missing notify went unnoticed
+        # for as long as it did.
+        logger.info("SYSTEMD readiness %s (notify socket %s)",
+                    "sent" if announced else "NOT SENT",
+                    "present" if self.systemd.available else "absent")
         if self._watchdog_interval_s:
             self._watchdog_task = self._start_runtime_task(
                 "watchdog", self._systemd_watchdog_loop())

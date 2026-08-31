@@ -212,7 +212,12 @@ class SourceIntelligence:
         # Connections first. A relay or a Telegram client that has not
         # connected answers its first poll with a failure, and the mesh would
         # count that against the source rather than against the connection.
-        failures = await start_transports(self.transports)
+        # The collector's client, when it has one: it is already connected
+        # and already authorised, and it holds the session file every other
+        # Telegram client in this process would otherwise fail to open.
+        failures = await start_transports(
+            self.transports,
+            telegram_client=getattr(self.social_intel, "_telegram_client", None))
         if failures:
             logger.warning("TRANSPORTS %d of %d failed to start: %s",
                            len(failures), len(self.transports),
