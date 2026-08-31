@@ -336,7 +336,8 @@ def _desk_source() -> str:
     root = Path(__file__).resolve().parents[1] / "src"
     return "\n".join((root / name).read_text(encoding="utf-8")
                      for name in ("main.py", "runtime/reporting.py",
-                                  "runtime/ingestion.py", "runtime/wiring.py"))
+                                  "runtime/ingestion.py", "runtime/wiring.py",
+                                  "runtime/source_intelligence.py"))
 
 
 class TestProviderCredentials(unittest.TestCase):
@@ -21910,3 +21911,77 @@ class TestWatchdogCoverageIsComplete(unittest.TestCase):
         for name, reason in self.UNWATCHED.items():
             self.assertTrue(reason and len(reason) > 20,
                             f"{name} is excused without a real reason")
+
+
+class TestExecutableLabels(unittest.TestCase):
+    """The evidence ledger was recording two numbers that cannot be traded.
+
+    A winning trade reported its PEAK as its realised multiple, and the
+    'max feasible multiple' was the chart high. A model fitted to either
+    learns to predict prices nobody could have filled, which is the most
+    likely single explanation for a return head that loses to a constant.
+    """
+
+    def _desk(self):
+        from src.main import MemecoinQuantDesk
+        return MemecoinQuantDesk.__new__(MemecoinQuantDesk)
+
+    def test_an_unmeasured_capacity_raises_nothing(self):
+        desk = self._desk()
+        position = {"exit_capacity_status": "DATA_BLOCKED",
+                    "exit_capacity_ratio": None}
+        desk._mark_feasible_high_water(position, 40.0)
+        # Reading unknown capacity as full capacity is the flattering
+        # direction, and it flatters hardest on the illiquid tokens where the
+        # gap between printed and sellable is widest.
+        self.assertIsNone(position.get("feasible_high_water_multiple"))
+        self.assertEqual(position.get("feasible_marks", 0), 0)
+
+    def test_a_measured_mark_is_discounted_by_capacity_and_cost(self):
+        desk = self._desk()
+        position = {"exit_capacity_status": "OK", "exit_capacity_ratio": 0.5,
+                    "exit_cost": 0.02}
+        desk._mark_feasible_high_water(position, 10.0)
+        # Half the size could leave, and leaving costs 2%.
+        self.assertAlmostEqual(position["feasible_high_water_multiple"], 4.9)
+        self.assertEqual(position["feasible_marks"], 1)
+
+    def test_the_feasible_high_water_only_rises(self):
+        desk = self._desk()
+        position = {"exit_capacity_status": "OK", "exit_capacity_ratio": 1.0,
+                    "exit_cost": 0.0}
+        for multiple in (3.0, 9.0, 2.0, 5.0):
+            desk._mark_feasible_high_water(position, multiple)
+        self.assertAlmostEqual(position["feasible_high_water_multiple"], 9.0)
+        self.assertEqual(position["feasible_marks"], 4)
+
+    def test_the_feasible_high_never_exceeds_the_chart_high(self):
+        desk = self._desk()
+        position = {"exit_capacity_status": "OK", "exit_capacity_ratio": 1.0,
+                    "exit_cost": 0.05}
+        desk._mark_feasible_high_water(position, 12.0)
+        self.assertLess(position["feasible_high_water_multiple"], 12.0)
+
+    def test_a_malformed_capacity_is_ignored_rather_than_crashing_the_loop(self):
+        desk = self._desk()
+        position = {"exit_capacity_status": "OK", "exit_capacity_ratio": "wat"}
+        desk._mark_feasible_high_water(position, 5.0)
+        self.assertIsNone(position.get("feasible_high_water_multiple"))
+
+    def test_the_recorded_outcome_uses_proceeds_not_the_peak(self):
+        source = _desk_source()
+        # The old line read the high water whenever pnl was positive.
+        self.assertNotIn(
+            '"realized_multiple": (float(position.get("high_water_multiple", 1.0))',
+            source)
+        self.assertIn('"realized_multiple": max(0.0, 1.0 + pnl / max(', source)
+
+    def test_the_feasible_label_is_the_feasible_field(self):
+        source = _desk_source()
+        self.assertIn(
+            '"max_feasible_multiple": position.get("feasible_high_water_multiple")',
+            source)
+        # The chart high is still recorded, under its own honest name, so the
+        # gap between printed and fillable stays measurable.
+        self.assertIn('"chart_high_multiple"', source)
+        self.assertIn('"feasible_marks_measured"', source)
