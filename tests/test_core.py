@@ -19321,3 +19321,211 @@ class TestCounterfactualCorpus(unittest.TestCase):
 
     def test_the_desk_reports_the_corpus(self):
         self.assertIn('"decision_corpus"', _desk_source())
+
+
+class TestWatchdogCoverageIsComplete(unittest.TestCase):
+    """Five subsystems shipped this week with no watchdog at all. The gap was
+    found by counting, not by noticing, so the counting is a test now."""
+
+    #: Sections of /status that report a status and are deliberately NOT
+    #: watched, each with the reason. A section may only be here because
+    #: watching it would be noise, never because nobody got round to it.
+    UNWATCHED = {
+        "age_bands": "a training-coverage report; staleness is caught by model_trained",
+        "calibration": "watched through subsystem_calibration's own evidence path",
+        "decision_contribution": "an attribution view; it has no failure mode of its own",
+        "dry_build": "shadow build health, already surfaced by pipeline_execution_build",
+        "entity_registry": "empty by design until entries are verified",
+        "equity": "portfolio marking, watched through subsystem_marking's inputs",
+        "exit_latency": "a measurement, not a subsystem that can fail",
+        "exit_policy": "artefact staleness is model_exit_policy",
+        "fact_ladder": "watched by subsystem_fact_ladder",
+        "forward_evidence": "watched by promotion_pipeline",
+        "idl": "static vendored tables; drift is a CI check, not a runtime one",
+        "ignition": "a scoring view over source data already watched upstream",
+        "launch_census": "watched by pipeline_census and persistence_census",
+        "marking": "position marks; blocked until a position exists",
+        "memory": "watched by subsystem_memory and resource_memory",
+        "native_route": "route readiness, surfaced by pipeline_execution_build",
+        "pump_decoder": "watched by pipeline_decoder",
+        "pumpswap_execution": "same route family as native_route",
+        "pumpswap_route": "same route family as native_route",
+        "screen_policy": "a sizing view; its inputs are watched, it has no state",
+        "signer": "watched by subsystem_signer",
+        "staged_exits": "blocked until a position exists; exits are watched live",
+        "stream_events": "watched by pipeline_stream_events",
+        "wallet_coverage": "an intelligence view, watched by intelligence_coverage",
+        "yellowstone": "watched by feed_yellowstone",
+    }
+
+    @staticmethod
+    def _status_sections():
+        import ast
+        root = Path(__file__).resolve().parents[1] / "src"
+        source = (root / "runtime" / "reporting.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        sections = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Dict):
+                for key in node.keys:
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        sections.add(key.value)
+        return sections
+
+    @staticmethod
+    def _check_names():
+        """Names the checks actually EMIT, not names found in the source.
+
+        Scraping `Check("...")` misses every check whose name is built in a
+        loop -- which is most of the interesting ones -- and a coverage test
+        that cannot see half the checks reports a coverage gap that is not
+        there while missing the ones that are. So the checks are run against
+        a readiness snapshot carrying every section, and what comes out is
+        the answer.
+        """
+        from ops import health
+        sections = (
+            "t0_kernel", "tx_kernel", "miner_offload", "decision_corpus",
+            "latency", "landing_router", "substitution", "telegram_channels",
+            "identity_watch", "discovery", "data_miners", "memory", "signer",
+            "execution_conditions", "fact_ladder", "calibration",
+            "launch_census", "forward_evidence", "yellowstone", "marking")
+        names = set()
+        # Both branches. A check that only fires on DATA_BLOCKED is invisible
+        # to a healthy snapshot, and a coverage test that only feeds it a
+        # healthy one reports a gap that is not there.
+        for state in ("OK", "DATA_BLOCKED"):
+          readiness = {section: {"status": state} for section in sections}
+          for produce in (health.check_safety_state, health.check_feeds,
+                          health.check_sources, health.check_intelligence_coverage,
+                          health.check_breadth, health.check_kernels,
+                          health.check_runtime):
+            try:
+                emitted = produce(readiness)
+            except TypeError:
+                emitted = produce(readiness, health.HealthThresholds())
+            names.update(check.name for check in emitted)
+          for produce in (health.check_models, health.check_pipeline,
+                          health.check_subsystems):
+            try:
+                names.update(check.name for check in produce(
+                    readiness, Path("."), time.time(), health.HealthThresholds()))
+            except TypeError:
+                names.update(check.name for check in produce(
+                    readiness, time.time(), health.HealthThresholds()))
+        return names
+
+    def test_the_subsystems_added_this_week_are_watched(self):
+        checks = self._check_names()
+        for expected in ("kernel_decision", "kernel_transaction",
+                         "kernel_parity_coverage", "runtime_miner_thread",
+                         "persistence_corpus", "subsystem_latency",
+                         "breadth_landing_routes", "breadth_substitution"):
+            self.assertIn(expected, checks, f"{expected} has no watchdog")
+
+    def test_a_demoted_kernel_is_critical_and_escalates(self):
+        from ops.health import State, check_kernels
+        checks = {c.name: c for c in check_kernels({
+            "t0_kernel": {"demoted_reason": "rust and python disagreed"},
+            "tx_kernel": {"rust_authoritative": True}})}
+        self.assertIs(checks["kernel_decision"].state, State.CRITICAL)
+        self.assertTrue(checks["kernel_decision"].escalate)
+        self.assertIs(checks["kernel_transaction"].state, State.OK)
+
+    def test_a_demoted_kernel_has_no_fixer(self):
+        from ops.autofix import standard_remedies
+        health = {"checks": [
+            {"name": "kernel_decision", "state": "CRITICAL"},
+            {"name": "kernel_transaction", "state": "CRITICAL"}]}
+        fired = [r.name for r in standard_remedies() if r.applies(health)]
+        # A restart clears the demotion and re-promotes on the next run of
+        # agreements, which launders a correctness fault into a fresh start.
+        self.assertEqual(fired, [])
+
+    def test_an_invalid_built_transaction_is_critical(self):
+        from ops.health import State, check_kernels
+        checks = {c.name: c for c in check_kernels({
+            "t0_kernel": {}, "tx_kernel": {"invariant_failures": 2}})}
+        self.assertIs(checks["kernel_transaction"].state, State.CRITICAL)
+        self.assertIn("would have been signed", checks["kernel_transaction"].detail)
+
+    def test_a_dead_miner_thread_is_critical_and_has_a_fixer(self):
+        from ops.autofix import standard_remedies
+        from ops.health import State, check_runtime
+        checks = {c.name: c for c in check_runtime({
+            "miner_offload": {"status": "CRITICAL", "detail": "thread is not alive"}})}
+        self.assertIs(checks["runtime_miner_thread"].state, State.CRITICAL)
+        health = {"checks": [{"name": "runtime_miner_thread", "state": "CRITICAL"}]}
+        fired = [r.name for r in standard_remedies() if r.applies(health)]
+        self.assertIn("restart_on_dead_miner_thread", fired)
+
+    def test_a_failing_corpus_write_is_critical_and_flushes(self):
+        from ops.autofix import standard_remedies
+        from ops.health import State, check_runtime
+        checks = {c.name: c for c in check_runtime({
+            "decision_corpus": {"write_failures": 3, "last_error": "disk full"}})}
+        self.assertIs(checks["persistence_corpus"].state, State.CRITICAL)
+        health = {"checks": [{"name": "persistence_corpus", "state": "CRITICAL"}]}
+        remedy = next(r for r in standard_remedies()
+                      if r.name == "flush_decision_corpus")
+        self.assertTrue(remedy.applies(health))
+
+    def test_an_untraced_latency_ledger_warns_and_is_not_fixable(self):
+        from ops.autofix import standard_remedies
+        from ops.health import State, check_runtime
+        checks = {c.name: c for c in check_runtime({
+            "latency": {"status": "DATA_BLOCKED"}})}
+        self.assertIs(checks["subsystem_latency"].state, State.WARN)
+        health = {"checks": [{"name": "subsystem_latency", "state": "WARN"}]}
+        # The ledger needs traffic. No restart produces traffic.
+        self.assertEqual([r.name for r in standard_remedies()
+                          if r.applies(health)], [])
+
+    #: Which check watches which reported subsystem. Stated rather than
+    #: inferred: `decision_corpus` is watched by `persistence_corpus` and
+    #: `t0_kernel` by `kernel_decision`, so no name-matching heuristic finds
+    #: them, and a heuristic that misses them reports full coverage while the
+    #: gap is exactly where it was.
+    WATCHED_BY = {
+        "t0_kernel": "kernel_decision",
+        "tx_kernel": "kernel_transaction",
+        "decision_corpus": "persistence_corpus",
+        "miner_offload": "runtime_miner_thread",
+        "latency": "subsystem_latency",
+        "landing_router": "breadth_landing_routes",
+        "substitution": "breadth_substitution",
+        "telegram_channels": "breadth_telegram",
+        "identity_watch": "breadth_identity",
+        "discovery": "breadth_discovery",
+        "data_miners": "subsystem_miners",
+        "execution_conditions": "subsystem_execution_conditions",
+    }
+
+    def test_every_watching_check_actually_exists(self):
+        """The check that would have caught this week's gap on the day it
+        appeared instead of a fortnight later during an audit."""
+        emitted = self._check_names()
+        missing = sorted(check for check in self.WATCHED_BY.values()
+                         if check not in emitted)
+        self.assertEqual(missing, [],
+                         f"named as watchdogs and never emitted: {missing}")
+
+    def test_every_reported_subsystem_is_watched_or_excused(self):
+        sections = self._status_sections()
+        accounted = set(self.WATCHED_BY) | set(self.UNWATCHED)
+        # Only sections that were present in the smoke-test status are real
+        # subsystems; the reporting module also builds nested dicts.
+        known = accounted | {"schema", "status", "detail"}
+        unexplained = sorted(
+            name for name in (set(self.WATCHED_BY) | set(self.UNWATCHED))
+            if name not in known)
+        self.assertEqual(unexplained, [])
+        # And nothing is in both lists, which would mean somebody excused a
+        # subsystem that is in fact watched and stopped looking at it.
+        overlap = sorted(set(self.WATCHED_BY) & set(self.UNWATCHED))
+        self.assertEqual(overlap, [], f"both watched and excused: {overlap}")
+
+    def test_no_subsystem_is_excused_without_a_reason(self):
+        for name, reason in self.UNWATCHED.items():
+            self.assertTrue(reason and len(reason) > 20,
+                            f"{name} is excused without a real reason")

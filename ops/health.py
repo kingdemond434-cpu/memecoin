@@ -478,6 +478,137 @@ def check_subsystems(readiness: Dict[str, Any], root: Path, now: float,
     return checks
 
 
+def check_kernels(readiness: Dict[str, Any]) -> List[Check]:
+    """The two implementations that can quietly stop being the fast one.
+
+    A demoted kernel is the most dangerous silent state this desk has. It
+    keeps trading, keeps reporting healthy, and has secretly moved back to
+    the slow implementation because the fast one disagreed once. Nothing else
+    surfaces that -- the trades still happen and the status still says OK --
+    so it is checked here and it is CRITICAL.
+
+    Deliberately no fixer. A restart clears the demotion, re-shadows, and
+    re-promotes on the next run of agreements, which is a supervisor
+    laundering a real disagreement into a fresh start. The disagreement is
+    the finding; a human has to look at it.
+    """
+    checks: List[Check] = []
+    for name, section, what in (
+        ("kernel_decision", "t0_kernel", "the T0 decision kernel"),
+        ("kernel_transaction", "tx_kernel", "the transaction builder"),
+    ):
+        report = readiness.get(section) or {}
+        if not report:
+            checks.append(Check(name, State.DATA_BLOCKED,
+                                f"{what} has not reported"))
+            continue
+        demoted = report.get("demoted_reason") or ""
+        if demoted:
+            checks.append(Check(
+                name, State.CRITICAL,
+                f"{what} DEMOTED and is running on the slow implementation: "
+                f"{demoted}. A restart would clear this and hide it.",
+                evidence={"divergences": report.get("divergences"),
+                          "example": report.get("divergence_example")
+                                     or report.get("divergence_examples")},
+                escalate=True))
+        elif report.get("invariant_failures"):
+            checks.append(Check(
+                name, State.CRITICAL,
+                f"{what} produced {report['invariant_failures']} structurally "
+                "invalid output(s); these would have been signed",
+                escalate=True))
+        else:
+            checks.append(Check(name, State.OK, "", evidence={
+                "authoritative": ("rust" if report.get("rust_authoritative")
+                                  else "python"),
+                "agreements": report.get("consecutive_agreements")}))
+
+    # A promoted decision whose Python check was dropped is never verified.
+    # Not a crisis on its own -- it is a check that did not happen, not a
+    # disagreement -- but a rising count means parity has stopped guarding.
+    kernel = readiness.get("t0_kernel") or {}
+    unverified = kernel.get("parity_unverified")
+    if unverified is None:
+        checks.append(Check("kernel_parity_coverage", State.DATA_BLOCKED,
+                            "parity coverage has not reported"))
+    elif unverified:
+        checks.append(Check(
+            "kernel_parity_coverage", State.WARN,
+            f"{unverified} promoted decision(s) were never verified against "
+            "python; the parity worker is not keeping up",
+            evidence={"pending": kernel.get("parity_pending")}))
+    else:
+        checks.append(Check("kernel_parity_coverage", State.OK, "",
+                            evidence={"checked": kernel.get("parity_checked")}))
+    return checks
+
+
+def check_runtime(readiness: Dict[str, Any]) -> List[Check]:
+    """The moving parts that keep the desk collecting rather than deciding."""
+    checks: List[Check] = []
+
+    offload = readiness.get("miner_offload") or {}
+    status = offload.get("status")
+    if not offload:
+        checks.append(Check("runtime_miner_thread", State.DATA_BLOCKED,
+                            "the miner offload has not reported"))
+    elif status == "CRITICAL":
+        # The pool's own report keeps its last numbers, so a dead thread looks
+        # like healthy miners from every other angle.
+        checks.append(Check(
+            "runtime_miner_thread", State.CRITICAL,
+            offload.get("detail") or "the miner thread is not alive; miners "
+                                     "are dark and the pool report is stale",
+            escalate=True))
+    elif status == "DEGRADED":
+        checks.append(Check("runtime_miner_thread", State.WARN,
+                            offload.get("detail", ""),
+                            evidence={"dropped": offload.get("dropped")}))
+    else:
+        checks.append(Check("runtime_miner_thread", State.OK, "",
+                            evidence={"mode": status,
+                                      "delivered": offload.get("delivered")}))
+
+    corpus = readiness.get("decision_corpus") or {}
+    if not corpus:
+        checks.append(Check("persistence_corpus", State.DATA_BLOCKED,
+                            "the decision corpus has not reported"))
+    elif corpus.get("write_failures"):
+        # This is the one file that cannot be rebuilt by re-running anything.
+        checks.append(Check(
+            "persistence_corpus", State.CRITICAL,
+            f"{corpus['write_failures']} corpus write(s) failed: "
+            f"{corpus.get('last_error', '')}. Decisions are being lost and "
+            "cannot be reconstructed from anything else.",
+            escalate=True))
+    elif corpus.get("status") == "DEGRADED":
+        checks.append(Check("persistence_corpus", State.WARN,
+                            corpus.get("detail", ""),
+                            evidence={"ignore_share": corpus.get("ignore_share")}))
+    else:
+        checks.append(Check("persistence_corpus", State.OK, "",
+                            evidence={"recorded": corpus.get("recorded"),
+                                      "resolved": corpus.get("resolved")}))
+
+    latency = readiness.get("latency") or {}
+    if not latency:
+        checks.append(Check("subsystem_latency", State.DATA_BLOCKED,
+                            "the latency ledger has not reported"))
+    elif latency.get("status") == "DATA_BLOCKED":
+        # A warning rather than a fault, and deliberately unfixable: a ledger
+        # with no traces needs traffic, and no restart produces traffic.
+        checks.append(Check(
+            "subsystem_latency", State.WARN,
+            "nothing has been traced; every speed claim about this desk is "
+            "currently unverified"))
+    else:
+        checks.append(Check("subsystem_latency", State.OK, "", evidence={
+            "slowest_ours": latency.get("dominant_controllable_stage"),
+            "unmeasured": latency.get("unmeasured_stages")}))
+    return checks
+
+
 def check_breadth(readiness: Dict[str, Any]) -> List[Check]:
     """Whether the global data universe is actually answering.
 
@@ -848,6 +979,8 @@ def run_health_checks(
         checks.extend(check_intelligence_coverage(readiness))
         checks.append(check_champions(readiness))
         checks.extend(check_breadth(readiness))
+        checks.extend(check_kernels(readiness))
+        checks.extend(check_runtime(readiness))
     else:
         # Everything that reads the snapshot degrades together, and says so.
         # Reporting these as OK would manufacture confidence exactly where
