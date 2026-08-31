@@ -1035,7 +1035,8 @@ def build_transports(declarations: Sequence[Any], client: Optional[HttpClient] =
     return transports, report, client
 
 
-async def share_telegram_client(transports: Dict[str, Any]) -> Optional[str]:
+async def share_telegram_client(transports: Dict[str, Any],
+                                existing: Any = None) -> Optional[str]:
     """Give every Telegram channel transport ONE connected client.
 
     Telethon's SQLite session is single-writer. A desk that declares 38
@@ -1058,6 +1059,23 @@ async def share_telegram_client(transports: Dict[str, Any]) -> Optional[str]:
     channels = [t for t in transports.values()
                 if getattr(t, "kind", "") == "telegram"
                 and hasattr(t, "attach_client")]
+    if not channels:
+        return None
+    # The desk already has an authorised, connected client if the social
+    # collector built one -- and it did, four phases before the transports
+    # start. Telethon's session is a single-writer SQLite file, so opening a
+    # SECOND client against it does not contend with the 38, it contends
+    # with the collector, and every one of them loses: "database is locked",
+    # for the client that was meant to fix exactly that. Reusing the live
+    # client is also the only arrangement Telegram itself likes: MTProto
+    # subscriptions are per-connection, so one connection carrying every
+    # channel is one socket instead of thirty-nine to the same datacentre.
+    if existing is not None and getattr(existing, "is_connected", lambda: False)():
+        for transport in channels:
+            transport.attach_client(existing)
+        logger.info("TELEGRAM reusing the collector's client for %d channel "
+                    "transports", len(channels))
+        return None
     if len(channels) < 2:
         return None
     first = channels[0]
@@ -1072,10 +1090,22 @@ async def share_telegram_client(transports: Dict[str, Any]) -> Optional[str]:
         from telethon import TelegramClient
     except ImportError as exc:
         return f"Telethon is not installed: {exc}"
+    client = None
     try:
         client = TelegramClient(session, int(api_id), api_hash)
         await client.connect()
     except Exception as exc:  # pragma: no cover - needs a live connection
+        # Disposed of explicitly. A half-built Telethon client dropped on the
+        # floor is collected later with its internal loops still pending,
+        # and asyncio reports that as "Task was destroyed but it is pending!"
+        # and "coroutine ignored GeneratorExit" -- four alarming tracebacks
+        # in the journal that describe the cleanup of this failure rather
+        # than the failure itself.
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:  # pragma: no cover - best effort
+                pass
         return f"shared Telegram client failed to connect: {exc}"
     for transport in channels:
         transport.attach_client(client)
@@ -1086,7 +1116,8 @@ async def share_telegram_client(transports: Dict[str, Any]) -> Optional[str]:
 
 async def start_transports(transports: Dict[str, Any], *,
                            timeout_s: float = 15.0,
-                           concurrency: int = 16) -> Dict[str, str]:
+                           concurrency: int = 16,
+                           telegram_client: Any = None) -> Dict[str, str]:
     """Connect everything that holds a connection. Returns what failed, by name.
 
     Failures are returned rather than raised: one relay refusing a connection
@@ -1095,7 +1126,7 @@ async def start_transports(transports: Dict[str, Any], *,
     failures: Dict[str, str] = {}
     # Before anything connects: 38 clients on one SQLite session deadlock
     # each other, and the first symptom is a startup that never finishes.
-    shared = await share_telegram_client(transports)
+    shared = await share_telegram_client(transports, telegram_client)
     if shared:
         logger.warning("TELEGRAM one client per channel (%s)", shared)
     semaphore = asyncio.Semaphore(max(1, int(concurrency)))

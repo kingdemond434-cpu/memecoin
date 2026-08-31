@@ -309,3 +309,79 @@ class SupervisorDoesNotRestartABootingDesk(unittest.TestCase):
         checks = build_health(None, None, 0.0, Path("."))["checks"]
         self.assertEqual("CRITICAL", checks[0]["state"])
         self.assertTrue(checks[0]["escalate"])
+
+
+class OneTelegramClientForTheWholeDesk(unittest.TestCase):
+    """38 clients on one SQLite session is a lock fight nobody wins.
+
+    Telethon's session is single-writer. The social collector opens it four
+    startup phases before the transports do and keeps it, so a client built
+    later does not contend with the other transports -- it contends with the
+    collector, and loses: `database is locked`, from the very client added
+    to stop that happening. The live client is the one to reuse.
+    """
+
+    def setUp(self):
+        from src.collectors.transports import TelegramChannelTransport
+
+        self.transports = {
+            f"telegram:c{index}": TelegramChannelTransport(f"telegram:c{index}",
+                                                           f"c{index}")
+            for index in range(4)}
+
+    def test_a_live_collector_client_is_reused_by_every_channel(self):
+        import asyncio as _asyncio
+
+        from src.collectors.transports import share_telegram_client
+
+        class LiveClient:
+            def is_connected(self):
+                return True
+
+        client = LiveClient()
+        reason = _asyncio.new_event_loop().run_until_complete(
+            share_telegram_client(self.transports, client))
+        self.assertIsNone(reason)
+        for transport in self.transports.values():
+            self.assertIs(client, transport.client)
+            # Ownership stays with the collector: a transport shutting down
+            # must not disconnect the client the whole desk is using.
+            self.assertFalse(transport._owns_client)
+
+    def test_a_disconnected_client_is_not_handed_out(self):
+        import asyncio as _asyncio
+
+        from src.collectors.transports import share_telegram_client
+
+        class DeadClient:
+            def is_connected(self):
+                return False
+
+        _asyncio.new_event_loop().run_until_complete(
+            share_telegram_client(self.transports, DeadClient()))
+        for transport in self.transports.values():
+            self.assertIsNone(transport.client)
+
+    def test_a_shared_client_is_never_disconnected_by_a_transport(self):
+        import asyncio as _asyncio
+
+        class Client:
+            def __init__(self):
+                self.disconnected = False
+
+            def is_connected(self):
+                return True
+
+            def remove_event_handler(self, handler):
+                pass
+
+            async def disconnect(self):
+                self.disconnected = True
+
+        client = Client()
+        transport = self.transports["telegram:c0"]
+        transport.attach_client(client)
+        _asyncio.new_event_loop().run_until_complete(transport.stop())
+        self.assertFalse(client.disconnected,
+                         "stopping one channel must not take the desk's "
+                         "Telegram connection down with it")
