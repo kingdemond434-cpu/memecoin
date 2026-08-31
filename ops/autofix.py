@@ -301,6 +301,24 @@ def standard_remedies(service: str = "memecoin-shadow.service",
     something. Anything not listed here is reported and left alone -- a
     supervisor that improvises against a fault it cannot name will eventually
     improvise against a fault that was not there.
+
+    Four checks are CRITICAL and deliberately have no entry here, because the
+    only available action would destroy the evidence:
+
+    `safety_kill_switch` -- a supervisor that clears the kill switch has
+    removed the one thing standing between a losing day and a worse one.
+
+    `kernel_decision` and `kernel_transaction` -- a demoted kernel is a real
+    disagreement between two implementations. Restarting clears the demotion,
+    re-shadows, and re-promotes on the next run of agreements, which is a
+    supervisor laundering a correctness fault into a fresh start. The
+    disagreement is the finding and a human has to read it.
+
+    `execution_failure_rate` -- a high failure rate is the market telling you
+    something, and restarting hides the message.
+
+    `subsystem_latency` warns when nothing has been traced. There is no fixer
+    because the ledger needs traffic, and no restart produces traffic.
     """
     return [
         Remedy(
@@ -381,6 +399,22 @@ def standard_remedies(service: str = "memecoin-shadow.service",
                  "gone silent; run the verification pass now rather than "
                  "waiting for its hourly slot"),
             budget=4, cooldown_s=900.0),
+        Remedy(
+            name="restart_on_dead_miner_thread",
+            applies=lambda health: _critical(health, "runtime_miner_thread"),
+            act=lambda: systemctl("restart", service),
+            why=("the miner thread died; the pool keeps reporting its last "
+                 "numbers, so every other signal says the miners are healthy "
+                 "while nothing is being collected"),
+            budget=3, cooldown_s=600.0),
+        Remedy(
+            name="flush_decision_corpus",
+            applies=lambda health: _critical(health, "persistence_corpus"),
+            act=lambda: post(f"{status_base}/flush"),
+            why=("corpus writes are failing and this is the one file that "
+                 "cannot be rebuilt by re-running anything; force a write "
+                 "rather than restarting into the same buffer"),
+            budget=6, cooldown_s=120.0),
         Remedy(
             name="retrain_stale_models",
             applies=lambda health: _warn(

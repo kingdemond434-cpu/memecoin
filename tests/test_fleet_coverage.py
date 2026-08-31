@@ -575,7 +575,31 @@ class TheDefaultBranchIsGuardedLocally(unittest.TestCase):
         result = self._run("refs/heads/main a refs/heads/main b\n")
         self.assertIn("--no-verify", result.stderr)
 
-    def test_the_repository_actually_uses_this_hooks_path(self):
+    def test_the_hook_is_installable_from_the_repository(self):
+        """The hook must exist and be runnable wherever this is checked out.
+
+        Its INSTALLATION is a property of a developer's clone, not of the
+        repository, so it is asserted separately below. Asserting the local
+        config unconditionally fails on every CI runner by construction --
+        a fresh checkout has no core.hooksPath -- which leaves the default
+        branch permanently red and teaches everyone to ignore it. A guard
+        rail whose own test cries wolf is worse than no guard rail.
+        """
+        hook = Path(__file__).resolve().parents[1] / "deploy" / "hooks" / "pre-push"
+        self.assertTrue(hook.exists(), hook)
+        self.assertTrue(os.access(hook, os.X_OK),
+                        f"{hook} is not executable; git will silently skip it")
+
+    @unittest.skipIf(os.getenv("CI"), "a fresh CI checkout has no local hooks path")
+    def test_a_developer_clone_has_the_hooks_path_configured(self):
+        """In a working clone the guard should actually be armed.
+
+        Skipped on CI rather than deleted: the check is worth keeping for the
+        machine that pushes, which is the only machine the hook can protect.
+        Install with: git config core.hooksPath deploy/hooks
+        """
         configured = subprocess.run(
             ["git", "config", "core.hooksPath"], capture_output=True, text=True)
-        self.assertEqual(configured.stdout.strip(), "deploy/hooks")
+        self.assertEqual(
+            configured.stdout.strip(), "deploy/hooks",
+            "run: git config core.hooksPath deploy/hooks")
