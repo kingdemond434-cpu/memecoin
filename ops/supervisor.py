@@ -29,10 +29,25 @@ def read_status(url: str, timeout: float = 10.0) -> Optional[Dict[str, Any]]:
 
     None is a finding, not an absence: a desk that does not answer is the
     single loudest thing this supervisor can observe.
+
+    A desk still booting is NOT that. It now binds its port before its
+    subsystems exist -- so it can be watched while it starts rather than
+    being invisible for the whole of it -- and answers /status with 503 and
+    the phase it is on until it is ready. Reading that as silence would have
+    this supervisor restart a desk whose only fault was starting, which is
+    the one action guaranteed to make it start again from the beginning.
     """
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code != 503:
+            return None
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+        except (ValueError, OSError):
+            return None
+        return payload if isinstance(payload, dict) else None
     except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
         return None
 
@@ -47,6 +62,19 @@ def build_health(status: Optional[Dict[str, Any]], previous: Optional[Dict[str, 
             "name": "readiness_freshness", "state": "CRITICAL",
             "detail": "the desk did not answer /status", "evidence": {},
             "escalate": True}]}
+    if str(status.get("status", "")) == "starting":
+        # Booting, and saying so. Every other check reads a field of a
+        # readiness document that does not exist yet, so running them here
+        # would report thirty absences as thirty faults. WARN and not
+        # CRITICAL, and explicitly not escalated: the phase name is the
+        # useful thing, and a restart is the opposite of useful.
+        return {"checks": [{
+            "name": "desk_startup", "state": "WARN",
+            "detail": ("the desk is starting: phase "
+                       f"{status.get('phase', 'unknown')}"),
+            "evidence": {"phase": status.get("phase"),
+                         "uptime_seconds": status.get("uptime_seconds")},
+            "escalate": False}]}
     thresholds = HealthThresholds()
     checks = (check_pipeline(status, now, thresholds, previous)
               + check_subsystems(status, root, now, thresholds))
