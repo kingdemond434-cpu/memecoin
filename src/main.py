@@ -66,6 +66,7 @@ from src.runtime.maintenance import DeskMaintenance
 from src.runtime.wiring import SubsystemWiring
 from src.runtime.source_intelligence import SourceIntelligence
 from src.runtime.offload import OffloadedPool, install_fast_event_loop
+from src.runtime.sd_notify import SystemdNotifier, watchdog_interval_s
 from src.runtime.memory_governor import (
     Band, MemoryGovernor, Relief, DEFAULT_SOFT_FRACTION,
     DEFAULT_HARD_FRACTION)
@@ -454,6 +455,19 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         self._closed_pnl: Dict[str, float] = {}
         self._market_cursor = 0
         self._model_artifact_mtime = 0.0
+        # The unit is Type=notify with WatchdogSec. Both are promises to the
+        # service manager that nothing in this process was keeping: see
+        # src/runtime/sd_notify.py. Constructed here so every phase of
+        # startup can report progress into `systemctl status`.
+        self.systemd = SystemdNotifier()
+        self._watchdog_interval_s = watchdog_interval_s()
+        self._watchdog_pings = 0
+        self._watchdog_task: Optional[asyncio.Task] = None
+        # Non-empty while a startup phase is in flight. The health endpoints
+        # read it so a probe that arrives mid-boot gets an honest "starting,
+        # on phase X" instead of an exception from a subsystem that does not
+        # exist yet.
+        self._starting_phase = "constructing"
 
     async def initialize(self):
         normalize_provider_environment(os.environ)
@@ -473,13 +487,32 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         )
         configured_dry_run = bool(self.global_config.get("dry_run", True))
         self.dry_run = configured_dry_run if self.dry_run_override is None else bool(self.dry_run_override)
-        await self._setup_keys()
-        await self._setup_chains()
-        await self._setup_intelligence()
-        await self._setup_prediction()
-        await self._setup_execution()
-        await self._setup_detection_and_risk()
-        await self._setup_research()
+        # The health server binds BEFORE the subsystems, not after. Startup
+        # restores thousands of wallets, loads model artifacts and resolves
+        # dozens of channels, and while it did that the desk answered nothing
+        # on its port -- so the one moment an operator most needs to see what
+        # is happening was the one moment the desk was invisible. /health and
+        # /status now answer from the first second, and say `starting`.
+        if not self.offline:
+            await self._setup_health_server()
+        for phase, step in (
+                ("keys", self._setup_keys),
+                ("chains", self._setup_chains),
+                ("intelligence", self._setup_intelligence),
+                ("prediction", self._setup_prediction),
+                ("execution", self._setup_execution),
+                ("detection and risk", self._setup_detection_and_risk),
+                ("research", self._setup_research)):
+            self._starting_phase = phase
+            self.systemd.status(f"starting: {phase}")
+            # Each phase buys its own deadline rather than the unit carrying
+            # one timeout big enough for the worst of them. A phase that
+            # stops progressing still fails within 90s.
+            self.systemd.extend_timeout(90.0)
+            began = time.time()
+            await step()
+            logger.info("STARTUP phase %s ready in %.1fs", phase, time.time() - began)
+        self._starting_phase = "social signals"
         await self._flush_pending_social_signals()
         # The stream connects LAST, after every consumer exists. A producer
         # that starts first delivers events into a desk that has nothing
@@ -529,9 +562,51 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             "market", self._market_observer_loop())
         self._source_task = self._start_runtime_task(
             "sources", self._source_consumer_loop())
+        # Every loop is scheduled and the port is bound: this is what
+        # `Type=notify` has been waiting to hear since the directive was
+        # added. Without it `systemctl start` blocks until TimeoutStartSec,
+        # the unit reports `activating` for its whole life, and anything
+        # ordered After= this unit waits on a readiness that never arrives.
+        self._starting_phase = ""
+        self.systemd.ready(
+            f"desk running: {'DRY_RUN' if self.dry_run else 'LIVE'}, "
+            f"{len(self.transports)} transports")
+        if self._watchdog_interval_s:
+            self._watchdog_task = self._start_runtime_task(
+                "watchdog", self._systemd_watchdog_loop())
+            logger.info("systemd watchdog ping every %.0fs",
+                        self._watchdog_interval_s)
+
+    async def _systemd_watchdog_loop(self):
+        """Ping WatchdogSec, on its own task, at a third of the interval.
+
+        Its own task rather than a line in _health_loop on purpose. That loop
+        also computes readiness and writes it to disk, and a readiness pass
+        that blocks for longer than the watchdog interval would have systemd
+        kill a process whose only fault was that reporting took too long --
+        the failure mode dressed as the thing it was meant to detect.
+
+        This does not make a hang undetectable: the ping runs on the same
+        event loop as the decision path, so a blocked loop still misses it
+        and systemd still acts. It only stops slow REPORTING from counting
+        as a hang.
+        """
+        interval = float(self._watchdog_interval_s or 0.0)
+        if interval <= 0:
+            return
+        while self._running:
+            await asyncio.sleep(interval)
+            if not self._running:
+                break
+            if self.systemd.watchdog():
+                self._watchdog_pings += 1
 
     async def stop(self):
         self._running = False
+        # Announced before the teardown, not after: shutdown flushes ledgers
+        # and can take seconds, and systemd counts that against
+        # TimeoutStopSec unless it has been told the exit is deliberate.
+        self.systemd.stopping("shutting down")
         # Producers first: they hold sockets, and cancelling the consumer
         # while producers keep publishing fills a queue nobody drains.
         try:
@@ -555,7 +630,7 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
         for task in (self._main_task, self._health_task, self._market_task,
                      self._safety_task, self._intelligence_task, self._source_task,
-                     self._parity_task,
+                     self._parity_task, self._watchdog_task,
                      *self._redecision_tasks):
             if task:
                 task.cancel()

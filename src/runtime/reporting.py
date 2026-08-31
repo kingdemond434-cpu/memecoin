@@ -757,6 +757,12 @@ class ReportingSurface:
                             content_type="text/html")
 
     async def _setup_health_server(self):
+        # Called from initialize() so the desk is observable while it boots,
+        # and still called from start() for any caller that only runs the
+        # latter. Binding twice would raise on the second attempt, so the
+        # already-bound case is the no-op it should be.
+        if self._web_runner is not None:
+            return
         app = web.Application()
         app.router.add_get("/health", self._health_endpoint)
         app.router.add_get("/metrics", self._metrics_endpoint)
@@ -785,6 +791,14 @@ class ReportingSurface:
         logger.info("health server on %s:%s", host, os.getenv("HEALTH_PORT", "8080"))
 
     async def _health_endpoint(self, request):
+        # The port is bound before the subsystems exist, so a probe can
+        # arrive during startup. Answering it with an exception from a
+        # half-built desk is worse than answering it honestly.
+        starting = getattr(self, "_starting_phase", "")
+        if starting:
+            return web.json_response({
+                "status": "starting", "phase": starting,
+                "uptime_seconds": time.time() - self.start_time})
         return web.json_response({"status": "healthy" if self._running else "stopping", "dry_run": self.dry_run,
                                   "uptime_seconds": time.time() - self.start_time,
                                   "live_submission_locked": os.getenv("ALLOW_LIVE_TRADING", "").lower() != "yes-i-understand"})
@@ -795,6 +809,15 @@ class ReportingSurface:
                                             "successful_exits": self.successful_exits}))
 
     async def _status_endpoint(self, request):
+        starting = getattr(self, "_starting_phase", "")
+        if starting:
+            # 503, not 200: a caller polling for readiness must be able to
+            # tell "not finished booting" from "booted, and this is the
+            # state", and a 200 with a partial body cannot say that.
+            return web.json_response(
+                {"status": "starting", "phase": starting,
+                 "uptime_seconds": time.time() - self.start_time},
+                status=503)
         return web.json_response(_jsonable(self.readiness()))
 
     async def _close_health_server(self):

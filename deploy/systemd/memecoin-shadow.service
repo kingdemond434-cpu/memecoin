@@ -25,7 +25,18 @@ NotifyAccess=main
 # real, measured contention room without making a genuine hang undetectable
 # for an unreasonable time -- this is DRY_RUN, so a slower kill costs
 # continuity, not capital.
+# The comment above diagnosed those kills as CPU starvation on a shared box.
+# It was not: this unit is Type=notify with WatchdogSec, and until
+# src/runtime/sd_notify.py existed the process sent NEITHER the READY=1 that
+# ends `activating` NOR the WATCHDOG=1 that this directive requires. systemd
+# was killing a process that had never once pinged it, exactly on schedule.
+# Both are now sent -- readiness when every loop is scheduled, the ping on its
+# own task at a third of this interval -- so the watchdog measures what it was
+# meant to measure and 240s is a real hang detector rather than a timer.
 WatchdogSec=240s
+# Startup extends its own deadline per phase (EXTEND_TIMEOUT_USEC), so a cold
+# cache restoring thousands of wallets is not killed for being slow, while a
+# phase that stops progressing still fails inside 90s.
 TimeoutStartSec=120s
 WorkingDirectory=%h/.local/opt/memecoin-shadow
 EnvironmentFile=-%h/.config/memecoin-shadow/env
@@ -57,9 +68,34 @@ ProtectHome=read-only
 ReadWritePaths=%h/.local/opt/memecoin-shadow/data %h/.local/opt/memecoin-shadow/models
 UMask=0077
 
-# Headroom for the hot state and the model artifacts, and a ceiling so a leak
-# takes the desk down rather than the machine.
-MemoryMax=4G
+# A ladder, not a cliff. MemoryMax=4G on a 4 GB host was a ceiling that could
+# never be reached: long before the cgroup hit 4 GB the HOST would be out of
+# memory and the kernel OOM killer would pick a victim -- possibly this desk,
+# possibly something else on the box, and in neither case a decision anyone
+# made. It also disabled the in-process governor, whose bands are fractions of
+# this number: SHED at 0.85 x 4 GB = 3.4 GB is a threshold the machine dies
+# before crossing, so no relief valve could ever fire. The desk's measured
+# peak is 549 MB (2026-08-31), so nothing below is a reduction in what it may
+# use -- it is 4x headroom over anything ever observed, arranged so each step
+# is cheaper than the next:
+#
+#   ~1.75 GB  governor TRIM   fewer miners, spill census detail. Reversible.
+#   ~2.13 GB  governor SHED   flush to disk, loudly. Still reversible.
+#    2.25 GB  MemoryHigh      kernel throttles and reclaims. Slow, never kills.
+#    2.5  GB  MemoryMax       cgroup kills THIS unit, and Restart=always
+#                             brings it back. A decision, not a lottery.
+#
+# MemoryHigh is the important one: it turns memory pressure into slowness
+# instead of death, which is the whole difference between a desk that loses a
+# minute and a desk that loses twelve hours of forward evidence.
+MemoryHigh=2304M
+MemoryMax=2560M
+# Cold pages may leave RAM rather than the process being killed for holding
+# them. Without a swap allowance the cgroup has no option between "resident"
+# and "dead".
+MemorySwapMax=1G
+# A child hitting the cgroup limit must not take the desk with it.
+OOMPolicy=continue
 CPUQuota=200%
 
 # Journald provides bounded rotation.  An append-only shadow.log grows without

@@ -118,18 +118,46 @@ class HttpClient:
     timeout_s: float = DEFAULT_TIMEOUT_S
     limit: int = 100
     limit_per_host: int = 4
-    _session: Any = field(default=None, repr=False)
+    #: One session PER EVENT LOOP, keyed by the loop it belongs to.
+    _sessions: Dict[int, Any] = field(default_factory=dict, repr=False)
 
     async def session(self):
-        if self._session is None or self._session.closed:
-            import aiohttp
+        """The session for the loop calling this, created on first use.
 
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.timeout_s),
-                connector=aiohttp.TCPConnector(limit=self.limit,
-                                               limit_per_host=self.limit_per_host),
-                headers={"User-Agent": USER_AGENT})
-        return self._session
+        An aiohttp session binds to the loop that created it: its connector,
+        its timers and its timeout contexts all live there. Used from a
+        different loop it raises `RuntimeError: Timeout context manager
+        should be used inside a task` on the very first request.
+
+        That is not hypothetical. `OffloadedPool` runs the miners on their
+        own loop in their own thread -- deliberately, to keep multi-megabyte
+        JSON parses off the decision path -- and those miners share this
+        client with the main loop. So every regional miner failed on its
+        first call, and because the substitution ladder reads a failure as
+        evidence against the ENDPOINT, it quarantined a perfectly healthy
+        operator for 300s and rotated to the next, which failed identically.
+        Four ladders burned down in the first minute of every run: new_pools,
+        venue_tickers, regional_venues and market_context. The desk reported
+        the outage as the world's fault.
+
+        Keying by loop keeps the one property the shared client existed for
+        -- a bounded connection pool rather than a socket per source -- while
+        making the client safe to hand to any loop that wants it.
+        """
+        loop = asyncio.get_running_loop()
+        key = id(loop)
+        existing = self._sessions.get(key)
+        if existing is not None and not existing[1].closed:
+            return existing[1]
+        import aiohttp
+
+        created = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self.timeout_s),
+            connector=aiohttp.TCPConnector(limit=self.limit,
+                                           limit_per_host=self.limit_per_host),
+            headers={"User-Agent": USER_AGENT})
+        self._sessions[key] = (loop, created)
+        return created
 
     async def get(self, url: str, *, headers: Optional[Dict[str, str]] = None
                   ) -> Tuple[int, str, Dict[str, str]]:
@@ -145,8 +173,29 @@ class HttpClient:
             raise TransportError(f"{type(exc).__name__}: {exc}") from exc
 
     async def close(self) -> None:
-        if self._session is not None and not self._session.closed:
-            await self._session.close()
+        """Close every loop's session, each on the loop that owns it.
+
+        Awaiting another loop's `close()` from here would raise the same
+        cross-loop error this class exists to avoid, so a session belonging
+        to a still-running loop is closed ON that loop. A loop already
+        stopped has taken its sockets with it and needs nothing.
+        """
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - called outside a loop
+            current = None
+        for loop, session in list(self._sessions.values()):
+            if session.closed:
+                continue
+            if loop is current:
+                await session.close()
+            elif loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(session.close(), loop)
+                try:
+                    future.result(timeout=5.0)
+                except Exception as exc:  # pragma: no cover - shutdown only
+                    logger.debug("cross-loop session close: %s", exc)
+        self._sessions.clear()
 
 
 class Transport:
@@ -986,6 +1035,55 @@ def build_transports(declarations: Sequence[Any], client: Optional[HttpClient] =
     return transports, report, client
 
 
+async def share_telegram_client(transports: Dict[str, Any]) -> Optional[str]:
+    """Give every Telegram channel transport ONE connected client.
+
+    Telethon's SQLite session is single-writer. A desk that declares 38
+    channels used to build 38 clients against the same session file, and
+    they contended on it: the journal fills with "database is locked",
+    each transport retries, and the mesh spends minutes in startup for a
+    connection one client could have made once. `attach_client` was written
+    for exactly this and nothing ever called it.
+
+    One client is also the correct shape for the protocol. MTProto
+    subscriptions are per-connection, not per-channel; every additional
+    client is a redundant socket to the same datacentre carrying a subset
+    of the same updates.
+
+    Returns a reason when sharing did not happen, so the caller can say why
+    rather than silently falling back to the contended path. Falling back
+    is safe -- each transport can still open its own client -- but a desk
+    that quietly does the slow thing is how this bug survived.
+    """
+    channels = [t for t in transports.values()
+                if getattr(t, "kind", "") == "telegram"
+                and hasattr(t, "attach_client")]
+    if len(channels) < 2:
+        return None
+    first = channels[0]
+    api_id = os.getenv(getattr(first, "api_id_env", "TELEGRAM_API_ID"), "")
+    api_hash = os.getenv(getattr(first, "api_hash_env", "TELEGRAM_API_HASH"), "")
+    if not api_id or not api_hash:
+        return "Telegram API credentials are not set"
+    session = getattr(first, "session_name", TelegramChannelTransport.SESSION_PATH)
+    if not os.path.exists(f"{session}.session"):
+        return f"no authorised session at {session}.session"
+    try:
+        from telethon import TelegramClient
+    except ImportError as exc:
+        return f"Telethon is not installed: {exc}"
+    try:
+        client = TelegramClient(session, int(api_id), api_hash)
+        await client.connect()
+    except Exception as exc:  # pragma: no cover - needs a live connection
+        return f"shared Telegram client failed to connect: {exc}"
+    for transport in channels:
+        transport.attach_client(client)
+    logger.info("TELEGRAM sharing one client across %d channel transports",
+                len(channels))
+    return None
+
+
 async def start_transports(transports: Dict[str, Any], *,
                            timeout_s: float = 15.0,
                            concurrency: int = 16) -> Dict[str, str]:
@@ -995,6 +1093,11 @@ async def start_transports(transports: Dict[str, Any], *,
     must not stop the other three hundred sources from starting.
     """
     failures: Dict[str, str] = {}
+    # Before anything connects: 38 clients on one SQLite session deadlock
+    # each other, and the first symptom is a startup that never finishes.
+    shared = await share_telegram_client(transports)
+    if shared:
+        logger.warning("TELEGRAM one client per channel (%s)", shared)
     semaphore = asyncio.Semaphore(max(1, int(concurrency)))
 
     async def start_one(source_id: str, transport: Any) -> None:

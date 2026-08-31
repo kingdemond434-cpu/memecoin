@@ -80,6 +80,29 @@ async def _fetch_json(client: Any, url: str,
         raise RuntimeError(f"response was not JSON: {exc}") from exc
 
 
+#: Substrings that identify a failure originating INSIDE this process
+#: rather than at the endpoint. Matched on the message because the
+#: exception types are shared with genuine network faults -- aiohttp raises
+#: RuntimeError for both "your session is on the wrong loop" and nothing
+#: else useful, so the text is the only discriminator available.
+LOCAL_FAULT_MARKERS = (
+    # A session used from a loop other than the one that created it.
+    "Timeout context manager should be used inside a task",
+    "attached to a different loop",
+    "Event loop is closed",
+    "no running event loop",
+    # The session was closed underneath a caller still using it.
+    "Session is closed",
+    "Connector is closed",
+)
+
+
+def _is_local_fault(exc: BaseException) -> bool:
+    """True when the failure is ours, so no endpoint should be blamed for it."""
+    message = f"{type(exc).__name__}: {exc}"
+    return any(marker in message for marker in LOCAL_FAULT_MARKERS)
+
+
 class LadderFetcher:
     """Ask a domain's live rung; on failure, rotate and try the next one.
 
@@ -94,6 +117,9 @@ class LadderFetcher:
         self.client = client
         self.registry = registry
         self.max_attempts = max(1, int(max_attempts))
+        #: Faults that were ours, kept separate from anything an endpoint did.
+        self.local_faults = 0
+        self.last_local_fault = ""
 
     async def get(self, domain: str, **params: Any) -> tuple:
         """Returns (payload, endpoint). Raises only when the ladder is spent."""
@@ -116,6 +142,18 @@ class LadderFetcher:
             except Exception as exc:
                 reason = f"{type(exc).__name__}: {exc}"
                 errors.append(f"{endpoint.name}: {reason}")
+                if _is_local_fault(exc):
+                    # Our bug, not their outage. Quarantining an operator
+                    # for a fault that never left this process is how a
+                    # cross-loop aiohttp error took down four ladders at
+                    # once and got reported as the world declining to
+                    # answer. The rung stays live and the fault is raised
+                    # so it is fixed rather than absorbed.
+                    self.local_faults += 1
+                    self.last_local_fault = reason
+                    logger.error("LADDER %s: local fault, not the endpoint's "
+                                 "(%s): %s", domain, endpoint.name, reason)
+                    raise
                 self.registry.note_failure(domain, endpoint.name, reason)
                 continue
             self.registry.note_success(domain, endpoint.name)
