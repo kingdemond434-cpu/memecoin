@@ -137,11 +137,19 @@ class EventSource(ABC):
     #: belong on one shared cadence, and a single polling loop forces exactly
     #: that.
     poll_interval_seconds: float = 1.0
+    #: How long this source may take to answer. A property of the source for
+    #: the same reason cadence is: a feed served from the other side of the
+    #: world is not slow because it is broken. Measured 2026-08-30, the
+    #: Korean, Chinese and Japanese outlets all exceeded the mesh's 5s
+    #: default on every poll and produced nothing, while answering fine to
+    #: curl. None means "use the mesh default".
+    poll_timeout_seconds: Optional[float] = None
 
     def __init__(self, source_id: str, source_class: SourceClass,
                  degraded_after_seconds: Optional[float] = None,
                  dead_after_seconds: Optional[float] = None,
-                 poll_interval_seconds: Optional[float] = None):
+                 poll_interval_seconds: Optional[float] = None,
+                 poll_timeout_seconds: Optional[float] = None):
         self.source_id = source_id
         self.source_class = source_class
         # How often this source is worth asking, which is a property of the
@@ -150,6 +158,8 @@ class EventSource(ABC):
         # them on one is what a single polling loop forces.
         if poll_interval_seconds is not None:
             self.poll_interval_seconds = max(0.01, float(poll_interval_seconds))
+        if poll_timeout_seconds is not None:
+            self.poll_timeout_seconds = max(0.1, float(poll_timeout_seconds))
         if degraded_after_seconds is not None:
             self.degraded_after_seconds = float(degraded_after_seconds)
         if dead_after_seconds is not None:
@@ -185,8 +195,14 @@ class EventSource(ABC):
             events = await self.poll()
         except Exception as exc:
             self._consecutive_failures += 1
-            logger.warning("source %s poll failed (%d consecutive): %s",
-                           self.source_id, self._consecutive_failures, exc)
+            # Keep the first failures loud, then log powers of two. A broken
+            # endpoint polled forever must not turn the research log into a
+            # denial of service or hide failures from healthy sources.
+            failures = self._consecutive_failures
+            emit_warning = failures <= 3 or failures & (failures - 1) == 0
+            log = logger.warning if emit_warning else logger.debug
+            log("source %s poll failed (%d consecutive): %s",
+                self.source_id, failures, exc)
             return []
         self._consecutive_failures = 0
         self._last_poll_ok_at = now
@@ -220,6 +236,20 @@ class EventSource(ABC):
                     f"(degraded at {self.degraded_after_seconds:.0f}s, "
                     f"dead at {self.dead_after_seconds:.0f}s, "
                     f"{self._timeouts} timeouts)"))
+
+    def retry_delay(self, elapsed_seconds: float = 0.0,
+                    max_backoff_seconds: float = 300.0) -> float:
+        """Next cadence, with bounded exponential backoff after failures."""
+        base = max(0.01, float(self.poll_interval_seconds))
+        if self._consecutive_failures:
+            # A 1s feed backs off 1,2,4,... seconds. A 5m repository
+            # remains at its declared cadence and never retries faster merely
+            # because the previous request failed.
+            exponent = min(max(0, self._consecutive_failures - 1), 12)
+            interval = min(max_backoff_seconds, max(base, 1.0) * (2 ** exponent))
+        else:
+            interval = base
+        return max(0.0, interval - max(0.0, float(elapsed_seconds)))
 
 
 class SourceMesh:
@@ -267,12 +297,18 @@ class SourceMesh:
             self._seen.pop(key, None)
 
     async def _collect_one(self, source: "EventSource", now: float) -> List[Event]:
-        """Poll one source under a timeout, never propagating its failure."""
+        """Poll one source under a timeout, never propagating its failure.
+
+        The source's own budget wins where it declares one. A distant feed
+        that needs eight seconds is not unhealthy, and holding every source
+        to the nearest one's latency silently drops whole regions.
+        """
+        timeout = getattr(source, "poll_timeout_seconds", None) or self.poll_timeout
         try:
-            return await asyncio.wait_for(source.collect(now), timeout=self.poll_timeout)
+            return await asyncio.wait_for(source.collect(now), timeout=timeout)
         except asyncio.TimeoutError:
             logger.warning("source %s exceeded the %.1fs poll timeout",
-                           source.source_id, self.poll_timeout)
+                           source.source_id, timeout)
             source.note_timeout()
             return []
         except Exception as exc:  # pragma: no cover - collect already guards
@@ -304,14 +340,13 @@ class SourceMesh:
         first -- and the barrier applied on every cycle, not just slow ones.
         A producer per source means a slow source is slow by itself.
         """
-        interval = max(0.01, float(getattr(source, "poll_interval_seconds", 1.0)))
         while self._running:
             started = time.time()
             events = await self._collect_one(source, started)
             for event in events:
                 self._publish(event, time.time())
             elapsed = time.time() - started
-            await asyncio.sleep(max(0.0, interval - elapsed))
+            await asyncio.sleep(source.retry_delay(elapsed))
 
     def _publish(self, event: Event, now: float) -> None:
         """Put one event on the fan-in queue, dropping the oldest when full.

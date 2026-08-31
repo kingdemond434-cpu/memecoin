@@ -57,6 +57,7 @@ sdist/
 var/
 venv/
 wheels/
+native/solana_fastpath/target/
 config/sources.verified.yaml
 config/entities.verified.yaml
 

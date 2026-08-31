@@ -254,6 +254,21 @@ sources:
   # catching, and it is served by exactly the same RSS parser. Cadences are
   # matched to how each outlet actually publishes: polling a daily every
   # second is four thousand pointless requests an hour and an eventual block.
+  # Japanese crypto-native coverage. Verified from this node 2026-08-30:
+  # HTTP 200 with 10 parseable items. Cointelegraph's Japanese feed is 410
+  # Gone, which is why this outlet rather than that one.
+  - id: rss:jp-neweconomy
+    kind: rss
+    url: "https://www.neweconomy.jp/feed"
+    tier: 2
+    language: ja
+    region: jp
+    poll_interval_seconds: 600
+    # Distance, not ill health: every poll exceeded the mesh's 5s default
+    # while the endpoint answered fine to curl.
+    poll_timeout_seconds: 20
+    degraded_after_seconds: 7200
+    dead_after_seconds: 43200
   - id: rss:jp-nhk
     kind: rss
     tier: 2
@@ -495,6 +510,14 @@ sources:
     options: {url: "https://www.techflowpost.com/rss.xml", language: zh}
   - id: rss:cn-chaincatcher
     kind: rss
+    # Verified from this node 2026-08-30: HTTP 200, 50 items. Verified
+    # rather than guessed -- PANews and Odaily answer 200 with ZERO
+    # items and Cointelegraph's regional feeds are 410 Gone, so a URL
+    # returning an empty document would report healthy and cover nothing.
+    url: "https://www.chaincatcher.com/rss.xml"
+    # Distance, not ill health: every poll exceeded the mesh's 5s
+    # default while the endpoint answered fine to curl.
+    poll_timeout_seconds: 20
     tier: 2
     language: zh
     region: cn
@@ -522,6 +545,14 @@ sources:
     options: {url: "https://jp.cointelegraph.com/rss", language: ja}
   - id: rss:kr-blockmedia
     kind: rss
+    # Verified from this node 2026-08-30: HTTP 200, 10 items. Verified
+    # rather than guessed -- PANews and Odaily answer 200 with ZERO
+    # items and Cointelegraph's regional feeds are 410 Gone, so a URL
+    # returning an empty document would report healthy and cover nothing.
+    url: "https://www.blockmedia.co.kr/feed"
+    # Distance, not ill health: every poll exceeded the mesh's 5s
+    # default while the endpoint answered fine to curl.
+    poll_timeout_seconds: 20
     tier: 2
     language: ko
     region: kr
@@ -531,6 +562,14 @@ sources:
     options: {url: "https://www.blockmedia.co.kr/feed", language: ko}
   - id: rss:kr-tokenpost
     kind: rss
+    # Verified from this node 2026-08-30: HTTP 200, 50 items. Verified
+    # rather than guessed -- PANews and Odaily answer 200 with ZERO
+    # items and Cointelegraph's regional feeds are 410 Gone, so a URL
+    # returning an empty document would report healthy and cover nothing.
+    url: "https://www.tokenpost.kr/rss"
+    # Distance, not ill health: every poll exceeded the mesh's 5s
+    # default while the endpoint answered fine to curl.
+    poll_timeout_seconds: 20
     tier: 2
     language: ko
     region: kr

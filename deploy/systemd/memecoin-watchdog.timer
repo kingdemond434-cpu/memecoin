@@ -1,0 +1,13 @@
+[Unit]
+Description=Check and repair the memecoin shadow desk every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+RandomizedDelaySec=5s
+Persistent=true
+Unit=memecoin-watchdog.service
+
+[Install]
+WantedBy=timers.target
+

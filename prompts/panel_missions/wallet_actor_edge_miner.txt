@@ -1,0 +1,58 @@
+INVO -- WALLET/ACTOR EDGE MINER
+
+Continuously mine public Solana/Pump/PumpSwap history for wallets, creators,
+funders, clusters and early-buyer sequences that may predict executable future
+returns.
+
+For every candidate wallet/cluster measure:
+- point-in-time entry timing and observation lag
+- OUR achievable entry/exit, not their displayed PnL
+- follow returns after fees, slippage, latency and capacity
+- E[log W], hit rate, tail capture and rug/collapse exposure
+- 2x/5x/10x/20x/50x/100x+ monster enrichment
+- creator/funder ancestry and linked-wallet independence
+- first-25-buyer sequence / smart-flow acceleration
+- regime dependence, decay, crowding and identity drift
+- whether value comes from direct copying, early-flow prediction, or rug-warning
+
+PREDICTORS ARE NOT ONLY COPY TARGETS (explicit, and often the larger prize).
+A wallet whose trades we can no longer profitably copy may still be one of the
+most valuable objects in the graph. Separate and score these roles
+INDEPENDENTLY, because a wallet can fail the first and still win the others:
+
+  COPYABLE       -- we can still enter behind them at a net-positive edge
+                    after fees, slippage, latency and capacity.
+  LEADING        -- their action reliably PRECEDES flow, liquidity or price
+                    we can act on, even when copying them directly is already
+                    too late. Score the forward signal, not the follow trade.
+  CONFIRMING     -- their appearance raises or lowers the probability of a
+                    state we are already evaluating. Value is conditional
+                    information, not a trade of its own.
+  WARNING        -- their appearance predicts rug, distribution, collapse or
+                    failed exit. A wallet with NO copy edge and a strong
+                    warning edge is a first-class asset: avoided losses
+                    compound exactly as realised gains do.
+
+A wallet that is too fast to copy is a DEMOTION of its copy role only. Never
+let a failed copy test delete a proven leading or warning signal -- that is
+the most expensive discard available here, because those roles survive
+crowding and latency decay that destroy copy edge first.
+
+Rank using conservative OOS/shrunk executable edge, never screenshots or
+headline ROI.
+
+Feed strong candidates into:
+wallet_value -> wallet_intelligence -> actor_graph -> funder_ancestry -> T0/Q policy.
+
+Never hard-code a wallet as "smart." Re-score continuously and demote when
+forward edge decays -- per role, not globally.
+
+Also mine missed monsters and bad entries to discover previously unknown
+wallet/actor patterns.
+
+Public/on-chain/lawfully accessible data only. Preserve PIT truth and
+provenance. No private information, access-control bypass, manipulation, wash
+trading or sandwiching.
+
+Goal: maximize forward net E[log W] and right-tail capture while keeping
+catastrophic ruin risk bounded.

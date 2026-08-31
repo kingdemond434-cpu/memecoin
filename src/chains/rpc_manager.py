@@ -5,7 +5,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -14,6 +14,15 @@ from web3 import AsyncWeb3
 from web3.providers import AsyncHTTPProvider
 
 logger = logging.getLogger(__name__)
+
+
+def _host_of(url: str) -> str:
+    """The host, for logs. Provider URLs carry the API key in the path or the
+    query string, so the whole URL must never reach a log line."""
+    try:
+        return urlsplit(url).netloc or "unknown-host"
+    except ValueError:
+        return "unknown-host"
 
 
 class ChainType(Enum):
@@ -66,6 +75,23 @@ class EndpointHealth:
     success_count: int = 0
     last_check: float = 0.0
     consecutive_failures: int = 0
+    #: Wall-clock before which this endpoint must not be selected. A provider
+    #: answering 429 has told us its quota is spent; re-selecting it inside
+    #: that window spends nothing but the remaining quota of the retry budget.
+    cooldown_until: float = 0.0
+    last_status: int = 0
+    #: Methods this endpoint refuses outright, learned at runtime.
+    #:
+    #: Free providers do not merely rate-limit, they carve out methods:
+    #: publicnode answers getLatestBlockhash and getAccountInfo but 403s
+    #: getTokenLargestAccounts ("Request blocked"), while leorpc serves
+    #: getTokenLargestAccounts and 429s getAccountInfo. They are complementary
+    #: rather than redundant, so a refusal has to disqualify an endpoint for
+    #: ONE method instead of cooling it for all of them -- otherwise the pool
+    #: is only ever as capable as its weakest member, and every call to a
+    #: carved-out method burns the whole retry budget rediscovering the same
+    #: 403.
+    blocked_methods: Set[str] = field(default_factory=set)
 
 
 class RPCManager:
@@ -125,16 +151,30 @@ class RPCManager:
                         ep.latency_ms = (time.time() - start) * 1000
                         ep.success_count += 1
                         ep.consecutive_failures = 0
+                        ep.last_status = 200
+                        ep.cooldown_until = 0.0
                         ep.last_check = time.time()
                         return
+                    self._penalise(ep, resp.status)
+                    ep.last_check = time.time()
+                    return
+                # The probe is also the cheapest place to learn a quota is
+                # spent. Recording the cooldown here keeps a rate-limited
+                # provider out of selection between probes instead of
+                # rediscovering the 429 on every caller's hot path.
+                cooldown = 0.0
+                if resp.status == 429:
+                    cooldown = self._retry_after_seconds(resp, 30.0)
+                elif resp.status in (402, 403):
+                    cooldown = 60.0
+                self._penalise(ep, resp.status, cooldown)
+                logger.warning("RPC health probe: %s answered HTTP %s",
+                               _host_of(ep.endpoint.url), resp.status)
+                ep.last_check = time.time()
+                return
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
-            logger.debug("RPC health probe failed for %s", ep.endpoint.url)
-        ep.error_count += 1
-        ep.consecutive_failures += 1
-        if ep.consecutive_failures >= 3:
-            ep.health = RPCHealth.DOWN
-        elif ep.consecutive_failures >= 1:
-            ep.health = RPCHealth.DEGRADED
+            logger.debug("RPC health probe failed for %s", _host_of(ep.endpoint.url))
+        self._penalise(ep, 0)
         ep.last_check = time.time()
 
     def _health_probe(self) -> tuple[str, List[Any]]:
@@ -148,10 +188,60 @@ class RPCManager:
             return result == "ok"
         return isinstance(result, str) and result.startswith("0x")
 
-    def _select_endpoint(self, prefer_ws: bool = False) -> Optional[EndpointHealth]:
-        candidates = [e for e in self.endpoints if e.health != RPCHealth.DOWN]
+    @staticmethod
+    def _retry_after_seconds(resp: Any, default: float) -> float:
+        """Honour a provider's own Retry-After, bounded so it cannot park an
+        endpoint for hours on a malformed or hostile header."""
+        raw = ""
+        try:
+            raw = str(resp.headers.get("Retry-After", "")).strip()
+        except Exception:
+            raw = ""
+        if raw:
+            try:
+                return max(0.0, min(float(raw), 300.0))
+            except ValueError:
+                pass
+        return default
+
+    def _penalise(self, ep: EndpointHealth, status: int, cooldown: float = 0.0) -> None:
+        """Record a transport-level refusal against an endpoint.
+
+        A non-200 is a failure. Left uncounted it could not demote an endpoint,
+        so a provider answering 429 to every call stayed HEALTHY, kept winning
+        selection, and surfaced only as an unattributed "All RPC endpoints
+        failed" -- the status that names the actual cause never reached a log.
+        """
+        ep.error_count += 1
+        ep.consecutive_failures += 1
+        ep.last_status = status
+        if cooldown > 0:
+            ep.cooldown_until = max(ep.cooldown_until, time.time() + cooldown)
+        if ep.consecutive_failures >= 3:
+            ep.health = RPCHealth.DOWN
+        else:
+            ep.health = RPCHealth.DEGRADED
+
+    def _select_endpoint(self, prefer_ws: bool = False,
+                         method: str = "") -> Optional[EndpointHealth]:
+        now = time.time()
+        candidates = [e for e in self.endpoints
+                      if e.health != RPCHealth.DOWN and e.cooldown_until <= now
+                      and not (method and method in e.blocked_methods)]
         if not candidates:
-            return None
+            # Everything is either down or cooling. Prefer the endpoint whose
+            # cooldown expires soonest over failing the call outright: a stale
+            # answer beats no answer for enrichment, and the caller still sees
+            # the refusal if that endpoint is still rate limited.
+            waiting = [e for e in self.endpoints
+                       if e.health != RPCHealth.DOWN
+                       and not (method and method in e.blocked_methods)]
+            if not waiting:
+                # Every endpoint that could serve this method is down or has
+                # carved it out. Returning one that answers 403 forever would
+                # dress a permanent refusal as a transient failure.
+                return None
+            candidates = [min(waiting, key=lambda e: e.cooldown_until)]
         if prefer_ws:
             candidates = [e for e in candidates if e.endpoint.ws_url]
         if not candidates:
@@ -166,10 +256,12 @@ class RPCManager:
 
     async def request(self, method: str, params: List[Any]) -> Any:
         async with self._request_semaphore:
+            last_refusal = ""
             for attempt in range(3):
-                ep = self._select_endpoint()
+                ep = self._select_endpoint(method=method)
                 if not ep:
-                    raise RuntimeError("No healthy RPC endpoints")
+                    raise RuntimeError(
+                        f"No healthy RPC endpoint serves {method}")
                 try:
                     async with self._session.post(
                         ep.endpoint.url,
@@ -181,21 +273,71 @@ class RPCManager:
                             if "result" in data:
                                 ep.success_count += 1
                                 ep.consecutive_failures = 0
+                                ep.last_status = 200
                                 ep.health = RPCHealth.HEALTHY
                                 return data["result"]
                             if "error" in data:
                                 raise RPCError(data["error"])
+                            raise RPCError(
+                                {"message": "response carried neither result nor error"})
+                        # A refusal the transport reported rather than raised.
+                        # 429 and 5xx are the providers' way of saying "not
+                        # now"; both must cost this endpoint its health, and a
+                        # spent quota must park it rather than be retried into.
+                        cooldown = 0.0
+                        if resp.status == 429:
+                            cooldown = self._retry_after_seconds(resp, 30.0)
+                        elif resp.status in (402, 403):
+                            # A free provider carving out one expensive method
+                            # -- publicnode's "Request blocked" on
+                            # getTokenLargestAccounts -- is permanent for that
+                            # method and irrelevant to the rest. Recorded per
+                            # method so the endpoint keeps serving what it can
+                            # instead of being cooled wholesale, which is what
+                            # makes three partial free endpoints add up to one
+                            # usable pool.
+                            ep.blocked_methods.add(method)
+                            logger.warning(
+                                "RPC %s refuses %s (HTTP %s); excluded for that "
+                                "method only", _host_of(ep.endpoint.url), method,
+                                resp.status)
+                        elif resp.status >= 500:
+                            cooldown = self._retry_after_seconds(resp, 5.0)
+                        self._penalise(ep, resp.status, cooldown)
+                        last_refusal = (f"{_host_of(ep.endpoint.url)} HTTP "
+                                        f"{resp.status}")
+                        logger.warning(
+                            "RPC %s refused %s with HTTP %s%s",
+                            _host_of(ep.endpoint.url), method, resp.status,
+                            f"; cooling {cooldown:.0f}s" if cooldown else "")
+                        if attempt == 2:
+                            break
+                        await asyncio.sleep(0.1 * (attempt + 1))
+                        continue
+                except RPCError:
+                    raise
                 except Exception as e:
-                    ep.error_count += 1
-                    ep.consecutive_failures += 1
-                    if ep.consecutive_failures >= 3:
-                        ep.health = RPCHealth.DOWN
+                    self._penalise(ep, 0)
+                    last_refusal = f"{_host_of(ep.endpoint.url)} {type(e).__name__}: {e}"
                     if attempt == 2:
                         raise
                     await asyncio.sleep(0.1 * (attempt + 1))
-            raise RuntimeError("All RPC endpoints failed")
+            raise RuntimeError(
+                f"All RPC endpoints failed for {method}"
+                + (f"; last: {last_refusal}" if last_refusal else ""))
 
     async def batch_request(self, requests: List[Dict[str, Any]]) -> List[Any]:
+        """Results aligned to ``requests`` by JSON-RPC id, not by arrival order.
+
+        A server is explicitly permitted to return batch responses in any
+        order, and may omit entries. Zipping the reply against the request list
+        therefore attributes one call's result to another call -- here, one
+        wallet's transaction to a different signature, which is a wrong feature
+        rather than a missing one and nothing downstream could detect it.
+
+        Missing ids come back as None so the caller sees a hole instead of a
+        shifted list.
+        """
         async with self._request_semaphore:
             ep = self._select_endpoint()
             if not ep:
@@ -205,10 +347,23 @@ class RPCManager:
                 json=requests,
                 headers=ep.endpoint.headers,
             ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return [r.get("result") for r in data]
-                raise RPCError(await resp.text())
+                if resp.status != 200:
+                    self._penalise(
+                        ep, resp.status,
+                        self._retry_after_seconds(resp, 30.0)
+                        if resp.status == 429 else 0.0)
+                    raise RPCError(
+                        f"{_host_of(ep.endpoint.url)} HTTP {resp.status}")
+                data = await resp.json()
+                if not isinstance(data, list):
+                    raise RPCError("batch reply was not a JSON-RPC array")
+                ep.success_count += 1
+                ep.consecutive_failures = 0
+                ep.health = RPCHealth.HEALTHY
+                by_id = {item.get("id"): item for item in data
+                         if isinstance(item, dict)}
+                return [(by_id.get(request.get("id")) or {}).get("result")
+                        for request in requests]
 
     async def broadcast_request(self, method: str, params: List[Any], timeout: float = 1.5) -> Any:
         """Race one idempotent signed transaction across every healthy RPC path."""

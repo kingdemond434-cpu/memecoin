@@ -24,7 +24,15 @@ UNITS="$HOME/.config/systemd/user"
 SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "installing from $SOURCE to $ROOT"
-mkdir -p "$ROOT" "$UNITS" "$HOME/.config/memecoin-shadow"
+mkdir -p "$ROOT/data/state" "$UNITS" "$HOME/.config/memecoin-shadow"
+MAINTENANCE_LOCK="$ROOT/data/state/maintenance.lock"
+touch "$MAINTENANCE_LOCK"
+trap 'rm -f "$MAINTENANCE_LOCK"' EXIT
+
+# Never replace imported files underneath a running interpreter, and never run
+# a trainer against a model directory while its code is being upgraded.
+systemctl --user stop memecoin-shadow-trainer.service 2>/dev/null || true
+systemctl --user stop memecoin-shadow.service 2>/dev/null || true
 
 # rsync rather than a copy so a reinstall over a running node does not
 # clobber the accumulated evidence, which is the one thing here that cannot
@@ -35,11 +43,15 @@ mkdir -p "$ROOT" "$UNITS" "$HOME/.config/memecoin-shadow"
 # reinstall. Losing them silently un-configures the source mesh and empties
 # the entity registry, and the desk would keep running and report less
 # coverage without anything saying why.
-rsync -a --delete \
-  --exclude 'data/' --exclude '.git/' --exclude '.venv/' \
-  --exclude 'config/*.verified.yaml' \
-  --exclude 'native/solana_fastpath/target/' \
-  "$SOURCE/" "$ROOT/"
+if [ "$(readlink -f "$SOURCE")" != "$(readlink -f "$ROOT")" ]; then
+  rsync -a --delete \
+    --exclude 'data/' --exclude '.git/' --exclude '.venv/' \
+    --exclude 'config/*.verified.yaml' \
+    --exclude 'native/solana_fastpath/target/' \
+    "$SOURCE/" "$ROOT/"
+else
+  echo "source is the installed checkout; preserving it in place"
+fi
 mkdir -p "$ROOT/data/state" "$ROOT/models"
 
 if [ ! -x "$ROOT/.venv/bin/python" ]; then
@@ -50,14 +62,23 @@ fi
 "$ROOT/.venv/bin/pip" install --quiet -r "$ROOT/requirements.txt"
 
 # The native extension is optional: the Python path is the reference
-# implementation and runs without it. Built when cargo is present, skipped
-# with a note when it is not, because a missing toolchain should not stop a
-# shadow run from accumulating evidence.
-if command -v cargo >/dev/null 2>&1; then
+# implementation and runs without it. rustup installs cargo in ~/.cargo/bin,
+# which a non-interactive SSH/systemd install commonly omits from PATH. The
+# node had a working toolchain but this check declared it absent and silently
+# left the deployment on the Python path, so resolve the standard rustup path
+# explicitly before deciding the extension is unavailable.
+CARGO_BIN="$(command -v cargo 2>/dev/null || true)"
+if [ -z "$CARGO_BIN" ] && [ -x "$HOME/.cargo/bin/cargo" ]; then
+  CARGO_BIN="$HOME/.cargo/bin/cargo"
+fi
+if [ -n "$CARGO_BIN" ]; then
   echo "building the native extension"
-  cargo build --release --manifest-path "$ROOT/native/solana_fastpath/Cargo.toml"
-  cp "$ROOT/native/solana_fastpath/target/release/libsolana_fastpath.so" \
-     "$ROOT/.venv/lib/python3."*"/site-packages/solana_fastpath.so"
+  "$CARGO_BIN" build --release --manifest-path "$ROOT/native/solana_fastpath/Cargo.toml"
+  VENV_SITE_PACKAGES="$("$ROOT/.venv/bin/python" -c \
+    'import sysconfig; print(sysconfig.get_path("platlib"))')"
+  install -m 0755 \
+    "$ROOT/native/solana_fastpath/target/release/libsolana_fastpath.so" \
+    "$VENV_SITE_PACKAGES/solana_fastpath.so"
 else
   echo "cargo not found; running on the Python reference path"
 fi
@@ -71,10 +92,15 @@ systemctl --user daemon-reload
 loginctl enable-linger "$USER" 2>/dev/null || \
   echo "could not enable linger; the desk will stop at logout"
 
-systemctl --user enable --now memecoin-shadow.service
+systemctl --user enable memecoin-shadow.service
 systemctl --user enable --now memecoin-health.timer
+systemctl --user enable --now memecoin-watchdog.timer
 systemctl --user enable --now memecoin-audit-pack.timer
 systemctl --user enable --now memecoin-shadow-trainer.timer
+systemctl --user restart memecoin-shadow.service
+
+rm -f "$MAINTENANCE_LOCK"
+trap - EXIT
 
 sleep 3
 systemctl --user --no-pager status memecoin-shadow.service | head -15

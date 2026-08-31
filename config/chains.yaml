@@ -113,10 +113,25 @@ chains:
   solana:
     name: "Solana Mainnet"
     chain_id: "solana"
+    # Free endpoints are complementary, not redundant, and the manager now
+    # records refusals per METHOD so the pool is the union of what they each
+    # serve rather than the intersection. Measured 2026-08-28:
+    #   publicnode   getLatestBlockhash OK, getAccountInfo OK,
+    #                getTokenLargestAccounts 403 "Request blocked"
+    #   leorpc       getTokenLargestAccounts OK, getLatestBlockhash OK,
+    #                getAccountInfo 429
+    #   mainnet-beta getLatestBlockhash OK, getAccountInfo OK,
+    #                getTokenLargestAccounts 429
+    # APPENDED, never reordered: rpc_urls and ws_urls are paired by position,
+    # so moving an entry here silently hands a provider another provider's
+    # websocket. The keyless additions go last and carry no ws_url of their
+    # own, which leaves every existing pairing exactly as it was.
     rpc_urls:
       - "https://api.mainnet-beta.solana.com"
       - "https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
       - "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
+      - "https://solana-rpc.publicnode.com"
+      - "https://solana.leorpc.com/?api_key=FREE"
     ws_urls:
       - "wss://api.mainnet-beta.solana.com"
       - "wss://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
@@ -140,6 +155,28 @@ chains:
 
 global:
   enabled_chains: ["solana"]
+  # Tokens the hazard model keeps RESIDENT. Not a limit on how many tokens
+  # the desk observes: evictions spill their full history to the research
+  # lake first (hazard_spill_path), so observation accumulates across
+  # millions of mints while memory stays bounded by what this box has.
+  #
+  # ops/watchdog.py owns this value at runtime. Repeated OOM kills shrink
+  # it automatically and a long clean run restores it, so edit the number
+  # freely but expect the watchdog to have the last word on a box under
+  # real pressure.
+  hazard_max_tracked_tokens: 1000
+  hazard_spill_path: data/launch_episodes/hazard_observations.jsonl
+  # Relief fires against the OBSERVED kill point, not the cgroup limit.
+  # The cgroup cap is 944 MB, but this box is shared and has no swap, so
+  # the GLOBAL OOM killer picks this process -- the largest single one --
+  # at roughly 450-500 MB whenever the box runs short. Measured
+  # 2026-08-29: twelve kills in one hour, not one of which came close to
+  # 944 MB. Defaults of 0.70/0.85 put trim at 661 MB and shed at 802 MB,
+  # both ABOVE the zone where this desk actually dies, so neither would
+  # ever fire in the one failure they exist to prevent. 0.50/0.68 puts
+  # trim at 472 MB and shed at 642 MB, straddling the real kill zone.
+  memory_soft_fraction: 0.50
+  memory_hard_fraction: 0.68
   max_concurrent_positions: 10
   max_position_size_usd: 500
   # Percentage of equity at the START of the UTC day, so the budget scales
@@ -185,6 +222,20 @@ global:
   shadow_max_total_exposure_pct: 0.50
   shadow_max_portfolio_risk: 0.10
   max_liquidity_fraction: 0.01
+  # Known veto facts always stop a trade. Owner-enriched concentration is
+  # still reported as unmeasured until the token-account owners are resolved;
+  # setting this true makes that optional enrichment itself mandatory.
+  require_complete_veto_inputs: false
+  max_veto_exit_impact_pct: 0.20
+  # A reporting definition, not an alpha threshold. Owner shares are summed
+  # from native SPL token accounts and kept as observed lower bounds.
+  holder_whale_supply_pct: 1.0
+  mutable_safety_refresh_seconds: 15
+  # Planning only. No module is allowed to sign a sweep transaction; a cold
+  # address and separate explicit authorization are still required.
+  profit_isolation_working_capital_usd: 10000
+  profit_isolation_trigger_usd: 1000
+  profit_isolation_fraction: 1.0
   min_liquidity_usd: 5000
   reject_data_blocked_safety_checks: true
   max_candidate_concurrency: 24

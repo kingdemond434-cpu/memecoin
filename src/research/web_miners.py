@@ -37,6 +37,9 @@ import time
 import urllib.parse
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
+from src.research.world_miners import (
+    GDELT_LASTUPDATE_URL, gdelt_world_news_miner,
+)
 from src.research.data_miners import (
     CADENCE_DAILY, CADENCE_HOURLY, CADENCE_MINUTE, CADENCE_QUARTER,
     DataMinerPool, Enriches, MinerSpec, RateLimited,
@@ -410,7 +413,14 @@ def register_web_miners(pool: DataMinerPool, *, http: Any,
          wikipedia_attention_miner(http)),
         (MinerSpec(
             miner_id="web:youtube_recent", enriches=Enriches.NARRATIVE,
-            cadence_seconds=CADENCE_MINUTE, endpoint="youtube data api search",
+            # Hourly because search.list costs 100 of the 10,000 free daily
+            # quota units and this miner spends two per pass. At a one-minute
+            # cadence that is 288,000 units a day -- 28.8x the quota, spent by
+            # 00:50, after which YouTube answers 429 for the remaining 23
+            # hours and the shared key is dead for the deliberately budgeted
+            # rotation in social_intelligence too. Hourly costs 4,800 a day
+            # and leaves better than half the quota for that caller.
+            cadence_seconds=CADENCE_HOURLY, endpoint="youtube data api search",
             requires_env=("YOUTUBE_API_KEY",),
             detail="uploads in the last two hours for standing queries"),
          youtube_recent_miner(http, youtube_key)),
@@ -427,9 +437,31 @@ def register_web_miners(pool: DataMinerPool, *, http: Any,
         (MinerSpec(
             miner_id="web:program_repos", enriches=Enriches.NARRATIVE,
             cadence_seconds=CADENCE_HOURLY, endpoint=GITHUB_SEARCH_URL,
-            requires_env=("GITHUB_TOKEN",),
-            detail="public repos touching the programs we decode"),
+            # NOT required: github_activity_miner already supports running
+            # tokenless (Authorization header omitted when the token is
+            # absent) against GitHub's public 60-req/hr limit, and this
+            # miner spends one request per hourly tick -- 1/60th of that
+            # budget. Declaring the credential required blocked the miner
+            # entirely (DATA_BLOCKED: missing credentials) instead of using
+            # the free tier the fetch code was already written to support.
+            # A real token still raises the ceiling to 5,000/hr if supplied.
+            detail="public repos touching the programs we decode; runs on "
+                   "GitHub's public rate limit, GITHUB_TOKEN raises it"),
          github_activity_miner(http, github_token)),
+        (MinerSpec(
+            miner_id="world:gdelt_news", enriches=Enriches.NARRATIVE,
+            # GDELT republishes every 15 minutes and there is nothing to
+            # gain from asking more often than it publishes.
+            cadence_seconds=CADENCE_QUARTER, endpoint=GDELT_LASTUPDATE_URL,
+            # No key, no account, no monthly allowance -- the reason this
+            # source is here. Worldwide mainstream news in 100+ languages,
+            # which makes it a narrative DISCOVERY layer: what the world is
+            # talking about before a coin is named after it. Measured
+            # 2026-08-29, a 15-minute slice carried 467 records and 1 that
+            # mentioned this desk's subjects, so returning nothing is the
+            # normal case here and is not a fault.
+            detail="worldwide public news; quota-free raw 15-minute files"),
+         gdelt_world_news_miner(http)),
     )
     return {spec.miner_id: pool.register(spec, fetch)
             for spec, fetch in registrations}

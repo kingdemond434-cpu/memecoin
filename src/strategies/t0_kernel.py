@@ -387,7 +387,8 @@ class T0Kernel:
                 float(state.exit_cost), float(state.entry_cost),
                 state.exit_capacity_ratio, state.escape_probability,
                 state.alternative_growth_per_second, state.expected_remaining_seconds,
-                state.add_fraction, state.probe_fraction,
+                state.add_fraction, state.add_capacity_fraction,
+                state.probe_fraction,
                 float(self.policy.min_edge if min_edge is None else min_edge),
                 float(getattr(self.policy, "max_add_fraction", 0.5)
                       if max_add_fraction is None else max_add_fraction),

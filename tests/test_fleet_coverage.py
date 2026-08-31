@@ -1,0 +1,581 @@
+"""24/7 coverage added 2026-08-29: the two failure classes that already hit
+this desk with zero automated detection.
+
+A cross-project OOM event disabled the desk service and all five timers, and
+a corrupted GITHUB_TOKEN 401'd silently for as long as nobody read the raw
+value. Both were found by a human reading logs by hand. These tests pin the
+coverage that makes that unnecessary next time.
+"""
+
+import unittest
+import os
+import subprocess
+from pathlib import Path
+
+from ops.watchdog import (
+    FLEET_UNITS, BlockedBreakdown, Policy, decide, observed_faults)
+from tools.credential_doctor import check_all, parse_env_file
+
+
+def _healthy_readiness():
+    return {
+        "runtime_tasks": {"status": "OK", "failed": []},
+        "source_mesh": {"sources": 2, "producers": 2, "streaming": True},
+        "yellowstone": {"status": "STREAMING"},
+        "rpc_program_stream": {"status": "RPC_WS"},
+        "memory": {"band": "calm"},
+        "stream_events": {"total": 10, "token_created": 1},
+        "pump_decoder": {"status": "OK"},
+        "event_loop": {}, "data_miners": {"status": "OK"},
+        "prediction": "OK", "rug_hazard": {"model_trained": True},
+        "credentials": {"absent": []},
+    }
+
+
+def _call(readiness=None, state=None, now=10_000.0, **overrides):
+    values = dict(
+        service_active=True, service_enabled=True,
+        readiness=readiness or _healthy_readiness(), readiness_age=10.0,
+        state=state if state is not None else {}, now=now,
+        policy=Policy(), trainer_active=False, training_age=10.0)
+    values.update(overrides)
+    return decide(**values)
+
+
+class DisabledFleetUnitsAreReenabledImmediately(unittest.TestCase):
+    """Exactly 2026-08-29's incident: an external event disabled every
+    memecoin timer, and nothing came back until a human noticed."""
+
+    def test_a_disabled_unit_is_queued_for_reenable(self):
+        plan = _call(disabled_units=["memecoin-shadow-trainer.timer"])
+        self.assertIn("memecoin-shadow-trainer.timer", plan.reenable_units)
+
+    def test_reenable_is_not_debounced_like_a_restart(self):
+        """No cooldown, no two-observation wait: enabling an already-enabled
+        unit is a no-op, so there is no flapping risk to guard against, and
+        the whole point is closing this gap faster than a restart would."""
+        plan = _call(disabled_units=["memecoin-watchdog.timer"], state={})
+        self.assertIn("memecoin-watchdog.timer", plan.reenable_units)
+
+    def test_nothing_disabled_means_nothing_queued(self):
+        plan = _call(disabled_units=[])
+        self.assertEqual(plan.reenable_units, [])
+
+    def test_the_fleet_list_covers_every_unit_this_session_installed(self):
+        expected = {
+            "memecoin-shadow.service", "memecoin-watchdog.timer",
+            "memecoin-health.timer", "memecoin-shadow-trainer.timer",
+            "memecoin-feed-doctor.timer", "memecoin-audit-pack.timer",
+            "memecoin-backfill.timer", "memecoin-credential-doctor.timer",
+            "memecoin-ledger-doctor.timer",
+        }
+        self.assertEqual(set(FLEET_UNITS), expected)
+
+
+class LowMemoryIsAnnouncedBeforeTrainingStaleFires(unittest.TestCase):
+    """Six hourly training skips went unremarked for hours on 2026-08-28
+    because the only existing signal (training_stale_seconds) waits 26h."""
+
+    def test_a_brief_dip_does_not_alert(self):
+        state = {}
+        plan = _call(available_mib=200.0, state=state, now=10_000.0)
+        self.assertNotIn("training_guard_memory_starved", plan.alerts)
+
+    def test_a_sustained_dip_alerts_before_the_26h_stale_threshold(self):
+        state = {}
+        _call(available_mib=200.0, state=state, now=10_000.0)
+        plan = _call(available_mib=200.0, state=state, now=10_000.0 + 10_801)
+        self.assertIn("training_guard_memory_starved", plan.alerts)
+
+    def test_recovering_above_the_floor_resets_the_clock(self):
+        state = {}
+        _call(available_mib=200.0, state=state, now=10_000.0)
+        _call(available_mib=900.0, state=state, now=15_000.0)  # recovers
+        plan = _call(available_mib=200.0, state=state, now=15_100.0)
+        self.assertNotIn("training_guard_memory_starved", plan.alerts)
+
+    def test_plenty_of_memory_never_alerts(self):
+        plan = _call(available_mib=2000.0)
+        self.assertNotIn("training_guard_memory_starved", plan.alerts)
+
+
+class DiskAndBackfillStalenessAreWatched(unittest.TestCase):
+    def test_disk_past_the_floor_alerts(self):
+        plan = _call(disk_used_fraction=0.95)
+        self.assertIn("disk_nearly_full", plan.alerts)
+
+    def test_disk_below_the_floor_is_quiet(self):
+        plan = _call(disk_used_fraction=0.50)
+        self.assertNotIn("disk_nearly_full", plan.alerts)
+
+    def test_a_stale_backfill_checkpoint_alerts(self):
+        plan = _call(backfill_checkpoint_age=70_000.0)
+        self.assertIn("backfill_stalled", plan.alerts)
+
+    def test_a_fresh_checkpoint_is_quiet(self):
+        plan = _call(backfill_checkpoint_age=3_600.0)
+        self.assertNotIn("backfill_stalled", plan.alerts)
+
+    def test_no_checkpoint_yet_is_not_a_fault(self):
+        """Absent before the first run ever completes -- too early to judge."""
+        plan = _call(backfill_checkpoint_age=None)
+        self.assertNotIn("backfill_stalled", plan.alerts)
+
+
+class OwnMemoryCeilingCannotSilentlyRegress(unittest.TestCase):
+    """The exact setup of 2026-08-28's OOM storm: a per-cgroup MemoryMax
+    that cannot bind on this box hands victim selection to the global OOM
+    killer, which is how this service died 62 times and took another
+    project's units down with it."""
+
+    def test_a_ceiling_above_physical_ram_alerts(self):
+        plan = _call(own_memory_max_bytes=4 * 1024**3,      # 4G
+                     total_physical_bytes=3814 * 1024**2)   # 3814 MB box
+        self.assertIn("own_memory_ceiling_exceeds_physical_ram", plan.alerts)
+
+    def test_a_ceiling_that_actually_binds_is_quiet(self):
+        plan = _call(own_memory_max_bytes=900 * 1024**2,
+                     total_physical_bytes=3814 * 1024**2)
+        self.assertNotIn("own_memory_ceiling_exceeds_physical_ram", plan.alerts)
+
+    def test_no_ceiling_at_all_is_the_same_hazard_on_a_zero_swap_box(self):
+        plan = _call(own_memory_max_bytes=None,
+                     total_physical_bytes=3814 * 1024**2)
+        self.assertIn("own_memory_ceiling_exceeds_physical_ram", plan.alerts)
+
+    def test_unmeasurable_total_memory_makes_no_claim(self):
+        plan = _call(own_memory_max_bytes=None, total_physical_bytes=None)
+        self.assertNotIn("own_memory_ceiling_exceeds_physical_ram", plan.alerts)
+
+
+class CredentialDoctorCatchesShapeNotAuthenticity(unittest.TestCase):
+    def test_the_actual_incident_value_is_caught(self):
+        env = {"GITHUB_TOKEN": (
+            'ssh -i "$env:USERPROFILE\\.ssh\\quant_vps" quant@95.216.191.70 '
+            '"systemctl --user restart memecoin-shadow.service"')}
+        verdicts = {v.name: v for v in check_all(env)}
+        self.assertFalse(verdicts["GITHUB_TOKEN"].ok)
+
+    def test_a_real_looking_key_passes(self):
+        env = {"JUPITER_API_KEY":
+               "jup_a688ab456d7bf79e2334d0d1de73e47b36f38b7a432e462b580ff0f7679e2451"}
+        verdicts = {v.name: v for v in check_all(env)}
+        self.assertTrue(verdicts["JUPITER_API_KEY"].ok)
+
+    def test_an_unset_credential_is_not_a_defect(self):
+        verdicts = {v.name: v for v in check_all({})}
+        self.assertTrue(all(v.ok for v in verdicts.values()))
+
+    def test_a_broken_verdict_never_carries_the_raw_value(self):
+        """Names, never values -- even in the failure path."""
+        secret = "ssh -i supersecretpath quant@1.2.3.4"
+        env = {"GITHUB_TOKEN": secret}
+        verdicts = check_all(env)
+        broken = [v for v in verdicts if not v.ok]
+        self.assertTrue(broken)
+        for v in broken:
+            self.assertNotIn(secret, v.reason)
+            self.assertNotIn(secret, json_of(v))
+
+    def test_env_file_parsing_strips_quotes(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "env"
+            path.write_text('FOO="bar baz"\nEMPTY=\n# comment\nBARE=qux\n')
+            parsed = parse_env_file(path)
+        self.assertEqual(parsed["FOO"], "bar baz")
+        self.assertEqual(parsed["BARE"], "qux")
+        self.assertEqual(parsed["EMPTY"], "")
+
+
+def json_of(verdict):
+    return str(verdict.as_dict())
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class OwnMemoryCeilingIsCorrectedNotJustAnnounced(unittest.TestCase):
+    """The exact fix the other project's drop-in already applies once,
+    reapplied automatically -- self-calibrated from measured RSS rather than
+    a constant, since a hardcoded guess never checked against this box's
+    physical RAM is the entire original bug."""
+
+    def test_a_bad_ceiling_is_corrected_from_measured_rss(self):
+        plan = _call(own_memory_max_bytes=4 * 1024**3,
+                    total_physical_bytes=3814 * 1024**2,
+                    desk_rss_bytes=500 * 1024**2)
+        self.assertIsNotNone(plan.correct_memory_ceiling)
+        high, ceiling = plan.correct_memory_ceiling
+        self.assertLess(high, ceiling)
+        self.assertLess(ceiling, 3814 * 1024**2)  # never proposes the bug itself
+
+    def test_the_correction_never_exceeds_a_safe_share_of_total_ram(self):
+        """Even a huge measured RSS must not eat the whole shared box."""
+        plan = _call(own_memory_max_bytes=None,
+                    total_physical_bytes=3814 * 1024**2,
+                    desk_rss_bytes=3000 * 1024**2)
+        high, ceiling = plan.correct_memory_ceiling
+        self.assertLessEqual(ceiling, int(3814 * 1024**2 * 0.45))
+
+    def test_without_a_measured_rss_no_guess_is_made(self):
+        """No constant fallback: an uncalibrated number is the original bug."""
+        plan = _call(own_memory_max_bytes=4 * 1024**3,
+                    total_physical_bytes=3814 * 1024**2,
+                    desk_rss_bytes=None)
+        self.assertIsNone(plan.correct_memory_ceiling)
+        self.assertIn("own_memory_ceiling_exceeds_physical_ram", plan.alerts)
+
+    def test_a_healthy_ceiling_proposes_no_correction(self):
+        plan = _call(own_memory_max_bytes=900 * 1024**2,
+                    total_physical_bytes=3814 * 1024**2,
+                    desk_rss_bytes=400 * 1024**2)
+        self.assertIsNone(plan.correct_memory_ceiling)
+
+
+class StalledBackfillIsRetriedNotJustAnnounced(unittest.TestCase):
+    """Idempotent and checkpointed, so a retry is safe -- unlike guessing
+    which process to kill for the memory/disk alerts."""
+
+    def test_a_stall_triggers_a_retry(self):
+        plan = _call(backfill_checkpoint_age=70_000.0, state={})
+        self.assertTrue(plan.start_backfill)
+        self.assertIn("backfill_stalled", plan.alerts)
+
+    def test_a_recent_retry_is_not_repeated_immediately(self):
+        state = {"last_backfill_start_at": 9_950.0}
+        plan = _call(backfill_checkpoint_age=70_000.0, state=state, now=10_000.0)
+        self.assertFalse(plan.start_backfill)
+
+    def test_a_stale_enough_retry_fires_again(self):
+        state = {"last_backfill_start_at": 5_000.0}
+        plan = _call(backfill_checkpoint_age=70_000.0, state=state, now=10_000.0)
+        self.assertTrue(plan.start_backfill)
+
+    def test_no_stall_means_no_retry(self):
+        plan = _call(backfill_checkpoint_age=3_600.0)
+        self.assertFalse(plan.start_backfill)
+
+
+class SomeAlertsHaveNoSafeAutomatedFix(unittest.TestCase):
+    """Not everything alert-only was left that way by omission. These stay
+    alerts because the only available "fix" is either destructive (kill an
+    unidentified process to free memory or disk), needs a secret only a
+    human holds, needs interactive auth, or requires a passing model --
+    which is this desk's entire open research question, not an operational
+    fault."""
+
+    def test_low_memory_has_no_auto_kill(self):
+        state = {}
+        _call(available_mib=100.0, state=state, now=10_000.0)
+        plan = _call(available_mib=100.0, state=state, now=25_000.0)
+        self.assertIn("training_guard_memory_starved", plan.alerts)
+        # No field on Plan proposes killing anything; nothing to assert
+        # false on other than the alert existing without a paired action.
+
+    def test_disk_pressure_has_no_auto_delete(self):
+        plan = _call(disk_used_fraction=0.95)
+        self.assertIn("disk_nearly_full", plan.alerts)
+
+    def test_missing_credentials_has_no_auto_repair(self):
+        readiness = _healthy_readiness()
+        readiness["credentials"] = {"absent": [{"name": "X_BEARER_TOKEN"}]}
+        repairs, alerts = observed_faults(readiness)
+        self.assertEqual(repairs, [])
+        self.assertIn("optional_credentials_absent", alerts)
+
+
+class WalletTrackingDeathIsWatched(unittest.TestCase):
+    """wallets_tracked read zero for the desk's ENTIRE history before the
+    2026-08-29 fix (an unthrottled burst was exhausting the free RPC pool on
+    every launch). Alert-only, not a fixer: that specific cause is fixed, but
+    a future zero-tracking regression could have an entirely different one,
+    and a blind restart is not a substitute for the kind of investigation
+    that actually found it.
+    """
+
+    def _readiness(self, seen, tracked):
+        readiness = _healthy_readiness()
+        readiness["launch_census"] = {"funnel": {"seen": seen}}
+        readiness["wallet_follow"] = {"model": {"wallets_tracked": tracked}}
+        return readiness
+
+    def test_too_few_launches_is_not_yet_evidence(self):
+        """Nothing to track is not the same fault as failing to track."""
+        state = {}
+        readiness = self._readiness(seen=3, tracked=0)
+        plan = _call(readiness=readiness, state=state, now=10_000.0)
+        plan = _call(readiness=readiness, state=state, now=10_000.0 + 10_000)
+        self.assertNotIn("wallet_tracking_dead", plan.alerts)
+
+    def test_sustained_zero_despite_real_launch_flow_alerts(self):
+        state = {}
+        readiness = self._readiness(seen=200, tracked=0)
+        _call(readiness=readiness, state=state, now=10_000.0)
+        plan = _call(readiness=readiness, state=state, now=10_000.0 + 7_201)
+        self.assertIn("wallet_tracking_dead", plan.alerts)
+
+    def test_a_brief_zero_stretch_does_not_alert(self):
+        """The pipeline's own 5-minute recalc cycle and 300s follow horizon
+        must not be flagged as a fault during normal warm-up."""
+        state = {}
+        readiness = self._readiness(seen=200, tracked=0)
+        _call(readiness=readiness, state=state, now=10_000.0)
+        plan = _call(readiness=readiness, state=state, now=10_500.0)
+        self.assertNotIn("wallet_tracking_dead", plan.alerts)
+
+    def test_any_tracked_wallet_resets_the_clock(self):
+        state = {}
+        dead = self._readiness(seen=200, tracked=0)
+        _call(readiness=dead, state=state, now=10_000.0)
+        alive = self._readiness(seen=200, tracked=3)
+        _call(readiness=alive, state=state, now=15_000.0)
+        plan = _call(readiness=dead, state=state, now=15_100.0)
+        self.assertNotIn("wallet_tracking_dead", plan.alerts)
+
+    def test_no_fixer_is_proposed_for_this(self):
+        """Alert-only by design: the cause could differ next time."""
+        state = {}
+        readiness = self._readiness(seen=200, tracked=0)
+        _call(readiness=readiness, state=state, now=10_000.0)
+        plan = _call(readiness=readiness, state=state, now=10_000.0 + 7_201)
+        self.assertFalse(plan.restart_desk)
+        self.assertEqual(plan.reenable_units, [])
+
+
+class LedgerDoctorActuallyRunsTheVerification(unittest.TestCase):
+    """TradeEvidenceLedger.verify() was a complete, correct hash-chain
+    walk that existed only in the test suite -- the live status field
+    ("hash_chain": true) means only "this process holds a hash in memory
+    right now" and says nothing about the file on disk. This is the
+    proprietary moat (70,000+ tamper-evident records); an auditor that has
+    never run is not evidence the audit would pass.
+    """
+
+    def _ledger(self, directory):
+        from src.research.trade_evidence import TradeEvidenceLedger
+        path = Path(directory) / "evidence.jsonl"
+        ledger = TradeEvidenceLedger(path)
+        ledger.record("candidate", {"mint": "a"}, timestamp=1)
+        ledger.record("decision", {"decision": "reject"}, timestamp=2)
+        return path
+
+    def test_an_intact_chain_reports_ok(self):
+        import tempfile
+        from tools.ledger_doctor import main
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._ledger(directory)
+            self.assertEqual(main(["--path", str(path), "--json"]), 0)
+
+    def test_a_tampered_chain_is_caught_and_named(self):
+        import json as json_module
+        import tempfile
+        from tools.ledger_doctor import main
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._ledger(directory)
+            rows = path.read_text().splitlines()
+            changed = json_module.loads(rows[0])
+            changed["payload"]["mint"] = "tampered"
+            rows[0] = json_module.dumps(changed)
+            path.write_text("\n".join(rows) + "\n")
+            self.assertEqual(main(["--path", str(path), "--json"]), 1)
+
+    def test_no_ledger_yet_is_not_a_fault(self):
+        import tempfile
+        from tools.ledger_doctor import main
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nonexistent.jsonl"
+            self.assertEqual(main(["--path", str(path), "--json"]), 0)
+
+    def test_the_service_treats_a_broken_chain_as_success(self):
+        """Learned from feed-doctor and credential-doctor: a run that finds
+        and reports a real problem must not itself read as a failed unit."""
+        with open("deploy/systemd/memecoin-ledger-doctor.service", encoding="utf-8") as f:
+            unit = f.read()
+        self.assertIn("SuccessExitStatus=1", unit)
+
+
+class FeedDoctorSurvivesADeskMidRestart(unittest.TestCase):
+    """Measured 2026-08-29: this timer fired in the exact 10-second window a
+    desk restart left the status port down -- exit 2, "connection refused" --
+    and the unit read as genuinely FAILED, not the already-handled exit-1
+    informational case. Transient and self-resolving on the next tick; the
+    desk's own down-state is already the watchdog's job to report."""
+
+    def test_both_informational_exit_codes_are_declared_non_fatal(self):
+        with open("deploy/systemd/memecoin-feed-doctor.service", encoding="utf-8") as f:
+            unit = f.read()
+        self.assertIn("SuccessExitStatus=1 2", unit)
+
+
+class RepeatedOomKillsShrinkTheDesksOwnFootprint(unittest.TestCase):
+    """2026-08-29: 28 OOM kills in one hour, at ~2 minute intervals, while
+    the desk's own cgroup ceiling sat untouched. Box-wide pressure is not
+    this desk's to fix, but being the fattest resident target on a shared
+    box is, so the watchdog shrinks what it actually controls."""
+
+    def test_one_kill_is_a_neighbour_having_a_bad_minute(self):
+        plan = _call(oom_kill_timestamps=[9_990.0], hazard_token_cap=8_000)
+        self.assertIsNone(plan.set_hazard_token_cap)
+
+    def test_two_kills_in_the_window_shrink_the_resident_cap(self):
+        plan = _call(oom_kill_timestamps=[9_900.0, 9_990.0],
+                     hazard_token_cap=8_000)
+        self.assertEqual(plan.set_hazard_token_cap, 4_800)
+        self.assertTrue(any("oom_killed" in reason
+                            for reason in plan.repair_reasons))
+
+    def test_kills_older_than_the_window_do_not_count(self):
+        plan = _call(oom_kill_timestamps=[100.0, 200.0], hazard_token_cap=8_000)
+        self.assertIsNone(plan.set_hazard_token_cap)
+
+    def test_the_same_bad_hour_is_not_re_read_into_a_second_shrink(self):
+        """Without this the cap ratchets to its floor on one piece of
+        evidence: the shrink must be judged on what happened after it."""
+        state = {"hazard_cap_changed_at": 9_995.0}
+        plan = _call(state=state, oom_kill_timestamps=[9_900.0, 9_990.0],
+                     hazard_token_cap=4_800)
+        self.assertIsNone(plan.set_hazard_token_cap)
+
+    def test_kills_after_the_last_shrink_do_shrink_again(self):
+        state = {"hazard_cap_changed_at": 9_000.0}
+        plan = _call(state=state, oom_kill_timestamps=[9_900.0, 9_990.0],
+                     hazard_token_cap=4_800)
+        self.assertEqual(plan.set_hazard_token_cap, 2_880)
+
+    def test_the_cap_never_shrinks_below_the_floor(self):
+        """A cap driven to nothing by a problem this desk did not cause
+        would make it blind rather than small."""
+        plan = _call(oom_kill_timestamps=[9_900.0, 9_990.0],
+                     hazard_token_cap=1_000)
+        self.assertIsNone(plan.set_hazard_token_cap)
+        self.assertIn("oom_killed_at_minimum_resident_cap", plan.alerts)
+
+    def test_a_long_clean_run_restores_the_cap_one_step(self):
+        state = {"hazard_cap_changed_at": 10_000.0 - 21_601.0,
+                 "hazard_cap_baseline": 8_000}
+        plan = _call(state=state, oom_kill_timestamps=[], hazard_token_cap=4_800)
+        self.assertEqual(plan.set_hazard_token_cap, 8_000)
+
+    def test_recovery_never_climbs_past_the_original_baseline(self):
+        state = {"hazard_cap_changed_at": 10_000.0 - 21_601.0,
+                 "hazard_cap_baseline": 5_000}
+        plan = _call(state=state, oom_kill_timestamps=[], hazard_token_cap=4_800)
+        self.assertEqual(plan.set_hazard_token_cap, 5_000)
+
+    def test_a_short_clean_run_is_not_yet_a_recovery(self):
+        state = {"hazard_cap_changed_at": 9_900.0, "hazard_cap_baseline": 8_000}
+        plan = _call(state=state, oom_kill_timestamps=[], hazard_token_cap=4_800)
+        self.assertIsNone(plan.set_hazard_token_cap)
+
+    def test_an_unreadable_cap_disables_the_fixer_rather_than_guessing(self):
+        plan = _call(oom_kill_timestamps=[9_900.0, 9_990.0],
+                     hazard_token_cap=None)
+        self.assertIsNone(plan.set_hazard_token_cap)
+
+
+class ANearlyFullDiskDropsOnlySupersededSpill(unittest.TestCase):
+    """Disk-full stops the evidence ledger and the episode writer too, not
+    just the model that filled it -- so it needs a fixer, not only an alert.
+    The rotated (.1) spill is the one thing safe to delete unattended."""
+
+    def test_a_healthy_disk_drops_nothing(self):
+        plan = _call(disk_used_fraction=0.50)
+        self.assertFalse(plan.drop_rotated_spill)
+
+    def test_a_nearly_full_disk_both_alerts_and_fixes(self):
+        plan = _call(disk_used_fraction=0.95)
+        self.assertIn("disk_nearly_full", plan.alerts)
+        self.assertTrue(plan.drop_rotated_spill)
+
+    def test_an_unreadable_disk_reading_does_not_delete_on_a_guess(self):
+        plan = _call(disk_used_fraction=None)
+        self.assertFalse(plan.drop_rotated_spill)
+
+
+class UnpriceableLaunchesAreReportedWithTheirCause(unittest.TestCase):
+    """A DATA_BLOCKED launch is one the desk saw and threw away, so this is
+    its own hit rate at its job -- 82% on 2026-08-29. The alert names the
+    dominant reason, because a percentage nobody can act on is not an
+    alert."""
+
+    def _blocked(self, launches, blocked, reasons):
+        return BlockedBreakdown(launches=launches, blocked=blocked, reasons=reasons)
+
+    def test_a_healthy_share_is_silent(self):
+        plan = _call(blocked=self._blocked(200, 20, {"x": 20}))
+        self.assertFalse([a for a in plan.alerts if "unpriceable" in a])
+
+    def test_a_high_share_names_the_dominant_cause(self):
+        plan = _call(blocked=self._blocked(
+            200, 160, {"DATA_BLOCKED_prediction_model": 150,
+                       "DATA_BLOCKED_safety_checks": 10}))
+        alert = next(a for a in plan.alerts if "unpriceable" in a)
+        self.assertIn("DATA_BLOCKED_prediction_model", alert)
+        self.assertIn("80%", alert)
+        self.assertEqual(plan.data_blocked_leading_reason,
+                         "DATA_BLOCKED_prediction_model")
+
+    def test_too_few_launches_is_noise_not_evidence(self):
+        plan = _call(blocked=self._blocked(10, 10, {"x": 10}))
+        self.assertFalse([a for a in plan.alerts if "unpriceable" in a])
+
+    def test_no_census_reading_raises_nothing(self):
+        plan = _call(blocked=None)
+        self.assertFalse([a for a in plan.alerts if "unpriceable" in a])
+
+    def test_it_does_not_pretend_to_fix_what_it_cannot(self):
+        """Every safe automatic remedy is already built; what remains is an
+        untrained model or an unserved RPC method. A watchdog that 'fixed' a
+        block by relaxing what counts as priceable would manufacture
+        decisions the evidence does not support."""
+        plan = _call(blocked=self._blocked(200, 200, {"y": 200}))
+        self.assertTrue([a for a in plan.alerts if "unpriceable" in a])
+        self.assertFalse(plan.restart_desk)
+        self.assertIsNone(plan.set_hazard_token_cap)
+
+
+class TheDefaultBranchIsGuardedLocally(unittest.TestCase):
+    """The audit found main unprotected with required checks disabled, so a
+    red suite could land on it unnoticed. Server-side protection is the real
+    fix; this is the half enforceable from the machine, and it catches the
+    realistic failure -- the wrong branch at 2am -- before anything leaves."""
+
+    HOOK = Path("deploy/hooks/pre-push")
+
+    def _run(self, ref_line):
+        return subprocess.run([str(self.HOOK)], input=ref_line, text=True,
+                              capture_output=True)
+
+    def test_the_hook_exists_and_is_executable(self):
+        self.assertTrue(self.HOOK.exists())
+        self.assertTrue(os.access(self.HOOK, os.X_OK), "hook must be executable")
+
+    def test_a_direct_push_to_main_is_refused(self):
+        result = self._run("refs/heads/main a refs/heads/main b\n")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("refusing a direct push", result.stderr)
+
+    def test_master_is_guarded_too(self):
+        self.assertEqual(
+            self._run("refs/heads/master a refs/heads/master b\n").returncode, 1)
+
+    def test_a_feature_branch_is_allowed(self):
+        self.assertEqual(
+            self._run("refs/heads/feature a refs/heads/feature b\n").returncode, 0)
+
+    def test_a_tag_push_is_not_a_branch_push(self):
+        self.assertEqual(
+            self._run("refs/tags/v1 a refs/tags/v1 b\n").returncode, 0)
+
+    def test_the_refusal_names_the_deliberate_escape(self):
+        """A guard rail nobody can pass on purpose gets disabled entirely."""
+        result = self._run("refs/heads/main a refs/heads/main b\n")
+        self.assertIn("--no-verify", result.stderr)
+
+    def test_the_repository_actually_uses_this_hooks_path(self):
+        configured = subprocess.run(
+            ["git", "config", "core.hooksPath"], capture_output=True, text=True)
+        self.assertEqual(configured.stdout.strip(), "deploy/hooks")

@@ -55,7 +55,7 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-LAUNCH_CENSUS_SCHEMA_VERSION = "v1"
+LAUNCH_CENSUS_SCHEMA_VERSION = "v2"
 
 #: What counts as a monster for census purposes. Matches the action-value
 #: trainer's threshold so "missed monster" means the same thing in both.
@@ -65,6 +65,16 @@ MONSTER_MULTIPLE = 10.0
 #: are spilled; unresolved ones are never evicted, because a launch we are
 #: still waiting on is the only kind whose detail we still need.
 DEFAULT_MAX_RECORDS = 20_000
+
+def rug_mechanism_monster_threshold() -> float:
+    """One definition of "monster", shared by the census and calibration.
+
+    Two thresholds that drift apart would make "missed monster" and
+    "monster probability" answer subtly different questions, and nothing
+    would look wrong.
+    """
+    return MONSTER_MULTIPLE
+
 
 #: How long an unresolved launch is kept before being written off as
 #: unobserved. Long enough to catch a slow migration, short enough that a
@@ -76,9 +86,26 @@ class Stage(Enum):
     """How far into our own funnel a launch got."""
 
     SEEN = "seen"
+    AWAITING_STATE = "awaiting_state"
+    DATA_BLOCKED = "data_blocked"
     SCREENED = "screened"
+    DECISION_READY = "decision_ready"
     DECIDED = "decided"
     ENTERED = "entered"
+
+
+class Disposition(Enum):
+    """Mutually exclusive current state of every launch in the denominator."""
+
+    AWAITING_STATE = "AWAITING_STATE"
+    DATA_BLOCKED = "DATA_BLOCKED"
+    SCREENED = "SCREENED"
+    DECISION_READY = "DECISION_READY"
+    DECIDED_REJECT = "DECIDED_REJECT"
+    DECIDED_IGNORE = "DECIDED_IGNORE"
+    DECIDED_PROBE = "DECIDED_PROBE"
+    DECIDED_ENTER = "DECIDED_ENTER"
+    ENTERED = "ENTERED"
 
 
 @dataclass
@@ -90,6 +117,9 @@ class LaunchRecord:
     detected_at: float = 0.0
     regime: str = "unknown"
     stage: Stage = Stage.SEEN
+    disposition: Disposition = Disposition.AWAITING_STATE
+    disposition_reason: str = "candidate_dispatch_pending"
+    disposition_updated_at: float = 0.0
     #: Why it never reached a decision. The single most valuable field here:
     #: it is what a missed monster is attributed to.
     screen_reason: str = ""
@@ -117,6 +147,9 @@ class LaunchRecord:
             "mint": self.mint, "creator": self.creator,
             "detected_at": self.detected_at, "regime": self.regime,
             "stage": self.stage.value, "screen_reason": self.screen_reason,
+            "disposition": self.disposition.value,
+            "disposition_reason": self.disposition_reason,
+            "disposition_updated_at": self.disposition_updated_at,
             "decided_action": self.decided_action,
             "peak_multiple": self.peak_multiple, "migrated": self.migrated,
             "rugged": self.rugged, "rug_mechanism": self.rug_mechanism,
@@ -141,7 +174,14 @@ class _Totals:
     monsters_by_stage: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
     monsters_by_screen: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
     screened_by_reason: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    #: Hard-reject reasons (the RiskVeto's safety_veto:* causes) never pass
+    #: through screen() -- they are a different, earlier policy layer -- so
+    #: they need their own counter. Without it, a report that looks up a
+    #: reject reason in screened_by_reason finds nothing and reads as "this
+    #: reason never touched a launch" even while it is costing monsters.
+    rejected_by_reason: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
     rugs_by_mechanism: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    dispositions: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
 
 
 class LaunchCensus:
@@ -162,6 +202,11 @@ class LaunchCensus:
         self._totals = _Totals()
         self.spilled = 0
         self.expired_unresolved = 0
+        #: Outcomes that arrived for a mint whose detail had already left
+        #: memory. Counted rather than dropped, and reported, because a
+        #: silently discarded outcome makes a rate wrong in the flattering
+        #: direction.
+        self.resolutions_after_eviction = 0
 
     # --- the funnel ------------------------------------------------------
 
@@ -179,9 +224,12 @@ class LaunchCensus:
             return existing
         record = LaunchRecord(mint=mint, creator=creator,
                               detected_at=float(at if at is not None else time.time()),
-                              regime=regime)
+                              regime=regime,
+                              stage=Stage.AWAITING_STATE,
+                              disposition_updated_at=time.time())
         self._records[mint] = record
         self._totals.seen += 1
+        self._totals.dispositions[Disposition.AWAITING_STATE.value] += 1
         self._evict_if_needed()
         return record
 
@@ -202,28 +250,80 @@ class LaunchCensus:
         nothing vanishes without a name attached.
         """
         record = self._records.get(mint)
-        if record is None or record.stage != Stage.SEEN:
+        if (record is None or record.stage in
+                (Stage.SCREENED, Stage.DECIDED, Stage.ENTERED)):
             return
+        self._transition(record, Stage.SCREENED, Disposition.SCREENED, reason)
         record.stage = Stage.SCREENED
         record.screen_reason = str(reason or "unattributed")
         self._totals.screened += 1
         self._totals.screened_by_reason[record.screen_reason] += 1
+
+    def awaiting_state(self, mint: str, reason: str = "candidate_pipeline") -> None:
+        record = self._records.get(mint)
+        if record is None or record.stage in (Stage.DECIDED, Stage.ENTERED):
+            return
+        self._transition(record, Stage.AWAITING_STATE,
+                         Disposition.AWAITING_STATE, reason)
+
+    def data_blocked(self, mint: str, reason: str) -> None:
+        """The launch was evaluated but a required fact was unavailable."""
+        record = self._records.get(mint)
+        if record is None or record.stage in (Stage.DECIDED, Stage.ENTERED):
+            return
+        self._transition(record, Stage.DATA_BLOCKED,
+                         Disposition.DATA_BLOCKED, reason or "unattributed")
+        record.screen_reason = str(reason or "unattributed")
+
+    def decision_ready(self, mint: str, reason: str = "facts_complete") -> None:
+        record = self._records.get(mint)
+        if record is None or record.stage in (Stage.DECIDED, Stage.ENTERED):
+            return
+        self._transition(record, Stage.DECISION_READY,
+                         Disposition.DECISION_READY, reason)
 
     def decide(self, mint: str, action: str) -> None:
         """A launch that reached the decision path, whatever it decided."""
         record = self._records.get(mint)
         if record is None:
             return
-        if record.stage in (Stage.SEEN, Stage.SCREENED):
+        if record.stage not in (Stage.DECIDED, Stage.ENTERED):
             if record.stage == Stage.SCREENED:
                 # It was screened and then decided anyway; undo the screen so
                 # the funnel stays a partition rather than double counting.
                 self._totals.screened -= 1
                 self._totals.screened_by_reason[record.screen_reason] -= 1
                 record.screen_reason = ""
-            record.stage = Stage.DECIDED
             self._totals.decided += 1
         record.decided_action = str(action or "")
+        lowered = record.decided_action.lower()
+        disposition = (Disposition.DECIDED_ENTER if "enter" in lowered
+                       else Disposition.DECIDED_PROBE if "probe" in lowered
+                       else Disposition.DECIDED_IGNORE)
+        self._transition(record, Stage.DECIDED, disposition,
+                         record.decided_action or "ignore")
+
+    def reject(self, mint: str, reason: str) -> None:
+        """Record a factually impossible/unsafe action as a terminal decision.
+
+        A hard reject is not a pre-decision disappearance. It is the economic
+        decision that every feasible size has unacceptable value because a
+        non-negotiable safety fact failed.
+        """
+        record = self._records.get(mint)
+        if record is None:
+            return
+        if record.stage not in (Stage.DECIDED, Stage.ENTERED):
+            if record.stage is Stage.SCREENED:
+                self._totals.screened = max(0, self._totals.screened - 1)
+                self._totals.screened_by_reason[record.screen_reason] = max(
+                    0, self._totals.screened_by_reason[record.screen_reason] - 1)
+                record.screen_reason = ""
+            self._totals.decided += 1
+            self._totals.rejected_by_reason[str(reason or "unattributed_hard_reject")] += 1
+        record.decided_action = "REJECT"
+        self._transition(record, Stage.DECIDED, Disposition.DECIDED_REJECT,
+                         str(reason or "unattributed_hard_reject"))
 
     def enter(self, mint: str) -> None:
         """A position was actually taken."""
@@ -233,8 +333,31 @@ class LaunchCensus:
         if record.stage != Stage.ENTERED:
             if record.stage != Stage.DECIDED:
                 self._totals.decided += 1
-            record.stage = Stage.ENTERED
+            self._transition(record, Stage.ENTERED, Disposition.ENTERED,
+                             "position_opened")
             self._totals.entered += 1
+
+    def _transition(self, record: LaunchRecord, stage: Stage,
+                    disposition: Disposition, reason: str) -> None:
+        """Move one record while keeping the disposition partition exact."""
+        old_disposition = record.disposition.value
+        if old_disposition != disposition.value:
+            self._totals.dispositions[old_disposition] = max(
+                0, self._totals.dispositions[old_disposition] - 1)
+            self._totals.dispositions[disposition.value] += 1
+        if record.is_monster and record.stage != stage:
+            self._totals.monsters_by_stage[record.stage.value] = max(
+                0, self._totals.monsters_by_stage[record.stage.value] - 1)
+            self._totals.monsters_by_stage[stage.value] += 1
+            if record.stage == Stage.SCREENED and record.screen_reason:
+                self._totals.monsters_by_screen[record.screen_reason] = max(
+                    0, self._totals.monsters_by_screen[record.screen_reason] - 1)
+            if stage == Stage.SCREENED:
+                self._totals.monsters_by_screen[str(reason or "unattributed")] += 1
+        record.stage = stage
+        record.disposition = disposition
+        record.disposition_reason = str(reason or "")
+        record.disposition_updated_at = time.time()
 
     # --- resolution, independent of what we did --------------------------
 
@@ -249,6 +372,16 @@ class LaunchCensus:
         """
         record = self._records.get(mint)
         if record is None:
+            # The mint has been evicted from memory, or belongs to a run
+            # before this one. Its OUTCOME still happened, and dropping it
+            # silently is how the desk produced three rug verdicts while
+            # reporting one rug: the classifier worked and the census threw
+            # the answer away. Counted here so the denominator and the
+            # mechanism tally stay honest even when the detail is gone.
+            if rugged:
+                self.resolutions_after_eviction += 1
+                self._totals.rugs += 1
+                self._totals.rugs_by_mechanism[rug_mechanism or "unclassified"] += 1
             return
         now = float(at if at is not None else time.time())
         first_resolution = record.peak_multiple is None
@@ -268,6 +401,19 @@ class LaunchCensus:
                 if record.stage == Stage.SCREENED:
                     self._totals.monsters_by_screen[
                         record.screen_reason or "unattributed"] += 1
+                elif (record.stage == Stage.DECIDED
+                        and record.decided_action == "REJECT"):
+                    # A hard-rejected monster is the costliest kind of miss,
+                    # and its disposition reason carries the exact veto causes
+                    # ("safety_veto:mint_authority_active,..."). Attributing
+                    # it keeps the question answerable per CAUSE: which
+                    # specific veto is discarding upside, and is that cause
+                    # ever credited with a save. Every observed monster so
+                    # far died under one aggregate label, which made the veto
+                    # untunable -- the only options were "trust it all" or
+                    # "doubt it all".
+                    self._totals.monsters_by_screen[
+                        record.disposition_reason or "unattributed_reject"] += 1
         if migrated is not None and record.migrated is None:
             record.migrated = bool(migrated)
             if record.migrated:
@@ -341,7 +487,9 @@ class LaunchCensus:
         by_stage = dict(totals.monsters_by_stage)
         reached = by_stage.get(Stage.DECIDED.value, 0) + by_stage.get(Stage.ENTERED.value, 0)
         screened_away = by_stage.get(Stage.SCREENED.value, 0)
-        never_reached = by_stage.get(Stage.SEEN.value, 0)
+        data_blocked = by_stage.get(Stage.DATA_BLOCKED.value, 0)
+        never_reached = (by_stage.get(Stage.SEEN.value, 0)
+                         + by_stage.get(Stage.AWAITING_STATE.value, 0))
         ranked = sorted(totals.monsters_by_screen.items(),
                         key=lambda item: item[1], reverse=True)
         return {
@@ -353,27 +501,53 @@ class LaunchCensus:
             "monsters_entered": by_stage.get(Stage.ENTERED.value, 0),
             "monsters_decided_not_entered": by_stage.get(Stage.DECIDED.value, 0),
             "monsters_screened_out": screened_away,
+            "monsters_data_blocked": data_blocked,
             "monsters_never_reached_a_screen": never_reached,
             # The headline. Of the monsters we resolved, what share did our
             # own filters discard before anything could decide on them?
             "monster_capture_rate": (reached / monsters) if monsters else None,
             "costliest_screens": [
                 {"reason": reason, "monsters_discarded": count,
-                 "total_screened": totals.screened_by_reason.get(reason, 0),
+                 # A reason lives in exactly one of these two counters: the
+                 # graded ScreenPolicy's screened_by_reason, or the hard
+                 # RiskVeto's rejected_by_reason. Reading only the first made
+                 # every safety_veto:* row show 0 total rejected next to a
+                 # nonzero monster count -- not a broken screen, a lookup
+                 # into the wrong policy layer's counter.
+                 "total_screened": (totals.screened_by_reason.get(reason, 0)
+                                    + totals.rejected_by_reason.get(reason, 0)),
                  # Of everything this screen rejected, how much was a monster.
                  # A screen with a high rate is mispriced; a screen with a high
                  # count is expensive even at a low rate.
                  "monster_share_of_rejections": (
-                     count / totals.screened_by_reason[reason]
-                     if totals.screened_by_reason.get(reason) else None)}
+                     count / (totals.screened_by_reason.get(reason, 0)
+                              + totals.rejected_by_reason.get(reason, 0))
+                     if (totals.screened_by_reason.get(reason)
+                         or totals.rejected_by_reason.get(reason)) else None)}
                 for reason, count in ranked[:10]],
             "detail": ("" if monsters else
                        "no resolved monster yet; capture rate is unmeasurable "
                        "and is reported as null rather than as perfect"),
         }
 
+    def mints_pending_death_classification(self) -> List[str]:
+        """Resolved launches with no rug verdict yet -- candidates to classify.
+
+        A launch stays a candidate forever until something calls
+        ``resolve(..., rugged=...)`` for it, which is deliberate: a token
+        that merely looks alive right now (drawdown under the death
+        threshold) is not the same claim as "confirmed survived", and only
+        the caller that actually re-examines its trade history gets to make
+        that call.
+        """
+        return [mint for mint, record in self._records.items()
+                if record.resolved and record.rugged is None]
+
     def report(self) -> Dict[str, Any]:
         totals = self._totals
+        dispositions = {state.value: int(totals.dispositions.get(state.value, 0))
+                        for state in Disposition}
+        partitioned = sum(dispositions.values())
         return {
             "schema": LAUNCH_CENSUS_SCHEMA_VERSION,
             "status": "OK" if totals.seen else "DATA_BLOCKED",
@@ -383,12 +557,20 @@ class LaunchCensus:
             "funnel": {
                 "seen": totals.seen,
                 "screened_out": totals.screened,
+                "data_blocked": dispositions[Disposition.DATA_BLOCKED.value],
+                "awaiting_state": dispositions[Disposition.AWAITING_STATE.value],
+                "decision_ready": dispositions[Disposition.DECISION_READY.value],
+                "decided_reject": dispositions[Disposition.DECIDED_REJECT.value],
+                "decided_ignore": dispositions[Disposition.DECIDED_IGNORE.value],
+                "decided_probe": dispositions[Disposition.DECIDED_PROBE.value],
+                "decided_enter": dispositions[Disposition.DECIDED_ENTER.value],
                 "reached_a_decision": totals.decided,
                 "entered": totals.entered,
                 # Seen but neither screened nor decided: launches that fell
                 # through the funnel without anything happening to them. A
                 # rising number here is a pipeline defect, not a policy.
-                "unaccounted": max(0, totals.seen - totals.screened - totals.decided),
+                "unaccounted": max(0, totals.seen - partitioned),
+                "dispositions": dispositions,
             },
             "outcomes": {
                 "resolved": totals.resolved,
@@ -423,10 +605,13 @@ class LaunchCensus:
                 "monsters_by_stage": dict(self._totals.monsters_by_stage),
                 "monsters_by_screen": dict(self._totals.monsters_by_screen),
                 "screened_by_reason": dict(self._totals.screened_by_reason),
+                "rejected_by_reason": dict(self._totals.rejected_by_reason),
                 "rugs_by_mechanism": dict(self._totals.rugs_by_mechanism),
+                "dispositions": dict(self._totals.dispositions),
             },
             "spilled": self.spilled,
             "expired_unresolved": self.expired_unresolved,
+            "resolutions_after_eviction": self.resolutions_after_eviction,
             "records": [record.to_dict() for record in self._records.values()],
         }
 
@@ -456,6 +641,17 @@ class LaunchCensus:
             logger.warning("launch census unreadable: %s", exc)
             return False
         totals = state.get("totals") or {}
+        has_dispositions = bool(totals.get("dispositions"))
+        legacy_unaccounted = max(
+            0, int(totals.get("seen", 0)) - int(totals.get("screened", 0))
+            - int(totals.get("decided", 0)))
+        dispositions = defaultdict(int, totals.get("dispositions") or {
+            Disposition.DATA_BLOCKED.value: legacy_unaccounted,
+            Disposition.SCREENED.value: int(totals.get("screened", 0)),
+            Disposition.DECIDED_IGNORE.value: max(
+                0, int(totals.get("decided", 0)) - int(totals.get("entered", 0))),
+            Disposition.ENTERED.value: int(totals.get("entered", 0)),
+        })
         self._totals = _Totals(
             seen=int(totals.get("seen", 0)), screened=int(totals.get("screened", 0)),
             decided=int(totals.get("decided", 0)), entered=int(totals.get("entered", 0)),
@@ -465,23 +661,98 @@ class LaunchCensus:
             monsters_by_stage=defaultdict(int, totals.get("monsters_by_stage") or {}),
             monsters_by_screen=defaultdict(int, totals.get("monsters_by_screen") or {}),
             screened_by_reason=defaultdict(int, totals.get("screened_by_reason") or {}),
-            rugs_by_mechanism=defaultdict(int, totals.get("rugs_by_mechanism") or {}))
+            rejected_by_reason=defaultdict(int, totals.get("rejected_by_reason") or {}),
+            rugs_by_mechanism=defaultdict(int, totals.get("rugs_by_mechanism") or {}),
+            dispositions=dispositions)
         self.spilled = int(state.get("spilled", 0))
         self.expired_unresolved = int(state.get("expired_unresolved", 0))
+        self.resolutions_after_eviction = int(
+            state.get("resolutions_after_eviction", 0))
         self._records.clear()
         for row in state.get("records") or []:
             mint = row.get("mint")
             if not mint:
                 continue
+            legacy_stage = Stage(row.get("stage", "seen"))
+            if row.get("disposition"):
+                disposition = Disposition(row["disposition"])
+            elif legacy_stage == Stage.SEEN:
+                disposition = Disposition.DATA_BLOCKED
+            elif legacy_stage == Stage.SCREENED:
+                disposition = Disposition.SCREENED
+            elif legacy_stage == Stage.ENTERED:
+                disposition = Disposition.ENTERED
+            else:
+                disposition = Disposition.DECIDED_IGNORE
             self._records[mint] = LaunchRecord(
                 mint=mint, creator=row.get("creator", ""),
                 detected_at=float(row.get("detected_at", 0.0) or 0.0),
                 regime=row.get("regime", "unknown"),
-                stage=Stage(row.get("stage", "seen")),
+                stage=(Stage.DATA_BLOCKED if legacy_stage == Stage.SEEN
+                       and not row.get("disposition") else legacy_stage),
+                disposition=disposition,
+                disposition_reason=row.get(
+                    "disposition_reason",
+                    "pipeline_disposition_missing_before_schema_v2"
+                    if legacy_stage == Stage.SEEN else ""),
+                disposition_updated_at=float(row.get(
+                    "disposition_updated_at", row.get("detected_at", 0.0)) or 0.0),
                 screen_reason=row.get("screen_reason", ""),
                 decided_action=row.get("decided_action", ""),
                 peak_multiple=row.get("peak_multiple"),
                 migrated=row.get("migrated"), rugged=row.get("rugged"),
                 rug_mechanism=row.get("rug_mechanism", ""),
                 resolved_at=float(row.get("resolved_at", 0.0) or 0.0))
+        # No candidate coroutine survives a process restart. Persisted
+        # AWAITING_STATE records therefore cannot still be running; keeping
+        # them awaiting forever would manufacture a pipeline leak.
+        for record in self._records.values():
+            if record.disposition is Disposition.AWAITING_STATE:
+                record.stage = Stage.DATA_BLOCKED
+                record.disposition = Disposition.DATA_BLOCKED
+                record.disposition_reason = "DATA_BLOCKED_pipeline_interrupted_by_restart"
+                record.screen_reason = record.disposition_reason
+                record.disposition_updated_at = time.time()
+        # Older states counted DATA_BLOCKED exits as screens.  Reclassify the
+        # in-memory detail we can prove without inventing anything about
+        # already-spilled rows.
+        if not has_dispositions:
+            for record in self._records.values():
+                if (record.disposition is Disposition.SCREENED
+                        and record.screen_reason.startswith("DATA_BLOCKED")):
+                    self._totals.screened = max(0, self._totals.screened - 1)
+                    self._totals.screened_by_reason[record.screen_reason] = max(
+                        0, self._totals.screened_by_reason[record.screen_reason] - 1)
+                    self._totals.dispositions[Disposition.SCREENED.value] = max(
+                        0, self._totals.dispositions[Disposition.SCREENED.value] - 1)
+                    self._totals.dispositions[Disposition.DATA_BLOCKED.value] += 1
+                    record.stage = Stage.DATA_BLOCKED
+                    record.disposition = Disposition.DATA_BLOCKED
+        # When no detail has been spilled, the records are the authoritative
+        # complete population. Repair stale aggregate pipeline counters from
+        # older writers or interrupted saves instead of showing contradictory
+        # screen totals on the dashboard. Outcome counters stay untouched.
+        if self.spilled == 0 and self._totals.seen == len(self._records):
+            dispositions: Dict[str, int] = defaultdict(int)
+            screened_by_reason: Dict[str, int] = defaultdict(int)
+            rejected_by_reason: Dict[str, int] = defaultdict(int)
+            screened = decided = entered = 0
+            for record in self._records.values():
+                dispositions[record.disposition.value] += 1
+                if record.stage is Stage.SCREENED:
+                    screened += 1
+                    screened_by_reason[record.screen_reason or "unattributed"] += 1
+                if record.disposition is Disposition.DECIDED_REJECT:
+                    rejected_by_reason[
+                        record.disposition_reason or "unattributed_hard_reject"] += 1
+                if record.stage in (Stage.DECIDED, Stage.ENTERED):
+                    decided += 1
+                if record.stage is Stage.ENTERED:
+                    entered += 1
+            self._totals.dispositions = dispositions
+            self._totals.screened_by_reason = screened_by_reason
+            self._totals.rejected_by_reason = rejected_by_reason
+            self._totals.screened = screened
+            self._totals.decided = decided
+            self._totals.entered = entered
         return True

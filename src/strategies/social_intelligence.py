@@ -128,6 +128,7 @@ class SocialIntelligenceEngine:
         self._telegram_event_handler = None
         self._telegram_poll_successes: Set[str] = set()
         self._telegram_poll_failures: Dict[str, str] = {}
+        self._causality_tasks: Set[asyncio.Task] = set()
         self._account_fetched_at: Dict[str, float] = {}
         self._seen_social_items: Set[str] = set()
         self._reddit_access_token = ""
@@ -167,6 +168,12 @@ class SocialIntelligenceEngine:
         if self._telegram_client:
             await self._telegram_client.disconnect()
             self._telegram_client = None
+        pending = list(self._causality_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._causality_tasks.clear()
 
     def on_mention(self, callback: Callable):
         self._mention_callbacks.append(callback)
@@ -251,8 +258,30 @@ class SocialIntelligenceEngine:
                 if value.strip()
             ]
             for channel in channels:
+                # Resolve the public username through Telegram itself before
+                # storing identity. A display handle is mutable; chat.id is
+                # the stable identifier carried by incoming events and by the
+                # verified entity registry. The old code pre-created every
+                # account with account_id=handle, so the push handler found an
+                # existing record and never upgraded it to event.chat_id.
+                account_id = channel
+                display_name = channel
+                try:
+                    entity = await self._telegram_client.get_entity(channel)
+                    account_id = str(getattr(entity, "id", "") or channel)
+                    display_name = str(
+                        getattr(entity, "title", "")
+                        or getattr(entity, "first_name", "")
+                        or channel
+                    )
+                except Exception as exc:
+                    # Polling will record the unavailable channel explicitly;
+                    # one optional bad username must not stop healthy channels
+                    # from starting.
+                    self._telegram_poll_failures[channel] = str(exc)
                 await self._add_account({
-                    "platform": "telegram", "handle": channel, "account_id": channel,
+                    "platform": "telegram", "handle": channel,
+                    "account_id": account_id, "display_name": display_name,
                 })
             self._telegram_handles = {channel.casefold() for channel in channels}
             if events is not None:
@@ -567,6 +596,17 @@ class SocialIntelligenceEngine:
             return
         key = f"{data['platform']}:{data['handle']}"
         if key in self.accounts:
+            # A collector can discover a handle before it resolves the
+            # platform's stable id. Upgrade only that placeholder; never
+            # overwrite one stable id with another because that is an
+            # identity conflict requiring investigation, not a rename.
+            existing = self.accounts[key]
+            incoming = str(data.get("account_id", "") or "")
+            placeholders = {key, str(data["handle"]), ""}
+            if incoming and existing.account_id in placeholders and incoming not in placeholders:
+                existing.account_id = incoming
+                if data.get("display_name"):
+                    existing.display_name = str(data["display_name"])
             return
         
         platform = SocialPlatform(data["platform"]) if isinstance(data["platform"], str) else data["platform"]
@@ -668,7 +708,9 @@ class SocialIntelligenceEngine:
         contracts = []
         contracts.extend(re.findall(solana_pattern, text))
         contracts.extend(re.findall(eth_pattern, text))
-        return contracts
+        # The same address is commonly repeated in the message body and a
+        # scanner button. One notification is one observation, not two votes.
+        return list(dict.fromkeys(contracts))
 
     def _parse_twitter_time(self, time_str: str) -> float:
         try:
@@ -734,7 +776,23 @@ class SocialIntelligenceEngine:
         if dedupe in self._seen_social_items:
             return
         self._seen_social_items.add(dedupe)
-        content = getattr(message, "message", "") or ""
+        # Scanner bots often place the only mint address in a link button or
+        # a hidden text-url entity. Consume every read-only text surface in
+        # the notification; otherwise an apparently healthy Telegram stream
+        # silently misses precisely the actionable messages it was added for.
+        content_parts = [
+            str(getattr(message, "message", "") or ""),
+            str(getattr(message, "raw_text", "") or ""),
+        ]
+        for entity in getattr(message, "entities", None) or ():
+            content_parts.append(str(getattr(entity, "url", "") or ""))
+        for row in getattr(message, "buttons", None) or ():
+            for button in row or ():
+                content_parts.extend([
+                    str(getattr(button, "text", "") or ""),
+                    str(getattr(button, "url", "") or ""),
+                ])
+        content = "\n".join(part for part in content_parts if part)
         timestamp = getattr(message, "date", None)
         timestamp_value = timestamp.timestamp() if timestamp else time.time()
         for token_address in self._extract_contracts(content):
@@ -832,8 +890,10 @@ class SocialIntelligenceEngine:
         mention.token_first_mention = is_first
         mention.mention_index = len(self.token_mentions[token]) - 1
         
-        await self._check_chain_causality(mention)
-        
+        ingested_at = time.time()
+        # The hot callback runs before any enrichment RPC. On the previous
+        # path, getTokenLargestAccounts/getMultipleAccounts delayed every
+        # Telegram notification before candidate triage even began.
         for callback in self._mention_callbacks:
             try:
                 await callback({
@@ -844,10 +904,18 @@ class SocialIntelligenceEngine:
                     "credibility": mention.account.credibility_score,
                     "first_mention": is_first,
                     "content": mention.content[:200],
-                    "timestamp": mention.timestamp
+                    "timestamp": mention.timestamp,
+                    "ingested_at": ingested_at,
+                    "source_lag_ms": max(0.0, (ingested_at - mention.timestamp) * 1000.0),
+                    "url": mention.url,
+                    "engagement": dict(mention.engagement),
                 })
             except Exception as e:
                 logger.error(f"Mention callback error: {e}")
+
+        task = asyncio.create_task(self._check_chain_causality(mention))
+        self._causality_tasks.add(task)
+        task.add_done_callback(self._causality_tasks.discard)
 
     async def _check_chain_causality(self, mention: SocialMention):
         token = mention.token

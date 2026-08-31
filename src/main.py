@@ -40,7 +40,14 @@ from src.execution.jupiter_jito import (
     PriorityFeeOptimizer,
     USDC_MINT,
 )
-from src.research.dataset_builder import PointInTimeDatasetBuilder
+from src.strategies.risk_veto import RiskVeto
+from src.strategies.memecoin_state import (
+    DevEvent, DevWalletMonitor, HolderTrajectoryMonitor, ObservedHolderLedger,
+    SmartWalletRotationTracker, social_price_disagreement)
+from src.research.trade_evidence import TradeEvidenceLedger
+from src.research.dataset_builder import (
+    PointInTimeDatasetBuilder, PUMP_INITIAL_VIRTUAL_SOL,
+    PUMP_INITIAL_VIRTUAL_TOKEN)
 from src.research.feature_engine import build_features
 from src.research.global_research_miner import GlobalResearchMiner
 from src.research.calibration import CalibrationBook
@@ -53,22 +60,18 @@ from src.runtime.latency import LatencyLedger
 from src.runtime.serialisation import jsonable as _jsonable
 from src.runtime.reporting import ReportingSurface
 from src.runtime.ingestion import MinedRecordIngestion
+from src.runtime.evidence import EvidenceRecording
+from src.runtime.supervision import TaskSupervision
+from src.runtime.maintenance import DeskMaintenance
 from src.runtime.wiring import SubsystemWiring
 from src.runtime.offload import OffloadedPool, install_fast_event_loop
-from src.runtime.memory_governor import Band, MemoryGovernor, Relief
+from src.runtime.memory_governor import (
+    Band, MemoryGovernor, Relief, DEFAULT_SOFT_FRACTION,
+    DEFAULT_HARD_FRACTION)
 from src.research.launch_census import LaunchCensus
 from src.research import rug_mechanism
-from src.research.launch_census import MONSTER_MULTIPLE
-
-
-def rug_mechanism_monster_threshold() -> float:
-    """One definition of "monster", shared by the census and calibration.
-
-    Two thresholds that drift apart would make "missed monster" and
-    "monster probability" answer subtly different questions, and nothing
-    would look wrong.
-    """
-    return MONSTER_MULTIPLE
+from src.research.launch_census import (
+    MONSTER_MULTIPLE, rug_mechanism_monster_threshold)
 from src.strategies.screen_policy import (
     ScreenPolicy, ScreenReading, Verdict as ScreenVerdict, graded, veto,
 )
@@ -154,6 +157,12 @@ from src.strategies.ignition import IgnitionModel, touches_from_events
 
 logger = logging.getLogger(__name__)
 
+#: How long a token must sit with no new observation before a death
+#: verdict is attempted. Below this, "no new trade yet" and "dead" are
+#: indistinguishable, and classifying early permanently brands a token that
+#: is only mid-launch.
+DEATH_CLASSIFICATION_QUIET_S = 300.0
+
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 MODEL_HYPOTHESIS_ID = "production_multihead_v1"
 
@@ -169,7 +178,9 @@ CAPACITY_REJECTIONS = frozenset({
 
 
 
-class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring):
+class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
+                       DeskMaintenance, TaskSupervision, EvidenceRecording,
+                       SubsystemWiring):
     def __init__(self, config_path: str = "config/chains.yaml", *, dry_run_override: Optional[bool] = None,
                  offline: bool = False):
         self.config_path = config_path
@@ -218,6 +229,16 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
         self._candidate_pipelines: Dict[str, asyncio.Task] = {}
         self._candidate_semaphore: Optional[asyncio.Semaphore] = None
         self._web_runner: Optional[web.AppRunner] = None
+        # Telegram can replay its configured channels as soon as the client
+        # connects, before the PIT dataset finishes constructing. Preserve
+        # those signals and drain them once every downstream consumer exists.
+        self.trade_evidence: Optional[TradeEvidenceLedger] = None
+        self._fatal_task_event = asyncio.Event()
+        self._fatal_task_detail = ""
+        self._task_health: Dict[str, Dict[str, Any]] = {}
+        self._background_failures = 0
+        self._pending_social_signals: deque = deque(maxlen=10_000)
+        self._pending_social_dropped = 0
         self.start_time = time.time()
         self.last_intelligence_update = 0.0
         self.sol_price_usd = 0.0
@@ -285,6 +306,18 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
             Path(self.global_config.get("ops_state_dir", "data/state"))
             / "launch_census.json")
         self.launch_census.load()
+        # Holder structure without an RPC call. getTokenLargestAccounts is
+        # unserved by the free pool (publicnode 403, mainnet-beta 429) and
+        # was blocking 41 of 63 launches in a measured sample; every trade
+        # already decoded carries a wallet and a signed token delta.
+        self.observed_holders = ObservedHolderLedger()
+        # Measurements, not parallel trading authorities: each reports into
+        # the decision record so the audit can tell a module that ran from
+        # one that never did. A contributor with no slot is an orphan.
+        self.holder_trajectory = HolderTrajectoryMonitor()
+        self.dev_wallet_monitor = DevWalletMonitor()
+        self.rotation_tracker = SmartWalletRotationTracker()
+        self.risk_veto: RiskVeto = RiskVeto()
         self._census_saved_at = 0.0
         # Are the stated probabilities true? Kelly is exquisitely sensitive to
         # them and nothing has ever checked.
@@ -426,6 +459,14 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
         with open(self.config_path, encoding="utf-8") as handle:
             self.config = yaml.safe_load(handle)
         self.global_config = self.config.get("global", {})
+        # The governor is constructed before the config is read, so
+        # memory_soft_fraction/memory_hard_fraction silently took defaults
+        # and had never once applied. Rebound rather than reconstructed:
+        # components built in between register reliefs on this object.
+        self.memory.soft_fraction = float(
+            self.global_config.get("memory_soft_fraction", DEFAULT_SOFT_FRACTION))
+        self.memory.hard_fraction = float(
+            self.global_config.get("memory_hard_fraction", DEFAULT_HARD_FRACTION))
         self._candidate_semaphore = asyncio.Semaphore(
             int(self.global_config.get("max_candidate_concurrency", 8))
         )
@@ -433,12 +474,16 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
         self.dry_run = configured_dry_run if self.dry_run_override is None else bool(self.dry_run_override)
         await self._setup_keys()
         await self._setup_chains()
-        await self._setup_yellowstone()
         await self._setup_intelligence()
         await self._setup_prediction()
         await self._setup_execution()
         await self._setup_detection_and_risk()
         await self._setup_research()
+        await self._flush_pending_social_signals()
+        # The stream connects LAST, after every consumer exists. A producer
+        # that starts first delivers events into a desk that has nothing
+        # wired to handle them, and those launches are lost silently.
+        await self._setup_yellowstone()
         await self._refresh_portfolio_state()
         logger.info("Desk initialized: mode=%s live_submission_locked=%s", "DRY_RUN" if self.dry_run else "LIVE",
                     os.getenv("ALLOW_LIVE_TRADING", "").lower() != "yes-i-understand")
@@ -457,22 +502,32 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
         if self.offline:
             return
         self._running = True
+        # An open follow is an unresolved measurement with a 300s horizon.
+        # Discarding it on restart is why no wallet ever reached the
+        # 12-outcome ranking bar: 56 open against 9 resolved.
+        self.load_follow_candidates()
         await self._setup_health_server()
         # Four independent loops rather than one clocked sweep. The two that
         # decide -- candidates and redecisions -- are driven by events and
         # never sleep; the two that maintain are driven by the clock and never
         # sit in front of a decision.
-        self._main_task = asyncio.create_task(self._candidate_dispatch_loop())
+        self._main_task = self._start_runtime_task(
+            "dispatch", self._candidate_dispatch_loop())
         self._redecision_tasks = [
-            asyncio.create_task(self._redecision_loop())
-            for _ in range(int(self.global_config.get("redecision_workers", 4)))]
-        self._safety_task = asyncio.create_task(self._safety_sweep_loop())
-        self._intelligence_task = asyncio.create_task(self._intelligence_loop())
-        self._parity_task = asyncio.create_task(self._parity_loop())
+            self._start_runtime_task(f"redecision_{index}", self._redecision_loop())
+            for index in range(int(self.global_config.get("redecision_workers", 4)))]
+        self._safety_task = self._start_runtime_task(
+            "safety", self._safety_sweep_loop())
+        self._intelligence_task = self._start_runtime_task(
+            "intelligence", self._intelligence_loop())
+        self._parity_task = self._start_runtime_task("parity", self._parity_loop())
         self._register_memory_reliefs()
-        self._health_task = asyncio.create_task(self._health_loop())
-        self._market_task = asyncio.create_task(self._market_observer_loop())
-        self._source_task = asyncio.create_task(self._source_consumer_loop())
+        self._health_task = self._start_runtime_task(
+            "health", self._health_loop())
+        self._market_task = self._start_runtime_task(
+            "market", self._market_observer_loop())
+        self._source_task = self._start_runtime_task(
+            "sources", self._source_consumer_loop())
 
     async def stop(self):
         self._running = False
@@ -552,10 +607,9 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
             except Exception as exc:
                 logger.warning("could not close the landing log: %s", exc)
 
-    def _spawn_background(self, coroutine):
-        task = asyncio.create_task(coroutine)
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+
+
+
 
     async def _candidate_dispatch_loop(self):
         """Dispatch every candidate the instant it is detected.
@@ -937,6 +991,10 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
         # forward.
         self._record_corpus_decision(token, decision_id, decision, trade_info,
                                      should_trade)
+        self._record_trade_evidence_packet(
+            token, candidate, risk, liquidity, trade_info, intelligence,
+            decision="ENTER" if should_trade else str(trade_info.get("reason", "IGNORE")),
+            veto=hard_veto.to_dict())
         if not should_trade:
             # A launch we screened is a closed trace, not an abandoned one.
             # Screening is most of the funnel, and a ledger that only ever saw
@@ -1155,19 +1213,7 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("corpus decision for %s not recorded: %s", token, exc)
 
-    def _prelaunch_context(self, deployer: str, detected_at: float) -> Optional[Dict[str, Any]]:
-        profile = self.prelaunch.get_entity_profile(deployer) if deployer else None
-        if not profile or profile.last_active > detected_at:
-            return None
-        return {
-            "as_of": profile.last_active,
-            "deployer_features": {"prior_launches": len(profile.prior_launches),
-                                  "prior_success_rate": profile.prior_success_rate,
-                                  "prior_rug_rate": profile.prior_rug_rate},
-            "wallet_features": {"cluster_id": profile.cluster_id or ""},
-            "social_features": {"social_creations": len(profile.social_creations)},
-            "entity_graph_features": {"intent_score": profile.intent_score},
-        }
+
 
     def _local_liquidity(self, token: str) -> float:
         """Tradeable depth from the streamed curve, in USD. Zero when unknown.
@@ -1320,8 +1366,36 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
                     # far worse failure than a missing coverage row.
                     logger.warning("position coverage failed for %s: %s", token, exc)
 
+
+
     async def _manage_one_position(self, token: str, position: Dict[str, Any]) -> None:
         """One position, one cycle. Returns early where the cycle is resolved."""
+        # Consult the safety modules before anything else, and RECORD what
+        # they said. A module that runs but never writes its finding into the
+        # position is an orphan: the decision cannot cite it and the audit
+        # cannot tell it apart from one that never ran.
+        dev_monitor = getattr(self, "dev_wallet_monitor", None)
+        holder_monitor = getattr(self, "holder_trajectory", None)
+        dev_state = (dev_monitor.state(token) if dev_monitor else {
+            "status": "DATA_BLOCKED", "detail": "developer monitor unavailable"})
+        position["dev_wallet"] = dev_state
+        position["holder_trajectory"] = (holder_monitor.state(token) if holder_monitor else {
+            "status": "DATA_BLOCKED", "detail": "holder monitor unavailable"})
+        risk = position.get("risk_object")
+        veto_engine = getattr(self, "risk_veto", None)
+        if risk is not None and veto_engine is not None:
+            veto = veto_engine.evaluate(
+                risk, dev_state=dev_state,
+                connected_holder_pct=getattr(risk, "connected_cluster_pct", None))
+            position["risk_veto"] = veto.to_dict()
+            # A non-negotiable safety fact discovered while HOLDING is still
+            # non-negotiable. Exiting on it is the whole point of re-running
+            # the veto against an open position rather than only at entry.
+            if veto.status == "VETO":
+                await self._execute_exit(
+                    token, position, 1.0,
+                    "hard_safety_veto:" + ",".join(veto.reasons))
+                return
         should_hazard_exit, urgency, pct = self.rug_hazard.should_exit(token, position)
         if should_hazard_exit:
             await self._execute_exit(token, position, pct, f"rug_hazard_{urgency}")
@@ -1575,10 +1649,22 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
         """
         hazard = self.rug_hazard.get_hazard(token)
         reentry = self.reentry_book.get(token)
+        observations = list(self.rug_hazard.observations.get(token, ()))
+        social_disagreement = social_price_disagreement(
+            [item for item in observations if item.get("type") == "social"],
+            [item for item in observations if item.get("type") in {"trade", "market"}],
+        )
+        dev_state = self.dev_wallet_monitor.state(token)
+        veto = self.risk_veto.evaluate(
+            risk, dev_state=dev_state,
+            position_value_usd=(float(trade_info["position_value_usd"])
+                                if trade_info.get("position_value_usd") is not None else None),
+            liquidity_usd=liquidity if liquidity > 0 else None,
+            connected_holder_pct=getattr(risk, "connected_cluster_pct", None))
         return {
             "safety": {"status": getattr(risk, "data_status", "DATA_BLOCKED"),
                        "ownership_renounced": bool(getattr(risk, "ownership_renounced", False)),
-                       "risk_score": getattr(risk, "risk_score", None)},
+                       "risk_score": getattr(risk, "score", None)},
             "hazard": ({"status": hazard.data_status, "hazard_30s": hazard.hazard_30s,
                         "hazard_5m": hazard.hazard_5m, "urgency": hazard.exit_urgency,
                         "reason": hazard.blocked_reason}
@@ -1598,6 +1684,11 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
                           or {"status": "DATA_BLOCKED", "reason": "no deployer profile"}),
             "coordination": self.public_coordination.get_features(token),
             "social": self.social_intel.get_token_social_signal(token),
+            "risk_veto": veto.to_dict(),
+            "holder_trajectory": self.holder_trajectory.state(token),
+            "dev_wallet": dev_state,
+            "capital_rotation": self.rotation_tracker.report(),
+            "social_price_disagreement": social_disagreement,
             "information": {"status": "OK", "lead_sequence": len(
                 self.info_graph.get_lead_sequence(token))} if self.info_graph else {
                 "status": "DATA_BLOCKED", "reason": "information graph not constructed"},
@@ -1624,6 +1715,8 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
     def _position_intelligence(self, token: str, position: Dict[str, Any]) -> Dict[str, Any]:
         """One slot per module that must be visible in an open-position decision."""
         hazard = self.rug_hazard.get_hazard(token)
+        holder = getattr(self, "holder_trajectory", None)
+        developer = getattr(self, "dev_wallet_monitor", None)
         return {
             "distribution": position.get("distribution")
             or {"status": "DATA_BLOCKED", "reason": "not read this cycle"},
@@ -1647,6 +1740,10 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
                         "urgency": hazard.exit_urgency}
                        if hazard is not None
                        else {"status": "DATA_BLOCKED", "reason": "token not registered"}),
+            "holder_trajectory": (holder.state(token) if holder else {
+                "status": "DATA_BLOCKED", "reason": "holder monitor unavailable"}),
+            "dev_wallet": (developer.state(token) if developer else {
+                "status": "DATA_BLOCKED", "reason": "developer monitor unavailable"}),
         }
 
     def ingest_curve_account(self, token: str, data: bytes) -> bool:
@@ -1912,12 +2009,29 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
 
 
     def _prune_curve_static(self) -> int:
-        """Drop static facts for tokens the hot state no longer tracks."""
-        stale = [key for key in self._curve_static
-                 if key not in self.hot_state.active_tokens]
-        for key in stale:
-            self._curve_static.pop(key, None)
-        return len(stale)
+        """Drop static facts for tokens the hot state no longer tracks.
+
+        Also prunes the latest curve and pool state on the same rule. Those
+        two were unbounded dicts keyed by mint -- they grew with every launch
+        the stream reported and nothing ever removed an entry, which is the
+        shape of leak that OOM-killed this service twelve times in one hour.
+        hot_state.active_tokens is the right boundary because it is itself
+        hard-capped and age-expiring, so "still active there" already means
+        "recent enough to be worth pricing".
+
+        An open position is kept whatever the hot state says: a position we
+        cannot quote an exit for is the one state we must never discard.
+        """
+        held = set(self.elogw_engine.open_positions)
+        dropped = 0
+        for store in (self._curve_static, self._latest_curve_state,
+                      self._latest_pool_state):
+            stale = [key for key in store
+                     if key not in self.hot_state.active_tokens and key not in held]
+            for key in stale:
+                store.pop(key, None)
+            dropped += len(stale)
+        return dropped
 
     def _cost_model(self, token: str, at_utc: Optional[float] = None) -> Dict[str, Any]:
         """The round-trip protocol cost of this token, priced rather than assumed.
@@ -2951,29 +3065,13 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("corpus resolution for %s failed: %s", token, exc)
 
-    def _resolve_census_death(self, token: str) -> None:
-        """Classify how a token died and record it against the denominator.
 
-        Runs over the observations the hazard tracker already collects, so no
-        new stream is needed. A death with no mechanism evidence is recorded
-        as unclassified rather than being folded into slow bleed, because a
-        residual that absorbs every unexplained death is how a rug model
-        learns nothing while reporting full coverage.
-        """
-        observations = list(self.rug_hazard.observations.get(token, ()) or ())
-        if not observations:
-            return
-        pool = self._latest_pool_state.get(token)
-        verdict = rug_mechanism.classify(
-            observations, migrated=(pool is not None))
-        if verdict.mechanism is rug_mechanism.RugMechanism.SURVIVED:
-            return
-        self.launch_census.resolve(
-            token, rugged=True, rug_mechanism=verdict.mechanism.value)
-        self._resolve_corpus(token, rugged=True,
-                             rug_mechanism=verdict.mechanism.value)
-        self._record_ops_event("rug_mechanisms", {
-            "token": token, **verdict.to_dict()})
+
+
+
+
+
+
 
     def _measured_congestion(self) -> Optional[float]:
         """Chain congestion in [0, 1], or None when unmeasured.
@@ -3187,7 +3285,14 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
         if quote is not None and self.sol_price_usd > 0:
             value_usd = (float(quote.output_amount) / LAMPORTS_PER_SOL) * self.sol_price_usd
             remaining = max(float(position.get("remaining_cost_usd", 0.0) or 0.0), 1e-9)
-            return (value_usd / remaining, value_usd, "local_executable_quote",
+            # Labelled by the venue that actually priced it. A sell into a
+            # bonding curve and a sell into a migrated pool are different
+            # measurements with different impact behaviour, and pooling them
+            # under one name makes the two indistinguishable downstream.
+            venue = ("local_pumpswap_executable_sell"
+                     if self._latest_pool_state.get(token) is not None
+                     else "local_pump_executable_sell")
+            return (value_usd / remaining, value_usd, venue,
                     quote.price_impact_pct)
         # No local quote. A recent streamed price ratio is still a measurement
         # of this market, just not of this size -- so it is used, and labelled
@@ -3533,6 +3638,11 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
         await self._refresh_portfolio_state()
         await self.genealogy.build_clusters()
         self._prune_curve_static()
+        self._sweep_rug_classification()
+        self._prune_hazard_tracking()
+        # Checkpointed on the cadence follows are resolved on, so a restart
+        # costs one cycle of measurement rather than every open follow.
+        self.save_follow_candidates()
         self._resolve_follow_candidates()
         self._refresh_independence()
         self._publish_attribution()
@@ -3580,6 +3690,29 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
                 regime=str(self.current_regime or "unknown"))
             self.wallet_intel.record_token_lifecycle(token, launch_at=event.get("timestamp", time.time()))
             self._assess_identity(token, event)
+            # Seed the curve at its protocol-defined starting depth. The
+            # CreateEvent carries no reserves, so without this the desk is
+            # blind at exactly T0 -- _local_liquidity returns 0 and liquidity
+            # is DATA_BLOCKED at the one instant a launch has to be priced.
+            # Measured across 400 live episodes, liquidity_features was 0%
+            # populated at T0.
+            #
+            # Program constants, not a claim about this token, and verified
+            # continuously against the constant product by
+            # pump_curve_invariant_holds. Replaced by real reserves on the
+            # first trade, so it is only ever the pre-first-trade answer --
+            # and an UPPER BOUND, since real reserves are unknowable here.
+            #
+            # Ordered before start_episode deliberately: that call captures
+            # the t0 snapshot, so seeding after it leaves t0 blind.
+            if token not in self._latest_curve_state:
+                self._latest_curve_state[token] = BondingCurveState(
+                    virtual_token_reserves=PUMP_INITIAL_VIRTUAL_TOKEN,
+                    virtual_sol_reserves=PUMP_INITIAL_VIRTUAL_SOL,
+                    real_token_reserves=0, real_sol_reserves=0,
+                    token_total_supply=int(event.get("token_total_supply", 0) or 0),
+                    complete=False, creator=str(event.get("creator", "") or ""),
+                )
             self.dataset_builder.start_episode(
                 token, event.get("creator", ""), event.get("program", PumpFunMonitor.PUMP_FUN_PROGRAM),
                 event.get("bonding_curve", ""), WSOL_MINT, detected_at=event.get("timestamp", time.time()),
@@ -3682,7 +3815,26 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
                            "instruction_token_amount": event.get("token_amount", 0),
                            "quote_limit_amount": event.get("quote_limit_amount", 0),
                            "timestamp": event.get("timestamp", time.time()), "slot": event.get("slot"),
-                           "signature": event.get("signature"), "program": event.get("program")}
+                           "signature": event.get("signature"), "program": event.get("program"),
+                           # Curve depth, free on the event already decoded.
+                           # liquidity_features measured 0% populated at t0
+                           # because it waited for a DexScreener quote a
+                           # pre-migration launch cannot have. Storing the
+                           # reserves keeps the derivation point-in-time.
+                           "virtual_sol_reserves": virtual_sol or None,
+                           "virtual_token_reserves": virtual_token or None}
+            # Reconstruct the holder set from fills we watched: free, exact
+            # for a launch this young, and available at stream latency
+            # rather than behind an RPC method nothing will serve.
+            _delta = event.get("actual_token_delta_raw")
+            if event.get("wallet") and _delta:
+                self.observed_holders.record_trade(
+                    token, str(event["wallet"]), float(_delta))
+                _observed = self.observed_holders.snapshot(token)
+                if _observed:
+                    self.holder_trajectory.record_mapping(
+                        token, _observed, timestamp=observation["timestamp"],
+                        source="observed_trades")
             # Our own transactions come back on this same stream. Telling the
             # execution engine the moment one appears is what turns fill
             # reconciliation from a poll into a notification.
@@ -3768,6 +3920,11 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
         token = signal.get("token", "")
         if not token:
             return
+        if self.dataset_builder is None:
+            if len(self._pending_social_signals) == self._pending_social_signals.maxlen:
+                self._pending_social_dropped += 1
+            self._pending_social_signals.append(dict(signal))
+            return
         if signal.get("type") == "new_mention":
             self.info_graph.record_event(token, LeadEventType.OBSCURE_X_MENTION, signal.get("account", ""),
                                          "social", signal.get("timestamp", time.time()), signal)
@@ -3775,6 +3932,15 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
         self.dataset_builder.record_market_observation(token, {"type": "social", **signal})
         if signal.get("type") == "new_mention" and signal.get("first_mention"):
             self._spawn_background(self._triage_social_candidate(signal))
+
+    async def _flush_pending_social_signals(self) -> None:
+        while self._pending_social_signals:
+            await self._on_social_mention(self._pending_social_signals.popleft())
+        if self._pending_social_dropped:
+            logger.error(
+                "social startup buffer overflowed; %d earliest signals were dropped",
+                self._pending_social_dropped,
+            )
 
     async def _triage_social_candidate(self, signal: Dict[str, Any]):
         """Evaluate social addresses only after verifying that the account is an SPL mint."""
@@ -3874,7 +4040,19 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
         count toward the promotion gate's diversity requirement -- a desk that
         never measured the market must not satisfy it with one bucket.
         """
-        stats = (self.global_research.get_stats() if self.global_research else {}) or {}
+        builder = getattr(self, "dataset_builder", None)
+        stats = (builder.current_market_state()
+                 if builder is not None and hasattr(builder, "current_market_state")
+                 else {}) or {}
+        # Compatibility for isolated callers which provide the measurements
+        # directly through a research stub. The production miner is not used:
+        # it discovers mechanisms and does not collect market state.
+        if (stats.get("meme_launch_rate_1h") is None
+                or stats.get("sol_change_24h") is None):
+            research = getattr(self, "global_research", None)
+            fallback = (research.get_stats() if research else {}) or {}
+            if fallback.get("meme_launch_rate_1h") is not None:
+                stats = fallback
         launch_rate = stats.get("meme_launch_rate_1h")
         sol_change = stats.get("sol_change_24h")
         if launch_rate is None or sol_change is None:
@@ -3928,76 +4106,6 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion, SubsystemWiring)
             self.launch_census.save()
             self.calibration.save()
 
-    def _record_calibration(self, payload: Dict[str, Any]) -> None:
-        """Score every stated probability against what actually happened.
-
-        Without this the calibration harness is inert -- it can measure, and
-        nothing feeds it. Each pair is stamped with where it came from, so a
-        model validated on shadow decisions is never mistaken for one proven
-        on real fills.
-
-        Probabilities the desk did not state are skipped rather than defaulted.
-        A model that was never consulted has no prediction to score, and
-        scoring it against a default would manufacture calibration evidence
-        out of the model's absence.
-        """
-        provenance = (Provenance.FORWARD_REAL.value
-                      if payload.get("entered") and not self.dry_run
-                      else Provenance.SHADOW.value)
-        when = float(payload.get("timestamp", time.time()))
-        rugged = payload.get("rugged")
-        stated = payload.get("stated_probabilities") or {}
-
-        # Rug hazards, at each horizon the desk states one for.
-        for model, key in (("rug_30s", "p_rug_30s"), ("rug_5m", "p_rug_5m")):
-            probability = stated.get(key)
-            if probability is None or rugged is None:
-                continue
-            self.calibration.record(model, float(probability), bool(rugged),
-                                    at=when, provenance=provenance)
-
-        # Monster: did the token reach the multiple the desk said it might?
-        monster_p = stated.get("p_monster")
-        multiple = payload.get("max_feasible_multiple")
-        if monster_p is not None and multiple is not None:
-            self.calibration.record(
-                "monster_p", float(monster_p),
-                float(multiple) >= rug_mechanism_monster_threshold(),
-                at=when, provenance=provenance)
-
-        # Landing: only scoreable on an attempt, and only real when the
-        # attempt spent real money.
-        landing_p = stated.get("p_land")
-        if landing_p is not None and payload.get("attempted"):
-            self.calibration.record(
-                "landing_p", float(landing_p), bool(payload.get("entered")),
-                at=when,
-                provenance=(Provenance.FORWARD_REAL.value if not self.dry_run
-                            else Provenance.SHADOW.value))
-
-        # Escape: stated when a hazard exit was chosen, scored on whether the
-        # position actually got out before the catastrophe.
-        escape_p = stated.get("p_escape")
-        if escape_p is not None and payload.get("escape_attempted"):
-            self.calibration.record(
-                "escape_p", float(escape_p), bool(payload.get("escaped")),
-                at=when, provenance=provenance)
-
-
-
-    #: Read once at first request and cached. The file ships with the repo,
-    #: so a missing one is a broken install rather than a runtime condition,
-    #: and it says so instead of serving a blank page.
-    _dashboard_cache: Optional[str] = None
-
-
-
-
-
-
-
-
-
 
 
 async def _run(args: argparse.Namespace):
@@ -4010,10 +4118,18 @@ async def _run(args: argparse.Namespace):
             return
         await desk.start()
         if args.run_seconds:
-            await asyncio.sleep(args.run_seconds)
+            try:
+                await asyncio.wait_for(
+                    desk._fatal_task_event.wait(), timeout=args.run_seconds)
+            except asyncio.TimeoutError:
+                pass
+            else:
+                raise RuntimeError(
+                    f"critical runtime task stopped: {desk._fatal_task_detail}")
         else:
-            while True:
-                await asyncio.sleep(3_600)
+            await desk._fatal_task_event.wait()
+            raise RuntimeError(
+                f"critical runtime task stopped: {desk._fatal_task_detail}")
     finally:
         await desk.stop()
 

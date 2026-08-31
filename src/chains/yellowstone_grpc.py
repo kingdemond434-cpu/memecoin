@@ -28,10 +28,12 @@ try:
         b58decode as _native_b58decode,
         b58encode as _native_b58encode,
         looks_like_pool_creation as _native_looks_like_pool_creation,
+        t0_decide as native_t0_decide,
     )
     NATIVE_FASTPATH_STATUS = "OK: rust-pyo3-abi3"
 except ImportError:
     _native_b58decode = _native_b58encode = _native_looks_like_pool_creation = None
+    native_t0_decide = None
     NATIVE_FASTPATH_STATUS = "DEGRADED: Python fallback"
 
 B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -876,9 +878,50 @@ class PumpFunMonitor:
             }
         return None
 
+    def _carries_cpi_trade(self, keys: List[str], instructions: List[Any]) -> bool:
+        """Does this transaction already carry a Pump CPI TradeEvent?
+
+        A buy/sell transaction emits BOTH an outer buy/sell instruction and an
+        inner CPI TradeEvent, and both decoded to type "token_trade". The
+        instruction carries only the REQUESTED amount and the slippage limit;
+        the event carries the actual fill, the notional, the price and the
+        curve reserves. Emitting both meant every trade was reported twice and
+        the surviving copy was usually the poorer one -- which is why
+        _latest_curve_state stayed empty, _local_liquidity returned 0, and
+        liquidity_features measured 0% populated at t0 while the stream looked
+        perfectly healthy.
+
+        Pre-scanned rather than handled in order, because the outer
+        instruction is iterated BEFORE the inner event it should defer to.
+        """
+        # Resolved from the monitor rather than hard-named: this helper is
+        # shared by the Pump and PumpSwap monitors, which carry different
+        # program constants. A monitor with no Pump program (PumpSwap) has no
+        # Pump CPI TradeEvent to defer to and keeps its original behaviour.
+        program_id = getattr(self, "PUMP_FUN_PROGRAM", None)
+        trade_event = getattr(self, "TRADE_EVENT", None)
+        cpi_prefix = getattr(self, "ANCHOR_CPI_EVENT", None)
+        if not program_id or not trade_event or not cpi_prefix:
+            return False
+        for instruction in instructions:
+            try:
+                program_index, _accounts, data = instruction_fields(instruction)
+            except Exception:
+                continue
+            if program_index < 0 or program_index >= len(keys) or len(data) < 16:
+                continue
+            if keys[program_index] != program_id:
+                continue
+            if data[:8] == cpi_prefix and data[8:16] == trade_event:
+                return True
+        return False
+
     async def _on_transaction(self, tx_data: Any):
         received_ns = time.time_ns()
         keys, instructions, signature, slot = transaction_parts(tx_data)
+        # The richer event wins. Decided once per transaction so the outer
+        # instruction can stand down for the inner event that supersedes it.
+        defer_to_cpi_trade = self._carries_cpi_trade(keys, instructions)
         for instruction_index, instruction in enumerate(instructions):
             name: Optional[str] = None
             try:
@@ -929,6 +972,13 @@ class PumpFunMonitor:
                 if len(self._seen) > 100_000:
                     self._seen = set(list(self._seen)[-50_000:])
                 event = self._decode_instruction(name, keys, accounts, data[8:], signature, slot)
+                if (event and event.get("type") == "token_trade"
+                        and defer_to_cpi_trade):
+                    # Counted, not silently dropped: "superseded by a richer
+                    # decode" and "never seen" are different facts.
+                    self.matched["token_trade:superseded_by_cpi_event"] = (
+                        self.matched.get("token_trade:superseded_by_cpi_event", 0) + 1)
+                    continue
                 if event:
                     if event.get("type") == "token_created" and event.get("creator"):
                         transfers = extract_system_transfers(keys, instructions)
@@ -1190,9 +1240,50 @@ class PumpSwapMonitor:
             out["tail_data_status"] = f"DATA_BLOCKED: {exc}"
         return out
 
+    def _carries_cpi_trade(self, keys: List[str], instructions: List[Any]) -> bool:
+        """Does this transaction already carry a Pump CPI TradeEvent?
+
+        A buy/sell transaction emits BOTH an outer buy/sell instruction and an
+        inner CPI TradeEvent, and both decoded to type "token_trade". The
+        instruction carries only the REQUESTED amount and the slippage limit;
+        the event carries the actual fill, the notional, the price and the
+        curve reserves. Emitting both meant every trade was reported twice and
+        the surviving copy was usually the poorer one -- which is why
+        _latest_curve_state stayed empty, _local_liquidity returned 0, and
+        liquidity_features measured 0% populated at t0 while the stream looked
+        perfectly healthy.
+
+        Pre-scanned rather than handled in order, because the outer
+        instruction is iterated BEFORE the inner event it should defer to.
+        """
+        # Resolved from the monitor rather than hard-named: this helper is
+        # shared by monitors carrying different program constants. One with
+        # no Pump program has no Pump CPI TradeEvent to defer to and keeps
+        # its original behaviour.
+        program_id = getattr(self, "PUMP_FUN_PROGRAM", None)
+        trade_event = getattr(self, "TRADE_EVENT", None)
+        cpi_prefix = getattr(self, "ANCHOR_CPI_EVENT", None)
+        if not program_id or not trade_event or not cpi_prefix:
+            return False
+        for instruction in instructions:
+            try:
+                program_index, _accounts, data = instruction_fields(instruction)
+            except Exception:
+                continue
+            if program_index < 0 or program_index >= len(keys) or len(data) < 16:
+                continue
+            if keys[program_index] != program_id:
+                continue
+            if data[:8] == cpi_prefix and data[8:16] == trade_event:
+                return True
+        return False
+
     async def _on_transaction(self, tx_data: Any):
         received_ns = time.time_ns()
         keys, instructions, signature, slot = transaction_parts(tx_data)
+        # The richer event wins. Decided once per transaction so the outer
+        # instruction can stand down for the inner event that supersedes it.
+        defer_to_cpi_trade = self._carries_cpi_trade(keys, instructions)
         for instruction_index, instruction in enumerate(instructions):
             try:
                 program_index, accounts, data = instruction_fields(instruction)
@@ -1210,6 +1301,13 @@ class PumpSwapMonitor:
                 if len(self._seen) > 100_000:
                     self._seen = set(list(self._seen)[-50_000:])
                 event = self._decode_instruction(name, keys, accounts, data[8:], signature, slot)
+                if (event and event.get("type") == "token_trade"
+                        and defer_to_cpi_trade):
+                    # Counted, not silently dropped: "superseded by a richer
+                    # decode" and "never seen" are different facts.
+                    self.matched["token_trade:superseded_by_cpi_event"] = (
+                        self.matched.get("token_trade:superseded_by_cpi_event", 0) + 1)
+                    continue
                 if event:
                     if event.get("type") == "pool_created" and event.get("pool") and event.get("token"):
                         self._pool_tokens[event["pool"]] = (
@@ -1309,9 +1407,50 @@ class RaydiumMonitor:
         self._seen: Set[Tuple[str, int]] = set()
         yellowstone.on("transaction", self._on_transaction)
 
+    def _carries_cpi_trade(self, keys: List[str], instructions: List[Any]) -> bool:
+        """Does this transaction already carry a Pump CPI TradeEvent?
+
+        A buy/sell transaction emits BOTH an outer buy/sell instruction and an
+        inner CPI TradeEvent, and both decoded to type "token_trade". The
+        instruction carries only the REQUESTED amount and the slippage limit;
+        the event carries the actual fill, the notional, the price and the
+        curve reserves. Emitting both meant every trade was reported twice and
+        the surviving copy was usually the poorer one -- which is why
+        _latest_curve_state stayed empty, _local_liquidity returned 0, and
+        liquidity_features measured 0% populated at t0 while the stream looked
+        perfectly healthy.
+
+        Pre-scanned rather than handled in order, because the outer
+        instruction is iterated BEFORE the inner event it should defer to.
+        """
+        # Resolved from the monitor rather than hard-named: this helper is
+        # shared by monitors carrying different program constants. One with
+        # no Pump program has no Pump CPI TradeEvent to defer to and keeps
+        # its original behaviour.
+        program_id = getattr(self, "PUMP_FUN_PROGRAM", None)
+        trade_event = getattr(self, "TRADE_EVENT", None)
+        cpi_prefix = getattr(self, "ANCHOR_CPI_EVENT", None)
+        if not program_id or not trade_event or not cpi_prefix:
+            return False
+        for instruction in instructions:
+            try:
+                program_index, _accounts, data = instruction_fields(instruction)
+            except Exception:
+                continue
+            if program_index < 0 or program_index >= len(keys) or len(data) < 16:
+                continue
+            if keys[program_index] != program_id:
+                continue
+            if data[:8] == cpi_prefix and data[8:16] == trade_event:
+                return True
+        return False
+
     async def _on_transaction(self, tx_data: Any):
         received_ns = time.time_ns()
         keys, instructions, signature, slot = transaction_parts(tx_data)
+        # The richer event wins. Decided once per transaction so the outer
+        # instruction can stand down for the inner event that supersedes it.
+        defer_to_cpi_trade = self._carries_cpi_trade(keys, instructions)
         for instruction_index, instruction in enumerate(instructions):
             try:
                 program_index, accounts, data = instruction_fields(instruction)

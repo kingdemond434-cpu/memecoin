@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Refuse a direct push to the default branch.
+#
+# The audit on 2026-08-29 found main unprotected with required checks
+# disabled, so a red suite could land on it unnoticed. Server-side branch
+# protection is the real fix and lives in the GitHub repository settings;
+# this is the half that can be enforced from the machine, and it catches the
+# realistic failure -- a tired operator on the wrong branch at 2am -- before
+# anything leaves the box.
+#
+# Deliberately not a substitute for the server-side rule. Anyone can pass
+# --no-verify, and a hook cannot govern a push from somewhere else. It is a
+# guard rail, not a gate.
+#
+# Install:  git config core.hooksPath deploy/hooks
+set -euo pipefail
+
+PROTECTED="${PROTECTED_BRANCHES:-main master}"
+remote_ref_prefix="refs/heads/"
+
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+    case "$remote_ref" in
+        "${remote_ref_prefix}"*) branch="${remote_ref#$remote_ref_prefix}" ;;
+        *) continue ;;
+    esac
+    for protected in $PROTECTED; do
+        if [ "$branch" = "$protected" ]; then
+            echo "pre-push: refusing a direct push to '$branch'." >&2
+            echo >&2
+            echo "  Open a pull request so CI runs before this lands." >&2
+            echo "  CI is configured for every push and PR (.github/workflows/ci.yml)," >&2
+            echo "  but nothing REQUIRES it to be green on the default branch, so a" >&2
+            echo "  direct push can put a red suite on main and nobody is told." >&2
+            echo >&2
+            echo "  Deliberate exception:  git push --no-verify" >&2
+            exit 1
+        fi
+    done
+done
+
+exit 0

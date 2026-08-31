@@ -114,7 +114,7 @@ class MinedRecordIngestion:
         """
         wallets: List[str] = []
         seen = set()
-        for source in (getattr(self.wallet_intelligence, "elite_wallets", None) or {},
+        for source in (getattr(self.wallet_intel, "elite_wallets", None) or {},
                        getattr(self, "_recent_funders", None) or {}):
             for address in source:
                 if address and address not in seen:

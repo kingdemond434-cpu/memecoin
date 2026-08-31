@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import numpy as np
 import aiohttp
 
@@ -19,6 +19,7 @@ from src.strategies.social_intelligence import SocialIntelligenceEngine
 from src.strategies.prelaunch_intent import PrelaunchIntentModel
 from src.strategies.information_graph import InformationLeadGraph, CounterfactualExecutionLab
 from src.strategies.rug_hazard import ContinuousRugHazardModel
+from src.strategies.memecoin_state import social_price_disagreement
 from src.strategies.champion_challenger import ChampionChallengerFramework
 
 logger = logging.getLogger(__name__)
@@ -151,6 +152,38 @@ class LaunchEpisode:
     prelaunch_status: str = "DATA_BLOCKED"
 
 
+#: pump.fun initialises every bonding curve with these virtual reserves.
+#: A protocol constant, not a per-token fact, which is what makes using it
+#: at T0 legitimate where inventing a token's mint authority would not be.
+#:
+#: Verified against this desk's own stream rather than trusted from
+#: documentation: the curve is constant-product, so k = sol * token must
+#: hold for any later observation of the same curve. Measured 2026-08-29 on
+#: an observed first trade (30.769 SOL / 1.046e15 tokens), k matched the
+#: value implied by these constants to 1e-6 percent. PUMP_CURVE_K exists so
+#: that check can run continuously instead of once.
+PUMP_INITIAL_VIRTUAL_SOL = 30_000_000_000
+PUMP_INITIAL_VIRTUAL_TOKEN = 1_073_000_000_000_000
+PUMP_CURVE_K = PUMP_INITIAL_VIRTUAL_SOL * PUMP_INITIAL_VIRTUAL_TOKEN
+
+#: How far an observed curve may drift from the constant product before the
+#: invariant is treated as no longer describing this token. Fees and
+#: rounding move k slightly; a different curve shape moves it a lot.
+PUMP_CURVE_K_TOLERANCE = 0.05
+
+
+def pump_curve_invariant_holds(sol_reserves: float, token_reserves: float) -> bool:
+    """Does an observed curve still satisfy the initialisation constant?
+
+    Returns False for anything that is not recognisably the same curve, so
+    a protocol change or a non-standard launch degrades to MISSING rather
+    than to a confident wrong number.
+    """
+    if sol_reserves <= 0 or token_reserves <= 0:
+        return False
+    return abs(sol_reserves * token_reserves - PUMP_CURVE_K) / PUMP_CURVE_K <= PUMP_CURVE_K_TOLERANCE
+
+
 class PointInTimeDatasetBuilder:
     def __init__(
         self,
@@ -163,7 +196,9 @@ class PointInTimeDatasetBuilder:
         info_graph: InformationLeadGraph,
         rug_hazard: ContinuousRugHazardModel,
         champion_challenger: ChampionChallengerFramework,
-        storage_path: str = "data/launch_episodes"
+        storage_path: str = "data/launch_episodes",
+        actor_provider: Optional[Callable[[str, Optional[float]], Dict[str, Any]]] = None,
+        memecoin_state_provider: Optional[Callable[[str, Optional[float]], Dict[str, Any]]] = None,
     ):
         self.chain_config = chain_config
         self.rpc = rpc
@@ -174,6 +209,8 @@ class PointInTimeDatasetBuilder:
         self.info_graph = info_graph
         self.rug_hazard = rug_hazard
         self.champion_challenger = champion_challenger
+        self.actor_provider = actor_provider
+        self.memecoin_state_provider = memecoin_state_provider
         self.storage_path = storage_path
         
         self.active_episodes: Dict[str, LaunchEpisode] = {}
@@ -479,10 +516,11 @@ class PointInTimeDatasetBuilder:
             if item.get("liquidity_usd") is not None and float(item.get("timestamp", 0) or 0) <= as_of
         ]
         if not observed:
-            return {"status": "DATA_BLOCKED", "reason": "liquidity_not_observed"}
+            return self._liquidity_from_curve(episode, as_of)
         latest = max(observed, key=lambda item: item.get("timestamp", 0))
         return {
             "status": "OK",
+            "source": "quoted",
             "liquidity_usd": latest.get("liquidity_usd"),
             "liquidity_locked": latest.get("liquidity_locked"),
             "lp_burned_pct": latest.get("lp_burned_pct"),
@@ -490,9 +528,96 @@ class PointInTimeDatasetBuilder:
             "price_impact_pct": latest.get("price_impact_pct"),
         }
 
+    def _liquidity_from_curve(self, episode: LaunchEpisode,
+                              as_of: float) -> Dict[str, Any]:
+        """Depth from the bonding curve when no external quote exists yet.
+
+        A pre-migration launch is not on DexScreener at t0 and never will be
+        while it is still on the curve, so waiting for a quote left this
+        feature 0% populated at the exact moment a decision is made --
+        measured across 400 live episodes. For a bonding curve the reserves
+        ARE the liquidity: SOL reserves are what a sell can be absorbed by,
+        and they arrive on the same trade event already being decoded.
+
+        Point-in-time by construction: only observations at or before
+        ``as_of`` are read, so a snapshot cannot see depth that had not
+        happened yet.
+
+        Reported in SOL, not USD. Converting would need a SOL price this
+        builder does not have at the snapshot instant, and inventing one
+        would put a guess into the training set wearing a measurement's
+        label. A consumer that needs USD applies its own PIT price.
+        """
+        priced = [
+            item for item in episode.market_observations
+            if item.get("virtual_sol_reserves") is not None
+            and float(item.get("timestamp", 0) or 0) <= as_of
+        ]
+        if not priced:
+            # Before the first trade there is nothing observed to read, and
+            # the CreateEvent carries no reserves -- so a launch is blind at
+            # exactly T0, the instant a decision is made. The initialisation
+            # constants are a property of the PROGRAM rather than of this
+            # token, so using them here states a protocol fact rather than
+            # inventing a measurement. Labelled INVARIANT so nothing
+            # downstream can mistake it for an observation of this curve.
+            return {
+                "status": "OK",
+                "source": "protocol_invariant",
+                "provenance": "INVARIANT",
+                "liquidity_sol": PUMP_INITIAL_VIRTUAL_SOL / 1e9,
+                "curve_sol_reserves": float(PUMP_INITIAL_VIRTUAL_SOL),
+                "curve_token_reserves": float(PUMP_INITIAL_VIRTUAL_TOKEN),
+                "route_feasible": True,
+                "liquidity_usd": None,
+                "liquidity_locked": None,
+                "lp_burned_pct": None,
+                "price_impact_pct": None,
+                "detail": ("curve initialisation constants; no trade has been "
+                           "observed yet, so this is the protocol's starting "
+                           "depth rather than a reading of this curve"),
+            }
+        latest = max(priced, key=lambda item: float(item.get("timestamp", 0) or 0))
+        sol_reserves = float(latest.get("virtual_sol_reserves") or 0.0)
+        token_reserves = float(latest.get("virtual_token_reserves") or 0.0)
+        if sol_reserves <= 0 or token_reserves <= 0:
+            return {"status": "DATA_BLOCKED", "reason": "curve_reserves_empty"}
+        # An observed curve that no longer satisfies the initialisation
+        # constant is not this protocol's curve any more. Saying so beats
+        # reporting depth from a shape we do not recognise.
+        if not pump_curve_invariant_holds(sol_reserves, token_reserves):
+            return {"status": "DATA_BLOCKED",
+                    "reason": "observed_curve_violates_pump_constant_product",
+                    "curve_sol_reserves": sol_reserves,
+                    "curve_token_reserves": token_reserves}
+        return {
+            "status": "OK",
+            # Named so a model can learn that curve depth and a routed quote
+            # are different measurements rather than pooling them as one.
+            "source": "bonding_curve",
+            "provenance": "MEASURED",
+            "liquidity_sol": sol_reserves / 1e9,
+            "curve_sol_reserves": sol_reserves,
+            "curve_token_reserves": token_reserves,
+            # A curve with reserves always has a route; that is the property
+            # that distinguishes it from a pool that may have none.
+            "route_feasible": True,
+            # Deliberately absent rather than zero: not measured here.
+            "liquidity_usd": None,
+            "liquidity_locked": None,
+            "lp_burned_pct": None,
+            "price_impact_pct": None,
+        }
+
     async def _capture_social_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
         social_signal = self.social_intel.get_token_social_signal(episode.token, as_of=as_of)
-        return social_signal
+        disagreement = social_price_disagreement(
+            [item for item in episode.market_observations if item.get("type") == "social"],
+            [item for item in episode.market_observations
+             if item.get("type") in {"trade", "market"}], as_of=as_of)
+        return {**social_signal,
+                "price_disagreement_status": disagreement.get("status"),
+                "price_disagreement": disagreement.get("evidence_score")}
 
     async def _capture_token_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
         reports = [item for item in episode.market_observations
@@ -502,22 +627,52 @@ class PointInTimeDatasetBuilder:
             return {"status": "DATA_BLOCKED", "reason": "risk_report_not_recorded"}
         concentrations = [float(item.get("top_10_pct", 0) or 0) for item in reports
                           if item.get("top_10_pct") is not None]
+        concentrations20 = [float(item.get("top_20_pct", 0) or 0) for item in reports
+                            if item.get("top_20_pct") is not None]
         concentration_delta = concentrations[-1] - concentrations[0] if len(concentrations) >= 2 else 0.0
+        concentration20_delta = (concentrations20[-1] - concentrations20[0]
+                                 if len(concentrations20) >= 2 else None)
         duration = (float(reports[-1].get("timestamp", 0)) - float(reports[0].get("timestamp", 0))) if len(reports) >= 2 else 0.0
-        return {
+        result = {
             "status": report.get("data_status", "OK"),
             "ownership_renounced": report.get("ownership_renounced"),
             "can_mint": report.get("can_mint"),
             "can_freeze": report.get("can_freeze"),
             "top_10_pct": report.get("top_10_pct"),
+            "top_20_pct": report.get("top_20_pct"),
             "top_10_delta_pct": concentration_delta,
             "top_10_velocity_pct_per_second": concentration_delta / duration if duration > 0 else 0.0,
+            "top_20_delta_pct": concentration20_delta,
+            "top_20_velocity_pct_per_second": (
+                concentration20_delta / duration
+                if concentration20_delta is not None and duration > 0 else None),
+            "dev_pct": report.get("deployer_balance_pct"),
+            "insider_pct": report.get("insider_pct"),
+            "bundler_pct": report.get("bundler_pct"),
+            "fresh_wallet_pct": report.get("fresh_wallet_pct"),
+            "whale_pct": report.get("whale_pct"),
+            "connected_cluster_pct": report.get("connected_cluster_pct"),
             "token_extensions": report.get("token_extensions", []),
             # The chronological model learns the actual outcome correlation;
             # this input is only the normalized native-extension hazard prior.
             "extension_risk": float(report.get("extension_risk", 0) or 0),
             "sell_route_feasible": report.get("sell_route_feasible"),
         }
+        if self.memecoin_state_provider is not None:
+            state = self.memecoin_state_provider(episode.token, as_of)
+            dev = state.get("dev_wallet") or {}
+            rotation = state.get("capital_rotation") or {}
+            result.update({
+                "dev_state_status": dev.get("status", "DATA_BLOCKED"),
+                "dev_balance_pct": dev.get("balance_pct"),
+                "dev_recent_sells": dev.get("recent_dev_sells"),
+                "dev_sell_supply_pct": dev.get("recent_measured_sell_supply_pct"),
+                "dev_hard_veto_count": len(dev.get("hard_vetoes", ())),
+                "capital_rotation_status": rotation.get("status", "DATA_BLOCKED"),
+                "capital_rotation_flow": (rotation.get("token_flow") or {}).get(
+                    episode.token),
+            })
+        return result
 
     async def _capture_market_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
         observed = [
@@ -644,13 +799,32 @@ class PointInTimeDatasetBuilder:
                     if data.get("type") == "funded" and float(data.get("timestamp", 0) or 0) <= as_of
                 }
                 funding_reuse = max(funding_reuse, len(funded_deployers))
-        return {
+        result = {
             "deployer_cluster_risk": cluster_risk,
             "funding_wallet_risk": max(funding_risks) if funding_risks else None,
             "funding_wallet_reuse": min(funding_reuse / 10, 1),
             "creator_genealogy_depth": len(dp.funding_wallets) if dp else None,
             "status": "OK" if dp else "DATA_BLOCKED",
         }
+        if self.actor_provider is not None:
+            actor = self.actor_provider(episode.token, as_of)
+            flow = actor.get("smart_flow") or {}
+            swarm = actor.get("swarm") or {}
+            result.update({
+                "actor_status": actor.get("status", "DATA_BLOCKED"),
+                "actor_adjusted_flow": (flow.get("evidence")
+                                        if flow.get("status") == "OK" else None),
+                "actor_naive_flow": (flow.get("naive_evidence")
+                                     if flow.get("status") == "OK" else None),
+                "sybil_discount": (flow.get("discount")
+                                   if flow.get("status") == "OK" else None),
+                "smart_wallet_sync_evidence": swarm.get("evidence"),
+                "smart_wallet_sync_probability": (
+                    swarm.get("probability") if swarm.get("status") == "OK" else None),
+            })
+            if actor.get("status") == "OK":
+                result["status"] = "OK"
+        return result
 
     async def _finalize_episode(self, token: str):
         if token not in self.active_episodes:
@@ -693,11 +867,20 @@ class PointInTimeDatasetBuilder:
                     )
 
     async def _determine_final_outcome(self, episode: LaunchEpisode) -> Dict[str, Any]:
-        prices = sorted(
+        # Never mix an absolute USD price series with a relative-multiple
+        # series. The old fallback admitted both shapes into one list, then
+        # selected the USD branch when even one row lacked a multiple;
+        # indexing the other rows at ``price_usd`` killed finalisation with a
+        # KeyError and retried the same episode every second forever.
+        multiple_prices = sorted(
             [item for item in episode.market_observations
-             if float(item.get("price_usd", item.get("price_multiple", 0)) or 0) > 0],
-            key=lambda item: item.get("timestamp", 0),
-        )
+             if float(item.get("price_multiple", 0) or 0) > 0],
+            key=lambda item: item.get("timestamp", 0))
+        usd_prices = sorted(
+            [item for item in episode.market_observations
+             if float(item.get("price_usd", 0) or 0) > 0],
+            key=lambda item: item.get("timestamp", 0))
+        prices = multiple_prices if len(multiple_prices) >= 3 else usd_prices
         if not prices:
             return {"status": "DATA_BLOCKED", "reason": "no_point_in_time_price_observations"}
         distinct_times = sorted({float(item.get("timestamp", 0) or 0) for item in prices})
@@ -711,7 +894,7 @@ class PointInTimeDatasetBuilder:
             for item in prices
         })
         provenance_verified = any(source != "unknown" for source in provenance_sources)
-        if all(float(item.get("price_multiple", 0) or 0) > 0 for item in prices):
+        if prices is multiple_prices:
             multiples = [float(item["price_multiple"]) for item in prices]
         else:
             entry = float(prices[0]["price_usd"])
@@ -971,6 +1154,7 @@ class PointInTimeDatasetBuilder:
         return episode
 
     def get_stats(self) -> Dict:
+        market = self.current_market_state()
         return {
             "active_episodes": len(self.active_episodes),
             "completed_episodes": len(self.completed_episodes),
@@ -978,4 +1162,40 @@ class PointInTimeDatasetBuilder:
             "storage_path": self.storage_path,
             "market_sources": dict(self._market_cache.get("sources", {})),
             "market_observed_at": self._market_cache.get("observed_at"),
+            "market_state": market,
+        }
+
+    def current_market_state(self, as_of: Optional[float] = None,
+                             max_cache_age_seconds: float = 180.0) -> Dict[str, Any]:
+        """Synchronous measured inputs for live regime attribution.
+
+        The external market collector already owns the CoinGecko/DefiLlama
+        cache. Regime attribution must read that cache rather than the public
+        research miner, which discovers papers and repositories and never
+        measures SOL price or launch rate.
+        """
+        cutoff = time.time() if as_of is None else float(as_of)
+        observed_at = self._market_cache.get("observed_at")
+        try:
+            cache_age = cutoff - float(observed_at)
+        except (TypeError, ValueError):
+            cache_age = float("inf")
+        # Active and completed are joined by token to avoid counting the same
+        # episode twice while it moves between stores.
+        episodes = {**self.completed_episodes, **self.active_episodes}
+        launch_rate = sum(
+            0 <= cutoff - float(episode.created_at) <= 3600
+            for episode in episodes.values())
+        sol_change = (self._market_cache.get("sol_change_24h")
+                      if 0 <= cache_age <= max_cache_age_seconds else None)
+        return {
+            "status": "OK" if sol_change is not None else "DATA_BLOCKED",
+            "meme_launch_rate_1h": launch_rate,
+            "sol_change_24h": sol_change,
+            "priority_fee_median": (self._market_cache.get("priority_fee_median")
+                                    if sol_change is not None else None),
+            "priority_fee_p90": (self._market_cache.get("priority_fee_p90")
+                                 if sol_change is not None else None),
+            "observed_at": observed_at,
+            "cache_age_seconds": cache_age if cache_age != float("inf") else None,
         }

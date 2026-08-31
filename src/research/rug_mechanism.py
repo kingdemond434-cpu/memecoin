@@ -224,17 +224,28 @@ def classify(observations: Sequence[Dict[str, Any]], *,
                         if float(row.get("timestamp", 0) or 0) - opened <= 30.0
                         and row.get("wallet")}
         if len(first_cohort) >= 5:
-            exits = sorted(float(row.get("timestamp", 0) or 0) for row in sells
+            # (when, who), because the question is how many of the cohort
+            # LEFT -- not how many sell transactions they sent. Counting
+            # transactions let one wallet selling repeatedly stand in for
+            # the whole cohort, so the ratio could exceed 1.0 and a cascade
+            # fired on ordinary active trading. Observed 2026-08-29 in a
+            # live verdict reading "24 of 5 first-block buyers exited",
+            # which is not a thing that can happen. A false mechanism label
+            # is worse than none: it trains the one head that currently
+            # passes validation on an event that did not occur.
+            exits = sorted((float(row.get("timestamp", 0) or 0),
+                            str(row.get("wallet", "")))
+                           for row in sells
                            if str(row.get("wallet", "")) in first_cohort)
-            for index, start in enumerate(exits):
-                inside = [stamp for stamp in exits[index:]
-                          if stamp - start <= CASCADE_WINDOW_S]
-                if len(inside) / len(first_cohort) >= CASCADE_SHARE:
+            for index, (start, _wallet) in enumerate(exits):
+                leavers = {who for when, who in exits[index:]
+                           if when - start <= CASCADE_WINDOW_S}
+                if len(leavers) / len(first_cohort) >= CASCADE_SHARE:
                     return RugVerdict(
                         mechanism=RugMechanism.SNIPER_CASCADE,
-                        detail=(f"{len(inside)} of {len(first_cohort)} first-block "
+                        detail=(f"{len(leavers)} of {len(first_cohort)} first-block "
                                 f"buyers exited within {CASCADE_WINDOW_S:.0f}s"),
-                        evidence={"cohort": len(first_cohort), "exited": len(inside),
+                        evidence={"cohort": len(first_cohort), "exited": len(leavers),
                                   "drawdown": drawdown},
                         unobserved=unobserved)
 

@@ -1,0 +1,41 @@
+[Unit]
+Description=Extend the historical launch corpus from public RPC, at zero cost
+After=memecoin-shadow.service
+Documentation=file:%h/.local/opt/memecoin-shadow/RUNBOOK.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/opt/memecoin-shadow
+EnvironmentFile=-%h/.config/memecoin-shadow/env
+Environment=ALLOW_LIVE_TRADING=
+Environment=SOLANA_PRIVATE_KEY=
+
+# --hours is a safety bound on how far into the past ONE run may walk, not a
+# "since last run" window -- resumption is by signature cursor
+# (data/state/backfill_checkpoint.json), so successive runs always continue
+# from where the last one stopped rather than re-treading ground. 24h of
+# headroom means the age cutoff essentially never fires before the
+# signature budget does. Measured 2026-08-29: 6,000 signatures, ~50 launches
+# with an observed creation, 35 reconstructed episodes, in under 5 minutes.
+#
+# This shares the free RPC pool with the always-on collector; both wanting
+# getSignaturesForAddress at once is why the tool retries transient
+# exhaustion with backoff instead of dying (fixed 2026-08-29 after a run
+# lost 2,239 already-decoded events to exactly that). Kept to a modest
+# per-run budget and a multi-hour cadence so this stays a background
+# contributor, not a competitor for the collector's real-time observations.
+ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m tools.backfill_history \
+  --hours 24 --max-signatures 10000 --batch 25
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/opt/memecoin-shadow/data
+UMask=0077
+MemoryMax=512M
+CPUQuota=100%
+Nice=15
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=memecoin-backfill

@@ -1,13 +1,14 @@
 """Continuous, evidence-backed Solana exit hazard tracking."""
 
 import asyncio
+import json
 import os
 import logging
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 from pathlib import Path
 
 import joblib
@@ -68,19 +69,80 @@ class HazardState:
     blocked_reason: str = "no_market_observations"
 
 
+#: Tokens RESIDENT at once, across hazard_states, observations and
+#: token_metadata. Every launch on the feed registers in all three and
+#: nothing ever left them: they are keyed by mint with no eviction, so a
+#: desk watching a continuous launch stream grows until the kernel stops
+#: it. That is not hypothetical -- on 2026-08-29 this service was
+#: OOM-killed repeatedly at roughly eight-minute intervals with ~4,300
+#: tokens accumulated in a few hours, while its own cgroup ceiling sat
+#: untouched, because the growth is in the NUMBER of tokens rather than
+#: in any one of them.
+#:
+#: Calibrated, not guessed. One observation measures ~1.9 KB, so a token
+#: carrying 50 of them costs ~25 KB and the arithmetic is unforgiving:
+#: 100k tokens is 2.5 GB and 1M tokens is 25 GB, on a 4 GB box shared with
+#: ~150 other processes under a 900 MB cgroup ceiling. 8,000 resident
+#: tokens is ~200 MB, which is what this desk can actually hold while
+#: staying alive.
+#:
+#: This bounds what is RESIDENT, not what is OBSERVED. Evictions spill to
+#: the research lake first, so the desk still accumulates history over
+#: millions of tokens -- it just stops trying to hold them all in RAM at
+#: once. An uncapped desk does not observe more; it observes nothing,
+#: because it is killed every eight minutes and loses all of it.
+DEFAULT_MAX_TRACKED_TOKENS = 8_000
+
+#: Observations kept per token. Was 5,000, which is ~9.7 MB for a single
+#: hot token -- one mint could take 1% of the cgroup on its own. Nothing
+#: reads that far back: the hazard windows are 60s and 300s, and the
+#: rug-mechanism classifier needs a first-30s cohort and >=20 priced
+#: points. 750 covers every one of those with room to spare and bounds
+#: the worst case to ~1.5 MB.
+DEFAULT_MAX_OBSERVATIONS_PER_TOKEN = 750
+
+#: Size at which the spill file rotates, keeping one previous generation.
+DEFAULT_MAX_SPILL_BYTES = 512 * 1024 * 1024
+
+
 class ContinuousRugHazardModel:
     """Combines observed flow, route, holder and liquidity deterioration."""
 
     def __init__(self, chain_config: ChainConfig, rpc: RPCManager, genealogy: GenealogyGraph,
-                 wallet_intel: WalletIntelligenceEngine, adversarial: AdversarialAdaptationDetector):
+                 wallet_intel: WalletIntelligenceEngine, adversarial: AdversarialAdaptationDetector,
+                 max_tracked_tokens: int = DEFAULT_MAX_TRACKED_TOKENS,
+                 max_observations_per_token: int = DEFAULT_MAX_OBSERVATIONS_PER_TOKEN,
+                 spill_path: Optional[Path] = None,
+                 max_spill_bytes: int = DEFAULT_MAX_SPILL_BYTES):
         self.chain_config = chain_config
         self.rpc = rpc
         self.genealogy = genealogy
         self.wallet_intel = wallet_intel
         self.adversarial = adversarial
         self.hazard_states: Dict[str, HazardState] = {}
-        self.observations: Dict[str, Deque[Dict[str, Any]]] = defaultdict(lambda: deque(maxlen=5_000))
+        self.max_observations_per_token = max(50, int(max_observations_per_token))
+        self.observations: Dict[str, Deque[Dict[str, Any]]] = defaultdict(
+            lambda: deque(maxlen=self.max_observations_per_token))
         self.token_metadata: Dict[str, Dict[str, Any]] = {}
+        self.max_tracked_tokens = max(100, int(max_tracked_tokens))
+        #: Where evicted token history goes. Without it the memory bound
+        #: would be a data-loss bound too; with it the desk observes across
+        #: millions of tokens cumulatively while holding thousands.
+        self.spill_path = Path(spill_path) if spill_path else None
+        self.tokens_spilled = 0
+        self.spill_failures = 0
+        #: Rotate at this size, keeping one previous generation. 512 MB of
+        #: live file plus 512 MB rotated is ~1 GB worst case against the
+        #: 9.8 GB free measured on this box -- bounded, and small next to
+        #: the disk-full alert the watchdog already raises at 90%.
+        self.max_spill_bytes = max(1_000_000, int(max_spill_bytes))
+        self.spill_rotations = 0
+        #: When each token was last written to, so eviction can pick the
+        #: stalest rather than an arbitrary one. Kept separately because a
+        #: token can be registered without ever being observed, and the
+        #: observation deque cannot date a token it never received.
+        self._last_touched: Dict[str, float] = {}
+        self.tokens_evicted = 0
         self.is_trained = False
         self.data_status = "DATA_BLOCKED"
         self.data_status_detail = "no versioned chronological hazard training artifact"
@@ -143,7 +205,140 @@ class ContinuousRugHazardModel:
         state = self.hazard_states.setdefault(token, HazardState(token=token, chain=self.chain_config.name))
         if metadata:
             self.token_metadata[token] = {**self.token_metadata.get(token, {}), **metadata}
+        # Stamped only on FIRST registration. Deliberately not refreshed here:
+        # _monitor_loop calls _compute_hazard -> register_token for every
+        # tracked token every 2 seconds, so refreshing on registration meant
+        # "last touched" tracked when the desk last LOOKED rather than when
+        # data last ARRIVED. Nothing could ever be seen as quiet, which
+        # silently disabled death classification entirely -- 2,714 launches
+        # awaiting a verdict produced exactly one, measured 2026-08-29.
+        self._last_touched.setdefault(token, time.time())
         return state
+
+    def _rotate_spill_if_large(self) -> bool:
+        """Keep the lake to one live file plus one rotation. Returns True if
+        a rotation happened.
+
+        An append-only spill solves a memory bound by creating a disk one:
+        this box was at 73% disk with 9.8 GB free when the spill was added,
+        so an unbounded JSONL would eventually trade OOM kills for a full
+        disk -- which is worse, because a full disk stops the evidence
+        ledger and the episode writer too, not just this model.
+
+        Two generations, not N: the older file is what a trainer reads for
+        history, and keeping more would be storing data nothing consumes.
+        """
+        if self.spill_path is None:
+            return False
+        try:
+            if self.spill_path.stat().st_size < self.max_spill_bytes:
+                return False
+        except OSError:
+            return False
+        previous = self.spill_path.with_suffix(self.spill_path.suffix + ".1")
+        try:
+            self.spill_path.replace(previous)
+            self.spill_rotations += 1
+            logger.info("hazard spill rotated at %.0f MB -> %s",
+                        self.max_spill_bytes / 1e6, previous.name)
+            return True
+        except OSError as exc:
+            logger.warning("hazard spill rotation failed: %s", exc)
+            return False
+
+    def _spill(self, token: str) -> bool:
+        """Append one token's observed history to the lake before it leaves.
+
+        Eviction is an unload, not a delete: the desk is meant to accumulate
+        evidence across every token it has ever seen, and only the RESIDENT
+        set is what the box can bound. A token with nothing observed is not
+        written -- an empty row is not evidence.
+        """
+        if self.spill_path is None:
+            return False
+        rows = self.observations.get(token)
+        if not rows:
+            return False
+        try:
+            self.spill_path.parent.mkdir(parents=True, exist_ok=True)
+            self._rotate_spill_if_large()
+            record = {
+                "token": token,
+                "metadata": self.token_metadata.get(token, {}),
+                "last_touched": self._last_touched.get(token),
+                "observations": list(rows),
+            }
+            with self.spill_path.open("a") as handle:
+                handle.write(json.dumps(record, default=str) + "\n")
+            self.tokens_spilled += 1
+            return True
+        except (OSError, TypeError, ValueError) as exc:
+            self.spill_failures += 1
+            logger.warning("hazard spill failed for %s: %s: %s",
+                           token, type(exc).__name__, exc)
+            return False
+
+    def last_touched(self, token: str) -> Optional[float]:
+        """When this token was last written to, in O(1).
+
+        Callers asking "has this gone quiet" would otherwise scan the whole
+        observation deque for a max timestamp -- up to 750 entries per
+        token, across thousands of tokens, on a box already stalled ~21% of
+        the time on CPU. The model tracks this for eviction anyway.
+        """
+        return self._last_touched.get(token)
+
+    def prune(self, protected: Optional[Set[str]] = None,
+              on_evict: Optional[Callable[[str], None]] = None) -> int:
+        """Drop the stalest tokens once past the cap. Returns how many went.
+
+        Protection is the caller's to define, because this module cannot
+        know which tokens carry an open position or are mid-decision.
+        Anything protected stays however stale it is: evicting a token the
+        desk still holds would silently blind the exit policy, and a
+        blinded exit is a far worse failure than using more memory.
+        """
+        if len(self._last_touched) <= self.max_tracked_tokens:
+            return 0
+        keep = set(protected or ())
+        candidates = sorted(
+            ((stamp, token) for token, stamp in self._last_touched.items()
+             if token not in keep),
+            key=lambda row: row[0])
+        # Never evict below the cap counting protected tokens, but never
+        # refuse to evict either: if protection alone exceeds the cap the
+        # desk is legitimately watching that much and the bound yields.
+        excess = len(self._last_touched) - self.max_tracked_tokens
+        evicted = 0
+        for _stamp, token in candidates[:max(0, excess)]:
+            # Last call on this token's observations. A token evicted while
+            # still awaiting a death verdict never gets one: the sweep can
+            # only reach RESIDENT tokens, so eviction silently ended the
+            # question. Measured 2026-08-29 across 71,748 spilled tokens,
+            # 107 of them satisfied the death criteria and none had been
+            # classified. Called before the spill so a callback that raises
+            # cannot cost us the archive copy too.
+            if on_evict is not None:
+                try:
+                    on_evict(token)
+                except Exception as exc:
+                    logger.warning("evict hook failed for %s: %s: %s",
+                                   token, type(exc).__name__, exc)
+            # Spill BEFORE dropping. If the write fails the history is still
+            # lost, but the failure is counted rather than silent -- an
+            # invisible hole in the research lake is what makes a corpus
+            # quietly wrong.
+            self._spill(token)
+            self.hazard_states.pop(token, None)
+            self.observations.pop(token, None)
+            self.token_metadata.pop(token, None)
+            self._last_touched.pop(token, None)
+            evicted += 1
+        self.tokens_evicted += evicted
+        if evicted:
+            logger.info("hazard model evicted %d stale tokens (tracking %d, cap %d)",
+                        evicted, len(self._last_touched), self.max_tracked_tokens)
+        return evicted
 
     def record_observation(self, token: str, observation: Dict[str, Any]):
         if not token or not isinstance(observation, dict):
@@ -153,6 +348,11 @@ class ContinuousRugHazardModel:
         item.setdefault("type", "unknown")
         self.register_token(token)
         self.observations[token].append(item)
+        # THIS is what freshness means: a real observation arrived. Stamped
+        # from the wall clock rather than item["timestamp"], because a
+        # backfilled or mis-stamped payload carrying an old time would mark a
+        # token we are actively receiving as stale.
+        self._last_touched[token] = time.time()
 
     async def _monitor_loop(self):
         while self._running:

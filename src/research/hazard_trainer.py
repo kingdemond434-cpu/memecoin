@@ -68,8 +68,22 @@ def train(storage: Path, model_dir: Path, min_rows: int=250) -> Dict[str,Any]:
             calibrator=IsotonicRegression(out_of_bounds="clip").fit(model.predict_proba(X_cal)[:,1],y_cal)
         raw=model.predict_proba(X_oos)[:,1];pred=calibrator.predict(raw) if calibrator else raw
         brier=float(np.mean((y_oos-pred)**2));rate=float(np.mean(y));baseline=float(np.mean((y_oos-rate)**2))
-        metrics[key]={"status":"PASSED" if brier<baseline else "REJECTED","brier":brier,"baseline_brier":baseline,
-                      "train_positive":positives,"oos_positive":oos_positives,"calibration":"isotonic" if calibrator else "raw"}
+        # A verdict either way needs enough out-of-sample positives to mean
+        # something. rug_30s was REJECTED on FIVE positives -- resample those
+        # five and the sign of brier-vs-baseline flips freely, so that word
+        # said "evidence against" where the truth was "not enough evidence".
+        # The champion pipeline treats the two differently, and should.
+        # Below the floor the model is still fitted and kept: a hazard signal
+        # with insufficient proof is used defensively, never as alpha.
+        if min(oos_positives, int(len(y_oos))-oos_positives) < 10:
+            metrics[key]={"status":"DATA_BLOCKED","reason":"insufficient_oos_positives_for_verdict",
+                          "brier":brier,"baseline_brier":baseline,
+                          "train_positive":positives,"oos_positive":oos_positives,
+                          "verdict_floor_positives":10,
+                          "calibration":"isotonic" if calibrator else "raw"}
+        else:
+            metrics[key]={"status":"PASSED" if brier<baseline else "REJECTED","brier":brier,"baseline_brier":baseline,
+                          "train_positive":positives,"oos_positive":oos_positives,"calibration":"isotonic" if calibrator else "raw"}
         models[key]=model
         if calibrator:calibrators[key]=calibrator
     passed=set(metrics)==set(HORIZONS) and all(item.get("status")=="PASSED" for item in metrics.values())

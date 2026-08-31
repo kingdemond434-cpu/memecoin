@@ -913,7 +913,8 @@ class ExecutionEngine:
                               amount: int, slippage_bps: int, started: float, *,
                               priority_fee: int, jito_tip: int, use_jito: bool,
                               decision_id: Optional[str],
-                              input_mint: str = "", output_mint: str = "") -> ExecutionResult:
+                              input_mint: str = "", output_mint: str = "",
+                              slot_value: Optional[Any] = None) -> ExecutionResult:
         """Sign and submit our own instruction. No quote call, no third-party build.
 
         The dry-run and live-lock gates sit here as well as on the Jupiter
@@ -988,7 +989,12 @@ class ExecutionEngine:
         result = await self._submit_signed(signed, amount, slippage_bps, started,
                                            jito_tip=jito_tip, use_jito=use_jito,
                                            route_type=route_type,
-                                           input_mint=input_mint, output_mint=output_mint)
+                                           input_mint=input_mint, output_mint=output_mint,
+                                           # The limit this transaction was
+                                           # actually built with, not a guess
+                                           # reconstructed at record time.
+                                           compute_unit_limit=self.native_compute_unit_limit,
+                                           slot_value=slot_value)
         result.quoted_output_amount = quote.output_amount
         self._record(result, decision_id)
         return result
@@ -1111,7 +1117,8 @@ class ExecutionEngine:
                     native, quote, amount, slippage_bps, started,
                     priority_fee=priority_fee, jito_tip=jito_tip,
                     use_jito=use_jito, decision_id=decision_id,
-                    input_mint=input_mint, output_mint=output_mint)
+                    input_mint=input_mint, output_mint=output_mint,
+                    slot_value=slot_value)
 
         quote = await self.jupiter.get_quote(input_mint, output_mint, amount, slippage_bps)
         if not quote or quote.output_amount <= 0:
@@ -1210,7 +1217,17 @@ class ExecutionEngine:
     async def _submit_signed(self, signed_tx: str, amount: int, slippage_bps: int,
                              started: float, *, jito_tip: int, use_jito: bool,
                              route_type: RouteType,
-                             input_mint: str = "", output_mint: str = "") -> ExecutionResult:
+                             input_mint: str = "", output_mint: str = "",
+                             # Both are recorded on the landing attempt below
+                             # and were previously read as free names: this
+                             # function referenced compute_unit_limit and
+                             # slot_value without either being a parameter, a
+                             # local, or a module global. That is a NameError
+                             # on the first REAL fill -- invisible in dry run,
+                             # which never reaches submission at all, and
+                             # invisible to CI for the same reason.
+                             compute_unit_limit: int = 0,
+                             slot_value: Optional[Any] = None) -> ExecutionResult:
         """Submit an already-signed transaction and reconcile what landed.
 
         Shared by the native route and anything else that composes its own
