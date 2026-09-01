@@ -194,13 +194,32 @@ class IngressEvent:
     slot: int
     received_ns: int
     is_vote: bool
+    #: The event already DECODED by the Rust side, when it recognised one.
+    #: None is the common case and a real answer: most instructions on the
+    #: program are the outer half of a buy or sell whose inner CPI event is
+    #: the one that carries the fill. Its presence is what lets a consumer
+    #: tell a launch from a trade WITHOUT decoding -- which is the point,
+    #: because the interpreter was otherwise decoding events it was about to
+    #: discard, the exact work the native path exists to stop doing.
+    decoded: Optional[Dict[str, Any]] = None
 
     @classmethod
     def from_tuple(cls, row: Sequence[Any]) -> "IngressEvent":
         return cls(
             signature=row[0], program=row[1], discriminator=row[2],
             fee_payer=row[3], data=row[4], accounts=tuple(row[5]),
-            slot=int(row[6]), received_ns=int(row[7]), is_vote=bool(row[8]))
+            slot=int(row[6]), received_ns=int(row[7]), is_vote=bool(row[8]),
+            # Tolerated absent, so a desk running against an extension built
+            # before the semantic decoder existed still works -- the two are
+            # deployed separately and a version skew must degrade, not fail.
+            decoded=(row[9] if len(row) > 9 else None))
+
+    @property
+    def kind(self) -> str:
+        """What this event IS, or "unknown" when nothing decoded it."""
+        if not self.decoded:
+            return "unknown"
+        return str(self.decoded.get("type", "") or "unknown")
 
     @property
     def signature_key(self) -> bytes:
@@ -253,6 +272,12 @@ class NativeIngress:
         self.unresolvable_signatures = 0
         self.drained = 0
         self.drain_calls = 0
+        #: How many drained events the Rust side had already decoded. The
+        #: ratio to `drained` is what says whether the semantic decoder is
+        #: actually carrying its weight or whether Python is still doing the
+        #: work on everything that matters.
+        self.decoded_natively = 0
+        self.by_kind: Dict[str, int] = {}
         self.started_at = 0.0
         self.last_drain_at = 0.0
         # Lead time: how much EARLIER the native path saw an event the
@@ -367,6 +392,10 @@ class NativeIngress:
         for row in rows:
             event = IngressEvent.from_tuple(row)
             events.append(event)
+            if event.decoded:
+                self.decoded_natively += 1
+                kind = event.kind
+                self.by_kind[kind] = self.by_kind.get(kind, 0) + 1
             key = event.signature_key
             if not key:
                 self.unresolvable_signatures += 1
@@ -541,6 +570,10 @@ class NativeIngress:
             "unresolvable_signatures": self.unresolvable_signatures,
             "agreement_rate": (self.agreements / total) if total else None,
             "drained": self.drained,
+            "decoded_natively": self.decoded_natively,
+            "decoded_share": (self.decoded_natively / self.drained
+                              if self.drained else None),
+            "by_kind": dict(self.by_kind),
             "drain_calls": self.drain_calls,
             "seconds_since_drain": (
                 round(time.time() - self.last_drain_at, 1)

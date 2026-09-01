@@ -465,3 +465,143 @@ class TheFeeConfigIsActuallyRead(unittest.IsolatedAsyncioTestCase):
         desk = self._desk({"value": None})
         self.assertFalse(await desk._refresh_pump_fee_config())
         self.assertEqual((), desk.fee_schedule.chain_tiers)
+
+
+class TheTwoDecodersMustAgreeOnTheSameBytes(unittest.TestCase):
+    """A semantic decoder that is subtly wrong is worse than a raw tuple.
+
+    A raw tuple is opaque and obviously needs decoding. A wrong reserve
+    looks like a number, flows into `_latest_curve_state`, prices a position
+    and sizes a trade. So the Rust decoder is held against the Python one on
+    the same bytes, and the discriminators are checked rather than assumed
+    to have been copied correctly.
+    """
+
+    def _payloads(self):
+        import struct
+
+        from src.chains.yellowstone_grpc import PumpFunMonitor
+
+        create = bytearray(PumpFunMonitor.CREATE_EVENT)
+        for text in (b"Name", b"SYM", b"https://example.invalid/x"):
+            create += len(text).to_bytes(4, "little") + text
+        create += bytes([1]) * 32 + bytes([2]) * 32 + bytes([3]) * 32 + bytes([4]) * 32
+        create += struct.pack("<q", 1_700_000_000)
+
+        trade = bytearray(PumpFunMonitor.TRADE_EVENT)
+        trade += bytes([9]) * 32
+        trade += struct.pack("<QQ", 5_000_000_000, 123_456)
+        trade += bytes([1])
+        trade += bytes([7]) * 32
+        trade += struct.pack("<q", 1_700_000_001)
+        trade += struct.pack("<QQ", 30_000_000_000, 1_073_000_000_000_000)
+
+        migrate = bytearray(PumpFunMonitor.COMPLETE_EVENT)
+        migrate += bytes([7]) * 32 + bytes([9]) * 32 + bytes([2]) * 32
+        migrate += struct.pack("<q", 1_700_000_002)
+        return bytes(create), bytes(trade), bytes(migrate)
+
+    def _native(self):
+        try:
+            import solana_fastpath
+        except ImportError:
+            self.skipTest("extension not built")
+        decode = getattr(solana_fastpath, "decode_pump_event", None)
+        if decode is None:
+            self.skipTest("extension built without the semantic decoder")
+        return decode
+
+    def test_the_two_decoders_agree_field_for_field_on_a_create(self):
+        # The comparison, not a re-implementation of the layout in the test:
+        # a fixture that encodes what it expects proves only that the test
+        # agrees with itself.
+        decode = self._native()
+        from src.chains.yellowstone_grpc import PumpFunMonitor
+
+        create, _, _ = self._payloads()
+        native = decode(create)
+        monitor = PumpFunMonitor.__new__(PumpFunMonitor)
+        python = PumpFunMonitor._decode_program_event(monitor, create, "sig", 1)
+        for field in ("type", "token", "bonding_curve", "wallet", "creator",
+                      "name", "symbol", "uri"):
+            self.assertEqual(python[field], native[field], field)
+
+    def test_the_two_decoders_agree_field_for_field_on_a_trade(self):
+        decode = self._native()
+        from src.chains.yellowstone_grpc import PumpFunMonitor
+
+        _, trade, _ = self._payloads()
+        native = decode(trade)
+        monitor = PumpFunMonitor.__new__(PumpFunMonitor)
+        python = PumpFunMonitor._decode_program_event(monitor, trade, "sig", 1)
+        self.assertEqual(python["token"], native["token"])
+        self.assertEqual(python["side"], native["side"])
+        self.assertEqual(python["virtual_sol_reserves"],
+                         native["virtual_sol_reserves"])
+        self.assertEqual(python["virtual_token_reserves"],
+                         native["virtual_token_reserves"])
+        # And the SOL amount, which the Python side reports already divided.
+        self.assertAlmostEqual(python["notional_sol"],
+                               native["sol_amount"] / 1e9)
+
+    def test_a_create_decodes_to_the_same_mint_and_creator(self):
+        decode = self._native()
+        from src.chains.yellowstone_grpc import b58encode
+
+        create, _, _ = self._payloads()
+        native = decode(create)
+        self.assertEqual("token_created", native["type"])
+        self.assertEqual(b58encode(bytes([1]) * 32), native["token"])
+        self.assertEqual(b58encode(bytes([4]) * 32), native["creator"])
+        self.assertEqual("SYM", native["symbol"])
+
+    def test_a_trade_decodes_to_the_same_reserves(self):
+        decode = self._native()
+        _, trade, _ = self._payloads()
+        native = decode(trade)
+        self.assertEqual("token_trade", native["type"])
+        self.assertEqual("buy", native["side"])
+        self.assertEqual(5_000_000_000, native["sol_amount"])
+        self.assertEqual(30_000_000_000, native["virtual_sol_reserves"])
+        self.assertEqual(1_073_000_000_000_000, native["virtual_token_reserves"])
+
+    def test_a_migration_decodes(self):
+        decode = self._native()
+        _, _, migrate = self._payloads()
+        native = decode(migrate)
+        self.assertEqual("token_migrated", native["type"])
+
+    def test_an_unrecognised_payload_decodes_to_nothing(self):
+        # The stream carries plenty of events that are not ours, and
+        # skipping them is normal rather than an error.
+        decode = self._native()
+        self.assertIsNone(decode(b"\x00" * 64))
+
+
+class ADecodedEventSaysWhatItIs(unittest.TestCase):
+
+    def test_an_event_with_no_decode_is_unknown_not_a_guess(self):
+        event = IngressEvent.from_tuple(_row(b"s" * 64))
+        self.assertEqual("unknown", event.kind)
+        self.assertIsNone(event.decoded)
+
+    def test_a_decoded_event_carries_its_kind(self):
+        row = list(_row(b"s" * 64)) + [{"type": "token_created", "token": b"m" * 32}]
+        event = IngressEvent.from_tuple(tuple(row))
+        self.assertEqual("token_created", event.kind)
+
+    def test_the_drain_counts_what_the_native_side_decoded(self):
+        # The ratio is what says whether the semantic decoder is carrying
+        # its weight or whether Python is still doing the work that matters.
+        ingress = NativeIngress("http://x", programs=("P",), mode=MODE_AUTO)
+        ingress._native = _Fake()
+        ingress.available = True
+        ingress.mode = MODE_SHADOW
+        ingress._native.rows.append(
+            tuple(list(_row(b"a" * 64)) + [{"type": "token_created"}]))
+        ingress._native.rows.append(_row(b"b" * 64))
+        ingress.drain()
+        report = ingress.report()
+        self.assertEqual(1, report["decoded_natively"])
+        self.assertEqual(0.5, report["decoded_share"])
+        self.assertEqual({"token_created": 1}, report["by_kind"])
