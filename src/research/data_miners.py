@@ -40,6 +40,7 @@ source as dead.
 from __future__ import annotations
 
 import asyncio
+from src.runtime.loop_local import loop_local_semaphore
 import json
 import logging
 import math
@@ -184,7 +185,10 @@ class DataMinerPool:
         self._callables: Dict[str, Callable[[], Awaitable[List[Dict[str, Any]]]]] = {}
         self._health: Dict[str, MinerHealth] = {}
         self._next_due: Dict[str, float] = {}
-        self._semaphore = asyncio.Semaphore(self.concurrency)
+        # Loop-local: this pool is CONSTRUCTED on the main loop and RUN on
+        # the offload thread's loop, which is precisely the split that made
+        # a plain semaphore leak a waiter per call until the box died.
+        self._semaphore = loop_local_semaphore(self.concurrency, "miners")
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self.total_records = 0

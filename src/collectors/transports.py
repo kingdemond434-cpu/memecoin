@@ -32,6 +32,7 @@ import html
 import json
 import logging
 import os
+import weakref
 import re
 import time
 import xml.etree.ElementTree as ElementTree
@@ -118,8 +119,9 @@ class HttpClient:
     timeout_s: float = DEFAULT_TIMEOUT_S
     limit: int = 100
     limit_per_host: int = 4
-    #: One session PER EVENT LOOP, keyed by the loop it belongs to.
-    _sessions: Dict[int, Any] = field(default_factory=dict, repr=False)
+    #: One session PER EVENT LOOP, weakly keyed by the loop it belongs to.
+    _sessions: Any = field(
+        default_factory=weakref.WeakKeyDictionary, repr=False)
 
     async def session(self):
         """The session for the loop calling this, created on first use.
@@ -144,11 +146,14 @@ class HttpClient:
         -- a bounded connection pool rather than a socket per source -- while
         making the client safe to hand to any loop that wants it.
         """
+        # Keyed on the loop OBJECT, held weakly. CPython reuses ids after
+        # collection, so id(loop) could hand a fresh loop a closed loop's
+        # session -- which fails in exactly the way this method exists to
+        # prevent, while looking correct.
         loop = asyncio.get_running_loop()
-        key = id(loop)
-        existing = self._sessions.get(key)
-        if existing is not None and not existing[1].closed:
-            return existing[1]
+        existing = self._sessions.get(loop)
+        if existing is not None and not existing.closed:
+            return existing
         import aiohttp
 
         created = aiohttp.ClientSession(
@@ -156,7 +161,7 @@ class HttpClient:
             connector=aiohttp.TCPConnector(limit=self.limit,
                                            limit_per_host=self.limit_per_host),
             headers={"User-Agent": USER_AGENT})
-        self._sessions[key] = (loop, created)
+        self._sessions[loop] = created
         return created
 
     async def get(self, url: str, *, headers: Optional[Dict[str, str]] = None
@@ -184,7 +189,7 @@ class HttpClient:
             current = asyncio.get_running_loop()
         except RuntimeError:  # pragma: no cover - called outside a loop
             current = None
-        for loop, session in list(self._sessions.values()):
+        for loop, session in list(self._sessions.items()):
             if session.closed:
                 continue
             if loop is current:

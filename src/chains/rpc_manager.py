@@ -1,4 +1,5 @@
 import asyncio
+from src.runtime.loop_local import loop_local_lock, loop_local_semaphore
 import logging
 import os
 import random
@@ -102,16 +103,52 @@ class RPCManager:
         ]
         self.max_concurrent_total = max_concurrent_total
         self._session: Optional[aiohttp.ClientSession] = None
+        #: loop id -> that loop's session. See _session_for_loop.
+        self._sessions: Dict[int, aiohttp.ClientSession] = {}
         self._ws_connections: Dict[str, Any] = {}
-        self._lock = asyncio.Lock()
+        # Loop-local, because the miners run on their own loop and every
+        # RPC call they make used to append a waiter to a semaphore bound to
+        # the MAIN loop, raise, and leave the waiter behind. 2,437 of them
+        # were counted before the OOM killer took the process on 2026-09-01.
+        # See src/runtime/loop_local.py.
+        self._lock = loop_local_lock("rpc_manager.lock")
         self._health_check_task: Optional[asyncio.Task] = None
-        self._request_semaphore = asyncio.Semaphore(max_concurrent_total)
+        self._request_semaphore = loop_local_semaphore(
+            max_concurrent_total, "rpc_manager.requests")
 
-    async def start(self):
-        self._session = aiohttp.ClientSession(
+    def _session_for_loop(self):
+        """This loop's aiohttp session, created on first use by that loop.
+
+        Same reasoning as the semaphore. A session binds to the loop that
+        created it -- its connector, its timers, its timeout contexts -- and
+        used from another it raises "Timeout context manager should be used
+        inside a task" on the first request. The miners run on their own
+        loop and share this manager, so a single session could never have
+        served them.
+        """
+        import asyncio as _asyncio
+
+        try:
+            key = id(_asyncio.get_running_loop())
+        except RuntimeError:
+            key = 0
+        existing = self._sessions.get(key)
+        if existing is not None and not existing.closed:
+            return existing
+        created = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=10),
             connector=aiohttp.TCPConnector(limit=100, limit_per_host=20),
         )
+        self._sessions[key] = created
+        return created
+
+    @property
+    def session(self):
+        """Always the calling loop's session. Every call site goes through here."""
+        return self._session_for_loop()
+
+    async def start(self):
+        self._session = self._session_for_loop()
         self._health_check_task = asyncio.create_task(self._health_check_loop())
         await self._initial_health_check()
 
@@ -124,7 +161,14 @@ class RPCManager:
                 pass
         for ws in self._ws_connections.values():
             await ws.close()
-        if self._session:
+        for session in list(self._sessions.values()):
+            if not session.closed:
+                try:
+                    await session.close()
+                except Exception:  # pragma: no cover - shutdown only
+                    pass
+        self._sessions.clear()
+        if self._session and not self._session.closed:
             await self._session.close()
 
     async def _initial_health_check(self):
@@ -139,7 +183,7 @@ class RPCManager:
         start = time.time()
         method, params = self._health_probe()
         try:
-            async with self._session.post(
+            async with self.session.post(
                 ep.endpoint.url,
                 json={"jsonrpc": "2.0", "method": method, "params": params, "id": 1},
                 headers=ep.endpoint.headers,
@@ -263,7 +307,7 @@ class RPCManager:
                     raise RuntimeError(
                         f"No healthy RPC endpoint serves {method}")
                 try:
-                    async with self._session.post(
+                    async with self.session.post(
                         ep.endpoint.url,
                         json={"jsonrpc": "2.0", "method": method, "params": params, "id": 1},
                         headers=ep.endpoint.headers,
@@ -342,7 +386,7 @@ class RPCManager:
             ep = self._select_endpoint()
             if not ep:
                 raise RuntimeError("No healthy RPC endpoints")
-            async with self._session.post(
+            async with self.session.post(
                 ep.endpoint.url,
                 json=requests,
                 headers=ep.endpoint.headers,
@@ -374,7 +418,7 @@ class RPCManager:
             raise RuntimeError("No usable RPC endpoints")
 
         async def submit(item: EndpointHealth):
-            async with self._session.post(
+            async with self.session.post(
                 item.endpoint.url,
                 json={"jsonrpc": "2.0", "method": method, "params": params, "id": 1},
                 headers=item.endpoint.headers,
