@@ -104,6 +104,7 @@ from src.chains.launchpads import LaunchpadRegistry
 from src.execution.exit_readiness import (
     ExcursionLedger, ExitReadinessLedger, choose_exit_mode)
 from src.runtime.feed_race import FeedRace
+from src.chains.native_ingress import NativeIngress
 from src.runtime.process_offload import ProcessOffloadedPool
 from src.research.benchmark_wallets import BenchmarkCorpus, load_roster
 from src.strategies.cohort_lifecycle import evaluate_cohorts
@@ -185,6 +186,14 @@ class SubsystemWiring:
             self.yellowstone.status_detail = "YELLOWSTONE_GRPC_URL is missing; RPC fallback enabled"
         if connected:
             await self.yellowstone.subscribe(create_combined_subscription())
+            # The native receiver comes up ALONGSIDE, not instead. Started
+            # here rather than at construction so it subscribes only when the
+            # reference client has a live stream to be compared against --
+            # a shadow with nothing to shadow proves nothing.
+            ingress = getattr(self, "native_ingress", None)
+            if ingress is not None and not ingress.start():
+                logger.info("NATIVE INGRESS not running: %s",
+                            ingress.unavailable_reason)
             self.pump_monitor = PumpFunMonitor(self.yellowstone, self._on_pump_event)
             self.pump_swap_monitor = PumpSwapMonitor(self.yellowstone, self._on_pump_event)
             self.raydium_monitor = RaydiumMonitor(self.yellowstone, self._on_raydium_event)
@@ -743,6 +752,25 @@ class SubsystemWiring:
             self.data_miners, sink=self._ingest_mined_records,
             queue_depth=int(self.global_config.get("miner_queue_depth", 4096)),
             name="miners")
+        # The chain receive path in Rust: socket, HTTP/2, prost decode,
+        # program filter and signature dedupe, with only what survives
+        # crossing into Python. Runs in SHADOW beside the grpc.aio client,
+        # which stays the reference -- the same bargain the Rust transaction
+        # builder made, because a receiver that is faster on what it catches
+        # and blind to one launch in a thousand is not an improvement.
+        self.native_ingress = self._optional(
+            "native ingress", lambda: None,
+            lambda: NativeIngress(
+                endpoint=os.getenv("YELLOWSTONE_GRPC_URL", ""),
+                token=os.getenv("YELLOWSTONE_GRPC_TOKEN", ""),
+                programs=tuple(self.global_config.get(
+                    "native_ingress_programs",
+                    ("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+                     "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"))),
+                mode=str(self.global_config.get(
+                    "native_ingress_mode", "SHADOW")).upper(),
+                promote_after=int(self.global_config.get(
+                    "native_ingress_promote_after", 5000))))
         # The heavy half, in its own INTERPRETER rather than its own thread.
         # A thread converts a multi-megabyte parse into interruptible slices;
         # it still holds the GIL against the decision path. A process does

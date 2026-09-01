@@ -155,6 +155,30 @@ chains:
 
 global:
   enabled_chains: ["solana"]
+
+  # --- hot-path isolation -----------------------------------------------
+  # The desk-independent miners in their own INTERPRETER rather than their
+  # own thread. A thread turns a multi-megabyte parse into interruptible
+  # slices and still holds the GIL against the decision path; a process does
+  # not. Thirteen miners move -- the web, venue and world set, which is also
+  # the expensive set: jupiter_tokens returns 3,174 records a pass,
+  # venue_tickers 401, regional_venues 331. The chain miners stay, because
+  # they read desk state through bound callables that cannot cross a process
+  # boundary and a snapshot of which would go stale immediately.
+  #
+  # On this two-vCPU box this is a real behaviour change, and the number to
+  # watch after turning it on is p99 rather than mean: the win is that a
+  # long parse can no longer stall a decision, which shows up in the tail.
+  offload_context_miners: true
+  context_miner_concurrency: 4
+
+  # The chain receive path in Rust -- socket, decode, filter and dedupe --
+  # running BESIDE the grpc.aio client, which stays the reference. SHADOW
+  # means it decides nothing; it is counted against the Python client until
+  # it has agreed on `native_ingress_promote_after` events, and a single
+  # event the reference saw and it did not demotes it permanently.
+  native_ingress_mode: "SHADOW"
+  native_ingress_promote_after: 5000
   # Tokens the hazard model keeps RESIDENT. Not a limit on how many tokens
   # the desk observes: evictions spill their full history to the research
   # lake first (hazard_spill_path), so observation accumulates across

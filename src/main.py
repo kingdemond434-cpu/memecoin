@@ -3688,6 +3688,20 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             noter = getattr(self, "_note_launch_venue", None)
             if noter is not None:
                 noter(event)
+            # Tell the shadow receiver what the REFERENCE client saw. Without
+            # this the parity ledger has only one side and can never conclude
+            # anything -- which is how a shadow stays a shadow for ever while
+            # looking wired.
+            ingress = getattr(self, "native_ingress", None)
+            if ingress is not None:
+                signature = event.get("signature")
+                if signature:
+                    try:
+                        ingress.note_python_event(
+                            signature.encode() if isinstance(signature, str)
+                            else bytes(signature))
+                    except Exception:  # pragma: no cover - accounting only
+                        pass
             # Seed the curve at its protocol-defined starting depth. The
             # CreateEvent carries no reserves, so without this the desk is
             # blind at exactly T0 -- _local_liquidity returns 0 and liquidity
