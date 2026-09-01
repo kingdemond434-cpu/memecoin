@@ -105,6 +105,7 @@ from src.chains.launchpads import LaunchpadRegistry
 from src.execution.exit_readiness import (
     ExcursionLedger, ExitReadinessLedger, choose_exit_mode)
 from src.runtime.feed_race import FeedRace
+from src.runtime.load_shedding import EconomicLoadShedder
 from src.chains.native_ingress import NativeIngress
 from src.runtime.process_offload import ProcessOffloadedPool
 from src.research.benchmark_wallets import BenchmarkCorpus, load_roster
@@ -116,6 +117,21 @@ import logging
 MODEL_HYPOTHESIS_ID = "production_multihead_v1"
 
 logger = logging.getLogger(__name__)
+
+
+def _tagged_feed(callback, feed: str):
+    """Stamp which feed delivered an event, without touching the decoders.
+
+    The race ledger keys on `event["feed"]`, and every decoder is shared
+    between the two paths -- so the tag has to be applied where the paths
+    differ, which is here, at the callback each one was given.
+    """
+    async def tagged(event):
+        if isinstance(event, dict):
+            event.setdefault("feed", feed)
+        return await callback(event)
+
+    return tagged
 
 
 class SubsystemWiring:
@@ -208,6 +224,23 @@ class SubsystemWiring:
                 logger.info("NATIVE INGRESS not running: %s",
                             ingress.unavailable_reason)
             await self.yellowstone.subscribe(create_combined_subscription())
+            # A SECOND feed, running at the same time rather than instead.
+            #
+            # The RPC program stream existed only as a fallback for when
+            # Yellowstone would not connect, which means the desk's
+            # redundancy was conditional on total failure -- the shape of
+            # outage that never happens. What does happen is one feed being
+            # a hundred milliseconds slower on a particular launch, or
+            # dropping a single update, and against that a standby is worth
+            # nothing because it is not running.
+            #
+            # Racing is free here because the duplicate guard makes it safe:
+            # every feed delivering the same launch calls `FeedRace.observe`
+            # and only the first gets a decision. The rest are the
+            # measurement, and the measurement is what says whether the
+            # second feed is ever first.
+            if bool(self.global_config.get("race_secondary_feed", True)):
+                await self._start_secondary_feed()
         elif not self.offline:
             self.rpc_program_stream = SolanaRpcProgramStream(
                 self.solana_rpc, [PumpFunMonitor.PUMP_FUN_PROGRAM, PumpSwapMonitor.PUMP_AMM_PROGRAM,
@@ -218,6 +251,40 @@ class SubsystemWiring:
             self.pump_monitor = PumpFunMonitor(self.rpc_program_stream, self._on_pump_event)
             self.pump_swap_monitor = PumpSwapMonitor(self.rpc_program_stream, self._on_pump_event)
             self.raydium_monitor = RaydiumMonitor(self.rpc_program_stream, self._on_raydium_event)
+
+    async def _start_secondary_feed(self) -> bool:
+        """Bring up the RPC program stream BESIDE Yellowstone, tagged.
+
+        Its events carry `feed: "rpc_ws"`, so the race ledger can say which
+        path was first per launch instead of attributing everything to the
+        one name the primary happens to use.
+        """
+        try:
+            stream = SolanaRpcProgramStream(
+                self.solana_rpc,
+                [PumpFunMonitor.PUMP_FUN_PROGRAM, PumpSwapMonitor.PUMP_AMM_PROGRAM,
+                 RaydiumMonitor.RAYDIUM_AMM_V4, RaydiumMonitor.RAYDIUM_CPMM,
+                 RaydiumMonitor.RAYDIUM_CLMM, RaydiumMonitor.METEORA_DLMM,
+                 RaydiumMonitor.METEORA_DYNAMIC_AMM, RaydiumMonitor.ORCA_WHIRLPOOL])
+            self.secondary_pump_monitor = PumpFunMonitor(
+                stream, _tagged_feed(self._on_pump_event, "rpc_ws"))
+            self.secondary_pump_swap_monitor = PumpSwapMonitor(
+                stream, _tagged_feed(self._on_pump_event, "rpc_ws"))
+            self.secondary_raydium_monitor = RaydiumMonitor(
+                stream, _tagged_feed(self._on_raydium_event, "rpc_ws"))
+            await stream.start()
+        except Exception as exc:
+            # A second feed is redundancy, not a dependency. Failing to bring
+            # it up must never stop the desk that already has a primary.
+            logger.warning("secondary feed not started: %s", exc)
+            self.secondary_stream = None
+            return False
+        self.secondary_stream = stream
+        if getattr(self, "feed_race", None) is not None:
+            self.feed_race.register_feed("yellowstone")
+            self.feed_race.register_feed("rpc_ws")
+        logger.info("SECONDARY FEED racing Yellowstone: RPC program stream")
+        return True
 
     def _optional(self, name, fallback, build):
         """Construct an OBSERVATIONAL subsystem, or run without it.
@@ -508,6 +575,11 @@ class SubsystemWiring:
         # Which feed reaches this box first, measured. Coverage outranks
         # speed: a feed that misses events is blind on them, not slow.
         self.feed_race = self._optional("feed race", FeedRace, FeedRace)
+        # Under a burst the desk cannot look at every launch, and which ones
+        # it drops is a decision rather than a queue discipline. See
+        # src/runtime/load_shedding.py.
+        self.load_shedder = EconomicLoadShedder(
+            int(self.global_config.get("max_candidate_pipelines", 100)))
         # The sell must exist before it is needed, and be proven to.
         self.exit_readiness = self._optional(
             "exit readiness", ExitReadinessLedger, ExitReadinessLedger)

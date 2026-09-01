@@ -32,13 +32,16 @@ several of which would be silently broken rather than loudly unpicklable.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
+import json
 import logging
 import multiprocessing as mp
 import os
 import queue
 import threading
 import time
+from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
@@ -62,6 +65,79 @@ RESTART_BACKOFF_S = (1.0, 2.0, 5.0, 15.0, 30.0, 60.0)
 #: is left down and reported CRITICAL. A miner pool that cannot start will not
 #: start on the hundredth try either, and the desk keeps running without it --
 #: which is the whole point of it being a separate process.
+
+
+
+#: How many record digests a child remembers. jupiter_tokens alone returns
+#: 3,174 records a pass, and the whole point is to remember enough of them
+#: that the second pass sends almost nothing.
+DELTA_MEMORY = 250_000
+
+#: A full resend every so many passes, whatever the digests say. Cheap
+#: insurance against the one failure a delta filter has: if the parent ever
+#: loses a record the child believes it has delivered, suppression makes the
+#: loss permanent, and a periodic resync bounds that to one interval instead
+#: of for ever.
+RESYNC_EVERY = 60
+
+
+class _DeltaFilter:  # pragma: no cover - runs in the child process
+    """Forwards only what CHANGED, per miner.
+
+    The miners are polls, not streams: `jupiter_tokens` returns the same
+    3,174 tokens every pass, `venue_tickers` 401, `regional_venues` 331. All
+    of it was pickled in the child, pushed through a pipe, and unpickled in
+    the parent -- every pass, for records almost all of which the parent had
+    already seen and would immediately discard. The deserialisation cost is
+    paid on the parent's loop, which is the one this whole class exists to
+    keep free.
+
+    A digest per record, keyed on the record's own identity where it has
+    one. Identity matters: a token whose price changed is a NEW record and
+    must be sent, while the same token unchanged is not -- so the digest
+    covers the content, and the identity only groups it.
+    """
+
+    def __init__(self, memory: int = DELTA_MEMORY, resync_every: int = RESYNC_EVERY):
+        self.memory = int(memory)
+        self.resync_every = int(resync_every)
+        self._seen: Dict[str, "OrderedDict"] = {}
+        self._passes: Dict[str, int] = {}
+        self.sent = 0
+        self.suppressed = 0
+
+    @staticmethod
+    def _digest(record: Any) -> str:
+        try:
+            encoded = json.dumps(record, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            encoded = repr(record)
+        return hashlib.blake2b(encoded.encode("utf-8"), digest_size=16).hexdigest()
+
+    def filter(self, miner_id: str, records: List[Any]) -> Tuple[List[Any], Dict[str, Any]]:
+        passes = self._passes.get(miner_id, 0) + 1
+        self._passes[miner_id] = passes
+        seen = self._seen.setdefault(miner_id, OrderedDict())
+        if self.resync_every and passes % self.resync_every == 0:
+            seen.clear()
+            for record in records:
+                seen[self._digest(record)] = None
+            self.sent += len(records)
+            return list(records), {"total": len(records), "sent": len(records),
+                                   "suppressed": 0, "resync": True}
+        fresh = []
+        for record in records:
+            digest = self._digest(record)
+            if digest in seen:
+                continue
+            seen[digest] = None
+            fresh.append(record)
+        while len(seen) > self.memory:
+            seen.popitem(last=False)
+        self.sent += len(fresh)
+        self.suppressed += len(records) - len(fresh)
+        return fresh, {"total": len(records), "sent": len(fresh),
+                       "suppressed": len(records) - len(fresh), "resync": False}
 
 
 def _child_main(factory_path: str, config: Dict[str, Any],
@@ -88,9 +164,18 @@ def _child_main(factory_path: str, config: Dict[str, Any],
     factory = getattr(importlib.import_module(module_name), attribute)
     pool = factory(config)
 
+    delta = _DeltaFilter()
+
     def publish(miner_id: str, records: List[Dict[str, Any]]) -> None:
+        # Only what changed. The pickling, the pipe and -- the expensive half
+        # -- the UNPICKLING on the parent's loop are all paid per record, so
+        # suppressing a record the parent already has is the cheapest
+        # possible win on the loop that has to decide.
+        fresh, meta = delta.filter(miner_id, records or [])
+        if not fresh:
+            return
         try:
-            out.put_nowait((miner_id, records))
+            out.put_nowait((miner_id, fresh, meta))
         except Exception:
             # Full or closed. Dropping here is correct: the parent is behind
             # and the freshest observation is the one worth keeping.
@@ -151,6 +236,10 @@ class ProcessOffloadedPool:
         self._running = False
         self.enqueued = 0
         self.delivered = 0
+        # What the delta filter bought, in records that never crossed the
+        # pipe and never had to be unpickled on the decision loop.
+        self.records_sent = 0
+        self.records_suppressed = 0
         # Per-CHILD, not per-pool. `delivered` is cumulative for the life of
         # the process, so forgiving failures on it meant a generation that
         # once worked absolved every generation after it: a child dying at
@@ -229,20 +318,32 @@ class ProcessOffloadedPool:
                 return
             if item is None:
                 return
-            miner_id, records = item
+            # Three elements from a child that filters deltas, two from
+            # anything older. Tolerating both means a child and a parent can
+            # be deployed in either order.
+            if len(item) == 3:
+                miner_id, records, meta = item
+                self.records_sent += int(meta.get("sent", len(records)))
+                self.records_suppressed += int(meta.get("suppressed", 0))
+            else:
+                miner_id, records = item
+                self.records_sent += len(records)
             if miner_id == "__error__":
                 self.child_error = str((records or [{}])[0].get("error", ""))
                 logger.error("PROCESS OFFLOAD %s child failed: %s",
                              self.name, self.child_error)
                 continue
             self.enqueued += 1
+            # Normalised here, so the drain -- which runs on the decision
+            # loop -- never has to know which wire shape the child used.
+            pair = (miner_id, records)
             try:
-                self._local.put_nowait(item)
+                self._local.put_nowait(pair)
             except queue.Full:
                 try:
                     self._local.get_nowait()
                     self.dropped += 1
-                    self._local.put_nowait(item)
+                    self._local.put_nowait(pair)
                 except (queue.Empty, queue.Full):
                     self.dropped += 1
 
@@ -380,6 +481,11 @@ class ProcessOffloadedPool:
             "queue_capacity": self.queue_depth,
             "enqueued": self.enqueued,
             "delivered": self.delivered,
+            "records_sent": self.records_sent,
+            "records_suppressed": self.records_suppressed,
+            "records_suppressed_share": (
+                self.records_suppressed
+                / max(1, self.records_sent + self.records_suppressed)),
             "delivered_this_generation": self.delivered_this_generation,
             "generation": self._generation,
             "dropped": self.dropped,

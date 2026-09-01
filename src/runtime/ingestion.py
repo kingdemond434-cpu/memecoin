@@ -120,6 +120,54 @@ class MinedRecordIngestion:
         }
         return build_features(episode_meta, snapshot)
 
+    def _shedding_features(self, candidate: Any) -> Dict[str, Any]:
+        """The free priors the shedder ranks on. Nothing here may cost a call.
+
+        The whole point of shedding is to decide before the expensive path
+        begins, so anything requiring a network round trip is by definition
+        unavailable here. What IS available is everything the desk already
+        knows: the deployer's record, whether a source named this mint
+        before it launched, whether the venue's decoder has been verified.
+
+        Unknowns are omitted rather than defaulted. A launch from a deployer
+        never seen before must score the base rate, not a penalty -- most
+        launches are exactly that, and most of the ones worth catching are
+        too.
+        """
+        token = candidate.address
+        deployer = candidate.deployer or ""
+        features: Dict[str, Any] = {}
+        if deployer:
+            try:
+                scored = self.wallet_intel.get_wallet_score(deployer)
+            except Exception:
+                scored = None
+            if scored is not None:
+                # Centred on the population mean, so a below-average deployer
+                # is worth a slot LESS than an unknown one rather than the
+                # same -- which is the whole difference between ranking and
+                # merely filtering.
+                features["deployer_score"] = (
+                    float(scored.overall_score) - 0.5) * 2.0
+            try:
+                features["deployer_launches"] = len(
+                    self._tokens_deployed_by(deployer))
+            except Exception:
+                pass
+        if self._source_events.get(token):
+            features["named_by_source"] = True
+        if getattr(self, "_identity_claims", None) and token in self._identity_claims:
+            features["named_actor"] = True
+        registry = getattr(self, "launchpads", None)
+        if registry is not None:
+            spec = registry.specs.get(str(candidate.factory or ""))
+            if spec is not None:
+                features["venue_verified"] = spec.trusted
+        funders = candidate.metadata.get("funding_transfers") if candidate.metadata else None
+        if funders:
+            features["funding_wallets"] = funders
+        return features
+
     def _risk_for_decision(self, candidate: Any) -> Any:
         """The safety view this decision gets, without waiting for one.
 

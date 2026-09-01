@@ -71,6 +71,10 @@ REQUIRED_CALLS = {
     "launch invariants persisted": ("self.invariant_ledger.save()", "src/main.py"),
     "portfolio refresh is off the decision path": ("self._ensure_portfolio_fresh()",
                                                    "src/main.py"),
+    # Redundancy conditional on total failure is redundancy that never runs.
+    "secondary feed races the primary": ("self._start_secondary_feed()",
+                                         "src/runtime/wiring.py"),
+    "secondary feed stopped": ("self.secondary_stream.stop()", "src/main.py"),
 }
 
 

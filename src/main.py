@@ -342,6 +342,7 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         self._native_ingress_task: Optional[asyncio.Task] = None
         self._native_ingress_events = 0
         self._fee_config_refreshed_at = 0.0
+        self.secondary_stream = None
         # The full risk audit, running BESIDE the decision instead of in
         # front of it. Keyed per token so a candidate re-checked five times
         # on the ladder starts one fetch, not five.
@@ -667,6 +668,11 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         # before its drain task is cancelled, so the last events it matched
         # are accounted for rather than discarded with the queue.
         try:
+            if getattr(self, "secondary_stream", None) is not None:
+                await self.secondary_stream.stop()
+        except Exception as exc:  # pragma: no cover - shutdown only
+            logger.warning("secondary feed shutdown: %s", exc)
+        try:
             if getattr(self, "native_ingress", None) is not None:
                 self.native_ingress.stop()
         except Exception as exc:  # pragma: no cover - shutdown only
@@ -900,9 +906,17 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         token = candidate.address
         if not token or token in self._candidate_pipelines:
             return False
-        if len(self._candidate_pipelines) >= int(self.global_config.get("max_candidate_pipelines", 100)):
-            logger.warning("Candidate pipeline saturated; preserving DATA_BLOCKED decision for %s", token)
-            self._record_blocked_decision(token, "DATA_BLOCKED_candidate_pipeline_saturated", {})
+        # Shed by WORTH, not by arrival order. The old rule dropped whatever
+        # arrived once the queue was full, so during the exact minute when
+        # the best launch of the day is most likely to appear -- a burst --
+        # the desk's rule for handling it was "were you 99th or 101st".
+        shed = self.load_shedder.admit(
+            self._shedding_features(candidate), len(self._candidate_pipelines))
+        if not shed.admitted:
+            logger.warning("Candidate shed under load: %s (%s)", token, shed.reason)
+            self._record_blocked_decision(
+                token, "DATA_BLOCKED_candidate_pipeline_saturated",
+                shed.as_dict())
             self._candidate_drops += 1
             return False
         self.latency.mark(token, "decode_to_dispatch")

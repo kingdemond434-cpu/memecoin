@@ -254,3 +254,67 @@ class ADyingChildIsNotRespawnedInATightLoop(unittest.TestCase):
         thread.join(timeout=3.0)
         self.assertFalse(thread.is_alive(),
                          "the reader for a retired child never exited")
+
+
+class OnlyWhatChangedCrossesThePipe(unittest.TestCase):
+    """The miners are polls, not streams.
+
+    `jupiter_tokens` returns the same 3,174 records every pass, and all of
+    them were pickled in the child, pushed through a pipe and unpickled in
+    the parent -- on the loop this whole class exists to keep free -- for
+    records the parent had already seen and would immediately discard.
+    """
+
+    def _filter(self, **kwargs):
+        from src.runtime.process_offload import _DeltaFilter
+        return _DeltaFilter(**kwargs)
+
+    def test_the_second_identical_pass_sends_nothing(self):
+        delta = self._filter(resync_every=0)
+        rows = [{"mint": f"M{index}", "price": 1.0} for index in range(3174)]
+        _, first = delta.filter("jupiter_tokens", rows)
+        self.assertEqual(3174, first["sent"])
+        fresh, second = delta.filter("jupiter_tokens", rows)
+        self.assertEqual([], fresh)
+        self.assertEqual(3174, second["suppressed"])
+
+    def test_a_changed_record_is_a_new_record(self):
+        # A token whose price moved must cross; the same token unchanged must
+        # not. The digest covers the content, and the identity only groups it.
+        delta = self._filter(resync_every=0)
+        delta.filter("m", [{"mint": "A", "price": 1.0}])
+        fresh, meta = delta.filter("m", [{"mint": "A", "price": 2.0}])
+        self.assertEqual(1, meta["sent"])
+        self.assertEqual(2.0, fresh[0]["price"])
+
+    def test_miners_do_not_suppress_each_other(self):
+        delta = self._filter(resync_every=0)
+        delta.filter("a", [{"x": 1}])
+        _, meta = delta.filter("b", [{"x": 1}])
+        self.assertEqual(1, meta["sent"])
+
+    def test_a_periodic_resync_bounds_a_lost_record_to_one_interval(self):
+        # The one failure a delta filter has: if the parent ever loses a
+        # record the child believes delivered, suppression makes the loss
+        # permanent. A resync makes it temporary.
+        delta = self._filter(resync_every=3)
+        rows = [{"x": 1}, {"x": 2}]
+        delta.filter("m", rows)
+        self.assertEqual(0, delta.filter("m", rows)[1]["sent"])
+        _, third = delta.filter("m", rows)
+        self.assertTrue(third["resync"])
+        self.assertEqual(2, third["sent"])
+
+    def test_memory_stays_bounded(self):
+        delta = self._filter(memory=100, resync_every=0)
+        for index in range(1000):
+            delta.filter("m", [{"x": index}])
+        self.assertLessEqual(len(delta._seen["m"]), 100)
+
+    def test_an_unpicklable_record_still_gets_a_digest(self):
+        # A record the child cannot serialise for hashing must still be
+        # forwarded once rather than crash the publish path.
+        delta = self._filter(resync_every=0)
+        fresh, meta = delta.filter("m", [object()])
+        self.assertEqual(1, meta["sent"])
+        self.assertEqual(1, len(fresh))
