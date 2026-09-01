@@ -136,6 +136,12 @@ class NativeIngress:
             self._native = None
             return False
         self.available = True
+        # Cleared, because it is no longer true. Leaving a construction-time
+        # reason in place after a successful start makes the report say
+        # "start() has not been called" beside "available: True" -- two
+        # fields of one document contradicting each other, which is worse
+        # than either being wrong alone.
+        self.unavailable_reason = ""
         self.mode = MODE_SHADOW
         self.started_at = time.time()
         logger.info(
