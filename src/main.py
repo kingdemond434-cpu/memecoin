@@ -626,6 +626,8 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         except Exception as exc:  # pragma: no cover - shutdown only
             logger.warning("source mesh shutdown: %s", exc)
         try:
+            if getattr(self, "context_offload", None) is not None:
+                await self.context_offload.stop()
             if self.miner_offload is not None:
                 await self.miner_offload.stop()
             else:

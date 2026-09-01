@@ -48,6 +48,11 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from src.execution.signer_protocol import (
+    HEADER_SIZE, OP_PING, OP_PUBKEY, OP_SIGN, STATUS_ERROR,
+    STATUS_OK, STATUS_REFUSED, decode_header, encode_request,
+    encode_response, read_frame)
+from src.runtime.loop_local import loop_local_lock
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
@@ -296,6 +301,12 @@ class SignerServer:
         self.service = service
         self.socket_path = Path(socket_path)
         self._server: Optional[asyncio.AbstractServer] = None
+        # Binary connections are HELD, so a handler outlives its request and
+        # is still awaiting the next frame at shutdown. Tracked so stop()
+        # can cancel them; without this they are garbage-collected mid-await
+        # and asyncio reports "coroutine ignored GeneratorExit" -- noise
+        # beside a real fault, in the log an operator reads during one.
+        self._connections: "set" = set()
 
     async def start(self) -> None:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -310,6 +321,11 @@ class SignerServer:
                     self.socket_path, self.service.public_key)
 
     async def stop(self) -> None:
+        for task in list(self._connections):
+            task.cancel()
+        if self._connections:
+            await asyncio.gather(*self._connections, return_exceptions=True)
+            self._connections.clear()
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -322,10 +338,30 @@ class SignerServer:
 
     async def _handle(self, reader: asyncio.StreamReader,
                       writer: asyncio.StreamWriter) -> None:
+        """Serve one connection, in whichever protocol it opens with.
+
+        Both protocols, chosen by looking at the first byte, and the
+        connection is HELD for the binary one -- that is the whole point of
+        it. A JSON caller still gets one request and a close, exactly as
+        before.
+
+        Keeping JSON is not politeness. The signer and the desk are separate
+        units that get deployed separately, and a protocol change that only
+        works when both restart in the right order is a protocol change that
+        strands a running desk on the wrong afternoon.
+        """
+        current = asyncio.current_task()
+        if current is not None:
+            self._connections.add(current)
+            current.add_done_callback(self._connections.discard)
         try:
-            raw = await reader.readline()
-            if not raw:
+            first = await reader.read(1)
+            if not first:
                 return
+            if first != b"{":
+                await self._serve_binary(first, reader, writer)
+                return
+            raw = first + await reader.readline()
             request = json.loads(raw)
             if request.get("op") == "pubkey":
                 response = {"ok": True, "public_key": self.service.public_key}
@@ -344,6 +380,51 @@ class SignerServer:
         try:
             writer.write((json.dumps(response) + "\n").encode())
             await writer.drain()
+        finally:
+            writer.close()
+
+    async def _serve_binary(self, first: bytes, reader: asyncio.StreamReader,
+                            writer: asyncio.StreamWriter) -> None:
+        """Length-prefixed frames on a connection held until the peer leaves.
+
+        Every frame is authorised independently. Holding the connection open
+        buys the desk a connect and two encodings per signature; it buys it
+        no standing permission, because the policy check happens per message
+        and always has.
+        """
+        try:
+            header = first + await reader.readexactly(HEADER_SIZE - 1)
+            while True:
+                length, op = decode_header(header)
+                payload = await reader.readexactly(length) if length else b""
+                if op == OP_PUBKEY:
+                    frame = encode_response(
+                        STATUS_OK, self.service.public_key.encode("ascii"))
+                elif op == OP_PING:
+                    frame = encode_response(STATUS_OK)
+                elif op == OP_SIGN:
+                    signature, decision = self.service.sign(payload)
+                    frame = (encode_response(STATUS_OK, signature)
+                             if signature is not None else
+                             encode_response(
+                                 STATUS_REFUSED,
+                                 str(decision.reason).encode("utf-8")[:4096]))
+                else:
+                    frame = encode_response(
+                        STATUS_ERROR, f"unknown op {op}".encode("utf-8"))
+                writer.write(frame)
+                await writer.drain()
+                header = await reader.readexactly(HEADER_SIZE)
+        except (asyncio.IncompleteReadError, ConnectionError,
+                asyncio.CancelledError):
+            pass  # the peer went away, or we are shutting down
+        except Exception as exc:  # pragma: no cover - defensive
+            try:
+                writer.write(encode_response(
+                    STATUS_ERROR, f"{type(exc).__name__}: {exc}".encode("utf-8")))
+                await writer.drain()
+            except Exception:
+                pass
         finally:
             writer.close()
 
@@ -368,8 +449,69 @@ class SignerClient:
         self.signed = 0
         self.refusals = 0
         self.last_refusal = ""
+        # One connection for the life of the process. Every signature used to
+        # open a new Unix socket, JSON-encode a dict and base64 the message
+        # -- a connect, a round trip through the kernel's accept path and two
+        # encodings, on the one path where microseconds are the product.
+        self._reader = None
+        self._writer = None
+        self._lock = loop_local_lock("signer")
+        self.reconnects = 0
+        self.binary = True
+        self.frames = 0
+
+    async def _connect(self):
+        """Open the persistent connection, on the loop that will use it."""
+        self._reader, self._writer = await asyncio.wait_for(
+            asyncio.open_unix_connection(str(self.socket_path)),
+            timeout=self.timeout_s)
+        return self._reader, self._writer
+
+    async def _frame(self, op: int, payload: bytes = b"") -> Tuple[int, bytes]:
+        """One request/response over the held connection, reconnecting once.
+
+        Exactly one retry, and only when the connection itself failed. A held
+        socket can be closed by a signer restart, a deploy, or an idle
+        timeout, and the first signature after that must not be the one that
+        fails -- but retrying a REFUSAL would ask a signer that already said
+        no to say it again, and retrying repeatedly on a dead signer would
+        turn a clear failure into a slow one.
+        """
+        async with self._lock:
+            for attempt in (0, 1):
+                try:
+                    if self._writer is None or self._writer.is_closing():
+                        await self._connect()
+                        if attempt:
+                            self.reconnects += 1
+                    self._writer.write(encode_request(op, payload))
+                    await self._writer.drain()
+                    frame = await asyncio.wait_for(
+                        read_frame(self._reader), timeout=self.timeout_s)
+                    if frame is None:
+                        raise ConnectionError("signer closed the connection")
+                    self.frames += 1
+                    return frame
+                except (ConnectionError, asyncio.IncompleteReadError, OSError):
+                    self._drop()
+                    if attempt:
+                        raise
+            raise ConnectionError("signer unreachable")
+
+    def _drop(self) -> None:
+        if self._writer is not None:
+            try:
+                self._writer.close()
+            except Exception:  # pragma: no cover - teardown only
+                pass
+        self._reader = None
+        self._writer = None
+
+    async def close(self) -> None:
+        self._drop()
 
     async def _call(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """The old JSON path, kept for anything that still speaks it."""
         reader, writer = await asyncio.wait_for(
             asyncio.open_unix_connection(str(self.socket_path)),
             timeout=self.timeout_s)
@@ -383,10 +525,11 @@ class SignerClient:
 
     async def pubkey(self) -> str:
         if self._public_key is None:
-            response = await self._call({"op": "pubkey"})
-            if not response.get("ok"):
-                raise RuntimeError(f"signer unreachable: {response.get('error')}")
-            self._public_key = response["public_key"]
+            status, payload = await self._frame(OP_PUBKEY)
+            if status != STATUS_OK:
+                raise RuntimeError(
+                    f"signer unreachable: {payload.decode('utf-8', 'replace')}")
+            self._public_key = payload.decode("ascii")
         return self._public_key
 
     async def sign_message(self, message_bytes: bytes) -> bytes:
@@ -397,18 +540,20 @@ class SignerClient:
         design exists to prevent, and a caller that ignores a return value is
         far more likely than one that ignores an exception.
         """
-        import base64
-        response = await self._call({
-            "op": "sign",
-            "message": base64.b64encode(bytes(message_bytes)).decode()})
-        if not response.get("ok"):
-            reason = ((response.get("decision") or {}).get("reason")
-                      or response.get("error") or "unknown")
+        status, payload = await self._frame(OP_SIGN, bytes(message_bytes))
+        if status != STATUS_OK:
+            reason = payload.decode("utf-8", "replace") or "unknown"
             self.refusals += 1
             self.last_refusal = reason
             raise PermissionError(f"signer refused: {reason}")
+        if len(payload) != 64:
+            # A 64-byte signature is the only correct answer. Anything else
+            # is a framing fault, and letting it through would put arbitrary
+            # bytes where a signature goes.
+            raise RuntimeError(
+                f"signer returned {len(payload)} bytes where a signature belongs")
         self.signed += 1
-        return base64.b64decode(response["signature"])
+        return payload
 
     def report(self) -> Dict[str, Any]:
         return {
@@ -420,7 +565,11 @@ class SignerClient:
             "signed": self.signed,
             "refused": self.refusals,
             "last_refusal": self.last_refusal,
-            "detail": "",
+            "transport": "binary/persistent" if self.binary else "json",
+            "frames": self.frames,
+            "reconnects": self.reconnects,
+            "detail": ("one held connection and length-prefixed frames; the "
+                       "key is still in its own process"),
         }
 
 
