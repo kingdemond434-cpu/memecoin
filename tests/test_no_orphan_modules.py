@@ -37,6 +37,8 @@ REQUIRED_CALLS = {
     "benchmark follow pricing": ("marker_delays(", "src/main.py"),
     "benchmark resolution": ("resolver(", "src/main.py"),
     "benchmark discovery": ("_promote_benchmark_candidates(", "src/main.py"),
+    "process-isolated miners": ("ProcessOffloadedPool(", "src/runtime/wiring.py"),
+    "binary signer transport": ("self._frame(", "src/execution/signer.py"),
 }
 
 

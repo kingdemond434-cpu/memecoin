@@ -495,6 +495,16 @@ class ReportingSurface:
                 self.benchmark_corpus.report()
                 if getattr(self, "benchmark_corpus", None) is not None
                 else {"status": "DATA_BLOCKED"}),
+            # The heavy miners in their own interpreter. OFF is a real and
+            # common state: it is a behaviour change on a two-vCPU box and
+            # should be turned on against a measured p99.
+            "context_offload": (
+                self.context_offload.report()
+                if getattr(self, "context_offload", None) is not None
+                else {"status": "OFF", "isolation": "thread",
+                      "detail": ("desk-independent miners still share this "
+                                 "interpreter; set offload_context_miners "
+                                 "to move them")}),
             # Launch venues, and which of them this node has PROVEN it can
             # decode. A declared program that never matches shows up here as
             # a venue stuck at zero rather than as silent absence.

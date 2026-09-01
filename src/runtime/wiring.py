@@ -104,6 +104,7 @@ from src.chains.launchpads import LaunchpadRegistry
 from src.execution.exit_readiness import (
     ExcursionLedger, ExitReadinessLedger, choose_exit_mode)
 from src.runtime.feed_race import FeedRace
+from src.runtime.process_offload import ProcessOffloadedPool
 from src.research.benchmark_wallets import BenchmarkCorpus, load_roster
 from src.strategies.cohort_lifecycle import evaluate_cohorts
 from src.strategies.funder_ancestry import FunderAncestry, compress_independence
@@ -742,9 +743,40 @@ class SubsystemWiring:
             self.data_miners, sink=self._ingest_mined_records,
             queue_depth=int(self.global_config.get("miner_queue_depth", 4096)),
             name="miners")
+        # The heavy half, in its own INTERPRETER rather than its own thread.
+        # A thread converts a multi-megabyte parse into interruptible slices;
+        # it still holds the GIL against the decision path. A process does
+        # not. The miners that move are the ones with no desk dependency,
+        # which -- from the desk's own report -- are also the expensive ones:
+        # venue_tickers 401 records a pass, regional_venues 331,
+        # jupiter_tokens 3,174.
+        #
+        # Off by default. It is a real behaviour change on a box with two
+        # vCPUs, and it should be turned on against a measured p99 rather
+        # than on the assumption that isolation is free.
+        self.context_offload: Optional[ProcessOffloadedPool] = None
+        if bool(self.global_config.get("offload_context_miners", False)):
+            self.context_offload = self._optional(
+                "context miner process", lambda: None,
+                lambda: ProcessOffloadedPool(
+                    "src.research.context_pool.build_context_pool",
+                    {"concurrency": int(self.global_config.get(
+                        "context_miner_concurrency", 4)),
+                     "search_terms": list(self.global_config.get(
+                         "context_search_terms", ("pump.fun", "solana"))),
+                     "youtube_key": os.getenv("YOUTUBE_API_KEY", ""),
+                     "github_token": os.getenv("GITHUB_TOKEN", "")},
+                    sink=self._ingest_mined_records,
+                    queue_depth=int(self.global_config.get(
+                        "miner_queue_depth", 4096)),
+                    affinity=tuple(self.global_config.get(
+                        "context_miner_cpus", ()) or ()),
+                    name="context"))
         if not self.offline:
             await self.dataset_builder.start()
             await self.global_research.start()
+            if self.context_offload is not None:
+                await self.context_offload.start()
             if bool(self.global_config.get("offload_miners", True)):
                 await self.miner_offload.start()
                 started = len(self.miner_registration)
