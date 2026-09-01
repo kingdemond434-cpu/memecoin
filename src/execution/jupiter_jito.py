@@ -1615,7 +1615,9 @@ class ExecutionEngine:
 
     def choose_bid(self, expected_value_usd: float, sol_price_usd: float,
                    fallback_lamports: int, congestion: Optional[float] = None,
-                   slot_value: Optional[Any] = None) -> Dict[str, Any]:
+                   slot_value: Optional[Any] = None,
+                   account_contention: Optional[int] = None,
+                   leader: str = "") -> Dict[str, Any]:
         """What to bid, from the landing curve where it can answer.
 
         The fallback ladder is used when the curve cannot, and the result says
@@ -1636,9 +1638,37 @@ class ExecutionEngine:
         urgency = ({"slot_value": slot_value.to_dict(), "raced_value_usd": raced}
                    if slot_value is not None and hasattr(slot_value, "to_dict")
                    else {"slot_value": None, "raced_value_usd": raced})
+        # Two conditioners the recommendation cannot see, applied only where
+        # each has been MEASURED. Both are reported so a bid can be explained
+        # afterwards rather than just observed.
+        conditioning: Dict[str, Any] = {}
         if recommendation.status == "OK":
-            return {"lamports": recommendation.bid_lamports, "measured": True,
-                    **urgency, **recommendation.to_dict()}
+            bid = int(recommendation.bid_lamports)
+            # Account-lock contention. Solana runs disjoint writers in
+            # parallel, but every sniper buying one new token writes the same
+            # bonding curve, so they serialise -- on a hot launch that queue,
+            # not the fee, decides who is first. Where the contended cell has
+            # its own measured landing rate, it replaces the pooled one.
+            contended = self.landing_model.contention_probability(
+                bid, account_contention)
+            if (contended.status == "OK" and contended.probability is not None
+                    and (contended.congestion or "").startswith("contention")):
+                conditioning["contention_p_land"] = contended.probability
+                conditioning["contention_bucket"] = contended.congestion
+                # A materially worse cell means the bid was priced against the
+                # wrong curve; scale it towards the harder one it faces.
+                base = recommendation.probability or contended.probability
+                if base > 0 and contended.probability < base:
+                    bid = int(bid * min(4.0, base / max(contended.probability, 1e-6)))
+                    conditioning["contention_scaled_bid"] = bid
+            effect = self.landing_model.leader_effect(leader) if leader else None
+            if effect is not None:
+                conditioning["leader_effect"] = round(effect, 4)
+                # A generous validator needs less to land; a stingy one more.
+                bid = int(bid / max(0.25, min(4.0, effect)))
+                conditioning["leader_scaled_bid"] = bid
+            return {"lamports": bid, "measured": True,
+                    **urgency, **conditioning, **recommendation.to_dict()}
         return {"lamports": int(fallback_lamports), "measured": False,
                 **urgency, **recommendation.to_dict()}
 
