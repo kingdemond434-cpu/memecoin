@@ -8,8 +8,27 @@ OnFailure=memecoin-health-escalate.service
 # will not fix, and hammering it buries the reason. These are [Unit]
 # directives -- under [Service] systemd silently ignores them, which is the
 # same way the health unit's OnFailure was disarmed without anyone noticing.
-StartLimitIntervalSec=60
-StartLimitBurst=5
+#
+# REVISED. The reasoning above is sound about not hammering and wrong about
+# what to do instead. With a burst limit, five failures inside a minute do
+# not slow the desk down -- they STOP it, permanently, until a human runs
+# `systemctl --user reset-failed`. For a shadow desk whose entire purpose is
+# accumulating forward evidence that cannot be backfilled, "stays down until
+# somebody notices" is the most expensive outcome available, and it is the
+# one this directive selects.
+#
+# So the rate limiter is disabled and the hammering is prevented by BACKOFF
+# instead: RestartSec starts at 5s and RestartSteps walks it up to
+# RestartMaxDelaySec. A desk with a transient fault recovers in seconds; a
+# desk with a real fault retries every few minutes forever, staying visible
+# in the journal and coming back by itself the moment the cause is fixed --
+# rather than sitting dead behind a state nobody checks.
+#
+# RestartSteps/RestartMaxDelaySec need systemd 254+. On anything older they
+# are ignored with a warning and RestartSec=5 applies, which is still
+# strictly better than stopping for good.
+StartLimitIntervalSec=0
+StartLimitBurst=0
 
 [Service]
 Type=notify
@@ -61,6 +80,8 @@ ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.main --dry-run
 # accumulates is the scarce thing here, not the CPU.
 Restart=always
 RestartSec=5
+RestartSteps=6
+RestartMaxDelaySec=300
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
