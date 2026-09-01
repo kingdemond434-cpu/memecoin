@@ -197,6 +197,20 @@ class SourceIntelligence:
         entries = self._actor_entries.setdefault(token, [])
         if len(entries) < self.buyer_dna.depth:
             entries.append(entry)
+        # A roster wallet entering is the only moment its decision can be
+        # captured point-in-time. Recorded here, on the live stream, because
+        # the follow verdict needs the price WE could have got after OUR
+        # delay -- an explorer can say what they paid, not what following
+        # them would have cost us.
+        observer = getattr(self, "observe_benchmark_entry", None)
+        if observer is not None:
+            try:
+                observer(token, entry.wallet, entry.timestamp,
+                         price=event.get("price"),
+                         launch_age_s=event.get("launch_age_s"),
+                         buyer_rank=len(entries))
+            except Exception as exc:  # pragma: no cover - measurement only
+                logger.debug("benchmark entry not recorded: %s", exc)
         for stale in [key for key in self._actor_entries
                       if key not in self.hot_state.active_tokens]:
             self._actor_entries.pop(stale, None)

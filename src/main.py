@@ -66,6 +66,7 @@ from src.runtime.maintenance import DeskMaintenance
 from src.runtime.wiring import SubsystemWiring
 from src.runtime.source_intelligence import SourceIntelligence
 from src.runtime.loop_local import loop_local_semaphore
+from src.runtime.position_forensics import PositionForensics
 from src.runtime.offload import OffloadedPool, install_fast_event_loop
 from src.runtime.sd_notify import SystemdNotifier, watchdog_interval_s
 from src.runtime.memory_governor import (
@@ -152,6 +153,7 @@ from src.strategies.social_intelligence import SocialIntelligenceEngine
 from src.strategies.wallet_intelligence import WalletIntelligenceEngine
 from src.strategies.wallet_value import FollowOutcome
 from src.strategies.t0_kernel import SurvivalInputs
+from src.execution.exit_readiness import MODE_RECYCLER
 from src.strategies.cohort_lifecycle import evaluate_cohorts
 from src.strategies.funder_ancestry import compress_independence
 from src.execution.staged_exits import StagedExits
@@ -184,7 +186,7 @@ CAPACITY_REJECTIONS = frozenset({
 
 class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
                        DeskMaintenance, TaskSupervision, EvidenceRecording,
-                       SubsystemWiring, SourceIntelligence):
+                       SubsystemWiring, SourceIntelligence, PositionForensics):
     def __init__(self, config_path: str = "config/chains.yaml", *, dry_run_override: Optional[bool] = None,
                  offline: bool = False):
         self.config_path = config_path
@@ -1157,6 +1159,13 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         staged = self._stage_exits(token, position)
         if staged is not None:
             position["staged_exits"] = staged.detail
+        # Prove it, with a number. "We build the sell early" is a claim, and
+        # the only version worth having is one that fails loudly when it
+        # stops being true -- an exit slower than its entry is a position
+        # that discovers its own accounts while a rug is happening.
+        prover = getattr(self, "_record_exit_readiness", None)
+        if prover is not None:
+            prover(token, position, staged)
         if self.reentry_book.get(token) is not None:
             # Counted only on a fill, not on admission: the next re-entry into
             # this token has to clear a strictly higher bar, and a bar that
@@ -1523,6 +1532,16 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             return
         multiple, current_value = marked
         position["high_water_multiple"] = max(float(position.get("high_water_multiple", 1)), multiple)
+        # The other half of the excursion. Without it MAE is always 1.0 and
+        # every entry state looks equally safe -- which is the failure the
+        # excursion ledger exists to prevent.
+        position["low_water_multiple"] = min(
+            float(position.get("low_water_multiple", multiple)), multiple)
+        # Every mark also prices what following a roster wallet into this
+        # token would have cost, at each delay it is now old enough to fill.
+        marker_delays = getattr(self, "mark_benchmark_delays", None)
+        if marker_delays is not None:
+            marker_delays(token, time.time(), current_value)
         # The chart high above, and separately the best mark this position
         # could actually have SOLD at. They are not the same number, and
         # training on the first is how a model learns to predict peaks nobody
@@ -1610,7 +1629,31 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         position["ratchet"] = ({"status": "OK", "reason": decision[0],
                                 "exit_pct": decision[1]} if decision
                                else {"status": "OK", "reason": "no threshold reached"})
-        if decision and self.monster_machine.overrides_ordinary_exit(token):
+        # What the opening cohort has already shown. Used ASYMMETRICALLY and
+        # only here: cohort evidence may VETO a hold, never create one.
+        #
+        # The monster machine suppresses a bank when its calibrated
+        # probability says this is the rare position worth riding. That is
+        # the right call on the model's evidence, and it is made before
+        # anyone has watched what the cohort did next. If the opening cohort
+        # has since distributed into buyers related to the sellers, or into
+        # late chasers while the skilled wallets left, the suppression is
+        # holding through the distribution rather than through the run.
+        #
+        # Letting the cohort force a HOLD would be the dangerous direction --
+        # it would create conviction from circumstantial evidence. Letting it
+        # cancel one only ever banks a position the ratchet had already
+        # decided to bank.
+        chooser = getattr(self, "_exit_mode", None)
+        mode = chooser(token, position) if chooser is not None else None
+        if decision and mode == MODE_RECYCLER and self.monster_machine.overrides_ordinary_exit(token):
+            logger.info("COHORT VETO %s: monster hold suppressed %s, but the "
+                        "cohort reads FAST_RECYCLER (%s); banking",
+                        token, decision[0],
+                        "; ".join(position.get("exit_mode_reasons", ())) or "no absorption")
+            position.setdefault("cohort_vetoes", []).append(
+                {"reason": decision[0], "at": time.time()})
+        elif decision and self.monster_machine.overrides_ordinary_exit(token):
             # A ratchet banks harder the higher a position goes, which is
             # right for ordinary winners and exactly wrong for the rare one
             # that would carry the account: it sells that one first and
@@ -3362,6 +3405,21 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
                 hazard_at_exit=(float(hazard_state.hazard_30s)
                                 if hazard_state is not None else None),
             )
+            # What this position actually put the desk through, on
+            # executable marks. Win rate cannot see it, and an entry that
+            # wins often by risking 40% to make 10% is worse than one that
+            # wins less while never drawing down 5%.
+            recorder = getattr(self, "_record_excursion", None)
+            if recorder is not None:
+                recorder(position)
+            # A resolved launch resolves every roster decision on it. Without
+            # this the corpus fills with open rows and the follow verdict
+            # stays DATA_BLOCKED for ever, which is the shape of a miner
+            # that collects and never concludes.
+            resolver = getattr(self, "resolve_benchmark_decisions", None)
+            if resolver is not None:
+                resolver(token, time.time(),
+                         float(position.get("last_price", 0.0) or 0.0))
             mechanism = str(position.get("sleeve", "t0_sniper"))
             self._mechanism_growth.setdefault(mechanism, []).append(
                 math.log(max(1e-9, 1.0 + pnl / max(self.wallet_equity_usd, 1e-9))))
@@ -3536,6 +3594,7 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         self._resolve_follow_candidates()
         self._refresh_independence()
         self._refresh_cohorts()
+        self._promote_benchmark_candidates()
         self._publish_attribution()
         if self.dry_run:
             latest_mtime = self._latest_model_mtime()
@@ -3551,6 +3610,34 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
                     self._register_model_validation(candidate.validation_report)
                     logger.info("Activated chronologically validated shadow model %s", candidate.model_version)
 
+    def _note_launch_venue(self, event: Dict[str, Any]) -> None:
+        """Credit the venue that emitted this launch, and verify it by use.
+
+        A launchpad program id is a hypothesis until this desk has watched
+        it decode cleanly. Every launch that arrives from a declared program
+        is one observation towards that, so coverage becomes something the
+        node PROVED rather than something a config file asserted.
+        """
+        registry = getattr(self, "launchpads", None)
+        if registry is None:
+            return
+        program = str(event.get("program", "") or "")
+        spec = registry.specs.get(program)
+        if spec is None:
+            return
+        from src.chains.launchpads import CanonicalLaunchEvent
+
+        observed = CanonicalLaunchEvent(
+            venue=spec.name, program_id=program,
+            mint=str(event.get("token", "") or ""),
+            creator=str(event.get("creator", "") or "") or None,
+            signature=str(event.get("signature", "") or ""),
+            slot=int(event.get("slot", 0) or 0),
+            observed_at=float(event.get("timestamp", 0) or time.time()),
+            instruction=str(event.get("instruction", "") or ""),
+            provisional=not spec.trusted)
+        registry.observe(observed)
+
     async def _on_pump_event(self, event: Dict[str, Any]):
         # Counted before anything can reject it, including the empty-token
         # guard below. "The stream is connected" and "the stream is delivering
@@ -3560,6 +3647,21 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         kind = str(event.get("type", "") or "unknown")
         self._stream_events[kind] = self._stream_events.get(kind, 0) + 1
         token = event.get("token", "")
+        # Which feed reached this box first. Every feed delivering the same
+        # launch calls this; only the first gets True and goes on to make a
+        # decision, the rest are the measurement. Duplicates are also the
+        # redundancy that makes one feed's outage a slower desk rather than
+        # a blind one.
+        race = getattr(self, "feed_race", None)
+        if race is not None and token and kind in {"token_created", "pool_created"}:
+            feed = str(event.get("feed", "") or event.get("source", "") or "yellowstone")
+            first = race.observe(
+                feed, f"{kind}:{token}",
+                at=float(event.get("received_at", 0) or 0) or None)
+            if not first:
+                self._stream_events[f"{kind}:duplicate_feed"] = (
+                    self._stream_events.get(f"{kind}:duplicate_feed", 0) + 1)
+                return
         if kind == "token_created" and token:
             # Opened on the first line the handler owns, so `receive_to_decode`
             # measures the monitor's decode and hand-off and nothing of ours.
@@ -3581,6 +3683,9 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
                 regime=str(self.current_regime or "unknown"))
             self.wallet_intel.record_token_lifecycle(token, launch_at=event.get("timestamp", time.time()))
             self._assess_identity(token, event)
+            noter = getattr(self, "_note_launch_venue", None)
+            if noter is not None:
+                noter(event)
             # Seed the curve at its protocol-defined starting depth. The
             # CreateEvent carries no reserves, so without this the desk is
             # blind at exactly T0 -- _local_liquidity returns 0 and liquidity
