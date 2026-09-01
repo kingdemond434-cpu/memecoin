@@ -82,6 +82,10 @@ REQUIRED_CALLS = {
     "latency value fed by resolved launches": (
         "ledger.observe_snapshots(", "src/research/dataset_builder.py"),
     "load shedding decides dispatch": ("self.load_shedder.admit(", "src/main.py"),
+    # A distillate nothing reads is a file. It has to reach the priors a
+    # decision under load actually ranks on.
+    "cold distillate loaded": ("ColdDistillate.load(", "src/runtime/wiring.py"),
+    "cold distillate consulted": ("cold.deployer_prior(", "src/runtime/ingestion.py"),
 }
 
 

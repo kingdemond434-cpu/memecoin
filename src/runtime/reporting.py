@@ -523,6 +523,12 @@ class ReportingSurface:
                            if getattr(self, "launchpads", None) is not None
                            else {"status": "DATA_BLOCKED"}),
             # Which inbound feed arrives first, and which one sees everything.
+            "cold_distillate": (
+                self.cold_distillate.report()
+                if getattr(self, "cold_distillate", None) is not None
+                else {"status": "DATA_BLOCKED",
+                      "reason": "no distilled history on this box; run "
+                                "tools/distil_history.py to build one"}),
             "latency_value": (
                 self.latency_value.report()
                 if getattr(self, "latency_value", None) is not None

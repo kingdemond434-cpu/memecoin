@@ -105,6 +105,7 @@ from src.chains.launchpads import LaunchpadRegistry
 from src.execution.exit_readiness import (
     ExcursionLedger, ExitReadinessLedger, choose_exit_mode)
 from src.runtime.feed_race import FeedRace
+from src.research.cold_distillation import ColdDistillate
 from src.research.latency_value import LatencyValueLedger
 from src.runtime.load_shedding import EconomicLoadShedder
 from src.chains.native_ingress import NativeIngress
@@ -579,6 +580,21 @@ class SubsystemWiring:
         # Under a burst the desk cannot look at every launch, and which ones
         # it drops is a decision rather than a queue discipline. See
         # src/runtime/load_shedding.py.
+        # Years of the chain, compressed to a lookup a T0 decision can
+        # afford. Absent on a fresh box, which is the honest state: a
+        # deployer nobody has history for is unknown, not safe.
+        self.cold_distillate = ColdDistillate.load(
+            Path(self.global_config.get("ops_state_dir", "data/state"))
+            / "cold_distillate.json")
+        if self.cold_distillate is not None:
+            logger.info(
+                "COLD DISTILLATE loaded: %d deployers (%d with a rate), "
+                "%d funders, covering to %s",
+                len(self.cold_distillate.deployers),
+                sum(1 for dna in self.cold_distillate.deployers.values()
+                    if dna.measurable),
+                len(self.cold_distillate.funders),
+                self.cold_distillate.covers_until)
         # Everything done for speed has been done on the belief that earlier
         # is better. That belief has never been priced, and the answer
         # decides whether the next month goes to latency or to alpha.

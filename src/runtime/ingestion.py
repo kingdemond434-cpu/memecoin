@@ -138,6 +138,27 @@ class MinedRecordIngestion:
         deployer = candidate.deployer or ""
         features: Dict[str, Any] = {}
         if deployer:
+            # The cold prior first: on a fresh box the desk has scored
+            # nobody, so without this every deployer is unknown and the
+            # ranking under load has nothing to rank on. A creator whose
+            # previous nineteen tokens all rugged inside a minute is exactly
+            # the launch a burst should shed.
+            cold = getattr(self, "cold_distillate", None)
+            if cold is not None:
+                prior = cold.deployer_prior(deployer)
+                if prior is not None and prior.get("status") == "OK":
+                    features["cold_deployer_prior"] = prior
+                    features["deployer_launches"] = prior.get("launches", 0)
+                    # Rug rate against the ran rate, on the same scale the
+                    # live score uses, so the two are combinable rather than
+                    # two units pretending to be one.
+                    # Ran rate against COLLAPSE rate, not rug rate: a
+                    # reconstruction cannot see who pushed a price to zero,
+                    # so its rug rate is usually absent and using collapses
+                    # states what was actually observed.
+                    features["deployer_score"] = (
+                        float(prior.get("ran_rate", 0.0) or 0.0)
+                        - float(prior.get("collapse_rate", 0.0) or 0.0))
             try:
                 scored = self.wallet_intel.get_wallet_score(deployer)
             except Exception:
@@ -147,6 +168,10 @@ class MinedRecordIngestion:
                 # is worth a slot LESS than an unknown one rather than the
                 # same -- which is the whole difference between ranking and
                 # merely filtering.
+                #
+                # OVERRIDES the cold prior where both exist. What the desk
+                # observed itself is not systematically flattered by
+                # survivorship, latency or depth; a reconstruction is.
                 features["deployer_score"] = (
                     float(scored.overall_score) - 0.5) * 2.0
             try:
