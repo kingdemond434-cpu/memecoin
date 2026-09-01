@@ -192,7 +192,7 @@ class ADyingChildIsNotRespawnedInATightLoop(unittest.TestCase):
         pool = ProcessOffloadedPool(FACTORY, {}, sink=lambda *_: None, name="ok")
         pool._running = True
         pool.consecutive_failures = 3
-        pool.delivered = 10
+        pool.delivered_this_generation = 10
 
         class _Live:
             exitcode = None
@@ -203,3 +203,54 @@ class ADyingChildIsNotRespawnedInATightLoop(unittest.TestCase):
         pool._process = _Live()
         pool._supervise()
         self.assertEqual(0, pool.consecutive_failures)
+
+    def test_an_earlier_generation_does_not_absolve_the_current_one(self):
+        """The pool's lifetime total is not evidence about THIS child.
+
+        Forgiving on `delivered` meant a first generation that ran for an
+        hour absolved every crash after it: the reset fired on any tick where
+        the newest child was still alive, `consecutive_failures` never
+        climbed, and the give-up point was unreachable. A child dying at
+        import was then respawned for ever, burying the reason under
+        identical tracebacks -- which is the failure this backoff exists to
+        prevent, reintroduced by the forgiveness rule.
+        """
+        pool = ProcessOffloadedPool(FACTORY, {}, sink=lambda *_: None, name="ok")
+        pool._running = True
+        pool.consecutive_failures = 3
+        pool.delivered = 10_000          # an earlier generation was healthy
+        pool.delivered_this_generation = 0
+
+        class _Live:
+            exitcode = None
+
+            def is_alive(self):
+                return True
+
+        pool._process = _Live()
+        pool._supervise()
+        self.assertEqual(3, pool.consecutive_failures)
+
+    def test_a_reader_retires_when_its_child_is_replaced(self):
+        """A reader is bound to the child it was started for.
+
+        Reading `self._queue` afresh each pass meant the old thread outlived
+        its child and then competed with the new reader for the NEW child's
+        records -- one leaked thread per restart, and one stream split
+        between two consumers.
+        """
+        import queue as queue_module
+        import threading
+
+        pool = ProcessOffloadedPool(FACTORY, {}, sink=lambda *_: None, name="ok")
+        pool._running = True
+        pool._generation = 1
+        old_queue = queue_module.Queue()
+        thread = threading.Thread(
+            target=pool._read_forever, args=(1, old_queue), daemon=True)
+        thread.start()
+        # The child is replaced.
+        pool._generation = 2
+        thread.join(timeout=3.0)
+        self.assertFalse(thread.is_alive(),
+                         "the reader for a retired child never exited")

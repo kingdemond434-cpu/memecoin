@@ -151,6 +151,18 @@ class ProcessOffloadedPool:
         self._running = False
         self.enqueued = 0
         self.delivered = 0
+        # Per-CHILD, not per-pool. `delivered` is cumulative for the life of
+        # the process, so forgiving failures on it meant a generation that
+        # once worked absolved every generation after it: a child dying at
+        # import was respawned for ever, because the reset ran on any tick
+        # where the newest child happened to still be alive.
+        self.delivered_this_generation = 0
+        # Bumped on every spawn. A reader thread checks it and exits when its
+        # own generation is superseded -- without this the old thread stayed
+        # in its loop, resolved `self._queue` afresh each pass, and started
+        # competing with the new reader for the NEW child's records, leaking
+        # one thread per restart.
+        self._generation = 0
         self.dropped = 0
         self.sink_errors = 0
         self.restarts = 0
@@ -172,33 +184,45 @@ class ProcessOffloadedPool:
         self._drainer = asyncio.create_task(self._drain_loop())
 
     def _spawn(self) -> None:
-        self._queue = self._ctx.Queue(maxsize=self.queue_depth)
+        self._generation += 1
+        generation = self._generation
+        self.delivered_this_generation = 0
+        child_queue = self._ctx.Queue(maxsize=self.queue_depth)
+        self._queue = child_queue
         self._stop = self._ctx.Event()
         self._process = self._ctx.Process(
             target=_child_main,
-            args=(self.factory_path, self.config, self._queue, self._stop,
+            args=(self.factory_path, self.config, child_queue, self._stop,
                   self.affinity),
             name=f"offload-{self.name}", daemon=True)
         self._process.start()
+        # The queue is passed to the thread rather than read off `self`, so a
+        # reader is bound for life to the child it was started for.
         self._reader = threading.Thread(
-            target=self._read_forever, name=f"offload-reader-{self.name}",
-            daemon=True)
+            target=self._read_forever, args=(generation, child_queue),
+            name=f"offload-reader-{self.name}-{generation}", daemon=True)
         self._reader.start()
         logger.info("PROCESS OFFLOAD %s running as pid %s%s", self.name,
                     self._process.pid,
                     f" pinned to CPU {list(self.affinity)}" if self.affinity else "")
 
-    def _read_forever(self) -> None:
-        """Moves records off the pipe. Its own thread, because mp.Queue blocks.
+    def _read_forever(self, generation: int, child_queue: Any) -> None:
+        """Moves records off ONE child's pipe. Its own thread, because
+        mp.Queue blocks.
 
         A blocking read on the main loop would reintroduce exactly the stall
         this class exists to remove, so the block happens on a thread that
         does nothing else and holds the GIL only long enough to hand the
         record on.
+
+        Bound to its generation and to its own queue object. Reading
+        `self._queue` each pass meant a reader outlived its child and then
+        started taking records from the child that replaced it, so two
+        threads split one stream and one thread leaked per restart.
         """
-        while self._running:
+        while self._running and generation == self._generation:
             try:
-                item = self._queue.get(timeout=0.5)
+                item = child_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
             except (OSError, ValueError, EOFError):
@@ -244,6 +268,7 @@ class ProcessOffloadedPool:
             try:
                 self.sink(miner_id, records)
                 self.delivered += 1
+                self.delivered_this_generation += 1
                 self.last_delivery_at = time.time()
             except Exception as exc:
                 self.sink_errors += 1
@@ -266,8 +291,12 @@ class ProcessOffloadedPool:
         if not self._running or self._process is None or self.gave_up:
             return
         if self._process.is_alive():
-            # A child that has produced records is healthy; forgive the past.
-            if self.delivered:
+            # THIS child having produced records is what makes it healthy.
+            # Checking the pool's lifetime total instead let a long-lived
+            # first generation absolve every crash after it, so the give-up
+            # point was unreachable and a child dying at import was respawned
+            # for ever.
+            if self.delivered_this_generation:
                 self.consecutive_failures = 0
             return
         now = time.time()
@@ -297,6 +326,8 @@ class ProcessOffloadedPool:
 
     async def stop(self) -> None:
         self._running = False
+        # Retires every reader, including any that has not noticed yet.
+        self._generation += 1
         if self._drainer is not None:
             self._drainer.cancel()
             try:
@@ -349,6 +380,8 @@ class ProcessOffloadedPool:
             "queue_capacity": self.queue_depth,
             "enqueued": self.enqueued,
             "delivered": self.delivered,
+            "delivered_this_generation": self.delivered_this_generation,
+            "generation": self._generation,
             "dropped": self.dropped,
             "sink_errors": self.sink_errors,
             "child_error": self.child_error,
