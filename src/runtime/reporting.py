@@ -495,6 +495,12 @@ class ReportingSurface:
                 self.benchmark_corpus.report()
                 if getattr(self, "benchmark_corpus", None) is not None
                 else {"status": "DATA_BLOCKED"}),
+            # The chain receive path in Rust, and whether it has yet
+            # matched the Python client it runs beside.
+            "native_ingress": (
+                self.native_ingress.report()
+                if getattr(self, "native_ingress", None) is not None
+                else {"status": "OFF"}),
             # The heavy miners in their own interpreter. OFF is a real and
             # common state: it is a behaviour change on a two-vCPU box and
             # should be turned on against a measured p99.

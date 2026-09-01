@@ -11,6 +11,8 @@ pub mod filter;
 pub mod generated_flags;
 pub mod helpers;
 pub mod inference;
+#[cfg(feature = "ingress")]
+pub mod ingress;
 pub mod instruction;
 pub mod message;
 pub mod policy;

@@ -813,6 +813,8 @@ fn solana_fastpath(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(pumpswap_account_list_status, module)?)?;
     module.add_function(wrap_pyfunction!(b58encode, module)?)?;
     module.add_function(wrap_pyfunction!(b58decode, module)?)?;
+    #[cfg(feature = "ingress")]
+    module.add_class::<ingress_binding::NativeIngress>()?;
     module.add_function(wrap_pyfunction!(anchor_discriminator, module)?)?;
     module.add_function(wrap_pyfunction!(hazard_predict, module)?)?;
     module.add_function(wrap_pyfunction!(decode_pump_event, module)?)?;
@@ -831,4 +833,166 @@ fn solana_fastpath(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(build_signed_transaction, module)?)?;
     module.add("IMPLEMENTATION", "rust-pyo3-abi3")?;
     Ok(())
+}
+
+// --- native Yellowstone ingress -----------------------------------------
+//
+// Exposed as a DRAIN rather than a callback. A callback per transaction would
+// put us back where we started: the GIL taken thousands of times a second to
+// hand over objects the desk mostly discards. Python asks for a batch of what
+// already survived the filter, and gets tuples of primitives.
+
+#[cfg(feature = "ingress")]
+mod ingress_binding {
+    use super::*;
+    use pyo3::exceptions::{PyRuntimeError, PyValueError};
+    use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
+    use pyo3::IntoPyObject;
+    use crate::ingress::{run, Sink};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    #[pyclass(module = "solana_fastpath")]
+    pub struct NativeIngress {
+        sink: Arc<Sink>,
+        runtime: Option<tokio::runtime::Runtime>,
+        endpoint: String,
+    }
+
+    #[pymethods]
+    impl NativeIngress {
+        #[new]
+        #[pyo3(signature = (endpoint, token=None, capacity=8192, seen_capacity=65536))]
+        fn new(
+            endpoint: String,
+            token: Option<String>,
+            capacity: usize,
+            seen_capacity: usize,
+        ) -> PyResult<Self> {
+            let _ = token;
+            Ok(Self {
+                sink: Arc::new(Sink::new(capacity, seen_capacity)),
+                runtime: None,
+                endpoint,
+            })
+        }
+
+        /// Begin receiving. Programs are base58, as the desk already holds them.
+        #[pyo3(signature = (programs, token=None, worker_threads=1))]
+        fn start(
+            &mut self,
+            programs: Vec<String>,
+            token: Option<String>,
+            worker_threads: usize,
+        ) -> PyResult<()> {
+            if self.runtime.is_some() {
+                return Ok(());
+            }
+            let mut keys: Vec<[u8; 32]> = Vec::with_capacity(programs.len());
+            for program in &programs {
+                let raw = bs58::decode(program)
+                    .into_vec()
+                    .map_err(|e| PyValueError::new_err(format!("bad program id: {e}")))?;
+                if raw.len() != 32 {
+                    return Err(PyValueError::new_err(format!(
+                        "program id {program} decoded to {} bytes, not 32",
+                        raw.len()
+                    )));
+                }
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&raw);
+                keys.push(key);
+            }
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(worker_threads.max(1))
+                .enable_all()
+                .thread_name("fastpath-ingress")
+                .build()
+                .map_err(|e| PyRuntimeError::new_err(format!("runtime: {e}")))?;
+            self.sink.running.store(true, Ordering::Relaxed);
+            let sink = Arc::clone(&self.sink);
+            let endpoint = self.endpoint.clone();
+            runtime.spawn(async move { run(endpoint, token, keys, sink).await });
+            self.runtime = Some(runtime);
+            Ok(())
+        }
+
+        /// Up to `max` matched events, as tuples of primitives.
+        ///
+        /// Pubkeys come back as BYTES. Base58 is a division loop and a fresh
+        /// allocation per key, and a transaction carries dozens; the desk
+        /// encodes only the handful it acts on.
+        #[pyo3(signature = (max=256))]
+        fn drain<'py>(&self, py: Python<'py>, max: usize) -> PyResult<Vec<Bound<'py, PyAny>>> {
+            let events = py.allow_threads(|| self.sink.drain(max));
+            let mut out = Vec::with_capacity(events.len());
+            for event in events {
+                let accounts: Vec<Bound<'py, PyAny>> = event
+                    .accounts
+                    .iter()
+                    .map(|key| PyBytes::new(py, key).into_any())
+                    .collect();
+                let tuple = PyTuple::new(
+                    py,
+                    [
+                        PyBytes::new(py, &event.signature).into_any(),
+                        PyBytes::new(py, &event.program).into_any(),
+                        PyBytes::new(py, &event.discriminator).into_any(),
+                        PyBytes::new(py, &event.fee_payer).into_any(),
+                        PyBytes::new(py, &event.data).into_any(),
+                        PyList::new(py, accounts)?.into_any(),
+                        event.slot.into_pyobject(py)?.into_any(),
+                        (event.received_ns as u64).into_pyobject(py)?.into_any(),
+                        event.is_vote.into_pyobject(py)?.to_owned().into_any(),
+                    ],
+                )?;
+                out.push(tuple.into_any());
+            }
+            Ok(out)
+        }
+
+        fn stop(&mut self) {
+            self.sink.running.store(false, Ordering::Relaxed);
+            if let Some(runtime) = self.runtime.take() {
+                runtime.shutdown_background();
+            }
+        }
+
+        fn report<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+            let stats = &self.sink.stats;
+            let dict = PyDict::new(py);
+            dict.set_item("schema", "v1")?;
+            dict.set_item("running", self.sink.running.load(Ordering::Relaxed))?;
+            dict.set_item("endpoint_host", host_of(&self.endpoint))?;
+            dict.set_item("updates", stats.updates.load(Ordering::Relaxed))?;
+            dict.set_item("transactions", stats.transactions.load(Ordering::Relaxed))?;
+            dict.set_item("matched", stats.matched.load(Ordering::Relaxed))?;
+            dict.set_item("duplicates", stats.duplicates.load(Ordering::Relaxed))?;
+            dict.set_item("dropped", stats.dropped.load(Ordering::Relaxed))?;
+            dict.set_item("delivered", stats.delivered.load(Ordering::Relaxed))?;
+            dict.set_item("reconnects", stats.reconnects.load(Ordering::Relaxed))?;
+            dict.set_item("queue_depth", self.sink.depth())?;
+            dict.set_item(
+                "last_error",
+                self.sink.last_error.lock().unwrap().clone(),
+            )?;
+            Ok(dict)
+        }
+    }
+
+    /// Host only. An endpoint carries a token in some deployments and this
+    /// value is reported; the rest of it is not ours to print.
+    fn host_of(endpoint: &str) -> String {
+        endpoint
+            .split("://")
+            .last()
+            .unwrap_or("")
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .split('@')
+            .last()
+            .unwrap_or("")
+            .to_string()
+    }
 }

@@ -39,6 +39,12 @@ REQUIRED_CALLS = {
     "benchmark discovery": ("_promote_benchmark_candidates(", "src/main.py"),
     "process-isolated miners": ("ProcessOffloadedPool(", "src/runtime/wiring.py"),
     "binary signer transport": ("self._frame(", "src/execution/signer.py"),
+    # Constructed AND started AND fed. Requiring only construction is what
+    # let this one ship reporting OFF with no reason: it existed, appeared in
+    # /status, and nothing ever called start().
+    "native chain ingress": ("NativeIngress(", "src/runtime/wiring.py"),
+    "native ingress started": ("ingress.start()", "src/runtime/wiring.py"),
+    "native ingress parity fed": ("note_python_event(", "src/main.py"),
 }
 
 

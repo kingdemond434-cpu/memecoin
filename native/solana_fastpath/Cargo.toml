@@ -16,6 +16,22 @@ ed25519-dalek = { version = "2", default-features = false, features = ["fast"] }
 base64 = "0.22"
 zeroize = "1"
 
+# --- native ingress (optional) ----------------------------------------
+# Off by default. The Python grpc.aio client remains the reference
+# implementation and the parity target; this is the fast path, and it has to
+# earn its place against that reference rather than replace it on assertion.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"], optional = true }
+tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"], optional = true }
+tonic-prost = { version = "0.14", optional = true }
+prost = { version = "0.14", optional = true }
+prost-types = { version = "0.14", optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[build-dependencies]
+tonic-prost-build = { version = "0.14", optional = true }
+prost = { version = "0.14", optional = true }
+prost-types = { version = "0.14", optional = true }
+
 [features]
 # On by default so `maturin build` and `pip install .` produce a working
 # extension without extra flags.
@@ -26,3 +42,10 @@ default = ["python"]
 # exercises all the pricing, decoding and construction logic with no Python in
 # the picture at all, which is where that logic belongs anyway.
 python = ["dep:pyo3", "pyo3/extension-module"]
+# The native Yellowstone receiver. Separate from `python` so the decoding and
+# pricing logic can still be tested with no Python and no network in the
+# picture, and so a build that does not want a gRPC stack does not pay for one.
+ingress = [
+    "dep:tokio", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:prost-types",
+    "dep:futures-util", "dep:tonic-prost-build",
+]
