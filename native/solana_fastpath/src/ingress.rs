@@ -328,14 +328,35 @@ async fn connect_and_stream(
 ) -> Result<(), String> {
     use pb::geyser_client::GeyserClient;
 
-    let uri = endpoint.to_string();
-    let channel = tonic::transport::Endpoint::from_shared(uri)
-        .map_err(|e| format!("bad endpoint: {e}"))?
+    // A scheme is required. `host:port` alone parses as a URI with the host
+    // in the PATH and no authority, and tonic then fails to connect to
+    // something that looks superficially fine in the error message.
+    let uri = if endpoint.contains("://") {
+        endpoint.to_string()
+    } else {
+        format!("https://{endpoint}")
+    };
+    let secure = uri.starts_with("https://");
+    let mut builder = tonic::transport::Endpoint::from_shared(uri.clone())
+        .map_err(|e| format!("bad endpoint {uri}: {e}"))?
         .tcp_nodelay(true)
         .http2_adaptive_window(true)
+        .connect_timeout(std::time::Duration::from_secs(10));
+    if secure {
+        // Explicit, because tonic does NOT infer TLS from the scheme. An
+        // https:// endpoint without this fails with a bare "transport
+        // error" that says nothing about the cause -- which is exactly how
+        // this shipped reconnecting six times against a healthy public
+        // endpoint the Python client was streaming from.
+        let tls = tonic::transport::ClientTlsConfig::new().with_native_roots();
+        builder = builder
+            .tls_config(tls)
+            .map_err(|e| format!("tls: {e}"))?;
+    }
+    let channel = builder
         .connect()
         .await
-        .map_err(|e| format!("connect: {e}"))?;
+        .map_err(|e| format!("connect to {uri}: {e}"))?;
 
     let owned_token = token.map(|value| value.to_string());
     let mut client = GeyserClient::with_interceptor(
