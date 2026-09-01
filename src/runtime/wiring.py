@@ -100,6 +100,10 @@ from src.strategies.rug_hazard import ContinuousRugHazardModel
 from src.strategies.social_intelligence import SocialIntelligenceEngine
 from src.strategies.wallet_intelligence import WalletIntelligenceEngine
 from src.strategies.t0_kernel import SurvivalInputs, T0Kernel
+from src.chains.launchpads import LaunchpadRegistry
+from src.execution.exit_readiness import (
+    ExcursionLedger, ExitReadinessLedger, choose_exit_mode)
+from src.runtime.feed_race import FeedRace
 from src.research.benchmark_wallets import BenchmarkCorpus, load_roster
 from src.strategies.cohort_lifecycle import evaluate_cohorts
 from src.strategies.funder_ancestry import FunderAncestry, compress_independence
@@ -443,6 +447,17 @@ class SubsystemWiring:
         self.temporal_discounts: Dict[str, float] = {}
         self.exchange_withdrawals: List[Withdrawal] = []
         self.exchange_rates: Dict[str, float] = {}
+        # Every launchpad normalises to one launch event. Programs start as
+        # HYPOTHESES and are promoted only by decoding cleanly on this node,
+        # so coverage reports what was seen rather than what was hoped for.
+        self.launchpads = LaunchpadRegistry()
+        # Which feed reaches this box first, measured. Coverage outranks
+        # speed: a feed that misses events is blind on them, not slow.
+        self.feed_race = FeedRace()
+        # The sell must exist before it is needed, and be proven to.
+        self.exit_readiness = ExitReadinessLedger()
+        # MFE:MAE per entry state -- what win rate cannot see.
+        self.excursions = ExcursionLedger()
         # Public wallets worth reconstructing, and what FOLLOWING them costs.
         # Headline PnL is recorded as a claim here and never scored.
         self.benchmark_corpus = load_roster(
