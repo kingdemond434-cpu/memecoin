@@ -495,31 +495,24 @@ class ReportingSurface:
                 self.benchmark_corpus.report()
                 if getattr(self, "benchmark_corpus", None) is not None
                 else {"status": "DATA_BLOCKED"}),
-            # What the opening cohort did after its fill, per held token.
-            "cohorts": {
-                token: report.report()
-                for token, report in sorted(
-                    getattr(self, "cohort_reports", {}).items())},
-            # Coordination an exchange withdrawal was used to hide. Reports
-            # its own denominator: without measured emission rates there are
-            # no clusters, and that is a finding rather than a clean slate.
-            "temporal_funding": {
-                "status": ("OK" if getattr(self, "temporal_clusters", None)
-                           else "DATA_BLOCKED"),
-                "clusters": len([c for c in getattr(self, "temporal_clusters", ())
-                                 if getattr(c, "status", "") == "OK"]),
-                "wallets_discounted": len(getattr(self, "temporal_discounts", {})),
-                "sources_rated": len(getattr(self, "exchange_rates", {})),
-                "detail": ("no exchange emission rates measured yet; a cluster "
-                           "scored without one would flag every busy exchange"
-                           if not getattr(self, "exchange_rates", {}) else ""),
-            },
-            # Public wallets under reconstruction, scored by what FOLLOWING
-            # them would return -- never by their headline PnL.
-            "benchmark_wallets": (
-                self.benchmark_corpus.report()
-                if getattr(self, "benchmark_corpus", None) is not None
-                else {"status": "DATA_BLOCKED"}),
+            # Launch venues, and which of them this node has PROVEN it can
+            # decode. A declared program that never matches shows up here as
+            # a venue stuck at zero rather than as silent absence.
+            "launchpads": (self.launchpads.report()
+                           if getattr(self, "launchpads", None) is not None
+                           else {"status": "DATA_BLOCKED"}),
+            # Which inbound feed arrives first, and which one sees everything.
+            "feed_race": (self.feed_race.report()
+                          if getattr(self, "feed_race", None) is not None
+                          else {"status": "DATA_BLOCKED"}),
+            # Proof the exit was ready before it was needed.
+            "exit_readiness": (self.exit_readiness.report()
+                               if getattr(self, "exit_readiness", None) is not None
+                               else {"status": "DATA_BLOCKED"}),
+            # MFE:MAE per entry state -- what win rate cannot see.
+            "excursions": (self.excursions.report()
+                           if getattr(self, "excursions", None) is not None
+                           else {"status": "DATA_BLOCKED"}),
             # Independent landing MECHANISMS, and which ones actually land.
             # Seven Jito regions is one mechanism; a router reporting one
             # mechanism has the redundancy of having none.
@@ -528,7 +521,6 @@ class ReportingSurface:
                                is not None else
                                {"status": "DATA_BLOCKED",
                                 "detail": "no execution engine yet"}),
-            "event_loop": os.getenv("MEMECOIN_EVENT_LOOP", "unmeasured"),
             "miner_offload": (self.miner_offload.report()
                               if self.miner_offload is not None
                               else {"status": "OFF",
@@ -605,6 +597,11 @@ class ReportingSurface:
             # A queue silently shedding work looks exactly like a quiet market,
             # so both drop counters are surfaced rather than only logged.
             "event_loop": {
+                # Folded in here because it was a SECOND "event_loop" key in
+                # this same dict literal and Python kept the later one, so
+                # the loop implementation has never once reached /status --
+                # the one field that says whether uvloop is actually in use.
+                "implementation": os.getenv("MEMECOIN_EVENT_LOOP", "unmeasured"),
                 "redecision_queued": self._redecide.qsize(),
                 "redecision_drops": self._redecision_drops,
                 "candidate_drops": self._candidate_drops,

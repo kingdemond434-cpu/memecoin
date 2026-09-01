@@ -1296,6 +1296,15 @@ class ExecutionEngine:
             compute_units=int(compute_unit_limit or 0),
             tip_lamports=int(jito_tip if use_jito else 0),
             blockhash_age_slots=self.tx_builder.last_blockhash_age_slots,
+            # How many others wrote the SAME writable accounts in the slot we
+            # targeted. Solana runs disjoint writers in parallel, but every
+            # sniper buying one new token writes the same bonding curve, so
+            # they serialise -- and on a hot launch that queue, not the fee,
+            # is what decides who is first. None when the fill did not carry
+            # it: unmeasured contention is not zero contention.
+            account_contention=(int(fill["account_contention"])
+                                if fill.get("account_contention") is not None
+                                else None),
             slot_value=(float(getattr(slot_value, "decay_per_slot", 0.0))
                         if slot_value is not None else None),
             # Paper and real fills must never share a curve: one of them

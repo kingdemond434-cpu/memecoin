@@ -574,8 +574,10 @@ class WalletIntelligenceEngine:
             proceeds = normalized["base_value"] * matched / max(total_sold, 1e-12)
             closed.append({
                 "token": token,
-                "entry_timestamp": first_entry,
                 "timestamp": normalized["timestamp"],
+                # The None-safe form. It was already the value that survived
+                # -- a repeated key keeps the LAST one -- so this is dead
+                # code removed, not behaviour changed.
                 "entry_timestamp": first_entry if first_entry is not None else normalized["timestamp"],
                 "multiple": proceeds / allocated_cost,
                 "realized_pnl": proceeds - allocated_cost,

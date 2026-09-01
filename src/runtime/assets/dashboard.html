@@ -390,6 +390,10 @@ code{font-family:var(--mono);font-size:11.5px;background:#0B0B11;border:1px soli
       <div class="phead"><h2>Signer</h2><div class="spacer"></div><span class="pill" id="sign-pill">—</span></div>
       <div class="pbody"><div class="feed" id="signer"></div></div>
     </section>
+    <section class="panel">
+      <div class="phead"><h2>ACTOR INTELLIGENCE V3</h2><span class="pill" id="actorv3-pill">—</span></div>
+      <div class="pbody"><div class="feed" id="actorv3"></div></div>
+    </section>
 
   </div>
 
@@ -751,6 +755,50 @@ function render(d){
     (num(cov.regions_proven)+" of "+num(cov.regions_declared)+" regions have actually returned a record; a declared region that never answers is configuration, not coverage.");
   pill($("sub-pill"),sub.status||"—",statusClass(sub.status));
 
+  /* actor intelligence V3 -- what the cohort did after its fill, who was
+     funded together out of one exchange, and whether following a famous
+     wallet would actually have paid. Empty until the desk has held a
+     position long enough to watch one, which is a real state and says so. */
+  const coh=d.cohorts||{},tf=d.temporal_funding||{},bw=d.benchmark_wallets||{};
+  const lp=d.launchpads||{},fr=d.feed_race||{},xr=d.exit_readiness||{};
+  const held=Object.keys(coh);
+  let absorbed=0,failed=0,captured=0;
+  held.forEach(t=>{const v=((coh[t]||{}).absorption||{}).verdict;
+    if(v==="ABSORBED")absorbed++;else if(v==="FAILED")failed++;
+    else if(v==="CAPTURED")captured++;});
+  const v3=[
+    ["cohorts watched",num(held.length),held.length?"s-ok":"s-blocked",
+     "positions whose opening cohort is being followed past its fill"],
+    ["absorbed",num(absorbed),absorbed?"s-ok":"s-blocked",
+     "independent demand took the cohort's supply and the price held"],
+    ["failed / captured",num(failed)+" / "+num(captured),
+     (failed||captured)?"s-warn":"s-blocked",
+     "supply not absorbed, or bought by wallets related to the sellers"],
+    ["exchange clusters",num(tf.clusters),tf.clusters?"s-warn":"s-blocked",
+     tf.detail||"wallets funded together out of one hot wallet, above its own rate"],
+    ["wallets discounted",num(tf.wallets_discounted),
+     tf.wallets_discounted?"s-warn":"s-blocked",
+     "independence cut for coordination an exchange withdrawal hid"],
+    ["launchpads proven",num(lp.verified)+" / "+num(lp.declared),
+     lp.verified?"s-ok":"s-blocked",
+     lp.detail||"a program is trusted only after it decodes cleanly here"],
+    ["feeds racing",num(fr.feeds),fr.feeds?"s-ok":"s-blocked",
+     "coverage outranks speed: a feed that misses events is blind, not slow"],
+    ["exit ready p95",xr.ready_p95_ms==null?"—":num(xr.ready_p95_ms)+"ms",
+     xr.status==="OK"?"s-ok":xr.status==="DEGRADED"?"s-warn":"s-blocked",
+     "an exit slower than its entry discovers its accounts during a rug"],
+    ["follow-verdicts",num(bw.measured)+" / "+num(bw.wallets),
+     bw.measured?"s-ok":"s-blocked",
+     "famous wallets scored by what FOLLOWING them returns, never by headline PnL"]
+  ];
+  const v3el=$("actorv3");
+  if(v3el) v3el.innerHTML=v3.map(([t,v,cls,note])=>
+    `<div class="fitem"><div class="ftime">${t}</div>
+     <div class="ftag" style="color:var(--${cls==="s-ok"?"ok":cls==="s-crit"?"crit":cls==="s-warn"?"warn":"blocked"})">${v}</div>
+     <div class="ftext">${note}</div></div>`).join("");
+  const v3pill=$("actorv3-pill");
+  if(v3pill) pill(v3pill,held.length?"WATCHING":"IDLE",held.length?"s-ok":"s-blocked");
+
   /* signer */
   const s=d.signer||{};
   const items=[
@@ -798,6 +846,17 @@ $("reset").addEventListener("click",()=>{
 async function poll(){
   try{
     const r=await fetch("/status",{cache:"no-store"});
+    /* 503 is not a failure. The desk binds its port BEFORE its subsystems
+       exist so a slow start is watchable, and answers 503 with the phase it
+       is on until it is ready. Treating that as an error showed a blank
+       terminal during the one window an operator most wants to see. */
+    if(r.status===503){
+      const boot=await r.json().catch(()=>({}));
+      $("msg").textContent="desk is starting — phase: "+(boot.phase||"unknown")
+        +" ("+Math.round(boot.uptime_seconds||0)+"s in). Stats appear when it is ready.";
+      $("src").textContent="SOURCE — desk starting";
+      return;
+    }
     if(!r.ok) throw new Error("HTTP "+r.status);
     render(await r.json());
     $("src").textContent="SOURCE — live /status @ "+new Date().toISOString().slice(11,19)+"Z";

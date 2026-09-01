@@ -64,6 +64,23 @@ def bid_bucket(lamports: int) -> int:
     return chosen
 
 
+#: Simultaneous writers against the same writable account, bucketed by lower
+#: bound. Coarse on purpose: the difference between 9 and 11 competitors is
+#: noise, the difference between 1 and 20 is the whole auction.
+CONTENTION_BUCKETS: Tuple[int, ...] = (0, 1, 3, 8, 20)
+
+
+def contention_bucket(writers: Optional[int]) -> int:
+    """The contention bucket a slot falls into, as its lower bound."""
+    if writers is None:
+        return -1
+    chosen = CONTENTION_BUCKETS[0]
+    for bound in CONTENTION_BUCKETS:
+        if writers >= bound:
+            chosen = bound
+    return chosen
+
+
 def congestion_bucket(congestion: Optional[float]) -> str:
     if congestion is None:
         return "unknown"
@@ -106,6 +123,15 @@ class Attempt:
     #: How stale the blockhash was when we submitted. A transaction built
     #: against an old hash is racing an expiry as well as a leader.
     blockhash_age_slots: Optional[int] = None
+    #: Other transactions observed writing the SAME writable accounts in the
+    #: slot we targeted. The term that decides launch sniping and that no
+    #: bid/congestion table can see: Solana executes disjoint writers in
+    #: parallel, but every sniper buying one new token writes the same
+    #: bonding curve, so they serialise. On a hot launch the binding
+    #: constraint is not the network and not the fee -- only one transaction
+    #: per slot is first against that account, and the rest are queued behind
+    #: it whatever they paid. None means nobody measured it.
+    account_contention: Optional[int] = None
     #: What one slot of delay was worth on this opportunity, from the slot
     #: value model. Lets a later analysis ask whether we bid correctly given
     #: what was at stake, not merely whether we landed.
@@ -124,6 +150,7 @@ class Attempt:
             "congestion": self.congestion, "route": self.route,
             "region": self.region, "latency_ms": self.latency_ms,
             "leader": self.leader, "slot": self.slot,
+            "account_contention": self.account_contention,
             "compute_units": self.compute_units, "tip_lamports": self.tip_lamports,
             "blockhash_age_slots": self.blockhash_age_slots,
             "slot_value": self.slot_value, "real": self.real,
@@ -140,6 +167,7 @@ class Attempt:
             region=row.get("region", ""),
             latency_ms=int(row.get("latency_ms", 0) or 0),
             leader=row.get("leader", ""), slot=row.get("slot"),
+            account_contention=row.get("account_contention"),
             compute_units=int(row.get("compute_units", 0) or 0),
             tip_lamports=int(row.get("tip_lamports", 0) or 0),
             blockhash_age_slots=row.get("blockhash_age_slots"),
@@ -191,6 +219,12 @@ class LandingModel:
         self._attempts: Deque[Attempt] = deque(maxlen=self.capacity)
         self._counts: Dict[Tuple[str, int], List[int]] = defaultdict(lambda: [0, 0])
         self._route_counts: Dict[str, List[int]] = defaultdict(lambda: [0, 0])
+        # The two conditioners this class was built to accept and never got.
+        # Attempt has carried `leader` since it was written precisely so
+        # these could exist later without the data being unrecoverable.
+        self._leader_counts: Dict[str, List[int]] = defaultdict(lambda: [0, 0])
+        self._contention_counts: Dict[Tuple[int, int], List[int]] = defaultdict(
+            lambda: [0, 0])
         # Attempts are the ONLY dataset real fills produce, and they were held
         # in memory alone -- so every restart destroyed the entire landing
         # corpus, and a desk restarted a dozen times in a day had none. There
@@ -219,6 +253,16 @@ class LandingModel:
             route = self._route_counts[attempt.route]
             route[0] += 1
             route[1] += int(attempt.landed)
+        if attempt.leader:
+            leader = self._leader_counts[attempt.leader]
+            leader[0] += 1
+            leader[1] += int(attempt.landed)
+        if attempt.account_contention is not None:
+            cell = self._contention_counts[
+                (contention_bucket(attempt.account_contention),
+                 bid_bucket(attempt.bid_lamports))]
+            cell[0] += 1
+            cell[1] += int(attempt.landed)
         self._append(attempt)
 
     def _append(self, attempt: Attempt) -> None:
@@ -313,6 +357,49 @@ class LandingModel:
             congestion=name,
             detail=f"need {self.min_bucket_attempts} attempts at this bid, "
                    f"have {pooled_total}")
+
+    def leader_effect(self, leader: str) -> Optional[float]:
+        """This validator's landing rate over the fleet's, or None.
+
+        A RATIO, never a rate: it is only ever used to adjust a probability
+        that already accounts for bid and congestion, and returning a bare
+        rate would invite double-counting those. None when the validator has
+        not been seen enough -- there are thousands of them, and a rate from
+        four attempts is a number with a decimal point rather than a
+        measurement.
+        """
+        counts = self._leader_counts.get(leader)
+        if counts is None or counts[0] < self.min_bucket_attempts:
+            return None
+        attempts = sum(c[0] for c in self._leader_counts.values())
+        landed = sum(c[1] for c in self._leader_counts.values())
+        if attempts < self.min_bucket_attempts or landed <= 0:
+            return None
+        fleet = landed / attempts
+        if fleet <= 0:
+            return None
+        return float((counts[1] / counts[0]) / fleet)
+
+    def contention_probability(self, bid_lamports: int, writers: Optional[int],
+                               ) -> LandingEstimate:
+        """P(land) conditioned on how many others write the same accounts.
+
+        Separate from `probability` rather than folded into it, because the
+        two conditioners have very different sample requirements and pooling
+        them would let a well-populated congestion bucket hide an empty
+        contention one. Falls back to the bid/congestion estimate when this
+        cell is thin, so a caller always gets the best available answer and
+        is told which one it got.
+        """
+        bucket = contention_bucket(writers)
+        if bucket >= 0:
+            total, landed = self._contention_counts.get((bucket, bid_bucket(int(bid_lamports))), [0, 0])
+            if total >= self.min_bucket_attempts:
+                return LandingEstimate(
+                    status="OK", probability=landed / total, attempts=total,
+                    bucket=bid_bucket(int(bid_lamports)),
+                    congestion=f"contention>={bucket}")
+        return self.probability(bid_lamports)
 
     def recommend(self, expected_value_usd: float, sol_price_usd: float,
                   congestion: Optional[float] = None,

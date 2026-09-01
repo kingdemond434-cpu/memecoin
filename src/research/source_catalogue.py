@@ -172,6 +172,41 @@ VENUE_TICKERS: Sequence[Endpoint] = (
 #: kimchi premium is a real, measurable, tradeable divergence and it is
 #: invisible in USD pairs; a Korean listing pop is invisible everywhere else
 #: until it has already happened.
+#: Local-language crypto media for the regions whose retail flow moves
+#: memecoins first. Korea and China lead narratives that reach English media
+#: hours later, and "hours" is several lifetimes for a launch.
+#:
+#: These are LADDER rungs, not a fixed list, which is the point: each is a
+#: conventional feed path for a publication known to run one, and any that
+#: does not answer is quarantined and the next operator is tried
+#: automatically. A rung that 404s costs one rotation and shows up as a
+#: stood-down endpoint in /status -- it does not silently zero the region,
+#: which is what the previous `rss:kr-local` placeholder with no endpoint at
+#: all was doing.
+REGIONAL_NEWS: Sequence[Endpoint] = (
+    Endpoint("tokenpost_kr", "https://www.tokenpost.kr/rss",
+             region="kr", shape="rss",
+             detail="Korean crypto daily; KRW-market narratives start here"),
+    Endpoint("blockmedia_kr", "https://www.blockmedia.co.kr/feed",
+             region="kr", shape="rss"),
+    Endpoint("coinreaders_kr", "https://www.coinreaders.com/rss/allArticle.xml",
+             region="kr", shape="rss"),
+    Endpoint("blockbeats_cn", "https://api.theblockbeats.news/v1/open-api/home-xml",
+             region="cn", shape="rss",
+             detail="Chinese-language flow commentary"),
+    Endpoint("chaincatcher_cn", "https://www.chaincatcher.com/rss.xml",
+             region="cn", shape="rss"),
+    Endpoint("panews_cn", "https://www.panewslab.com/zh/rss",
+             region="cn", shape="rss"),
+    Endpoint("odaily_cn", "https://www.odaily.news/rss",
+             region="cn", shape="rss"),
+    Endpoint("forklog_ru", "https://forklog.com/feed",
+             region="cis", shape="rss"),
+    Endpoint("incrypted_ru", "https://incrypted.com/feed/",
+             region="cis", shape="rss"),
+)
+
+
 REGIONAL_VENUES: Sequence[Endpoint] = (
     Endpoint("upbit_markets", "https://api.upbit.com/v1/market/all?isDetails=false",
              region="kr", shape="upbit_markets",
@@ -269,6 +304,7 @@ DOMAINS: Dict[str, Sequence[Endpoint]] = {
     "market_context": MARKET_CONTEXT,
     "venue_tickers": VENUE_TICKERS,
     "regional_venues": REGIONAL_VENUES,
+    "regional_news": REGIONAL_NEWS,
     "solana_rpc": SOLANA_RPC,
     "social_attention": SOCIAL_ATTENTION,
     "telegram_preview": TELEGRAM_PREVIEW,
