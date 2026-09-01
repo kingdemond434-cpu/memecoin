@@ -100,7 +100,11 @@ from src.strategies.rug_hazard import ContinuousRugHazardModel
 from src.strategies.social_intelligence import SocialIntelligenceEngine
 from src.strategies.wallet_intelligence import WalletIntelligenceEngine
 from src.strategies.t0_kernel import SurvivalInputs, T0Kernel
+from src.research.benchmark_wallets import BenchmarkCorpus, load_roster
+from src.strategies.cohort_lifecycle import evaluate_cohorts
 from src.strategies.funder_ancestry import FunderAncestry, compress_independence
+from src.strategies.temporal_funding import (
+    Withdrawal, find_clusters, independence_discounts, measure_source_rate)
 import logging
 MODEL_HYPOTHESIS_ID = "production_multihead_v1"
 
@@ -429,6 +433,29 @@ class SubsystemWiring:
             skill_threshold=float(self.global_config.get("swarm_skill_threshold", 0.6)),
             independence_threshold=float(
                 self.global_config.get("swarm_independence_threshold", 0.5)))
+        # What the opening cohort did AFTER its fill. BuyerDNA stops at the
+        # entry; these carry the position through absorption and distribution.
+        self.cohort_reports: Dict[str, Any] = {}
+        # Coordination that a centralised-exchange withdrawal was used to
+        # hide. Needs each hot wallet's own emission rate as a denominator,
+        # so it stays empty -- and says so -- until rates are measured.
+        self.temporal_clusters: List[Any] = []
+        self.temporal_discounts: Dict[str, float] = {}
+        self.exchange_withdrawals: List[Withdrawal] = []
+        self.exchange_rates: Dict[str, float] = {}
+        # Public wallets worth reconstructing, and what FOLLOWING them costs.
+        # Headline PnL is recorded as a claim here and never scored.
+        self.benchmark_corpus = load_roster(
+            str(self.global_config.get("benchmark_roster",
+                                       "config/benchmark_wallets.yaml")),
+            BenchmarkCorpus(
+                path=(None if self.offline else str(
+                    Path(self.global_config.get("ops_state_dir", "data/state"))
+                    / "benchmark_wallets.json")),
+                cost_per_round_trip=float(
+                    self.global_config.get("follow_cost_round_trip", 0.02))))
+        if not self.offline:
+            self.benchmark_corpus.load()
         # Entries per token, kept only for tokens the hot state still holds.
         self._actor_entries: Dict[str, List[Entry]] = {}
         self.independence_report = IndependenceReport(status="DATA_BLOCKED")

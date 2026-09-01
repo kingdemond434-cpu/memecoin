@@ -151,6 +151,7 @@ from src.strategies.social_intelligence import SocialIntelligenceEngine
 from src.strategies.wallet_intelligence import WalletIntelligenceEngine
 from src.strategies.wallet_value import FollowOutcome
 from src.strategies.t0_kernel import SurvivalInputs
+from src.strategies.cohort_lifecycle import evaluate_cohorts
 from src.strategies.funder_ancestry import compress_independence
 from src.execution.staged_exits import StagedExits
 from src.execution.slot_value import SlotValueModel
@@ -3436,6 +3437,89 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             self.wallet_equity_usd, reserve)
         self.equity_status = "OK"
 
+    def _refresh_cohorts(self) -> None:
+        """Follow the opening cohort of every token we still hold.
+
+        Held tokens only, and off the decision path. The entry fingerprint is
+        a T0 input; what the cohort did afterwards is an EXIT input, and the
+        position is the only thing that can act on it. Computing it for the
+        thousands of launches the desk merely watched would cost the loop a
+        great deal to answer a question nobody is going to ask.
+        """
+        held = list(self.elogw_engine.open_positions)
+        if not held:
+            self.cohort_reports = {}
+            return
+        now = time.time()
+        scores = dict(getattr(self.independence_report, "scores", {}) or {})
+        skills = self._wallet_skill_scores()
+        reports = {}
+        for token in held:
+            entries = self._actor_entries.get(token) or []
+            flows = self._token_unit_flows(token)
+            if not entries or not flows:
+                continue
+            position = self.elogw_engine.open_positions.get(token) or {}
+            opened = float(position.get("entry_time", 0.0) or 0.0)
+            window = (opened, now) if opened else None
+            try:
+                reports[token] = evaluate_cohorts(
+                    entries, flows, scores, skills, now,
+                    absorption_window=window)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("cohort evaluation failed for %s: %s", token, exc)
+        self.cohort_reports = reports
+
+    def _wallet_skill_scores(self) -> Dict[str, float]:
+        """wallet -> historical composite score, for wallets with a record.
+
+        Only wallets that cleared the minimum sample size are included. A
+        wallet with three observed trades has no historical record, and
+        putting it in this map as a low number would let the late-chaser
+        reading call every newcomer a chaser -- which would fire the
+        distribution pattern on any launch that attracted fresh wallets,
+        i.e. all of them. Absent means unknown, and the cohort module treats
+        unknown as unknown rather than as unskilled.
+        """
+        intel = getattr(self, "wallet_intel", None)
+        if intel is None:
+            return {}
+        minimum = int(getattr(intel, "min_trades", 0) or 0)
+        return {wallet: float(score.overall_score)
+                for wallet, score in getattr(intel, "wallet_scores", {}).items()
+                if int(getattr(score, "sample_size", 0) or 0) >= minimum}
+
+    def _token_unit_flows(self, token: str) -> List[Dict[str, Any]]:
+        """Signed per-wallet unit flows for one token, from observed trades.
+
+        Units, not notional: retention is a fraction of what a wallet BOUGHT,
+        and dividing dollars by a price the desk may not have measured at
+        that instant would manufacture the denominator the whole reading
+        rests on. A trade without a unit amount is skipped rather than
+        estimated.
+        """
+        episode = None
+        builder = getattr(self, "dataset_builder", None)
+        if builder is not None:
+            episode = builder.active_episodes.get(token)
+        if episode is None:
+            return []
+        flows: List[Dict[str, Any]] = []
+        for item in episode.market_observations:
+            if item.get("type") not in {"trade", "buy", "sell"}:
+                continue
+            wallet = str(item.get("wallet", "") or item.get("buyer", "") or "")
+            units = item.get("token_amount", item.get("units"))
+            if not wallet or units is None:
+                continue
+            amount = float(units)
+            if item.get("type") == "sell" and amount > 0:
+                amount = -amount
+            flows.append({"wallet": wallet,
+                          "timestamp": float(item.get("timestamp", 0.0) or 0.0),
+                          "units": amount})
+        return flows
+
     async def _update_intelligence(self):
         if time.time() - self.last_intelligence_update < 60:
             return
@@ -3450,6 +3534,7 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         self.save_follow_candidates()
         self._resolve_follow_candidates()
         self._refresh_independence()
+        self._refresh_cohorts()
         self._publish_attribution()
         if self.dry_run:
             latest_mtime = self._latest_model_mtime()

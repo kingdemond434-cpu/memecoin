@@ -29,6 +29,8 @@ from src.strategies.actor_graph import (
 from src.strategies.authenticity import EntityRegistry, ProofLevel, SourceSignal, load_entities
 from src.strategies.source_genealogy import SourcePost, build_source_dna
 from src.strategies.funder_ancestry import compress_independence
+from src.strategies.temporal_funding import (
+    find_clusters, independence_discounts, measure_source_rate)
 from src.strategies.disagreement import DisagreementModel, views_from_intelligence
 from src.strategies.ignition import IgnitionModel, touches_from_events
 import logging
@@ -316,10 +318,53 @@ class SourceIntelligence:
                 logger.info(
                     "FUNDER ANCESTRY %s; independence mass %.2f -> %.2f",
                     ancestry.detail, before, after)
+        # The third compression, after behaviour and after ancestry: wallets
+        # funded out of the same exchange hot wallet inside the same seconds,
+        # in similar amounts. Ancestry cannot see that -- the hot wallet funds
+        # hundreds of thousands of unrelated people, so the edge carries no
+        # information, which is exactly what routing through an exchange buys.
+        # Applied last because it is the weakest evidence of the three, and
+        # capped so it can only ever discount.
+        self._apply_temporal_clusters()
         logger.info("INDEPENDENCE status=%s pairs=%d wallets=%d",
                     self.independence_report.status,
                     self.independence_report.observed_pairs,
                     len(self.independence_report.scores))
+
+    def _apply_temporal_clusters(self) -> None:
+        """Discount wallets funded together out of one exchange hot wallet.
+
+        Silent and harmless without measured emission rates: a cluster scored
+        against a guessed base rate would make every busy exchange look like
+        a conspiracy, so `find_clusters` refuses and this does nothing.
+        """
+        withdrawals = list(getattr(self, "exchange_withdrawals", ()) or ())
+        if not withdrawals or self.independence_report.status != "OK":
+            return
+        span = (max(w.timestamp for w in withdrawals)
+                - min(w.timestamp for w in withdrawals))
+        rates = dict(getattr(self, "exchange_rates", {}) or {})
+        for source in {w.source for w in withdrawals}:
+            measured = measure_source_rate(withdrawals, source, span)
+            if measured is not None:
+                rates[source] = measured
+        self.exchange_rates = rates
+        clusters = find_clusters(
+            withdrawals, target_buyers=list(self.independence_report.scores),
+            source_rates=rates)
+        self.temporal_clusters = clusters
+        discounts = independence_discounts(clusters)
+        self.temporal_discounts = discounts
+        if not discounts:
+            return
+        for wallet, multiplier in discounts.items():
+            if wallet in self.independence_report.scores:
+                self.independence_report.scores[wallet] *= multiplier
+        logger.info(
+            "TEMPORAL FUNDING %d cluster(s) discounted %d wallet(s); "
+            "strongest cut %.0f%%",
+            len([c for c in clusters if c.status == "OK"]), len(discounts),
+            (1.0 - min(discounts.values())) * 100.0)
 
     def _read_ignition(self, token: str):
         """Where this token's narrative is in its lifecycle.
