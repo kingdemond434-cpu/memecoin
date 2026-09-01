@@ -24,6 +24,7 @@ from src.chains.yellowstone_grpc import (
 )
 from src.detection.rug_detector import RiskLevel, RugDetector
 from src.detection.t0_risk import LaunchInvariantLedger, T0RiskView
+from src.execution.leader_schedule import LeaderSchedule
 from src.detection.token_detector import DetectionSource, TokenCandidate, TokenDetectionEngine
 from src.execution.jupiter_jito import (
     ExecutionEngine,
@@ -730,10 +731,19 @@ class SubsystemWiring:
             quote_token_program=str(self.global_config.get(
                 "pump_quote_token_program", TOKEN_PROGRAM)),
         ))
+        # Which validator produces which slot, and where it listens. Two
+        # free RPC calls whose answer is fixed for an epoch, refreshed in the
+        # background so a lookup at decision time is a dictionary hit.
+        self.leader_schedule = LeaderSchedule(self.solana_rpc)
         self.execution_engine = ExecutionEngine(self.solana_config, self.solana_rpc, self.jupiter, self.jito,
                                                 builder, self.counterfactual_lab, dry_run=self.dry_run,
                                                 pump_route=self.pump_route,
                                                 pumpswap_route=self.pumpswap_route)
+        # Attached after construction rather than passed in: the engine is
+        # already eight arguments deep, and the schedule is an OPTIONAL
+        # conditioner -- an engine without one records `leader: ""` exactly
+        # as it always has, rather than failing to start.
+        self.execution_engine.leader_schedule = self.leader_schedule
         # The landing corpus is the only dataset real fills produce, and it
         # was held in memory alone -- so every restart destroyed it and a desk
         # restarted a dozen times in a day had none. A landing attempt cannot

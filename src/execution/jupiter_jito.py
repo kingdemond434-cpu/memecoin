@@ -662,6 +662,10 @@ class ExecutionEngine:
         self.jupiter = jupiter
         self.jito = jito
         self.tx_builder = tx_builder
+        # Set by wiring. Turns `leader: ""` on every recorded attempt into an
+        # actual validator identity, which is what the landing model's
+        # per-leader accept rates have always been keyed on and never had.
+        self.leader_schedule: Optional[Any] = None
         self.counterfactual_lab = counterfactual_lab
         self.dry_run = bool(dry_run)
         self.confirmation_timeout = confirmation_timeout
@@ -1291,7 +1295,13 @@ class ExecutionEngine:
             # what compute limit we set, how stale the blockhash was -- so it
             # is recorded now and read later.
             region=self.region,
-            leader=str(fill.get("leader", "") or ""),
+            # Resolved from the schedule when the fill did not carry one,
+            # which until now was ALWAYS -- so every attempt the desk ever
+            # recorded went into a single empty-string bucket and the
+            # per-leader accept rates the landing model exists to learn have
+            # never had a leader to key on.
+            leader=(str(fill.get("leader", "") or "")
+                    or self._leader_for_slot(fill.get("slot"))),
             slot=fill.get("slot"),
             compute_units=int(compute_unit_limit or 0),
             tip_lamports=int(jito_tip if use_jito else 0),
@@ -1596,6 +1606,21 @@ class ExecutionEngine:
         if index >= len(before) or index >= len(after):
             return 0
         return int(after[index]) - int(before[index])
+
+    def _leader_for_slot(self, slot: Any) -> str:
+        """The validator that produced this slot, or "" when unknown.
+
+        Empty rather than a guess: a wrong leader puts one validator's
+        accept rate into another's bucket, and the landing model never
+        unlearns it.
+        """
+        schedule = getattr(self, "leader_schedule", None)
+        if schedule is None or not slot:
+            return ""
+        try:
+            return schedule.leader_for(int(slot))
+        except Exception:  # pragma: no cover - accounting only
+            return ""
 
     def current_congestion(self) -> Optional[float]:
         """Measured congestion, or None. Never a default.

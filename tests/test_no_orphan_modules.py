@@ -86,6 +86,12 @@ REQUIRED_CALLS = {
     # decision under load actually ranks on.
     "cold distillate loaded": ("ColdDistillate.load(", "src/runtime/wiring.py"),
     "cold distillate consulted": ("cold.deployer_prior(", "src/runtime/ingestion.py"),
+    # The landing model has bucketed accept rates on `leader` since it was
+    # written, and every attempt ever recorded carried the empty string.
+    "leader schedule refreshed": ("self.leader_schedule.refresh()", "src/main.py"),
+    "leader schedule follows the chain": ("schedule.observe_slot(", "src/main.py"),
+    "leader resolved onto landing attempts": ("self._leader_for_slot(",
+                                              "src/execution/jupiter_jito.py"),
 }
 
 

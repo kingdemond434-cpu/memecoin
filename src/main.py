@@ -881,6 +881,18 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
                 await self._observe_active_markets()
             except Exception as exc:
                 logger.exception("Market observer error: %s", exc)
+            # The leader schedule, refreshed on need rather than on a clock:
+            # it is fixed for an epoch, so a desk that has consumed its
+            # lookahead should refresh and an idle one should not. Here
+            # rather than in the intelligence sweep because 120 slots is
+            # under a minute and that sweep runs every sixty seconds.
+            try:
+                if (getattr(self, "leader_schedule", None) is not None
+                        and not self.offline
+                        and self.leader_schedule.needs_refresh()):
+                    await self.leader_schedule.refresh()
+            except Exception as exc:
+                logger.debug("leader schedule refresh: %s", exc)
             await asyncio.sleep(float(self.global_config.get("market_observer_sleep_seconds", 0.25)))
 
     async def _process_new_tokens(self):
@@ -3599,6 +3611,12 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         # healthy connection and an empty denominator.
         kind = str(event.get("type", "") or "unknown")
         self._stream_events[kind] = self._stream_events.get(kind, 0) + 1
+        # Free: the stream already carries the slot, and knowing which slot
+        # the chain is on is what makes the leader lookup answer about NOW
+        # rather than about whenever the last refresh happened.
+        schedule = getattr(self, "leader_schedule", None)
+        if schedule is not None and event.get("slot"):
+            schedule.observe_slot(event["slot"])
         token = event.get("token", "")
         # Which feed reached this box first. Every feed delivering the same
         # launch calls this; only the first gets True and goes on to make a
