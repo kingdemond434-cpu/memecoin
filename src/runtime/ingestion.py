@@ -8,6 +8,7 @@ is sized, and the two stop sharing a merge surface.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -31,6 +32,42 @@ class MinedRecordIngestion:
     WHICH tokens and wallets are worth a miner pass lives here too, because
     it answers the same question from the other end -- what is worth
     collecting, and where does what we collected go."""
+
+    async def _native_ingress_loop(self):
+        """Drain the Rust receiver, which is what makes the shadow REAL.
+
+        Without this loop the whole native path is a subscription nobody
+        reads: the Rust sink fills, evicts its oldest events at capacity and
+        reports a growing `dropped`, while the parity ledger sees one side
+        only and concludes -- correctly, and uselessly -- that the native
+        receiver missed everything. It was built, constructed, started, and
+        then never consumed. That is the orphan failure one level further in
+        than the one the orphan test was written to catch, which is why
+        `test_no_orphan_modules` now requires this call by name.
+
+        Draining also produces the number the promotion decision actually
+        needs. Agreement proves the native path is CORRECT; the lead time
+        between the two sightings of the same signature is the only evidence
+        that it is FASTER, and it can be measured for nothing here because
+        both timestamps already exist.
+        """
+        ingress = getattr(self, "native_ingress", None)
+        if ingress is None or not ingress.running:
+            return
+        interval = float(self.global_config.get("native_ingress_drain_seconds", 0.05))
+        budget = int(self.global_config.get("native_ingress_drain_budget", 512))
+        while self._running:
+            try:
+                events = ingress.drain(budget)
+            except Exception as exc:
+                logger.exception("Native ingress drain error: %s", exc)
+                events = []
+            if events:
+                self._native_ingress_events += len(events)
+            # A short sleep even after a full batch. This loop competes with
+            # the decision path for one interpreter, and a tight drain would
+            # spend the latency it exists to win.
+            await asyncio.sleep(0.0 if len(events) >= budget else interval)
 
     def _mineable_tokens(self) -> List[str]:
         """Which mints are worth spending a miner pass on, most urgent first.

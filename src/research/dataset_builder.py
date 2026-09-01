@@ -166,6 +166,17 @@ PUMP_INITIAL_VIRTUAL_SOL = 30_000_000_000
 PUMP_INITIAL_VIRTUAL_TOKEN = 1_073_000_000_000_000
 PUMP_CURVE_K = PUMP_INITIAL_VIRTUAL_SOL * PUMP_INITIAL_VIRTUAL_TOKEN
 
+#: Every pump.fun mint is created with one billion tokens at six decimals.
+#: A protocol constant of the same kind as the virtual reserves above -- a
+#: property of how the program initialises a curve, not a claim about any
+#: particular token -- and it matters because the fee tier table is indexed
+#: on MARKET CAP, which is supply times price. The CreateEvent carries no
+#: supply field, so without this the seeded curve reports a total supply of
+#: zero, market cap resolves to zero for every launch, and every trade is
+#: priced in the lowest tier regardless of where the coin actually is.
+#: Superseded the moment a real supply is observed.
+PUMP_TOKEN_TOTAL_SUPPLY = 1_000_000_000_000_000
+
 #: How far an observed curve may drift from the constant product before the
 #: invariant is treated as no longer describing this token. Fees and
 #: rounding move k slightly; a different curve shape moves it a lot.

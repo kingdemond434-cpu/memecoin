@@ -185,18 +185,28 @@ class SubsystemWiring:
             self.yellowstone.status = "DATA_BLOCKED"
             self.yellowstone.status_detail = "YELLOWSTONE_GRPC_URL is missing; RPC fallback enabled"
         if connected:
-            await self.yellowstone.subscribe(create_combined_subscription())
-            # The native receiver comes up ALONGSIDE, not instead. Started
-            # here rather than at construction so it subscribes only when the
-            # reference client has a live stream to be compared against --
-            # a shadow with nothing to shadow proves nothing.
+            # HANDLERS FIRST, stream second. Each monitor registers its
+            # callbacks in its constructor, and `subscribe` starts consuming
+            # immediately -- so constructing them afterwards left a window in
+            # which decoded events found `self._handlers` empty and were
+            # dropped with no record anywhere. It is a short window, but it
+            # sits at exactly the moment the desk comes up after a restart,
+            # and every launch inside it is unbackfillable.
+            self.pump_monitor = PumpFunMonitor(self.yellowstone, self._on_pump_event)
+            self.pump_swap_monitor = PumpSwapMonitor(self.yellowstone, self._on_pump_event)
+            self.raydium_monitor = RaydiumMonitor(self.yellowstone, self._on_raydium_event)
+            # The native receiver comes up ALONGSIDE, not instead, and BEFORE
+            # the reference stream: a gRPC subscription takes a moment to be
+            # served, and if the reference starts first every event in that
+            # gap reads as a native miss, which under a permanent-demotion
+            # latch means the shadow can never be promoted however correct it
+            # is. Starting it first turns that skew into `native_only`, which
+            # is counted and not punished.
             ingress = getattr(self, "native_ingress", None)
             if ingress is not None and not ingress.start():
                 logger.info("NATIVE INGRESS not running: %s",
                             ingress.unavailable_reason)
-            self.pump_monitor = PumpFunMonitor(self.yellowstone, self._on_pump_event)
-            self.pump_swap_monitor = PumpSwapMonitor(self.yellowstone, self._on_pump_event)
-            self.raydium_monitor = RaydiumMonitor(self.yellowstone, self._on_raydium_event)
+            await self.yellowstone.subscribe(create_combined_subscription())
         elif not self.offline:
             self.rpc_program_stream = SolanaRpcProgramStream(
                 self.solana_rpc, [PumpFunMonitor.PUMP_FUN_PROGRAM, PumpSwapMonitor.PUMP_AMM_PROGRAM,

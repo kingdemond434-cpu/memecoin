@@ -203,6 +203,7 @@ from src.research.dataset_builder import (
     SNAPSHOT_OFFSETS_S, TAIL_THRESHOLDS, LaunchEpisode, LaunchSnapshot,
     PointInTimeDatasetBuilder, SnapshotTimepoint,
     PUMP_INITIAL_VIRTUAL_SOL, PUMP_INITIAL_VIRTUAL_TOKEN, PUMP_CURVE_K,
+    PUMP_TOKEN_TOTAL_SUPPLY,
     pump_curve_invariant_holds,
 )
 from src.research.shadow_trainer import (
@@ -8955,6 +8956,24 @@ class TestOrphanIntelligence(unittest.IsolatedAsyncioTestCase):
                             "timestamp": 1_000.0 + index},
                 {"notional_usd": 100.0})
 
+        # The two things trade costing needs, both of which the live desk
+        # now has and this fixture previously did not: the fee tiers, which
+        # `_refresh_pump_fee_config` reads off the FeeConfig account at
+        # startup, and a curve to price the market cap the tiers are indexed
+        # on, which `_on_pump_event` seeds at T0. Without them `cost_model`
+        # answers DATA_BLOCKED, no expected value can be computed net of
+        # cost, and the desk cannot justify an entry -- which is not a
+        # missing field in a report, it is the reason nothing gets entered.
+        desk.fee_schedule.adopt_chain_config(
+            parse_fee_config(TestOnChainFeeConfig._account()),
+            source="chain:test")
+        desk._latest_curve_state[self.MINT] = BondingCurveState(
+            virtual_token_reserves=PUMP_INITIAL_VIRTUAL_TOKEN,
+            virtual_sol_reserves=PUMP_INITIAL_VIRTUAL_SOL,
+            real_token_reserves=0, real_sol_reserves=0,
+            token_total_supply=PUMP_TOKEN_TOTAL_SUPPLY,
+            complete=False, creator=candidate.deployer)
+
         prediction = MultiHeadPrediction(self.MINT, "solana", 0, p_2x=0.6, p_5x=0.4, p_10x=0.2)
         trade_info = {"position_size_sol": 0.5, "position_value_usd": 75.0,
                       "risk_contribution": 0.01}
@@ -8962,6 +8981,9 @@ class TestOrphanIntelligence(unittest.IsolatedAsyncioTestCase):
             self.MINT, candidate, None, prediction, trade_info, 50_000.0)
         report = audit_intelligence("entry", intelligence)
 
+        self.assertEqual("OK", intelligence["cost_model"]["status"],
+                         intelligence["cost_model"])
+        self.assertFalse(intelligence["cost_model"]["assumed"])
         self.assertEqual(report.orphans, [])
         for key in ("prediction", "sources", "coordination", "sizing", "cost_model"):
             self.assertIn(key, report.contributing,

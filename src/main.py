@@ -47,7 +47,7 @@ from src.strategies.memecoin_state import (
 from src.research.trade_evidence import TradeEvidenceLedger
 from src.research.dataset_builder import (
     PointInTimeDatasetBuilder, PUMP_INITIAL_VIRTUAL_SOL,
-    PUMP_INITIAL_VIRTUAL_TOKEN)
+    PUMP_INITIAL_VIRTUAL_TOKEN, PUMP_TOKEN_TOTAL_SUPPLY)
 from src.research.feature_engine import build_features
 from src.research.global_research_miner import GlobalResearchMiner
 from src.research.calibration import CalibrationBook
@@ -131,7 +131,7 @@ from src.chains.pumpswap_curve import quote_buy as pool_quote_buy
 from src.chains.pumpswap_curve import quote_sell as pool_quote_sell
 from src.chains.pumpswap_route import PoolState, parse_pool
 from src.execution.pump_fees import (
-    DEFAULT_SCHEDULE as PUMP_FEE_SCHEDULE, VENUE_BONDING_CURVE,
+    DEFAULT_SCHEDULE as PUMP_FEE_SCHEDULE, VENUE_BONDING_CURVE, round_trip_cost,
 )
 from src.execution.tradeability import curve_tradeability, exit_capacity_ratio, pool_tradeability
 from src.strategies.distribution import DistributionDetector
@@ -339,6 +339,9 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         self._safety_task: Optional[asyncio.Task] = None
         self._intelligence_task: Optional[asyncio.Task] = None
         self._parity_task: Optional[asyncio.Task] = None
+        self._native_ingress_task: Optional[asyncio.Task] = None
+        self._native_ingress_events = 0
+        self._fee_config_refreshed_at = 0.0
         self._source_task: Optional[asyncio.Task] = None
         # Coverage says a module was consulted; this says whether it mattered.
         # A component that is disconnected and one that is connected but inert
@@ -522,6 +525,11 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         # that starts first delivers events into a desk that has nothing
         # wired to handle them, and those launches are lost silently.
         await self._setup_yellowstone()
+        # Before anything can be costed, and therefore before anything can be
+        # entered. Without it `round_trip_bps` is DATA_BLOCKED for every trade
+        # after the dynamic schedule activated, and a decision that cannot
+        # price its own cost cannot clear an expected-value bar.
+        await self._refresh_pump_fee_config()
         await self._refresh_portfolio_state()
         logger.info("Desk initialized: mode=%s live_submission_locked=%s", "DRY_RUN" if self.dry_run else "LIVE",
                     os.getenv("ALLOW_LIVE_TRADING", "").lower() != "yes-i-understand")
@@ -559,6 +567,12 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         self._intelligence_task = self._start_runtime_task(
             "intelligence", self._intelligence_loop())
         self._parity_task = self._start_runtime_task("parity", self._parity_loop())
+        # Started only when the receiver is actually streaming, so a box
+        # without the extension built does not carry a loop that wakes
+        # twenty times a second to drain nothing.
+        if getattr(self, "native_ingress", None) is not None and self.native_ingress.running:
+            self._native_ingress_task = self._start_runtime_task(
+                "native_ingress", self._native_ingress_loop())
         self._register_memory_reliefs()
         self._health_task = self._start_runtime_task(
             "health", self._health_loop())
@@ -642,9 +656,18 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             task.cancel()
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        # The native stream holds a socket and an OS thread in Rust. Stopped
+        # before its drain task is cancelled, so the last events it matched
+        # are accounted for rather than discarded with the queue.
+        try:
+            if getattr(self, "native_ingress", None) is not None:
+                self.native_ingress.stop()
+        except Exception as exc:  # pragma: no cover - shutdown only
+            logger.warning("native ingress shutdown: %s", exc)
         for task in (self._main_task, self._health_task, self._market_task,
                      self._safety_task, self._intelligence_task, self._source_task,
                      self._parity_task, self._watchdog_task,
+                     self._native_ingress_task,
                      *self._redecision_tasks):
             if task:
                 task.cancel()
@@ -2206,47 +2229,15 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
     def _cost_model(self, token: str, at_utc: Optional[float] = None) -> Dict[str, Any]:
         """The round-trip protocol cost of this token, priced rather than assumed.
 
-        The desk used two config constants for entry and exit cost. They were
-        right until 2026-09-01, when Pump replaced the flat 100 bps with a
-        market-cap tier schedule -- and a constant that silently stops being
-        true is worse than one that was never trusted, because every E[log W]
-        downstream keeps quoting it with full confidence.
-
-        Where the schedule can answer, it does. Where it cannot -- the tier
-        table is published as an image, so it is only loadable from an
-        operator transcription -- the config constant is used AND LABELLED as
-        an assumption, so a decision made on an unpriced fee is distinguishable
-        after the fact from one made on a measured one.
+        Thin on purpose: the pricing itself lives beside the fee schedule in
+        `src.execution.pump_fees`, where the tier logic it depends on is, and
+        all this supplies is the curve state that gives it a market cap.
         """
-        at_utc = time.time() if at_utc is None else float(at_utc)
-        market_cap = None
-        state = self._latest_curve_state.get(token)
-        if state is not None and state.virtual_sol_reserves > 0:
-            # Market cap in lamports at the marginal curve price: total supply
-            # priced off the virtual reserves, which is the quantity the tier
-            # table is indexed on.
-            market_cap = int(state.token_total_supply * state.virtual_sol_reserves
-                             // max(1, state.virtual_token_reserves))
-        status, round_trip_bps, detail = self.fee_schedule.round_trip_bps(
-            venue=VENUE_BONDING_CURVE,
-            entry_market_cap_lamports=market_cap, exit_market_cap_lamports=market_cap,
-            entry_utc=at_utc, exit_utc=at_utc,
-        )
-        if status == "OK":
-            leg = round_trip_bps / 2 / 10_000
-            return {"status": "OK", "assumed": False, "entry_cost": leg, "exit_cost": leg,
-                    "round_trip_bps": round_trip_bps,
-                    "schedule_version": detail["entry"].schedule_version,
-                    "market_cap_lamports": market_cap}
-        return {
-            "status": "DATA_BLOCKED_FEE_SCHEDULE", "assumed": True,
-            "entry_cost": float(self.global_config.get("assumed_entry_cost", 0.02)),
-            "exit_cost": float(self.global_config.get("assumed_exit_cost", 0.02)),
-            "reason": detail["entry"].reason or detail["exit"].reason,
-            "schedule_version": self.fee_schedule.version,
-            "market_cap_lamports": market_cap,
-        }
-
+        return round_trip_cost(
+            self.fee_schedule, self._latest_curve_state.get(token),
+            at_utc=at_utc,
+            assumed_entry_cost=float(self.global_config.get("assumed_entry_cost", 0.02)),
+            assumed_exit_cost=float(self.global_config.get("assumed_exit_cost", 0.02)))
 
 
     def _score_entry(self, token: str, prediction: Any, liquidity: float,
@@ -3586,6 +3577,11 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             return
         self.last_intelligence_update = time.time()
         await self._refresh_portfolio_state()
+        # Re-read rather than read once: Pump can change the tiers, and the
+        # desk's cost of trading is only as current as this account read.
+        if time.time() - self._fee_config_refreshed_at > float(
+                self.global_config.get("fee_config_refresh_seconds", 900.0)):
+            await self._refresh_pump_fee_config()
         await self.genealogy.build_clusters()
         self._prune_curve_static()
         self._sweep_rug_classification()
@@ -3697,9 +3693,12 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
                 signature = event.get("signature")
                 if signature:
                     try:
-                        ingress.note_python_event(
-                            signature.encode() if isinstance(signature, str)
-                            else bytes(signature))
+                        # Passed in whatever form the decoder produced. The
+                        # ledger reduces base58 text and raw bytes to the
+                        # same identity itself -- doing the conversion here
+                        # is how the two sides came to be keyed on different
+                        # eight bytes and agreed on nothing.
+                        ingress.note_python_event(signature)
                     except Exception:  # pragma: no cover - accounting only
                         pass
             # Seed the curve at its protocol-defined starting depth. The
@@ -3722,7 +3721,12 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
                     virtual_token_reserves=PUMP_INITIAL_VIRTUAL_TOKEN,
                     virtual_sol_reserves=PUMP_INITIAL_VIRTUAL_SOL,
                     real_token_reserves=0, real_sol_reserves=0,
-                    token_total_supply=int(event.get("token_total_supply", 0) or 0),
+                    # The protocol's own initialisation, not a guess about
+                    # this mint: the CreateEvent carries no supply, and a
+                    # zero here makes market cap zero, which prices every
+                    # launch in the lowest fee tier for its whole life.
+                    token_total_supply=int(event.get("token_total_supply", 0)
+                                           or PUMP_TOKEN_TOTAL_SUPPLY),
                     complete=False, creator=str(event.get("creator", "") or ""),
                 )
             self.dataset_builder.start_episode(

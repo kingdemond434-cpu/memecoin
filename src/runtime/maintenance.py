@@ -28,6 +28,7 @@ Four jobs, each closing a hole that made a real number wrong:
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import math
@@ -36,6 +37,8 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from src.research import rug_mechanism
+
+from src.chains.pump_fee_config import fee_config_address, parse_fee_config
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +51,68 @@ DEATH_CLASSIFICATION_QUIET_S = 300.0
 
 class DeskMaintenance:
     """Upkeep the desk mixes in. Requires the desk's own attributes."""
+
+    async def _refresh_pump_fee_config(self) -> bool:
+        """Read the on-chain FeeConfig, which is what UNBLOCKS trade costing.
+
+        Pump publishes the dynamic fee tiers only as an image, and
+        transcribing numbers out of a picture is fabrication -- so the fee
+        engine refused, correctly, and returned DATA_BLOCKED for every quote
+        after the schedule went dynamic. The decoder for the account those
+        numbers describe was then written, tested, and never called by
+        anything: `adopt_chain_config` had zero callers in the entire tree.
+
+        The consequence is not a missing field in a report. `round_trip_bps`
+        is DATA_BLOCKED, so the cost of a trade is unknown, so no expected
+        value can be computed net of cost, so the desk cannot justify an
+        entry. A refusal nobody ever lifts is indistinguishable from a
+        decision never to trade.
+
+        Re-read rather than read once: Pump can change the tiers, and the
+        published guidance is explicit that correct implementations should
+        survive that. A failed refresh keeps the tiers already adopted --
+        losing a good table to one bad RPC response would re-block costing
+        for no reason.
+        """
+        rpc = getattr(self, "solana_rpc", None)
+        schedule = getattr(self, "fee_schedule", None)
+        if rpc is None or schedule is None or getattr(self, "offline", False):
+            return False
+        try:
+            address = fee_config_address()
+        except Exception as exc:
+            logger.warning("Pump fee config address unavailable: %s", exc)
+            return False
+        try:
+            response = await rpc.request(
+                "getAccountInfo",
+                [address, {"encoding": "base64", "commitment": "confirmed"}])
+        except Exception as exc:
+            logger.warning("Pump fee config read failed: %s", exc)
+            return False
+        value = (response or {}).get("value") if isinstance(response, dict) else None
+        encoded = ((value or {}).get("data") or [None])[0] if value else None
+        if not encoded:
+            logger.warning(
+                "Pump fee config account %s returned no data; trade costing "
+                "stays DATA_BLOCKED", address)
+            return False
+        try:
+            config = parse_fee_config(base64.b64decode(encoded))
+        except Exception as exc:
+            logger.warning("Pump fee config did not decode: %s", exc)
+            return False
+        if not schedule.adopt_chain_config(config, source=f"chain:{address}"):
+            logger.warning(
+                "Pump fee config decoded but carried no tiers (%s); trade "
+                "costing stays DATA_BLOCKED",
+                getattr(config, "reason", "no reason given"))
+            return False
+        self._fee_config_refreshed_at = time.time()
+        logger.info(
+            "Pump fee tiers adopted from chain: %d tier(s) from %s",
+            len(getattr(config, "fee_tiers", ()) or ()), address)
+        return True
 
     def _prune_hazard_tracking(self) -> int:
         """Bound the hazard model's per-token memory. Returns tokens evicted.

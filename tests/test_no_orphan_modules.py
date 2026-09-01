@@ -45,6 +45,19 @@ REQUIRED_CALLS = {
     "native chain ingress": ("NativeIngress(", "src/runtime/wiring.py"),
     "native ingress started": ("ingress.start()", "src/runtime/wiring.py"),
     "native ingress parity fed": ("note_python_event(", "src/main.py"),
+    # Constructed, started AND consumed. The first two were true while the
+    # sink filled and evicted its own events, because nothing drained it --
+    # the orphan one level in from the orphan this file was written to catch.
+    "native ingress drained": ("ingress.drain(", "src/runtime/ingestion.py"),
+    "native ingress drain scheduled": ("self._native_ingress_loop()", "src/main.py"),
+    "native ingress stopped": ("self.native_ingress.stop()", "src/main.py"),
+    # The fee tiers are published only as an image, so the engine refuses to
+    # transcribe them and blocks costing until the on-chain account is read.
+    # `adopt_chain_config` had zero callers, so the block was permanent and
+    # nothing could ever be priced net of cost.
+    "pump fee config read from chain": ("adopt_chain_config(",
+                                        "src/runtime/maintenance.py"),
+    "pump fee config refreshed": ("self._refresh_pump_fee_config()", "src/main.py"),
 }
 
 
