@@ -75,6 +75,13 @@ REQUIRED_CALLS = {
     "secondary feed races the primary": ("self._start_secondary_feed()",
                                          "src/runtime/wiring.py"),
     "secondary feed stopped": ("self.secondary_stream.stop()", "src/main.py"),
+    # Speed has been optimised for months on an unpriced belief. The ledger
+    # is only real if resolved launches actually reach it.
+    "latency value ledger attached": ("self.dataset_builder.latency_value =",
+                                      "src/runtime/wiring.py"),
+    "latency value fed by resolved launches": (
+        "ledger.observe_snapshots(", "src/research/dataset_builder.py"),
+    "load shedding decides dispatch": ("self.load_shedder.admit(", "src/main.py"),
 }
 
 

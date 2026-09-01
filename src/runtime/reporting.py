@@ -523,6 +523,10 @@ class ReportingSurface:
                            if getattr(self, "launchpads", None) is not None
                            else {"status": "DATA_BLOCKED"}),
             # Which inbound feed arrives first, and which one sees everything.
+            "latency_value": (
+                self.latency_value.report()
+                if getattr(self, "latency_value", None) is not None
+                else {"status": "MISSING"}),
             "load_shedding": (
                 self.load_shedder.report()
                 if getattr(self, "load_shedder", None) is not None

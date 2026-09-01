@@ -105,6 +105,7 @@ from src.chains.launchpads import LaunchpadRegistry
 from src.execution.exit_readiness import (
     ExcursionLedger, ExitReadinessLedger, choose_exit_mode)
 from src.runtime.feed_race import FeedRace
+from src.research.latency_value import LatencyValueLedger
 from src.runtime.load_shedding import EconomicLoadShedder
 from src.chains.native_ingress import NativeIngress
 from src.runtime.process_offload import ProcessOffloadedPool
@@ -578,6 +579,10 @@ class SubsystemWiring:
         # Under a burst the desk cannot look at every launch, and which ones
         # it drops is a decision rather than a queue discipline. See
         # src/runtime/load_shedding.py.
+        # Everything done for speed has been done on the belief that earlier
+        # is better. That belief has never been priced, and the answer
+        # decides whether the next month goes to latency or to alpha.
+        self.latency_value = LatencyValueLedger()
         self.load_shedder = EconomicLoadShedder(
             int(self.global_config.get("max_candidate_pipelines", 100)))
         # The sell must exist before it is needed, and be proven to.
@@ -769,6 +774,10 @@ class SubsystemWiring:
             self.solana_config, self.solana_rpc, self.genealogy, self.wallet_intel, self.social_intel,
             self.prelaunch, self.info_graph, self.rug_hazard, self.champion_challenger,
         )
+        # Attached rather than constructed inside, so the builder's own
+        # constructor stays a data-collection concern and the ledger can be
+        # driven directly by a test.
+        self.dataset_builder.latency_value = self.latency_value
         self.info_graph.set_outcome_provider(self.dataset_builder.get_outcome)
         if hasattr(self.genealogy, "set_outcome_provider"):
             self.genealogy.set_outcome_provider(self.dataset_builder.get_outcome)

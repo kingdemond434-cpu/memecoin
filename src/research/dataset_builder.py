@@ -53,6 +53,13 @@ class SnapshotTimepoint(Enum):
 
     PRELAUNCH = "prelaunch"
     T0 = "t0"
+    # Below the desk's own decode time, and there on purpose: they bound the
+    # value of latency work FROM BENEATH. If ten milliseconds already costs
+    # something measurable then the remaining microsecond effort has a
+    # ceiling, and knowing that ceiling before spending another month on it
+    # is worth two rows a launch.
+    T10MS = "t10ms"
+    T25MS = "t25ms"
     T50MS = "t50ms"
     T100MS = "t100ms"
     T250MS = "t250ms"
@@ -72,6 +79,8 @@ class SnapshotTimepoint(Enum):
 SNAPSHOT_OFFSETS_S.update({
     SnapshotTimepoint.PRELAUNCH: -1,
     SnapshotTimepoint.T0: 0,
+    SnapshotTimepoint.T10MS: 0.01,
+    SnapshotTimepoint.T25MS: 0.025,
     SnapshotTimepoint.T50MS: 0.05,
     SnapshotTimepoint.T100MS: 0.1,
     SnapshotTimepoint.T250MS: 0.25,
@@ -226,6 +235,9 @@ class PointInTimeDatasetBuilder:
         
         self.active_episodes: Dict[str, LaunchEpisode] = {}
         self.completed_episodes: Dict[str, LaunchEpisode] = {}
+        #: Set by wiring. Prices the delay ladder from the
+        #: snapshots this builder already takes.
+        self.latency_value: Optional[Any] = None
         self.outcome_index: Dict[str, Dict[str, Any]] = {}
         
         # The sweep runs at the fast cadence only while a sub-second target is
@@ -934,6 +946,20 @@ class PointInTimeDatasetBuilder:
             snapshot.feasible_exit_multiple = labels.get("feasible_exit_multiple")
             snapshot.realized_pnl = labels.get("realized_pnl")
         
+        # What being late would have cost on THIS launch, priced from the
+        # curve reserves already sitting in its own snapshot rows. Fed here
+        # because this is the one moment both halves exist: the sub-second
+        # prices and the outcome they would have been paid against.
+        ledger = getattr(self, "latency_value", None)
+        if ledger is not None and episode.final_outcome.get("status") == "OK":
+            try:
+                ledger.observe_snapshots(
+                    {SNAPSHOT_OFFSETS_S[timepoint]: snapshot.liquidity_features
+                     for timepoint, snapshot in episode.snapshots.items()
+                     if timepoint in SNAPSHOT_OFFSETS_S},
+                    episode.final_outcome.get("max_multiple"))
+            except Exception as exc:  # pragma: no cover - accounting only
+                logger.debug("latency value ledger for %s: %s", token, exc)
         self.completed_episodes[token] = episode
         self._active_checkpoint_path(token).unlink(missing_ok=True)
         if episode.final_outcome.get("status") == "OK":
