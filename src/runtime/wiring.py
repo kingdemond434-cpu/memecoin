@@ -198,6 +198,38 @@ class SubsystemWiring:
             self.pump_swap_monitor = PumpSwapMonitor(self.rpc_program_stream, self._on_pump_event)
             self.raydium_monitor = RaydiumMonitor(self.rpc_program_stream, self._on_raydium_event)
 
+    def _optional(self, name, fallback, build):
+        """Construct an OBSERVATIONAL subsystem, or run without it.
+
+        The distinction this enforces: a subsystem that informs a decision
+        may fail loudly, because trading on a half-built brain is worse than
+        not trading. A subsystem that only WATCHES -- scores other people's
+        wallets, counts which feed was first, records how quickly the sell
+        template was ready -- must never be able to stop the desk.
+
+        The asymmetry is about what is recoverable. A research convenience
+        that is missing for an hour can be computed later from the same
+        public data. Forward evidence not gathered during an hour the desk
+        was down is gone permanently, and with StartLimitBurst a startup
+        exception does not cost an hour, it leaves the unit stopped until
+        somebody notices and runs reset-failed.
+
+        The fallback is the empty instance, so every caller and every
+        /status reader gets the shape it expects and simply sees nothing
+        measured -- which is exactly what happened.
+        """
+        try:
+            return build()
+        except Exception as exc:
+            logger.error(
+                "OPTIONAL SUBSYSTEM %s failed to build (%s: %s); the desk "
+                "continues without it rather than refusing to start",
+                name, type(exc).__name__, exc)
+            try:
+                return fallback()
+            except Exception:  # pragma: no cover - fallback must be trivial
+                return None
+
     async def _setup_intelligence(self):
         helius = os.getenv("HELIUS_API_KEY", "")
         self.genealogy = GenealogyGraph(self.solana_config, self.solana_rpc, helius)
@@ -450,17 +482,32 @@ class SubsystemWiring:
         # Every launchpad normalises to one launch event. Programs start as
         # HYPOTHESES and are promoted only by decoding cleanly on this node,
         # so coverage reports what was seen rather than what was hoped for.
-        self.launchpads = LaunchpadRegistry()
+        self.launchpads = self._optional(
+            "launchpad registry", LaunchpadRegistry, LaunchpadRegistry)
         # Which feed reaches this box first, measured. Coverage outranks
         # speed: a feed that misses events is blind on them, not slow.
-        self.feed_race = FeedRace()
+        self.feed_race = self._optional("feed race", FeedRace, FeedRace)
         # The sell must exist before it is needed, and be proven to.
-        self.exit_readiness = ExitReadinessLedger()
+        self.exit_readiness = self._optional(
+            "exit readiness", ExitReadinessLedger, ExitReadinessLedger)
         # MFE:MAE per entry state -- what win rate cannot see.
-        self.excursions = ExcursionLedger()
+        self.excursions = self._optional(
+            "excursion ledger", ExcursionLedger, ExcursionLedger)
         # Public wallets worth reconstructing, and what FOLLOWING them costs.
         # Headline PnL is recorded as a claim here and never scored.
-        self.benchmark_corpus = load_roster(
+        #
+        # Wrapped, like every other purely OBSERVATIONAL subsystem above,
+        # because none of them is worth the desk's life. This one reads a
+        # YAML roster and a JSON corpus off disk at startup; a malformed
+        # file, a permission the unit does not have, or a library that
+        # behaves differently on another Python would otherwise raise here,
+        # take the process down, and -- with StartLimitBurst -- leave the
+        # desk permanently stopped. A desk that cannot score other people's
+        # wallets is a desk missing a research convenience. A desk that is
+        # not running has lost the forward evidence that is the whole point
+        # of it, and that evidence cannot be backfilled.
+        self.benchmark_corpus = self._optional(
+            "benchmark corpus", BenchmarkCorpus, lambda: load_roster(
             str(self.global_config.get("benchmark_roster",
                                        "config/benchmark_wallets.yaml")),
             BenchmarkCorpus(
@@ -468,9 +515,13 @@ class SubsystemWiring:
                     Path(self.global_config.get("ops_state_dir", "data/state"))
                     / "benchmark_wallets.json")),
                 cost_per_round_trip=float(
-                    self.global_config.get("follow_cost_round_trip", 0.02))))
+                    self.global_config.get("follow_cost_round_trip", 0.02)))))
         if not self.offline:
-            self.benchmark_corpus.load()
+            try:
+                self.benchmark_corpus.load()
+            except Exception as exc:  # pragma: no cover - disk only
+                logger.warning("benchmark corpus did not load (%s); the desk "
+                               "runs without it", exc)
         # Entries per token, kept only for tokens the hot state still holds.
         self._actor_entries: Dict[str, List[Entry]] = {}
         self.independence_report = IndependenceReport(status="DATA_BLOCKED")

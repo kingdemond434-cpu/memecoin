@@ -385,3 +385,44 @@ class OneTelegramClientForTheWholeDesk(unittest.TestCase):
         self.assertFalse(client.disconnected,
                          "stopping one channel must not take the desk's "
                          "Telegram connection down with it")
+
+
+class TheDeskCanNeverBeLeftPermanentlyStopped(unittest.TestCase):
+    """A burst limit turns a transient crash into a dead desk.
+
+    With StartLimitBurst set, five failures inside the interval do not slow
+    the unit down -- systemd stops it and leaves it stopped until a human
+    runs `reset-failed`. For a desk whose whole purpose is accumulating
+    forward evidence that cannot be backfilled, that is the most expensive
+    outcome available, and it is silent: nothing is listening on the port and
+    nothing is retrying.
+    """
+
+    def test_the_shadow_desk_disables_the_give_up_limit(self):
+        directives = _directives(UNITS / "memecoin-shadow.service")
+        self.assertEqual(["0"], directives.get("StartLimitBurst"),
+                         "a non-zero burst limit can leave the desk stopped "
+                         "until somebody notices")
+
+    def test_and_prevents_hammering_with_backoff_instead(self):
+        directives = _directives(UNITS / "memecoin-shadow.service")
+        self.assertTrue(directives.get("RestartSec"))
+        self.assertTrue(directives.get("RestartMaxDelaySec"),
+                        "without a growing delay, disabling the limit means "
+                        "retrying a hard failure every few seconds forever")
+        self.assertGreater(_seconds(directives["RestartMaxDelaySec"][0]),
+                           _seconds(directives["RestartSec"][0]))
+
+    def test_it_still_always_restarts(self):
+        directives = _directives(UNITS / "memecoin-shadow.service")
+        self.assertEqual(["always"], directives.get("Restart"))
+
+
+def _seconds(value: str) -> float:
+    text = value.strip().lower()
+    if text.endswith("ms"):
+        return float(text[:-2]) / 1000.0
+    for suffix, scale in (("s", 1.0), ("min", 60.0), ("h", 3600.0)):
+        if text.endswith(suffix):
+            return float(text[: -len(suffix)]) * scale
+    return float(text)
