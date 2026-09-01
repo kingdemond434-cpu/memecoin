@@ -1,0 +1,80 @@
+# Public Solana addresses worth STUDYING. Not addresses worth copying.
+#
+# Every wallet here entered the corpus because a public source reported it as
+# profitable. That is a sample selected on the outcome: wallets become famous
+# by winning, and the ones that ran the same strategy into zero are not on any
+# list. So no statistic computed over this roster is evidence about wallets in
+# general, and the corpus carries that warning into every report it prints.
+#
+# The `claimed_pnl_usd` figures are NOT measurements. They are what third-party
+# trackers displayed at the time of reading, recorded so they can never be
+# mistaken for something the desk verified. Where two trackers disagree the
+# disagreement is kept rather than averaged away -- it is the cheapest proof
+# available that headline PnL is not a number to build on. Nothing in the
+# scoring path reads these fields.
+#
+# What the desk actually does with a wallet here: reconstruct its decisions
+# point-in-time, then measure E[Δlog W] for FOLLOWING it at +50/100/250/500
+# /1000ms after its fill, net of costs. A wallet whose edge is being first is
+# not followable at any delay, and that result is as useful as the opposite.
+
+schema: v1
+
+wallets:
+  - address: DfMxre4cKmvogbLrPigxmibVTTQDuzjdXojWzjCXXhzj
+    label: euris
+    rationale: >
+      Long observable history of low-market-cap entries, still active at the
+      time of reading. The value is the LENGTH of the record, not the total:
+      thousands of decisions is a corpus, one big winner is an anecdote.
+    claimed_pnl_usd:
+      okx_tracker: 11190000
+    claim_note: >
+      Read from a public wallet-analytics page; unverified and not
+      reconstructed from chain by this desk.
+
+  - address: 2LNQo1MGb7MN9S9fQA2s9K4vi9orceJMXyjMdLMjZuK1
+    label: fast_flipper
+    rationale: >
+      The closest public specimen to the capital-time efficiency this desk
+      cares about: many tokens, sub-hour holds, capital recycled rather than
+      parked. Reported inactive recently, so treat as a historical strategy
+      specimen and not a live signal.
+    claimed_pnl_usd:
+      lookonchain_report: 1000000
+    claim_note: >
+      Reported as >$1M over one seven-day window across 88 tokens. A single
+      week is a sample of one week.
+
+  - address: 71CPXu3TvH3iUKaY1bNkAAow24k6tjH473SsKprQBABC
+    label: large_cumulative
+    rationale: >
+      Very large cumulative realised figure but little recent activity, and
+      not clearly a sniper. Included for the WalletDNA corpus rather than as
+      a behavioural benchmark.
+    claimed_pnl_usd:
+      okx_tracker: 24200000
+    claim_note: Unverified; the wallet may be a long-horizon trader.
+
+  - address: o7RY6P2vQMuGSu1TrLM81weuzgDjaCRTXYRaXJwWcvc
+    label: high_volume_sniper
+    rationale: >
+      Independently described by more than one public source as a sniper with
+      thousands of launches. High decision count is exactly what makes a
+      wallet worth reconstructing: the follow verdict needs sample size.
+    claimed_pnl_usd:
+      pawscan: 7100000
+    claim_note: Unverified. Reported as largely inactive at the time of reading.
+
+  - address: AcULspHXYRmoKkUhKN2WmFo4f8USUkmJtAE1LE2twJ2E
+    label: filtered_launch_trader
+    rationale: >
+      Two independent trackers both show seven figures but DISAGREE on the
+      amount by roughly 20%. Kept deliberately as the worked example of why
+      headline PnL is never an input here.
+    claimed_pnl_usd:
+      okx_tracker: 1900000
+      pawscan: 2370000
+    claim_note: >
+      The disagreement is the point. Two public sources cannot both be right,
+      and neither is a measurement this desk made.

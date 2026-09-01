@@ -619,12 +619,83 @@ class PointInTimeDatasetBuilder:
                 "price_disagreement_status": disagreement.get("status"),
                 "price_disagreement": disagreement.get("evidence_score")}
 
+    def _creation_native_token_features(self, episode: LaunchEpisode,
+                                        as_of: float) -> Dict[str, Any]:
+        """What is knowable about a token before any enrichment returns.
+
+        PARTIAL rather than OK: the caller must be able to tell this apart
+        from a full report, and a status of OK on a document missing every
+        concentration field would be a lie of omission. Every enriched field
+        stays None -- absent, never zero -- because a zero for `can_mint`
+        asserts the mint authority was revoked, which is exactly the fact
+        nobody has looked up yet.
+
+        The concentration PROXY is the useful part. Holder percentages need
+        an account scan, but the desk has already watched every trade it
+        streamed, and the share of observed buy volume taken by the largest
+        buyers is a real point-in-time measurement of the same underlying
+        thing. It is named `observed_*` and carries PROXY provenance so it
+        can never be confused with `top_10_pct`, which it is not.
+        """
+        trades = [item for item in episode.market_observations
+                  if item.get("type") in {"trade", "buy"}
+                  and float(item.get("timestamp", 0) or 0) <= as_of]
+        by_wallet: Dict[str, float] = {}
+        for trade in trades:
+            wallet = str(trade.get("wallet", "") or trade.get("buyer", "") or "")
+            amount = float(trade.get("sol_amount", 0) or trade.get("amount_sol", 0) or 0)
+            if wallet and amount > 0:
+                by_wallet[wallet] = by_wallet.get(wallet, 0.0) + amount
+        total = sum(by_wallet.values())
+        ranked = sorted(by_wallet.values(), reverse=True)
+        result: Dict[str, Any] = {
+            # PARTIAL is a first-class status here, not a softened failure.
+            "status": "PARTIAL",
+            "reason": "risk_report_not_recorded; creation-native facts only",
+            "provenance": "CREATION_NATIVE",
+            "launch_age_s": max(0.0, float(as_of) - float(episode.created_at)),
+            "deployer_known": bool(episode.deployer),
+            "factory": episode.factory or None,
+            "observed_buyers": len(by_wallet),
+            # Enrichment fields stay ABSENT. None is "nobody looked"; 0.0
+            # would assert a measurement that was never made.
+            "ownership_renounced": None, "can_mint": None, "can_freeze": None,
+            "top_10_pct": None, "top_20_pct": None, "dev_pct": None,
+            "insider_pct": None, "bundler_pct": None, "fresh_wallet_pct": None,
+            "whale_pct": None, "connected_cluster_pct": None,
+            "token_extensions": [], "extension_risk": None,
+            "sell_route_feasible": None,
+        }
+        if total > 0 and len(ranked) >= 3:
+            result["observed_buyer_concentration_top3"] = float(sum(ranked[:3]) / total)
+            result["observed_buyer_concentration_top10"] = float(sum(ranked[:10]) / total)
+            result["observed_concentration_provenance"] = "PROXY"
+        if self.memecoin_state_provider is not None:
+            state = self.memecoin_state_provider(episode.token, as_of)
+            dev = state.get("dev_wallet") or {}
+            result.update({
+                "dev_state_status": dev.get("status", "DATA_BLOCKED"),
+                "dev_balance_pct": dev.get("balance_pct"),
+                "dev_recent_sells": dev.get("recent_dev_sells"),
+                "dev_hard_veto_count": len(dev.get("hard_vetoes", ())),
+            })
+        return result
+
     async def _capture_token_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
         reports = [item for item in episode.market_observations
                    if item.get("type") == "risk_report" and float(item.get("timestamp", 0) or 0) <= as_of]
         report = max(reports, key=lambda item: float(item.get("timestamp", 0) or 0)) if reports else episode.risk_report
         if not report:
-            return {"status": "DATA_BLOCKED", "reason": "risk_report_not_recorded"}
+            # Degraded, not absent. A risk report is ENRICHMENT -- it arrives
+            # from account-owner lookups that take an RPC round trip -- and
+            # blocking the whole token group on it meant that at literal T0,
+            # the moment the decision is actually made, the desk knew nothing
+            # about the token even though the creation event itself carries
+            # facts. Everything below is derivable from observations already
+            # in hand, and each field says where it came from so a model can
+            # learn that a creation-native fact and an enriched one are
+            # different measurements rather than pooling them.
+            return self._creation_native_token_features(episode, as_of)
         concentrations = [float(item.get("top_10_pct", 0) or 0) for item in reports
                           if item.get("top_10_pct") is not None]
         concentrations20 = [float(item.get("top_20_pct", 0) or 0) for item in reports

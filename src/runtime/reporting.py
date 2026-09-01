@@ -470,6 +470,56 @@ class ReportingSurface:
             # included. `ignore_share` is the line that matters: a corpus
             # where IGNORE is a minority is still only recording trades.
             "decision_corpus": self.counterfactual_corpus.report(),
+            # What the opening cohort did after its fill, per held token.
+            "cohorts": {
+                token: report.report()
+                for token, report in sorted(
+                    getattr(self, "cohort_reports", {}).items())},
+            # Coordination an exchange withdrawal was used to hide. Reports
+            # its own denominator: without measured emission rates there are
+            # no clusters, and that is a finding rather than a clean slate.
+            "temporal_funding": {
+                "status": ("OK" if getattr(self, "temporal_clusters", None)
+                           else "DATA_BLOCKED"),
+                "clusters": len([c for c in getattr(self, "temporal_clusters", ())
+                                 if getattr(c, "status", "") == "OK"]),
+                "wallets_discounted": len(getattr(self, "temporal_discounts", {})),
+                "sources_rated": len(getattr(self, "exchange_rates", {})),
+                "detail": ("no exchange emission rates measured yet; a cluster "
+                           "scored without one would flag every busy exchange"
+                           if not getattr(self, "exchange_rates", {}) else ""),
+            },
+            # Public wallets under reconstruction, scored by what FOLLOWING
+            # them would return -- never by their headline PnL.
+            "benchmark_wallets": (
+                self.benchmark_corpus.report()
+                if getattr(self, "benchmark_corpus", None) is not None
+                else {"status": "DATA_BLOCKED"}),
+            # What the opening cohort did after its fill, per held token.
+            "cohorts": {
+                token: report.report()
+                for token, report in sorted(
+                    getattr(self, "cohort_reports", {}).items())},
+            # Coordination an exchange withdrawal was used to hide. Reports
+            # its own denominator: without measured emission rates there are
+            # no clusters, and that is a finding rather than a clean slate.
+            "temporal_funding": {
+                "status": ("OK" if getattr(self, "temporal_clusters", None)
+                           else "DATA_BLOCKED"),
+                "clusters": len([c for c in getattr(self, "temporal_clusters", ())
+                                 if getattr(c, "status", "") == "OK"]),
+                "wallets_discounted": len(getattr(self, "temporal_discounts", {})),
+                "sources_rated": len(getattr(self, "exchange_rates", {})),
+                "detail": ("no exchange emission rates measured yet; a cluster "
+                           "scored without one would flag every busy exchange"
+                           if not getattr(self, "exchange_rates", {}) else ""),
+            },
+            # Public wallets under reconstruction, scored by what FOLLOWING
+            # them would return -- never by their headline PnL.
+            "benchmark_wallets": (
+                self.benchmark_corpus.report()
+                if getattr(self, "benchmark_corpus", None) is not None
+                else {"status": "DATA_BLOCKED"}),
             # Independent landing MECHANISMS, and which ones actually land.
             # Seven Jito regions is one mechanism; a router reporting one
             # mechanism has the redundancy of having none.
