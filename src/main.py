@@ -65,6 +65,7 @@ from src.runtime.supervision import TaskSupervision
 from src.runtime.maintenance import DeskMaintenance
 from src.runtime.wiring import SubsystemWiring
 from src.runtime.source_intelligence import SourceIntelligence
+from src.runtime.loop_local import loop_local_semaphore
 from src.runtime.offload import OffloadedPool, install_fast_event_loop
 from src.runtime.sd_notify import SystemdNotifier, watchdog_interval_s
 from src.runtime.memory_governor import (
@@ -3895,13 +3896,19 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
 
         def trim_miners():
             miners.concurrency = max(1, original_concurrency // 2)
-            miners._semaphore = asyncio.Semaphore(miners.concurrency)
+            # loop_local, not asyncio.Semaphore: the miners run on the
+            # offload loop, and handing them a primitive bound to THIS loop
+            # is the leak that OOM-killed the desk. Trimming under memory
+            # pressure must not reintroduce the thing that caused it.
+            miners._semaphore = loop_local_semaphore(
+                miners.concurrency, "miners")
 
         self.memory.register(Relief(
             name="data_miners", trim=trim_miners,
             restore=lambda: (setattr(miners, "concurrency", original_concurrency),
                              setattr(miners, "_semaphore",
-                                     asyncio.Semaphore(original_concurrency))),
+                                     loop_local_semaphore(original_concurrency,
+                                                          "miners"))),
             detail="fewer simultaneous fetches; context is not on the hot path"))
 
         def trim_marks():
