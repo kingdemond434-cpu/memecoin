@@ -342,6 +342,13 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         self._native_ingress_task: Optional[asyncio.Task] = None
         self._native_ingress_events = 0
         self._fee_config_refreshed_at = 0.0
+        # The full risk audit, running BESIDE the decision instead of in
+        # front of it. Keyed per token so a candidate re-checked five times
+        # on the ladder starts one fetch, not five.
+        self._risk_enrichment: Dict[str, asyncio.Task] = {}
+        self._portfolio_refresh_task: Optional[asyncio.Task] = None
+        self._portfolio_refreshed_at = 0.0
+        self.sol_price_age_s = 0.0
         self._source_task: Optional[asyncio.Task] = None
         # Coverage says a module was consulted; this says whether it mattered.
         # A component that is disconnected and one that is connected but inert
@@ -958,7 +965,14 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             candidate.base_token or WSOL_MINT, detected_at=candidate.timestamp,
             prelaunch_context=self._prelaunch_context(candidate.deployer or "", candidate.timestamp),
         )
-        risk = await self.rug_detector.analyze(token, candidate.pair, candidate.base_token)
+        # NO NETWORK AWAIT HERE. `analyze` is three to five sequential RPC
+        # round trips, and it used to sit directly in front of the decision:
+        # one to five hundred milliseconds of the desk waiting, on the one
+        # launch it is trying to be first to, while it optimises signer IPC
+        # in microseconds behind it. The local view is taken now and the full
+        # audit is fetched concurrently; the checkpoint ladder re-runs this
+        # candidate a second later and finds the completed report cached.
+        risk = self._risk_for_decision(candidate)
         risk_data = _jsonable(risk)
         self.dataset_builder.record_risk_report(token, risk_data)
         self.rug_hazard.register_token(token, {"deployer": candidate.deployer or "", "pair": candidate.pair or ""})
@@ -997,7 +1011,12 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         if not self.dry_run and not self.champion_challenger.is_live(MODEL_HYPOTHESIS_ID):
             self._record_blocked_decision(token, "champion_not_promoted_for_live_authority", _jsonable(prediction))
             return
-        await self._refresh_portfolio_state()
+        # Refreshed on a cadence, not per candidate. This is a Jupiter quote
+        # for the SOL price and, when live, a getBalance -- another full
+        # network round trip in the middle of T0, taken once per candidate to
+        # learn a number that moves by fractions of a percent in the seconds
+        # between launches. Staleness is recorded rather than paid for.
+        self._ensure_portfolio_fresh()
         # Hard admissibility, then a size, then Q. NOT `should_trade`, which
         # composes all three plus four economic thresholds -- and those
         # thresholds are opinions about quantities the objective already
@@ -1412,89 +1431,6 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         self.dataset_builder.record_market_observation(candidate.address, observation)
         self.rug_hazard.record_observation(candidate.address, observation)
         return estimate
-
-    async def _build_prediction_features(self, candidate: TokenCandidate, risk: Any, liquidity: float) -> PredictionFeatures:
-        as_of = time.time()
-        episode = self.dataset_builder.active_episodes.get(candidate.address)
-        episode_meta = {
-            "token": candidate.address,
-            "chain": candidate.chain,
-            "created_at": float(getattr(episode, "created_at", candidate.timestamp or as_of)),
-        }
-
-        if episode is not None:
-            deployer_features = await self.dataset_builder._capture_deployer_features(episode, as_of)
-            wallet_features = await self.dataset_builder._capture_wallet_features(episode, as_of)
-            flow_features = await self.dataset_builder._capture_flow_features(episode, as_of)
-            graph_features = await self.dataset_builder._capture_entity_graph_features(episode, as_of)
-            social_features = await self.dataset_builder._capture_social_features(episode, as_of)
-            token_features = await self.dataset_builder._capture_token_features(episode, as_of)
-            market_features = await self.dataset_builder._capture_market_features(episode, as_of)
-        else:
-            # No episode yet: report every group DATA_BLOCKED rather than
-            # substituting zeros that would read as real observations.
-            blocked = {"status": "DATA_BLOCKED", "reason": "episode_not_started"}
-            deployer_features = {"has_profile": False}
-            wallet_features = {}
-            flow_features = dict(blocked)
-            graph_features = dict(blocked)
-            token_features = dict(blocked)
-            market_features = dict(blocked)
-            social_features = self.social_intel.get_token_social_signal(candidate.address, as_of=as_of)
-
-        # Actor intelligence is computed from live entries rather than from
-        # the episode snapshot, so it reaches the decision at the age it was
-        # measured. Its status travels with it: a launch with no scored buyers
-        # must not read as one whose buyers scored zero.
-        actors = self.actor_intelligence(candidate.address, as_of)
-        graph_features = {
-            **graph_features,
-            "actor_status": actors.get("status", "DATA_BLOCKED"),
-            "observed_buyers": actors.get("observed_buyers", 0),
-        }
-        flow = actors.get("smart_flow") or {}
-        if flow.get("status") == "OK":
-            graph_features["actor_adjusted_flow"] = flow.get("evidence")
-            graph_features["sybil_discount"] = flow.get("discount")
-        swarm = actors.get("swarm") or {}
-        if swarm.get("status") == "OK":
-            graph_features["swarm_probability"] = swarm.get("probability")
-        elif swarm:
-            graph_features["swarm_evidence_uncalibrated"] = swarm.get("evidence")
-        dna = actors.get("buyer_dna") or {}
-        if dna.get("status") == "OK":
-            graph_features["first25_label"] = dna.get("label")
-            graph_features["first25_confidence"] = dna.get("confidence")
-
-        # The safety report is fresher than the episode snapshot for the
-        # fields it owns, so it takes precedence where both are present.
-        token_features = {
-            **token_features,
-            "status": risk.data_status,
-            "ownership_renounced": bool(risk.ownership_renounced),
-            "can_mint": bool(risk.can_mint),
-            "can_freeze": bool(risk.can_freeze),
-            "top_10_pct": float(risk.top_10_pct),
-            "extension_risk": float(getattr(risk, "extension_risk", 0) or 0),
-            "sell_route_feasible": risk.sell_route_feasible,
-        }
-        liquidity_features = (
-            {"status": "OK", "liquidity_usd": liquidity, "liquidity_locked": bool(risk.liquidity_locked)}
-            if liquidity > 0 else {"status": "DATA_BLOCKED", "reason": "liquidity_not_observed"}
-        )
-
-        snapshot = {
-            "timestamp": as_of,
-            "deployer_features": deployer_features,
-            "wallet_features": wallet_features,
-            "flow_features": flow_features,
-            "liquidity_features": liquidity_features,
-            "social_features": social_features,
-            "token_features": token_features,
-            "market_features": market_features,
-            "entity_graph_features": graph_features,
-        }
-        return build_features(episode_meta, snapshot)
 
     async def _manage_positions(self):
         for token, position in list(self.elogw_engine.open_positions.items()):
@@ -3463,6 +3399,7 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             self.equity_status = "DATA_BLOCKED"
             return
         self.sol_price_usd = quote.output_amount / 1_000_000
+        self._portfolio_refreshed_at = time.time()
         if self.dry_run:
             self.wallet_equity_usd = float(self.global_config.get("paper_equity_usd", 10_000)) + self.total_pnl
         else:
@@ -3589,6 +3526,10 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         # Checkpointed on the cadence follows are resolved on, so a restart
         # costs one cycle of measurement rather than every open follow.
         self.save_follow_candidates()
+        # Two hundred observations thrown away on every restart is two
+        # hundred that never accumulate -- the failure that kept the follow
+        # book empty, applied to the evidence that keeps T0 off the network.
+        self.invariant_ledger.save()
         self._resolve_follow_candidates()
         self._refresh_independence()
         self._refresh_cohorts()

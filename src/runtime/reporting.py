@@ -497,6 +497,11 @@ class ReportingSurface:
                 else {"status": "DATA_BLOCKED"}),
             # The chain receive path in Rust, and whether it has yet
             # matched the Python client it runs beside.
+            "t0_risk": (
+                self.t0_risk.report()
+                if getattr(self, "t0_risk", None) is not None
+                else {"status": "MISSING"}),
+            "sol_price_age_s": round(float(getattr(self, "sol_price_age_s", 0.0)), 1),
             "native_ingress": (
                 self.native_ingress.report()
                 if getattr(self, "native_ingress", None) is not None

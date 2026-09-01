@@ -22,7 +22,8 @@ from src.chains.yellowstone_grpc import (
     NATIVE_FASTPATH_STATUS, PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
     create_combined_subscription,
 )
-from src.detection.rug_detector import RugDetector
+from src.detection.rug_detector import RiskLevel, RugDetector
+from src.detection.t0_risk import LaunchInvariantLedger, T0RiskView
 from src.detection.token_detector import DetectionSource, TokenCandidate, TokenDetectionEngine
 from src.execution.jupiter_jito import (
     ExecutionEngine,
@@ -677,6 +678,18 @@ class SubsystemWiring:
             # recorded as a confident "no route", which hard-vetoed 100% of
             # decided launches.
             curve_state_provider=self._latest_curve_state.get)
+        # What a decision can know for free, and the ledger that decides how
+        # much that is. The full audit is three to five sequential RPC round
+        # trips; it now runs BESIDE the decision rather than in front of it,
+        # and every completed report teaches this ledger what the launch
+        # program guarantees so the next launch needs fewer of them.
+        self.invariant_ledger = LaunchInvariantLedger(
+            Path(self.global_config.get("ops_state_dir", "data/state"))
+            / "launch_invariants.json")
+        self.t0_risk = T0RiskView(
+            self.invariant_ledger,
+            curve_state_provider=self._latest_curve_state.get,
+            risk_level_enum=RiskLevel)
         self.detection_engine = TokenDetectionEngine(self.chain_registry)
 
     async def _setup_research(self):

@@ -58,6 +58,19 @@ REQUIRED_CALLS = {
     "pump fee config read from chain": ("adopt_chain_config(",
                                         "src/runtime/maintenance.py"),
     "pump fee config refreshed": ("self._refresh_pump_fee_config()", "src/main.py"),
+    # T0 used to await three to five sequential RPC round trips before it
+    # could decide. The local view has to be the one the decision reads, and
+    # the full audit has to be scheduled beside it -- both, or neither works.
+    "t0 local risk view used": ("self.t0_risk.assess(", "src/runtime/ingestion.py"),
+    "t0 risk enrichment scheduled": ("self._schedule_risk_enrichment(",
+                                     "src/runtime/ingestion.py"),
+    "t0 risk view is what the decision reads": ("self._risk_for_decision(",
+                                                "src/main.py"),
+    "launch invariants learned from full reports": (
+        "self.invariant_ledger.observe_report(", "src/runtime/ingestion.py"),
+    "launch invariants persisted": ("self.invariant_ledger.save()", "src/main.py"),
+    "portfolio refresh is off the decision path": ("self._ensure_portfolio_fresh()",
+                                                   "src/main.py"),
 }
 
 

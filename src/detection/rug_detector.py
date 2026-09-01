@@ -137,6 +137,26 @@ class RugDetector:
     def set_curve_state_provider(self, provider: Any):
         self.curve_state_provider = provider
 
+    def cache_key(self, token_address: str,
+                  deployer_address: Optional[str] = None) -> str:
+        return f"{self.chain_config.name}:{token_address}:{deployer_address or ''}"
+
+    def cached_report(self, token_address: str,
+                      deployer_address: Optional[str] = None) -> Optional[TokenRiskReport]:
+        """The completed audit if one is in hand, WITHOUT awaiting anything.
+
+        `analyze` is three to five sequential RPC round trips, and awaiting
+        it to discover that the answer was already cached still costs a
+        coroutine hop through a hot path where the desk is otherwise counting
+        microseconds. More importantly it makes "do I have this yet?" and "go
+        and fetch this" the same call, so a T0 decision cannot ask the first
+        question without risking the second.
+        """
+        cached = self._cache.get(self.cache_key(token_address, deployer_address))
+        if cached and time.time() - cached[1] < self._cache_ttl:
+            return cached[0]
+        return None
+
     async def analyze(
         self,
         token_address: str,
