@@ -2470,6 +2470,21 @@ class FakeJito:
         raise AssertionError("dry-run must not submit a bundle")
 
 
+
+class _AuthorisedLedger:
+    """A promotion ledger that says the stage has been earned.
+
+    Live-path tests exercise SUBMISSION, and submission now requires an
+    earned stage as well as `dry_run=False`. Without this every live test
+    would pass for the wrong reason -- blocked by the ladder rather than
+    exercising the behaviour it was written to check.
+    """
+
+    @staticmethod
+    def authorises_live_capital():
+        return True, "authorised for test"
+
+
 class FakeRpc:
     async def request(self, method, params):
         raise AssertionError("dry-run must not submit or confirm a transaction")
@@ -2641,6 +2656,7 @@ class TestExecution(unittest.IsolatedAsyncioTestCase):
         keypair = Keypair()
         engine = ExecutionEngine(solana_chain(), FakeRpc(), FakeJupiter(), FakeJito(),
                                  SolanaTransactionBuilder(FakeRpc(), keypair), None, dry_run=False)
+        engine.promotion_ledger = _AuthorisedLedger()
         result = await engine.execute_swap("in", "out", 1000)
         self.assertEqual(result.status, TransactionStatus.REJECTED)
         self.assertIn("locked", result.error)
@@ -2675,6 +2691,7 @@ class TestExecution(unittest.IsolatedAsyncioTestCase):
             jito or LiveFakeJito(), builder, CounterfactualExecutionLab(),
             dry_run=False, confirmation_timeout=confirmation_timeout,
         )
+        engine.promotion_ledger = _AuthorisedLedger()
         return engine
 
     async def test_live_jito_bundle_fills_with_verified_output_balance_delta(self):
@@ -14340,6 +14357,10 @@ class TestNativeRouteIsActuallyTaken(unittest.IsolatedAsyncioTestCase):
 
     def _engine(self, curve=None):
         engine = ExecutionEngine.__new__(ExecutionEngine)
+        # Submission now needs an earned stage as well as `dry_run`, and
+        # these engines skip __init__.
+        engine.promotion_ledger = None
+        engine.simulation_reasons = {}
         engine.pump_route = NativePumpRoute()
         engine.curve_state_provider = (lambda token: curve) if curve else None
         engine.pumpswap_route = None
@@ -14395,17 +14416,29 @@ class TestNativeRouteIsActuallyTaken(unittest.IsolatedAsyncioTestCase):
             return SimpleNamespace(output_amount=123, route_type=RouteType.JUPITER_V1)
         return get_quote
 
-    async def test_the_dry_run_gate_guards_the_native_path_too(self):
+    async def test_every_gate_guards_the_native_path_too(self):
         """A path whose safety gate is only on the other branch will one day
-        be the branch taken."""
+        be the branch taken.
+
+        Three gates now, not one: the operator's `dry_run` intent, the
+        EARNED promotion stage, and the live-trading acknowledgement. All
+        three have to be visible on this branch, because this is the branch
+        that spends money.
+        """
         source = Path("src/execution/jupiter_jito.py").read_text()
         tree = ast.parse(source)
         native = next(node for node in ast.walk(tree)
                       if isinstance(node, ast.AsyncFunctionDef)
                       and node.name == "_execute_native")
         text = ast.unparse(native)
-        self.assertIn("self.dry_run", text)
+        self.assertIn("self._submission_blocked()", text)
         self.assertIn("ALLOW_LIVE_TRADING", text)
+        blocker = next(node for node in ast.walk(tree)
+                       if isinstance(node, ast.FunctionDef)
+                       and node.name == "_submission_blocked")
+        blocker_text = ast.unparse(blocker)
+        self.assertIn("self.dry_run", blocker_text)
+        self.assertIn("live_capital_authorised", blocker_text)
 
     async def test_hard_invariants_still_run_before_any_route(self):
         engine = self._engine(curve=self._curve(creator=self.MINT))
@@ -19288,12 +19321,21 @@ class TestShadowExercisesTheExecutionPath(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(source.count("await self._build_native_signed("), 2)
         self.assertNotIn("await self.tx_builder.build_and_sign(", source)
 
-    def test_dry_run_never_submits(self):
+    def test_a_blocked_submission_never_submits(self):
+        """The guard is no longer `dry_run` alone.
+
+        Submission requires an operator's intent AND an earned promotion
+        stage, so the branch that must not touch the network is the one
+        `_submission_blocked` selects -- and it must still build and sign,
+        which is what keeps the live path exercised in shadow.
+        """
         source = inspect.getsource(ExecutionEngine._execute_native)
-        dry = source[source.index("if self.dry_run:"):
-                     source.index("TransactionStatus.SIMULATED")]
+        self.assertIn("blocked = self._submission_blocked()", source)
+        blocked = source[source.index("blocked = self._submission_blocked()"):
+                         source.index("TransactionStatus.SIMULATED")]
         for forbidden in ("_submit_signed", "send_transaction", "self.jito."):
-            self.assertNotIn(forbidden, dry)
+            self.assertNotIn(forbidden, blocked)
+        self.assertIn("_build_native_signed", blocked)
 
     def test_an_unexercised_path_reports_blocked(self):
         engine = ExecutionEngine.__new__(ExecutionEngine)

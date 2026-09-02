@@ -27,7 +27,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,19 @@ class PromotionCriteria:
 #: control, so a change to one is a reviewable diff rather than a runtime
 #: argument nobody sees.
 DEFAULT_CRITERIA: Dict[Stage, PromotionCriteria] = {
+    # The bottom rung, which had NO criteria at all -- so a fresh desk sat at
+    # HISTORICAL with nothing to pass, and the ladder was unclimbable from
+    # its own first step. Deliberately the weakest bar on the ladder: it asks
+    # only whether the thing works at all on history the desk did not choose,
+    # and every rung above it is where the evidence that matters lives. It is
+    # a bar rather than a formality because a model that cannot clear this
+    # has no business being measured forward for a fortnight to find out.
+    Stage.HISTORICAL: PromotionCriteria(
+        stage=Stage.HISTORICAL,
+        min_decisions=100, min_launch_cohorts=25, min_regimes=1,
+        min_net_log_growth=0.0, max_rug_loss_share=0.30,
+        min_monster_enrichment=1.2,
+    ),
     Stage.CHRONOLOGICAL_OOS: PromotionCriteria(
         stage=Stage.CHRONOLOGICAL_OOS,
         min_decisions=500, min_launch_cohorts=100, min_regimes=2,
@@ -269,3 +282,107 @@ class PromotionLedger:
 
     def bar_moved(self, stage: Stage) -> bool:
         return len(self.fingerprints_for(stage)) > 1
+
+    # --- the part that makes the ladder load-bearing ---------------------
+
+    @property
+    def _stage_path(self) -> Path:
+        return self.path.with_name(self.path.stem + "_stage.json")
+
+    def current_stage(self) -> Stage:
+        """The stage this desk has EARNED, read from disk.
+
+        On disk rather than in memory, because a stage that resets on
+        restart is a desk that silently returns to trading without
+        authorisation -- or, in the other direction, forgets that it earned
+        the right to. Neither is survivable in something that decides on its
+        own whether to spend money.
+        """
+        try:
+            payload = json.loads(self._stage_path.read_text(encoding="utf-8"))
+            return Stage(str(payload.get("stage", "")))
+        except (OSError, ValueError, KeyError):
+            # No record is the FIRST stage, never the last. A missing or
+            # corrupt file must never read as authorisation.
+            return STAGE_ORDER[0]
+
+    def _write_stage(self, stage: Stage, reason: str) -> None:
+        payload = {"stage": stage.value, "reason": reason, "at": time.time()}
+        self._stage_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._stage_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload), encoding="utf-8")
+        temporary.replace(self._stage_path)
+
+    def submit(self, evidence: Evidence,
+               criteria: Optional[PromotionCriteria] = None) -> Verdict:
+        """Evaluate evidence at the CURRENT stage, record it, and advance on a pass.
+
+        One stage per pass, never two: each stage buys evidence the previous
+        one could not, and skipping one means promoting on evidence that was
+        never gathered.
+        """
+        stage = self.current_stage()
+        criteria = criteria or DEFAULT_CRITERIA.get(stage)
+        if criteria is None:  # pragma: no cover - every stage has criteria
+            return Verdict(False, stage, "", failures=["no criteria for stage"])
+        verdict = evaluate(criteria, evidence)
+        self.record(verdict, evidence, criteria)
+        if can_advance(stage, verdict):
+            earned = next_stage(stage)
+            self._write_stage(earned, f"passed {stage.value}")
+            logger.warning(
+                "PROMOTION: %s -> %s on %d decisions, %d real fills, "
+                "net log growth %s. The desk's trading authority has CHANGED.",
+                stage.value, earned.value, evidence.decisions,
+                evidence.real_fills, evidence.net_log_growth)
+        return verdict
+
+    def demote(self, reason: str) -> Stage:
+        """Drop one stage. The only thing that ever lowers trading authority.
+
+        Deliberately not automatic on a failed verdict: evidence windows are
+        noisy and a desk that flaps between authorised and not would trade
+        on the noise. This is for the cases that are not noise -- a
+        catastrophic failure, or an operator deciding the thing is
+        misbehaving -- and it is one stage, so recovering means passing the
+        gate again rather than being handed back what was taken away.
+        """
+        stage = self.current_stage()
+        index = STAGE_ORDER.index(stage)
+        lower = STAGE_ORDER[max(0, index - 1)]
+        self._write_stage(lower, f"demoted: {reason}")
+        logger.error("DEMOTION: %s -> %s (%s)", stage.value, lower.value, reason)
+        return lower
+
+    def authorises_live_capital(self) -> Tuple[bool, str]:
+        """Whether the EARNED stage permits spending real money, and why not.
+
+        CANARY is the first stage that does. Everything below it is
+        measurement, and the whole point of the ladder is that the
+        measurement happens before the money rather than after it.
+        """
+        stage = self.current_stage()
+        index = STAGE_ORDER.index(stage)
+        canary = STAGE_ORDER.index(Stage.CANARY)
+        if index >= canary:
+            return True, f"stage {stage.value} authorises live capital"
+        return False, (
+            f"stage is {stage.value}; live capital requires "
+            f"{Stage.CANARY.value}, which is reached by passing the "
+            f"{stage.value} gate on measured evidence")
+
+    def status(self) -> Dict[str, Any]:
+        stage = self.current_stage()
+        authorised, reason = self.authorises_live_capital()
+        history = self.history()
+        return {
+            "schema_version": PROMOTION_GATE_SCHEMA_VERSION,
+            "earned_stage": stage.value,
+            "next_stage": (next_stage(stage).value
+                           if next_stage(stage) else None),
+            "authorises_live_capital": authorised,
+            "authorisation_detail": reason,
+            "verdicts_recorded": len(history),
+            "bar_moved_at_this_stage": self.bar_moved(stage),
+            "last_verdict": (history[-1]["verdict"] if history else None),
+        }

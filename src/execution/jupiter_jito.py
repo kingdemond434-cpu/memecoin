@@ -13,7 +13,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
@@ -666,6 +666,12 @@ class ExecutionEngine:
         # actual validator identity, which is what the landing model's
         # per-leader accept rates have always been keyed on and never had.
         self.leader_schedule: Optional[Any] = None
+        # Set by wiring. The ladder the desk has to climb before it may
+        # spend anything; see live_capital_authorised.
+        self.promotion_ledger: Optional[Any] = None
+        #: Why submissions were simulated, by reason. "dry_run" is an
+        #: operator's choice; anything else is the ladder refusing.
+        self.simulation_reasons: Dict[str, int] = {}
         self.counterfactual_lab = counterfactual_lab
         self.dry_run = bool(dry_run)
         self.confirmation_timeout = confirmation_timeout
@@ -932,7 +938,8 @@ class ExecutionEngine:
         # pre-graduation bucket, and the two are not the same market.
         route_type = (RouteType.PUMPSWAP_NATIVE if native.venue == "pumpswap"
                       else RouteType.PUMP_NATIVE)
-        if self.dry_run:
+        blocked = self._submission_blocked()
+        if blocked:
             # BUILD AND SIGN ANYWAY. This used to return here, which left the
             # whole build path -- account derivation, compute budget, the
             # blockhash cache, the signer -- as dead code for the entire
@@ -972,6 +979,18 @@ class ExecutionEngine:
                 # trade the desk was never capable of making.
                 error=build_error,
             )
+            # WHY it was simulated: an operator's flag, or an unearned stage.
+            # Those are different states and an operator staring at a desk
+            # that is not trading needs to know which one they are in.
+            #
+            # Resolved defensively because this is ACCOUNTING sitting inside
+            # a safety path, and accounting that can raise turns "we
+            # correctly refused to spend money" into a crashed decision loop.
+            reasons = getattr(self, "simulation_reasons", None)
+            if reasons is None:
+                reasons = {}
+                self.simulation_reasons = reasons
+            reasons[blocked] = reasons.get(blocked, 0) + 1
             self.native_route_attempts["simulated"] += 1
             self.native_route_attempts[f"simulated:{native.venue}"] += 1
             self._record(result, decision_id)
@@ -1128,7 +1147,7 @@ class ExecutionEngine:
         if not quote or quote.output_amount <= 0:
             return ExecutionResult(False, TransactionStatus.REJECTED, error="no executable quote")
 
-        if self.dry_run:
+        if self._submission_blocked():
             result = ExecutionResult(
                 success=True,
                 status=TransactionStatus.SIMULATED,
@@ -1606,6 +1625,43 @@ class ExecutionEngine:
         if index >= len(before) or index >= len(after):
             return 0
         return int(after[index]) - int(before[index])
+
+    def live_capital_authorised(self) -> Tuple[bool, str]:
+        """Whether the EARNED promotion stage permits spending real money.
+
+        This is the check `dry_run` never was. `dry_run` is an operator's
+        intent -- a flag somebody set -- and intent is not evidence. This
+        asks the ledger what the desk has actually demonstrated, and the
+        ledger only advances on a passing verdict against frozen criteria.
+
+        Fails CLOSED in every ambiguous case. No ledger, an unreadable
+        stage file, an exception while checking: all of them mean not
+        authorised. The direction of that default is the entire point --
+        a bug in this function must never be the reason money moves.
+        """
+        ledger = getattr(self, "promotion_ledger", None)
+        if ledger is None:
+            return False, ("no promotion ledger attached; live capital "
+                           "requires a recorded, earned stage")
+        try:
+            return ledger.authorises_live_capital()
+        except Exception as exc:  # pragma: no cover - defensive
+            return False, f"promotion ledger unreadable: {exc}"
+
+    def _submission_blocked(self) -> Optional[str]:
+        """Why this submission must not go out, or None to proceed.
+
+        Both conditions, not either. `dry_run=False` says an operator
+        intends to trade; the ledger says the desk has earned the right to.
+        Trading needs both, and the historical failure mode here is a flag
+        somebody flipped weeks ago on a desk whose evidence never arrived.
+        """
+        if self.dry_run:
+            return "dry_run"
+        authorised, reason = self.live_capital_authorised()
+        if not authorised:
+            return reason
+        return None
 
     def _leader_for_slot(self, slot: Any) -> str:
         """The validator that produced this slot, or "" when unknown.

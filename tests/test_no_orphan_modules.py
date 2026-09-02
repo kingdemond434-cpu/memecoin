@@ -105,6 +105,13 @@ REQUIRED_CALLS = {
     "observed bids decoded from the stream": ("extract_compute_budget(",
                                               "src/chains/yellowstone_grpc.py"),
     "observed bids recorded": ("corpus.observe(", "src/main.py"),
+    # The ladder had no callers at all: it computed a verdict, printed it,
+    # and gated nothing. These three make it load-bearing.
+    "promotion evidence submitted": ("self.promotion_ledger.submit(", "src/main.py"),
+    "promotion ledger reaches execution": (
+        "self.execution_engine.promotion_ledger =", "src/runtime/wiring.py"),
+    "submission checks the earned stage": ("self._submission_blocked()",
+                                           "src/execution/jupiter_jito.py"),
     # Three actor signals that read events the desk already produced and
     # that nothing consumed. A ring that never reaches sizing is decoration.
     "sniper rings fed": ("rings.observe_launch(", "src/runtime/source_intelligence.py"),

@@ -108,6 +108,7 @@ from src.execution.exit_readiness import (
 from src.runtime.feed_race import FeedRace
 from src.research.cold_distillation import ColdDistillate
 from src.research.latency_value import LatencyValueLedger
+from src.research.promotion_gate import PromotionLedger
 from src.runtime.load_shedding import EconomicLoadShedder
 from src.chains.launchpad_discovery import LaunchpadDiscovery
 from src.execution.observed_bids import ObservedBidCorpus
@@ -161,12 +162,43 @@ class SubsystemWiring:
     dependency inside a call graph rather than stating it in one place."""
 
     async def _setup_keys(self):
+        """Load the signing key, or run on an ephemeral paper wallet.
+
+        The key is required when the desk can actually SPEND, not when a
+        flag says it intends to. Those came apart the moment the promotion
+        ladder became load-bearing: `dry_run: false` now means "armed, and
+        governed by the ladder", and a desk armed at stage HISTORICAL cannot
+        spend anything, so demanding a key from it would refuse to start a
+        desk that was only ever going to observe.
+
+        That refusal is not a small thing. It raises at startup, before the
+        health server binds, so a desk armed in config and left without a
+        key would crash-loop -- losing exactly the unbackfillable forward
+        evidence the ladder is waiting for. The requirement therefore
+        follows the EARNED stage: no key needed until CANARY, and a hard
+        refusal the moment the desk has earned the right to trade and has
+        nothing to sign with.
+        """
         encoded = os.getenv("SOLANA_PRIVATE_KEY", "").strip()
         if not encoded:
-            if not self.dry_run:
-                raise RuntimeError("SOLANA_PRIVATE_KEY is required for live mode")
+            authorised = False
+            try:
+                ledger = PromotionLedger(
+                    Path(self.global_config.get("ops_state_dir", "data/state"))
+                    / "promotion.jsonl")
+                authorised, _ = ledger.authorises_live_capital()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("promotion ledger unreadable at key setup: %s", exc)
+            if authorised:
+                raise RuntimeError(
+                    "SOLANA_PRIVATE_KEY is required: the promotion ladder has "
+                    "reached a stage that authorises live capital, so this "
+                    "desk is expected to sign and has nothing to sign with")
             self.keypair = Keypair()
-            logger.warning("Using an ephemeral paper wallet; no private key was loaded")
+            logger.warning(
+                "Using an ephemeral paper wallet; no private key was loaded. "
+                "The desk cannot spend at its current stage, and will refuse "
+                "to start without a real key once it reaches canary.")
             return
         try:
             if encoded.startswith("["):
@@ -594,6 +626,19 @@ class SubsystemWiring:
         # DOES rather than who it is (so a rotated address is not
         # automatically unknown), and whether a wallet beats the first
         # public mention more often than its own timing predicts.
+        # The ladder, made load-bearing. It records every verdict, advances
+        # exactly one stage on a pass, and is the thing the execution path
+        # asks before it is allowed to spend real money. Persisted, because
+        # a stage that resets on restart is a desk that silently returns to
+        # trading without authorisation -- or forgets it earned the right to.
+        self.promotion_ledger = PromotionLedger(
+            Path(self.global_config.get("ops_state_dir", "data/state"))
+            / "promotion.jsonl")
+        # The evidence accumulator is evaluated against the criteria of the
+        # stage actually EARNED, not a constant. It was pinned to
+        # FORWARD_SHADOW by a constructor default that nothing ever changed,
+        # so the ladder could not have been climbed even in principle.
+        self.forward_evidence.stage = self.promotion_ledger.current_stage()
         self.sniper_rings = SniperRingDetector()
         self.wallet_signatures = WalletSignatures()
         self.pre_event_anomaly = PreEventAnomaly()
@@ -784,6 +829,9 @@ class SubsystemWiring:
         # conditioner -- an engine without one records `leader: ""` exactly
         # as it always has, rather than failing to start.
         self.execution_engine.leader_schedule = self.leader_schedule
+        # The check `dry_run` never was. `dry_run` is an operator's intent;
+        # this is what the desk has demonstrated. Submission needs both.
+        self.execution_engine.promotion_ledger = self.promotion_ledger
         # The landing corpus is the only dataset real fills produce, and it
         # was held in memory alone -- so every restart destroyed it and a desk
         # restarted a dozen times in a day had none. A landing attempt cannot

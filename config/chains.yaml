@@ -244,7 +244,24 @@ global:
   flashbots_relay: "https://relay.flashbots.net"
   jito_tip_lamports: 100000
   log_level: "INFO"
-  dry_run: true
+  # ARMED, AND GOVERNED BY THE LADDER RATHER THAN BY THIS FLAG.
+  #
+  # This used to be the whole live-trading mechanism: set it false, export
+  # ALLOW_LIVE_TRADING, and the desk submitted real transactions immediately
+  # -- at whatever stage, with or without a trained model, while the
+  # promotion gate sat in /status reporting REJECTED and gating nothing.
+  #
+  # Submission now requires THREE things, and this is only the first:
+  #   1. dry_run false            an operator intends to trade
+  #   2. an EARNED stage >= canary  the desk has demonstrated it should
+  #   3. ALLOW_LIVE_TRADING       the signer's own acknowledgement
+  #
+  # So false here does not mean trading. It means the desk will begin
+  # trading at the moment it climbs to CANARY on measured evidence, and not
+  # one launch before. The stage is persisted, advances by at most one rung
+  # per passing verdict against frozen criteria, and every ambiguous case --
+  # no ledger, an unreadable file, an exception -- reads as NOT authorised.
+  dry_run: false
   paper_equity_usd: 10000
   max_total_exposure_pct: 0.30
   # Broad shadow portfolio: many small independent trials capture rare tails

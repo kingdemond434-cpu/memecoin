@@ -694,6 +694,14 @@ class ReportingSurface:
             # that difference decides whether to keep running or change
             # something.
             "forward_evidence": self.forward_evidence.report(),
+            # The ladder, and whether it currently authorises spending
+            # anything. This is the field that answers "are we live" -- not
+            # dry_run, which is only what an operator intended.
+            "promotion": (self.promotion_ledger.status()
+                          if getattr(self, "promotion_ledger", None) is not None
+                          else {"status": "MISSING"}),
+            "simulation_reasons": dict(
+                getattr(self.execution_engine, "simulation_reasons", {}) or {}),
             # WHY the gate above cannot measure what it needs. The gate can
             # only say "unmeasured", which is a symptom several levels above
             # whatever has to be fixed -- and a list of seven failures where

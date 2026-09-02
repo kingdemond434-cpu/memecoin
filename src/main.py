@@ -3551,6 +3551,20 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         if time.time() - self._fee_config_refreshed_at > float(
                 self.global_config.get("fee_config_refresh_seconds", 900.0)):
             await self._refresh_pump_fee_config()
+        # The ladder, evaluated against frozen criteria and advanced by at
+        # most one stage. This is the ONLY thing that raises the desk's
+        # trading authority, and it does it on measured evidence rather than
+        # on anybody remembering to.
+        try:
+            verdict = self.promotion_ledger.submit(self.forward_evidence.evidence())
+            earned = self.promotion_ledger.current_stage()
+            if earned is not self.forward_evidence.stage:
+                # Promoted. The accumulator must now be judged against the
+                # NEW stage's criteria, or it would keep clearing a bar it
+                # has already passed and never climb again.
+                self.forward_evidence.stage = earned
+        except Exception as exc:
+            logger.exception("Promotion evaluation error: %s", exc)
         await self.genealogy.build_clusters()
         self._prune_curve_static()
         self._sweep_rug_classification()
