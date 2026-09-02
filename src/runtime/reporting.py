@@ -559,6 +559,10 @@ class ReportingSurface:
                            if getattr(self, "launchpads", None) is not None
                            else {"status": "DATA_BLOCKED"}),
             # Which inbound feed arrives first, and which one sees everything.
+            "observed_bids": (
+                self.observed_bids.report()
+                if getattr(self, "observed_bids", None) is not None
+                else {"status": "MISSING"}),
             "launchpad_discovery": (
                 self.launchpad_discovery.report()
                 if getattr(self, "launchpad_discovery", None) is not None

@@ -100,6 +100,11 @@ REQUIRED_CALLS = {
     # A launch from a program the registry does not declare used to be
     # dropped on one line, so the desk was shown new venues and forgot them.
     "unknown venues are recorded not dropped": ("discovery.observe(", "src/main.py"),
+    # Every transaction on the stream landed and carried the price its sender
+    # chose. The desk was walking past that on every single one.
+    "observed bids decoded from the stream": ("extract_compute_budget(",
+                                              "src/chains/yellowstone_grpc.py"),
+    "observed bids recorded": ("corpus.observe(", "src/main.py"),
 }
 
 

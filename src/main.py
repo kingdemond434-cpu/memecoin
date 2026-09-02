@@ -131,6 +131,7 @@ from src.chains.pumpswap_curve import PumpSwapPoolState
 from src.chains.pumpswap_curve import quote_buy as pool_quote_buy
 from src.chains.pumpswap_curve import quote_sell as pool_quote_sell
 from src.chains.pumpswap_route import PoolState, parse_pool
+from src.execution.observed_bids import ComputeBudget, ObservedBidCorpus
 from src.execution.pump_fees import (
     DEFAULT_SCHEDULE as PUMP_FEE_SCHEDULE, VENUE_BONDING_CURVE, round_trip_cost,
 )
@@ -3624,6 +3625,20 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         if schedule is not None and event.get("slot"):
             schedule.observe_slot(event["slot"])
         token = event.get("token", "")
+        # What the competition paid to land this. Free: the transaction
+        # carried its own ComputeBudget instructions and the desk was walking
+        # past them. The landing model has almost no data because a bid model
+        # learns from ATTEMPTS and DRY_RUN makes none -- this is the same
+        # question asked of everybody else's attempts.
+        corpus = getattr(self, "observed_bids", None)
+        if corpus is not None and event.get("priority_lamports") is not None:
+            record = self.launch_census._records.get(token)
+            launched_at = getattr(record, "detected_at", 0.0) if record else 0.0
+            corpus.observe(
+                ComputeBudget(event.get("compute_unit_price"),
+                              event.get("compute_unit_limit")),
+                (float(event.get("timestamp", time.time())) - launched_at)
+                if launched_at else None)
         # Which feed reached this box first. Every feed delivering the same
         # launch calls this; only the first gets True and goes on to make a
         # decision, the rest are the measurement. Duplicates are also the

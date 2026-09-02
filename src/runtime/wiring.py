@@ -110,6 +110,7 @@ from src.research.cold_distillation import ColdDistillate
 from src.research.latency_value import LatencyValueLedger
 from src.runtime.load_shedding import EconomicLoadShedder
 from src.chains.launchpad_discovery import LaunchpadDiscovery
+from src.execution.observed_bids import ObservedBidCorpus
 from src.runtime.training import TrainingSupervisor
 from src.chains.native_ingress import NativeIngress
 from src.runtime.process_offload import ProcessOffloadedPool
@@ -578,6 +579,11 @@ class SubsystemWiring:
         # Venues the desk has WATCHED create mints and that the registry does
         # not declare. Fed from the one line that used to drop them.
         self.launchpad_discovery = LaunchpadDiscovery()
+        # What everybody else pays to land, off the same stream. The landing
+        # model has almost no data because a bid model learns from attempts
+        # and DRY_RUN makes none; this asks the same question of attempts the
+        # desk did not have to make.
+        self.observed_bids = ObservedBidCorpus()
         self.launchpads = self._optional(
             "launchpad registry", LaunchpadRegistry, LaunchpadRegistry)
         # Seeded with what the registry already declares, so an adopted venue
