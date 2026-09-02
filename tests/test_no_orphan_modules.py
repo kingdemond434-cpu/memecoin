@@ -105,6 +105,17 @@ REQUIRED_CALLS = {
     "observed bids decoded from the stream": ("extract_compute_budget(",
                                               "src/chains/yellowstone_grpc.py"),
     "observed bids recorded": ("corpus.observe(", "src/main.py"),
+    # Three actor signals that read events the desk already produced and
+    # that nothing consumed. A ring that never reaches sizing is decoration.
+    "sniper rings fed": ("rings.observe_launch(", "src/runtime/source_intelligence.py"),
+    "sniper rings discount smart flow": ("rings=getattr(self, \"sniper_rings\", None)",
+                                         "src/runtime/reporting.py"),
+    "wallet behaviour observed": ("signatures.observe_entry(",
+                                  "src/runtime/source_intelligence.py"),
+    "public mentions timed": ("anomaly.note_public_mention(",
+                              "src/runtime/source_intelligence.py"),
+    "entry earliness scored": ("anomaly.observe_entry(",
+                               "src/runtime/source_intelligence.py"),
 }
 
 

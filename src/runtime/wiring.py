@@ -111,6 +111,9 @@ from src.research.latency_value import LatencyValueLedger
 from src.runtime.load_shedding import EconomicLoadShedder
 from src.chains.launchpad_discovery import LaunchpadDiscovery
 from src.execution.observed_bids import ObservedBidCorpus
+from src.strategies.pre_event_anomaly import PreEventAnomaly
+from src.strategies.sniper_rings import SniperRingDetector
+from src.strategies.wallet_signature import WalletSignatures
 from src.runtime.training import TrainingSupervisor
 from src.chains.native_ingress import NativeIngress
 from src.runtime.process_offload import ProcessOffloadedPool
@@ -584,6 +587,16 @@ class SubsystemWiring:
         # and DRY_RUN makes none; this asks the same question of attempts the
         # desk did not have to make.
         self.observed_bids = ObservedBidCorpus()
+        # Three actor signals that all read events the desk was already
+        # producing and that nothing was consuming: wallet sets that keep
+        # opening launches together (so a First-25 that is really a First-3
+        # stops being counted as 25 independent decisions), what a wallet
+        # DOES rather than who it is (so a rotated address is not
+        # automatically unknown), and whether a wallet beats the first
+        # public mention more often than its own timing predicts.
+        self.sniper_rings = SniperRingDetector()
+        self.wallet_signatures = WalletSignatures()
+        self.pre_event_anomaly = PreEventAnomaly()
         self.launchpads = self._optional(
             "launchpad registry", LaunchpadRegistry, LaunchpadRegistry)
         # Seeded with what the registry already declares, so an adopted venue

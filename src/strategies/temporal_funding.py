@@ -39,6 +39,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from src.strategies.surprisal import poisson_surprisal
+
 logger = logging.getLogger(__name__)
 
 TEMPORAL_FUNDING_SCHEMA_VERSION = "v1"
@@ -133,27 +135,6 @@ def _amount_agreement(amounts: Sequence[float]) -> float:
     return float(close / len(amounts))
 
 
-def _surprisal(count: int, span_s: float, rate_per_s: float) -> float:
-    """-ln P(at least `count` arrivals in `span_s` from a Poisson stream).
-
-    The whole point of the module. An exchange hot wallet emitting two
-    withdrawals a second produces a five-in-ten-seconds group constantly, and
-    calling that a cluster would flag most of Solana. Measured against the
-    wallet's own rate, that group is unremarkable and this returns ~0.
-    """
-    if count <= 0 or span_s <= 0 or rate_per_s <= 0:
-        return 0.0
-    expected = rate_per_s * span_s
-    if expected <= 0:
-        return 0.0
-    # Poisson tail, computed in logs to stay stable for the rare-but-real case.
-    # P(N >= count) <= (e*expected/count)^count for count > expected, which is
-    # the Chernoff bound -- an underestimate of surprisal, so the module errs
-    # towards NOT flagging.
-    if count <= expected:
-        return 0.0
-    return float(count * (math.log(count / expected) - 1.0) + expected)
-
 
 def find_clusters(withdrawals: Sequence[Withdrawal],
                   target_buyers: Optional[Sequence[str]] = None,
@@ -197,7 +178,7 @@ def find_clusters(withdrawals: Sequence[Withdrawal],
                 # somebody else's cluster. Real, and not this token's problem.
                 continue
             span = float(group[-1].timestamp) - float(group[0].timestamp)
-            surprisal = _surprisal(len(group), max(span, 1e-6), rate)
+            surprisal = poisson_surprisal(len(group), max(span, 1e-6), rate)
             if surprisal < MIN_SURPRISAL:
                 continue
             amounts = [float(entry.amount_sol) for entry in group]

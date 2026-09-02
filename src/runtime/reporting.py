@@ -208,7 +208,9 @@ class ReportingSurface:
             "depth": fingerprint.depth,
         }
 
-        flow = aggregate_smart_flow(entries, report, ancestry=ancestry)
+        flow = aggregate_smart_flow(
+            entries, report, ancestry=ancestry,
+            rings=getattr(self, "sniper_rings", None))
         intelligence["smart_flow"] = {
             "status": flow.status, "evidence": flow.evidence,
             "naive_evidence": flow.naive_evidence, "discount": flow.discount,
@@ -559,6 +561,18 @@ class ReportingSurface:
                            if getattr(self, "launchpads", None) is not None
                            else {"status": "DATA_BLOCKED"}),
             # Which inbound feed arrives first, and which one sees everything.
+            "sniper_rings": (
+                self.sniper_rings.report()
+                if getattr(self, "sniper_rings", None) is not None
+                else {"status": "MISSING"}),
+            "wallet_signatures": (
+                self.wallet_signatures.report()
+                if getattr(self, "wallet_signatures", None) is not None
+                else {"status": "MISSING"}),
+            "pre_event_anomaly": (
+                self.pre_event_anomaly.report()
+                if getattr(self, "pre_event_anomaly", None) is not None
+                else {"status": "MISSING"}),
             "observed_bids": (
                 self.observed_bids.report()
                 if getattr(self, "observed_bids", None) is not None
