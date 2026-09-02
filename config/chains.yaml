@@ -173,11 +173,20 @@ global:
   context_miner_concurrency: 4
 
   # The chain receive path in Rust -- socket, decode, filter and dedupe --
-  # running BESIDE the grpc.aio client, which stays the reference. SHADOW
-  # means it decides nothing; it is counted against the Python client until
-  # it has agreed on `native_ingress_promote_after` events, and a single
-  # event the reference saw and it did not demotes it permanently.
-  native_ingress_mode: "SHADOW"
+  # running BESIDE the grpc.aio client, which stays the reference.
+  #
+  # AUTO does not mean trusted. It means ALLOWED TO EARN TRUST: the receiver
+  # starts in shadow deciding nothing, is counted against the Python client,
+  # and may become authoritative only after agreeing on
+  # `native_ingress_promote_after` events with no miss. A single event the
+  # reference saw and it did not demotes it permanently, for the rest of the
+  # run, and no amount of later agreement wins it back.
+  #
+  # SHADOW is the stronger setting and means never: it runs and is measured
+  # and is not promoted however well it agrees. That is a real choice, and
+  # it was the default -- which meant the promotion ladder existed, was
+  # tested, and could not be climbed by any desk running the shipped config.
+  native_ingress_mode: "AUTO"
   native_ingress_promote_after: 5000
   # Tokens the hazard model keeps RESIDENT. Not a limit on how many tokens
   # the desk observes: evictions spill their full history to the research

@@ -919,7 +919,7 @@ class SubsystemWiring:
                     ("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
                      "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"))),
                 mode=str(self.global_config.get(
-                    "native_ingress_mode", "SHADOW")).upper(),
+                    "native_ingress_mode", "AUTO")).upper(),
                 promote_after=int(self.global_config.get(
                     "native_ingress_promote_after", 5000))))
         # The heavy half, in its own INTERPRETER rather than its own thread.

@@ -88,6 +88,17 @@ class TrainingJob:
     report_file: str
     #: Extra CLI arguments beyond --storage and --model-dir.
     extra: Sequence[str] = ()
+    #: Which standard arguments this module actually accepts. The trainers
+    #: take both; the corpus jobs take neither, and handing a script an
+    #: argument it has never seen turns a working job into a failed one --
+    #: which is how a chain of subprocesses quietly becomes a chain of
+    #: nothing.
+    takes_storage: bool = True
+    takes_model_dir: bool = True
+    #: Seconds between attempts, on top of the new-evidence trigger. The
+    #: trainers run every round; a six-hour history walk does not, because
+    #: its cost is a sustained RPC crawl and its benefit accrues in days.
+    min_interval_s: float = 0.0
     #: Run after a PASS, to carry the artifact the last step of the way.
     #: `export_hazard_model.py` had no caller either -- so even a hazard
     #: model that trained and passed would never have reached the Rust
@@ -148,6 +159,22 @@ _FRESH = {
 #: artifact the native fast path already evaluates, so a desk that can only
 #: finish one fit before the next launch burst should finish that one.
 DEFAULT_JOBS = (
+    # The corpus first, then the models fitted to it. Both were orphans:
+    # `tools/backfill_history.py` walks the Pump program backwards and
+    # reconstructs episodes at zero cost, and `tools/distil_history.py`
+    # compresses them into the priors a T0 decision can afford -- and
+    # nothing called either, so the moat never grew and the distillate was
+    # never built. A desk that has been running for a month had exactly the
+    # history it happened to watch live.
+    TrainingJob("backfill", "tools.backfill_history",
+                # It writes episodes, not a report. There is no verdict to
+                # read, so success is the exit code and the corpus count is
+                # the measurement -- which the next round sees.
+                "", takes_storage=False, takes_model_dir=False,
+                min_interval_s=6 * 3600.0),
+    TrainingJob("distil", "tools.distil_history", "",
+                takes_storage=False, takes_model_dir=False,
+                min_interval_s=6 * 3600.0),
     TrainingJob("hazard", "src.research.hazard_trainer",
                 "last_hazard_training_report.json",
                 export_module="tools.export_hazard_model"),
@@ -249,9 +276,15 @@ class TrainingSupervisor:
         self.artifact_written = False
         self._pending_exports = []
         results: Dict[str, Any] = {}
+        now = time.time()
         for job in self.jobs:
             if job.abandoned:
                 results[job.name] = "ABANDONED"
+                continue
+            if (job.min_interval_s
+                    and job.last_attempt_at
+                    and now - job.last_attempt_at < job.min_interval_s):
+                results[job.name] = "NOT_DUE"
                 continue
             results[job.name] = await self._run_job(job)
         # After the fits, not between them: an export is cheap and the round
@@ -302,12 +335,12 @@ class TrainingSupervisor:
         job.last_attempt_at = time.time()
         self.running = job.name
         started = time.monotonic()
-        command = [
-            sys.executable, "-m", job.module,
-            "--storage", str(self.storage),
-            "--model-dir", str(self.model_dir),
-            *job.extra,
-        ]
+        command = [sys.executable, "-m", job.module]
+        if job.takes_storage:
+            command += ["--storage", str(self.storage)]
+        if job.takes_model_dir:
+            command += ["--model-dir", str(self.model_dir)]
+        command += list(job.extra)
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -355,6 +388,14 @@ class TrainingSupervisor:
 
     def _read_report(self, job: TrainingJob) -> str:
         """The trainer's own verdict, in its own words."""
+        if not job.report_file:
+            # A job that writes data rather than a model has no gate to
+            # report. Its exit code is the whole verdict, and pretending
+            # otherwise would mean inventing a status.
+            job.consecutive_failures = 0
+            job.last_status = "COMPLETED"
+            job.last_detail = "no gate; produced data rather than a model"
+            return "COMPLETED"
         path = self.model_dir / job.report_file
         try:
             report = json.loads(path.read_text(encoding="utf-8"))

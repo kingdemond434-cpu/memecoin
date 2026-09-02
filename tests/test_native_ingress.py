@@ -605,3 +605,55 @@ class ADecodedEventSaysWhatItIs(unittest.TestCase):
         self.assertEqual(1, report["decoded_natively"])
         self.assertEqual(0.5, report["decoded_share"])
         self.assertEqual({"token_created": 1}, report["by_kind"])
+
+
+class TheShippedConfigCanReachTheTopOfItsOwnLadder(unittest.TestCase):
+    """A promotion ladder no shipped desk can climb is a ladder in a diagram.
+
+    SHADOW means never promote -- a real and defensible setting, and the one
+    that was shipped. So the 5,000-agreement gate existed, was tested, and
+    could not be reached by any desk running the config in this repository.
+    AUTO does not mean trusted; it means allowed to earn trust, and every
+    guard behind it is unchanged.
+    """
+
+    def test_the_shipped_mode_is_promotable(self):
+        import yaml
+
+        from src.chains.native_ingress import PROMOTABLE_MODES, normalise_mode
+
+        with open("config/chains.yaml", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle)
+        mode = normalise_mode(
+            (config.get("global") or config).get("native_ingress_mode"))
+        self.assertIn(mode, PROMOTABLE_MODES,
+                      "the shipped config cannot reach AUTO however well the "
+                      "native receiver agrees")
+
+    def test_promotion_still_requires_the_full_agreement_count(self):
+        import yaml
+
+        with open("config/chains.yaml", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle)
+        section = (config.get("global") or config)
+        self.assertGreaterEqual(int(section.get("native_ingress_promote_after", 0)),
+                                5000)
+
+    def test_a_single_miss_still_demotes_permanently_under_auto(self):
+        ingress = NativeIngress("http://x", programs=("P",), promote_after=2,
+                                mode=MODE_AUTO)
+        ingress._native = _Fake()
+        ingress.available = True
+        ingress.mode = MODE_SHADOW
+        for index in range(2):
+            signature = bytes([index]) * 64
+            ingress._native.rows.append(_row(signature))
+            ingress.drain()
+            ingress.note_python_event(signature)
+        self.assertTrue(ingress.authoritative)
+        ingress.note_python_event(b"\xff" * 64)
+        for key in list(ingress._python_seen):
+            ingress._python_seen[key] = time.time() - PARITY_WINDOW_S - 1
+        ingress.drain()
+        self.assertFalse(ingress.authoritative)
+        self.assertIn("missed", ingress.demoted_reason)

@@ -67,6 +67,42 @@ class ReportingSurface:
     #: on every request turns a page refresh into disk IO on the trading box.
     _dashboard_cache = None
 
+    def _promotion_readiness(self):
+        """The deepest thing that is not true yet, from facts already reported.
+
+        Named `_promotion_readiness` rather than `readiness` because this
+        class already has a `readiness()` -- the health-server payload -- and
+        two methods a letter apart, one of which is the liveness endpoint, is
+        a name collision waiting to be made at 3am.
+        """
+        from src.research.readiness import diagnose
+
+        census = self.launch_census.report()
+        funnel = census.get("funnel", {}) if isinstance(census, dict) else {}
+        training = (self.training.report()
+                    if getattr(self, "training", None) is not None else {})
+        try:
+            cost = self._cost_model("readiness-probe")
+        except Exception:  # pragma: no cover - defensive
+            cost = {"status": "DATA_BLOCKED"}
+        landing = getattr(getattr(self, "execution_engine", None),
+                          "landing_model", None)
+        attempts = getattr(landing, "attempts", None)
+        return diagnose({
+            "launches_seen": int(funnel.get("seen", 0) or 0),
+            "resolved_episodes": int(training.get("resolved_episodes", 0) or 0),
+            "training_rounds": int(training.get("rounds", 0) or 0),
+            "model_trained": bool(
+                getattr(self.predictor, "_is_trained", False)
+                or any((getattr(self.predictor, "trained", None) or {}).values())),
+            # A probe on a token nobody holds: the question is whether the
+            # SCHEDULE can price anything, not what this mint costs.
+            "cost_model_ok": cost.get("status") == "OK",
+            "entries": int(funnel.get("entered", 0) or 0),
+            "real_fills": len(attempts) if attempts is not None else 0,
+            "dry_run": bool(self.dry_run),
+        })
+
     def pool_route_report(self) -> Dict[str, Any]:
         """Whether graduation actually keeps native execution.
 
@@ -640,6 +676,12 @@ class ReportingSurface:
             # that difference decides whether to keep running or change
             # something.
             "forward_evidence": self.forward_evidence.report(),
+            # WHY the gate above cannot measure what it needs. The gate can
+            # only say "unmeasured", which is a symptom several levels above
+            # whatever has to be fixed -- and a list of seven failures where
+            # six are consequences of the seventh sends whoever reads it to
+            # fix the wrong thing.
+            "promotion_blocked_at": self._promotion_readiness().to_dict(),
             "regime": self.current_regime,
             # A queue silently shedding work looks exactly like a quiet market,
             # so both drop counters are surfaced rather than only logged.
