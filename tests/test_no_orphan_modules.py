@@ -92,6 +92,11 @@ REQUIRED_CALLS = {
     "leader schedule follows the chain": ("schedule.observe_slot(", "src/main.py"),
     "leader resolved onto landing attempts": ("self._leader_for_slot(",
                                               "src/execution/jupiter_jito.py"),
+    # Every trainer in this repo was a __main__ with no caller: the desk
+    # collected evidence for weeks and never fitted anything to it.
+    "trainers actually run": ("self.training.run_round()", "src/runtime/training.py"),
+    "a passed model is activated without a restart": (
+        "self._reload_promoted_model()", "src/main.py"),
 }
 
 

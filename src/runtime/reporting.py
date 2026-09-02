@@ -523,6 +523,10 @@ class ReportingSurface:
                            if getattr(self, "launchpads", None) is not None
                            else {"status": "DATA_BLOCKED"}),
             # Which inbound feed arrives first, and which one sees everything.
+            "training": (
+                self.training.report()
+                if getattr(self, "training", None) is not None
+                else {"status": "MISSING"}),
             "leader_schedule": (
                 self.leader_schedule.report()
                 if getattr(self, "leader_schedule", None) is not None

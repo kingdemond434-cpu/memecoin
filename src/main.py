@@ -63,6 +63,7 @@ from src.runtime.ingestion import MinedRecordIngestion
 from src.runtime.evidence import EvidenceRecording
 from src.runtime.supervision import TaskSupervision
 from src.runtime.maintenance import DeskMaintenance
+from src.runtime.training import DeskTraining
 from src.runtime.wiring import SubsystemWiring
 from src.runtime.source_intelligence import SourceIntelligence
 from src.runtime.loop_local import loop_local_semaphore
@@ -186,7 +187,8 @@ CAPACITY_REJECTIONS = frozenset({
 
 class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
                        DeskMaintenance, TaskSupervision, EvidenceRecording,
-                       SubsystemWiring, SourceIntelligence, PositionForensics):
+                       SubsystemWiring, SourceIntelligence, PositionForensics,
+                       DeskTraining):
     def __init__(self, config_path: str = "config/chains.yaml", *, dry_run_override: Optional[bool] = None,
                  offline: bool = False):
         self.config_path = config_path
@@ -340,6 +342,7 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         self._intelligence_task: Optional[asyncio.Task] = None
         self._parity_task: Optional[asyncio.Task] = None
         self._native_ingress_task: Optional[asyncio.Task] = None
+        self._training_task: Optional[asyncio.Task] = None
         self._native_ingress_events = 0
         self._fee_config_refreshed_at = 0.0
         self.secondary_stream = None
@@ -575,6 +578,8 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         self._intelligence_task = self._start_runtime_task(
             "intelligence", self._intelligence_loop())
         self._parity_task = self._start_runtime_task("parity", self._parity_loop())
+        self._training_task = self._start_runtime_task(
+            "training", self._training_loop())
         # Started only when the receiver is actually streaming, so a box
         # without the extension built does not carry a loop that wakes
         # twenty times a second to drain nothing.
@@ -680,7 +685,7 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         for task in (self._main_task, self._health_task, self._market_task,
                      self._safety_task, self._intelligence_task, self._source_task,
                      self._parity_task, self._watchdog_task,
-                     self._native_ingress_task,
+                     self._native_ingress_task, self._training_task,
                      *self._redecision_tasks):
             if task:
                 task.cancel()
@@ -3562,18 +3567,7 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         self._promote_benchmark_candidates()
         self._publish_attribution()
         if self.dry_run:
-            latest_mtime = self._latest_model_mtime()
-            if latest_mtime > self._model_artifact_mtime:
-                candidate = AgeBandedPredictor(
-                    os.getenv("MODEL_DIR", "models"),
-                    allow_pooled_fallback=bool(
-                        self.global_config.get("allow_pooled_model_fallback", True)))
-                if any(candidate.load_latest().values()):
-                    self.predictor = candidate
-                    self.elogw_engine.predictor = candidate
-                    self._model_artifact_mtime = latest_mtime
-                    self._register_model_validation(candidate.validation_report)
-                    logger.info("Activated chronologically validated shadow model %s", candidate.model_version)
+            self._reload_promoted_model()
 
     def _note_launch_venue(self, event: Dict[str, Any]) -> None:
         """Credit the venue that emitted this launch, and verify it by use.

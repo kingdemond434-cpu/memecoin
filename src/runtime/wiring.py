@@ -109,6 +109,7 @@ from src.runtime.feed_race import FeedRace
 from src.research.cold_distillation import ColdDistillate
 from src.research.latency_value import LatencyValueLedger
 from src.runtime.load_shedding import EconomicLoadShedder
+from src.runtime.training import TrainingSupervisor
 from src.chains.native_ingress import NativeIngress
 from src.runtime.process_offload import ProcessOffloadedPool
 from src.research.benchmark_wallets import BenchmarkCorpus, load_roster
@@ -600,6 +601,18 @@ class SubsystemWiring:
         # is better. That belief has never been priced, and the answer
         # decides whether the next month goes to latency or to alpha.
         self.latency_value = LatencyValueLedger()
+        # The thing that was missing. Every trainer in this repo is a
+        # complete, strictly gated __main__ that nothing called: the desk
+        # observed launches, resolved outcomes, wrote episodes to disk, and
+        # never fitted anything to them. That is why the report says
+        # DATA_BLOCKED and every age band says "no artifact" -- not a model
+        # that failed, a model that was never asked.
+        self.training = TrainingSupervisor(
+            Path(self.global_config.get("episode_storage", "data/launch_episodes")),
+            Path(os.getenv("MODEL_DIR", "models")),
+            new_episodes_required=int(self.global_config.get(
+                "training_new_episodes", 250)),
+            timeout_s=float(self.global_config.get("training_timeout_s", 1800.0)))
         self.load_shedder = EconomicLoadShedder(
             int(self.global_config.get("max_candidate_pipelines", 100)))
         # The sell must exist before it is needed, and be proven to.
