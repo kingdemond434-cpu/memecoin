@@ -3583,6 +3583,18 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         program = str(event.get("program", "") or "")
         spec = registry.specs.get(program)
         if spec is None:
+            # NOT dropped. The desk was being shown launches from venues it
+            # does not declare -- Bags, Believe, whatever launched this month
+            # -- and forgetting them on this line. A program that keeps
+            # producing mints becomes a candidate whose id this node
+            # MEASURED, which is the only kind of program id worth having.
+            discovery = getattr(self, "launchpad_discovery", None)
+            if discovery is not None:
+                discovery.observe(
+                    program, str(event.get("token", "") or ""),
+                    signature=str(event.get("signature", "") or ""),
+                    instruction=str(event.get("instruction", "") or ""),
+                    at=float(event.get("timestamp", 0) or time.time()))
             return
         from src.chains.launchpads import CanonicalLaunchEvent
 

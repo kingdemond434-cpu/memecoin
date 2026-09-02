@@ -109,6 +109,7 @@ from src.runtime.feed_race import FeedRace
 from src.research.cold_distillation import ColdDistillate
 from src.research.latency_value import LatencyValueLedger
 from src.runtime.load_shedding import EconomicLoadShedder
+from src.chains.launchpad_discovery import LaunchpadDiscovery
 from src.runtime.training import TrainingSupervisor
 from src.chains.native_ingress import NativeIngress
 from src.runtime.process_offload import ProcessOffloadedPool
@@ -574,8 +575,15 @@ class SubsystemWiring:
         # Every launchpad normalises to one launch event. Programs start as
         # HYPOTHESES and are promoted only by decoding cleanly on this node,
         # so coverage reports what was seen rather than what was hoped for.
+        # Venues the desk has WATCHED create mints and that the registry does
+        # not declare. Fed from the one line that used to drop them.
+        self.launchpad_discovery = LaunchpadDiscovery()
         self.launchpads = self._optional(
             "launchpad registry", LaunchpadRegistry, LaunchpadRegistry)
+        # Seeded with what the registry already declares, so an adopted venue
+        # stops being proposed the moment it is added.
+        for program_id in self.launchpads.specs:
+            self.launchpad_discovery.note_known(program_id)
         # Which feed reaches this box first, measured. Coverage outranks
         # speed: a feed that misses events is blind on them, not slow.
         self.feed_race = self._optional("feed race", FeedRace, FeedRace)

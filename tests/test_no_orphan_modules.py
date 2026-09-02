@@ -97,6 +97,9 @@ REQUIRED_CALLS = {
     "trainers actually run": ("self.training.run_round()", "src/runtime/training.py"),
     "a passed model is activated without a restart": (
         "self._reload_promoted_model()", "src/main.py"),
+    # A launch from a program the registry does not declare used to be
+    # dropped on one line, so the desk was shown new venues and forgot them.
+    "unknown venues are recorded not dropped": ("discovery.observe(", "src/main.py"),
 }
 
 
