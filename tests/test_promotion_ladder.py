@@ -23,6 +23,34 @@ class _Fixture(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.ledger = PromotionLedger(Path(self._tmp.name) / "promotion.jsonl")
 
+    def _backdate(self, days: float = 60.0) -> None:
+        """Pretend the desk arrived at this rung `days` ago.
+
+        Dwell time is now enforced, so a test that wants to exercise a
+        HIGHER rung has to buy the lower one honestly -- and the only thing
+        it cannot wait for is the clock.
+        """
+        if not self.ledger._stage_path.exists():
+            return
+        record = json.loads(self.ledger._stage_path.read_text())
+        record["at"] = record["at"] - days * 86_400
+        record["decisions_at_entry"] = 0
+        self.ledger._stage_path.write_text(json.dumps(record))
+
+    def _climb(self, target: Stage, limit: int = 12) -> None:
+        """Climb to `target`, backdating each rung. Bounded, never a `while`.
+
+        An unbounded loop here spun forever the moment dwell time became
+        real: the condition it waited on was one the ladder would never
+        satisfy inside a test.
+        """
+        for _ in range(limit):
+            if self.ledger.current_stage() is target:
+                return
+            self._backdate()
+            self.ledger.submit(self._passing(self.ledger.current_stage()))
+        self.fail(f"could not reach {target} in {limit} submissions")
+
     def _passing(self, stage: Stage) -> Evidence:
         criteria = DEFAULT_CRITERIA[stage]
         return Evidence(
@@ -94,29 +122,27 @@ class ItAdvancesExactlyOneStagePerPass(_Fixture):
         # HISTORICAL -> CHRONOLOGICAL_OOS -> FORWARD_SHADOW -> CANARY -> LIVE
         for expected in STAGE_ORDER[1:]:
             stage = self.ledger.current_stage()
+            self._backdate()
             self.ledger.submit(self._passing(stage))
             self.assertIs(expected, self.ledger.current_stage())
         self.assertIs(Stage.LIVE, self.ledger.current_stage())
 
     def test_live_is_the_top_and_does_not_wrap(self):
-        for _ in STAGE_ORDER[1:]:
-            self.ledger.submit(self._passing(self.ledger.current_stage()))
+        self._climb(Stage.LIVE)
+        self._backdate()
         self.ledger.submit(self._passing(Stage.LIVE))
         self.assertIs(Stage.LIVE, self.ledger.current_stage())
 
 
 class CanaryIsWhereMoneyStarts(_Fixture):
 
-    def _climb_to(self, target: Stage):
-        while self.ledger.current_stage() is not target:
-            self.ledger.submit(self._passing(self.ledger.current_stage()))
 
     def test_forward_shadow_still_authorises_nothing(self):
-        self._climb_to(Stage.FORWARD_SHADOW)
+        self._climb(Stage.FORWARD_SHADOW)
         self.assertFalse(self.ledger.authorises_live_capital()[0])
 
     def test_canary_authorises_live_capital(self):
-        self._climb_to(Stage.CANARY)
+        self._climb(Stage.CANARY)
         authorised, reason = self.ledger.authorises_live_capital()
         self.assertTrue(authorised)
         self.assertIn("canary", reason)
@@ -124,13 +150,13 @@ class CanaryIsWhereMoneyStarts(_Fixture):
     def test_the_stage_survives_a_restart(self):
         # A stage that resets on restart is a desk that silently returns to
         # trading without authorisation -- or forgets it earned the right.
-        self._climb_to(Stage.CANARY)
+        self._climb(Stage.CANARY)
         reopened = PromotionLedger(self.ledger.path)
         self.assertIs(Stage.CANARY, reopened.current_stage())
         self.assertTrue(reopened.authorises_live_capital()[0])
 
     def test_a_demotion_drops_exactly_one_stage(self):
-        self._climb_to(Stage.CANARY)
+        self._climb(Stage.CANARY)
         self.assertIs(Stage.FORWARD_SHADOW, self.ledger.demote("misbehaving"))
         self.assertFalse(self.ledger.authorises_live_capital()[0])
 
@@ -280,3 +306,83 @@ class AnArmedDeskStillBootsWithoutAKey(unittest.IsolatedAsyncioTestCase):
             fresh = PromotionLedger(Path(directory) / "p.jsonl")
             self.assertIs(Stage.HISTORICAL, fresh.current_stage())
             self.assertFalse(fresh.authorises_live_capital()[0])
+
+
+class TheLadderCannotBeClimbedInOneAfternoon(_Fixture):
+    """Measured on this repository: HISTORICAL to CANARY in three sweeps.
+
+    The evidence pool is cumulative, so a desk with 70,000 banked shadow
+    decisions satisfied every rung's volume gate simultaneously and reached
+    authority to spend real money in about four minutes, having observed
+    nothing forward at all. The docstring said each stage buys evidence the
+    previous one could not; nothing enforced it.
+    """
+
+    def _banked(self, stage):
+        # The real numbers from a desk that has been observing for weeks.
+        return Evidence(
+            stage=stage, decisions=70_612, real_fills=0,
+            launch_cohorts=10_121, regimes_covered=4,
+            net_log_growth=0.03, rug_loss_share=0.10,
+            monster_enrichment=2.4, execution_success=0.9,
+            catastrophic_failures=0)
+
+    def test_banked_evidence_does_not_buy_the_forward_stage(self):
+        for _ in range(6):
+            stage = self.ledger.current_stage()
+            self.ledger.submit(self._banked(stage))
+            if self.ledger.current_stage() is stage:
+                break
+        self.assertIs(Stage.FORWARD_SHADOW, self.ledger.current_stage())
+        self.assertFalse(self.ledger.authorises_live_capital()[0])
+
+    def test_the_refusal_says_it_is_about_elapsed_observation(self):
+        while self.ledger.current_stage() is not Stage.FORWARD_SHADOW:
+            self.ledger.submit(self._banked(self.ledger.current_stage()))
+        verdict = self.ledger.submit(self._banked(Stage.FORWARD_SHADOW))
+        self.assertFalse(verdict.passed)
+        joined = " ".join(verdict.failures)
+        self.assertTrue("since entering" in joined or "days at" in joined,
+                        joined)
+
+    def test_fresh_decisions_at_this_stage_are_what_count(self):
+        while self.ledger.current_stage() is not Stage.FORWARD_SHADOW:
+            self.ledger.submit(self._banked(self.ledger.current_stage()))
+        banked = self.ledger.decisions_at_entry()
+        self.assertGreater(banked, 0, "arrival should snapshot the count")
+        # Enough NEW decisions, but no elapsed time: still refused.
+        evidence = self._banked(Stage.FORWARD_SHADOW)
+        evidence.decisions = banked + 5_000
+        verdict = self.ledger.submit(evidence)
+        self.assertFalse(verdict.passed)
+        self.assertIn("days at", " ".join(verdict.failures))
+
+    def test_enough_time_and_fresh_evidence_does_advance(self):
+        import json
+
+        while self.ledger.current_stage() is not Stage.FORWARD_SHADOW:
+            self.ledger.submit(self._banked(self.ledger.current_stage()))
+        # Backdate the arrival past the dwell requirement.
+        record = json.loads(self.ledger._stage_path.read_text())
+        record["at"] = record["at"] - 30 * 86_400
+        self.ledger._stage_path.write_text(json.dumps(record))
+        evidence = self._banked(Stage.FORWARD_SHADOW)
+        evidence.decisions = self.ledger.decisions_at_entry() + 5_000
+        self.assertTrue(self.ledger.submit(evidence).passed)
+        self.assertIs(Stage.CANARY, self.ledger.current_stage())
+
+    def test_a_first_submission_cannot_pass_by_having_no_history(self):
+        # No recorded arrival reads as arriving NOW -- the same direction as
+        # a missing stage file reading as the first stage.
+        while self.ledger.current_stage() is not Stage.FORWARD_SHADOW:
+            self.ledger.submit(self._banked(self.ledger.current_stage()))
+        self.ledger._stage_path.unlink()
+        fresh = PromotionLedger(self.ledger.path)
+        self.assertIs(STAGE_ORDER[0], fresh.current_stage())
+
+    def test_the_historical_stages_are_not_slowed_down(self):
+        # They are backtests and buy nothing by waiting.
+        for stage in (Stage.HISTORICAL, Stage.CHRONOLOGICAL_OOS):
+            self.assertEqual(0.0, DEFAULT_CRITERIA[stage].min_days_at_stage)
+        for stage in (Stage.FORWARD_SHADOW, Stage.CANARY):
+            self.assertGreater(DEFAULT_CRITERIA[stage].min_days_at_stage, 0.0)

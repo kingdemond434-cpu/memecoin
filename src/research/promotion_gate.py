@@ -53,6 +53,23 @@ class PromotionCriteria:
     """What must be true to advance, fixed at declaration time."""
 
     stage: Stage
+    #: How long the desk must sit AT this stage before it may leave it.
+    #:
+    #: Without this the ladder collapses. The evidence pool is cumulative,
+    #: so a desk that has banked 70,000 shadow decisions satisfies every
+    #: rung's volume gate at once and climbs from the bottom to CANARY in
+    #: three consecutive sweeps -- about four minutes -- reaching authority
+    #: to spend real money having observed nothing forward at all. Measured
+    #: on this exact repository before this field existed.
+    #:
+    #: Zero for the two historical stages, which are backtests and buy
+    #: nothing by waiting. Non-zero for FORWARD_SHADOW, whose entire purpose
+    #: is forward observation, and for CANARY, whose purpose is to find out
+    #: what real execution does.
+    min_days_at_stage: float = 0.0
+    #: Decisions taken SINCE ENTERING this stage. The lifetime count is
+    #: already banked and proves nothing about the stage being left.
+    min_decisions_at_stage: int = 0
     min_decisions: int = 0
     min_real_fills: int = 0
     min_launch_cohorts: int = 0
@@ -100,12 +117,21 @@ DEFAULT_CRITERIA: Dict[Stage, PromotionCriteria] = {
     ),
     Stage.FORWARD_SHADOW: PromotionCriteria(
         stage=Stage.FORWARD_SHADOW,
+        # The rung that has to cost real time. Its whole purpose is forward
+        # observation across regimes, and a fortnight is the shortest window
+        # in which "three regimes" means three genuinely different markets
+        # rather than three labels applied inside one afternoon.
+        min_days_at_stage=14.0, min_decisions_at_stage=2_000,
         min_decisions=5_000, min_launch_cohorts=1_000, min_regimes=3,
         min_net_log_growth=0.0, max_rug_loss_share=0.20,
         min_monster_enrichment=2.0, min_execution_success=0.0,
     ),
     Stage.CANARY: PromotionCriteria(
         stage=Stage.CANARY,
+        # Real money, deliberately slowly. The fills are the point and they
+        # cannot be hurried: this stage exists to learn what execution
+        # actually does, and that is a thing only elapsed time reveals.
+        min_days_at_stage=14.0, min_decisions_at_stage=2_000,
         min_decisions=5_000, min_real_fills=1_000, min_launch_cohorts=1_000,
         min_regimes=3, min_net_log_growth=0.0, max_rug_loss_share=0.15,
         min_monster_enrichment=2.0, min_execution_success=0.60,
@@ -289,6 +315,30 @@ class PromotionLedger:
     def _stage_path(self) -> Path:
         return self.path.with_name(self.path.stem + "_stage.json")
 
+    def _stage_record(self) -> Dict[str, Any]:
+        try:
+            return json.loads(self._stage_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def entered_stage_at(self) -> float:
+        """When the desk arrived at its current rung, or 0 if never recorded.
+
+        Zero means "no record", and the caller treats that as having just
+        arrived rather than as having been here for ever -- the direction
+        that withholds promotion rather than granting it.
+        """
+        try:
+            return float(self._stage_record().get("at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def decisions_at_entry(self) -> int:
+        try:
+            return int(self._stage_record().get("decisions_at_entry", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
     def current_stage(self) -> Stage:
         """The stage this desk has EARNED, read from disk.
 
@@ -306,8 +356,15 @@ class PromotionLedger:
             # corrupt file must never read as authorisation.
             return STAGE_ORDER[0]
 
-    def _write_stage(self, stage: Stage, reason: str) -> None:
-        payload = {"stage": stage.value, "reason": reason, "at": time.time()}
+    def _write_stage(self, stage: Stage, reason: str,
+                     decisions_at_entry: int = 0) -> None:
+        payload = {"stage": stage.value, "reason": reason, "at": time.time(),
+                   # The two numbers that make "time and evidence AT this
+                   # stage" answerable after a restart. Without them the
+                   # ledger could only ever ask about lifetime totals, which
+                   # are already banked and prove nothing about the rung
+                   # being left.
+                   "decisions_at_entry": int(decisions_at_entry)}
         self._stage_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self._stage_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(payload), encoding="utf-8")
@@ -326,16 +383,54 @@ class PromotionLedger:
         if criteria is None:  # pragma: no cover - every stage has criteria
             return Verdict(False, stage, "", failures=["no criteria for stage"])
         verdict = evaluate(criteria, evidence)
+        # Time and evidence AT THIS STAGE, which the criteria alone cannot
+        # see: `evaluate` is handed a cumulative snapshot and has no idea
+        # when the desk arrived. Checked here, where the arrival is known.
+        for failure in self._stage_dwell_failures(criteria, evidence):
+            verdict.failures.append(failure)
+            verdict.passed = False
         self.record(verdict, evidence, criteria)
         if can_advance(stage, verdict):
             earned = next_stage(stage)
-            self._write_stage(earned, f"passed {stage.value}")
+            self._write_stage(earned, f"passed {stage.value}",
+                              decisions_at_entry=int(evidence.decisions or 0))
             logger.warning(
                 "PROMOTION: %s -> %s on %d decisions, %d real fills, "
                 "net log growth %s. The desk's trading authority has CHANGED.",
                 stage.value, earned.value, evidence.decisions,
                 evidence.real_fills, evidence.net_log_growth)
         return verdict
+
+    def _stage_dwell_failures(self, criteria: PromotionCriteria,
+                              evidence: Evidence) -> List[str]:
+        """Why this rung may not be left yet, on time and fresh evidence.
+
+        A first-ever submission has no recorded arrival. That reads as
+        arriving NOW, so a desk cannot be promoted on its first sweep by
+        having no history -- which is the same failure as reading a missing
+        stage file as authorisation, one level in.
+        """
+        failures: List[str] = []
+        if criteria.min_days_at_stage > 0:
+            entered = self.entered_stage_at()
+            if not entered:
+                self._write_stage(criteria.stage, "arrival recorded",
+                                  decisions_at_entry=int(evidence.decisions or 0))
+                entered = time.time()
+            days = (time.time() - entered) / 86_400.0
+            if days < criteria.min_days_at_stage:
+                failures.append(
+                    f"{days:.2f} days at {criteria.stage.value}; "
+                    f"{criteria.min_days_at_stage:g} required. The evidence "
+                    "below is cumulative and was mostly banked at earlier "
+                    "stages; this rung is bought with elapsed observation")
+        if criteria.min_decisions_at_stage > 0:
+            fresh = int(evidence.decisions or 0) - self.decisions_at_entry()
+            if fresh < criteria.min_decisions_at_stage:
+                failures.append(
+                    f"{fresh} decisions since entering {criteria.stage.value}; "
+                    f"{criteria.min_decisions_at_stage} required")
+        return failures
 
     def demote(self, reason: str) -> Stage:
         """Drop one stage. The only thing that ever lowers trading authority.
