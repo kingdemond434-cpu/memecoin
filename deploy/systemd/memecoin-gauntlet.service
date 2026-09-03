@@ -1,0 +1,45 @@
+[Unit]
+Description=Score every candidate edge against the statistical gauntlet
+After=memecoin-shadow.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/opt/memecoin-shadow
+EnvironmentFile=-%h/.config/memecoin-shadow/env
+Environment=ALLOW_LIVE_TRADING=
+Environment=SOLANA_PRIVATE_KEY=
+
+# Reads the launch corpus and writes ONE file: data/state/gauntlet.json.
+#
+# Deliberately not forward_evidence.json. The desk owns that ledger and
+# rewrites it whole on every save, so a second writer there either loses this
+# verdict or destroys the desk's decision counters depending on which process
+# saved last. The desk reads this sidecar before each promotion evaluation.
+#
+# Exit codes are outcomes, not failures: 3 means the gauntlet ran and no
+# mechanism survived, which is the desk's current honest state and must not
+# page anyone. 4 means the corpus could not be scored at all.
+ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m tools.run_gauntlet --storage data/launch_episodes --record data/state/gauntlet.json
+SuccessExitStatus=0 3 4
+
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+# The whole observation set is held resident for the bootstrap -- roughly a
+# kilobyte per launch per mechanism, so a thirty-thousand launch corpus across
+# six mechanisms sits in the low hundreds of megabytes. Capped in the same
+# shape as the trainer: throttle into reclaim first, kill only a run that
+# keeps climbing.
+MemoryHigh=900M
+MemoryMax=1200M
+CPUQuota=100%
+Nice=15
+
+# The desk is never the process the kernel takes. A gauntlet run repeats next
+# week; a minute of forward evidence cannot be recovered at any price.
+OOMScoreAdjust=500
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=memecoin-gauntlet

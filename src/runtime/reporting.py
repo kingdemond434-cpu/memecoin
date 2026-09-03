@@ -466,6 +466,48 @@ class ReportingSurface:
             "kol_reach_threshold": self.ignition.kol_reach,
         }
 
+    @property
+    def gauntlet_verdict_path(self) -> Path:
+        """Where `tools.run_gauntlet` leaves its verdict.
+
+        Its own file, never `forward_evidence.json`: the desk owns that ledger
+        and rewrites it whole on every save, so a second writer there either
+        loses the verdict or destroys the desk's decision counters depending
+        on which process saved last.
+        """
+        return (Path(self.global_config.get("ops_state_dir", "data/state"))
+                / "gauntlet.json")
+
+    def gauntlet_report(self) -> Dict[str, Any]:
+        """The mechanism scoreboard's last verdict, and whether it still counts.
+
+        Read from the sidecar `tools.run_gauntlet` writes rather than from the
+        forward evidence ledger, which is the desk's own file. Reports the age
+        as well as the count: CANARY needs one survivor and LIVE needs two,
+        and a verdict past its expiry contributes neither -- a distinction
+        that is invisible if only the number is shown.
+        """
+        ledger = getattr(self, "forward_evidence", None)
+        if ledger is None:
+            return {"status": "DATA_BLOCKED", "detail": "not wired"}
+        path = self.gauntlet_verdict_path
+        if not path.exists():
+            return {"status": "DATA_BLOCKED",
+                    "detail": "the gauntlet has never been run; CANARY and "
+                              "LIVE fail closed until it is",
+                    "remedy": "python -m tools.run_gauntlet --record"}
+        loaded = ledger.load_gauntlet(path)
+        counted = ledger.gauntlet_survivors()
+        age = ledger.gauntlet_age_s()
+        return {
+            "status": "OK" if counted is not None else "STALE",
+            "survivors": loaded,
+            "counted_by_the_gate": counted,
+            "age_days": None if age is None else round(age / 86_400.0, 2),
+            "expires_after_days": ledger.GAUNTLET_MAX_AGE_S / 86_400.0,
+            "path": str(path),
+        }
+
     def readiness(self) -> Dict[str, Any]:
         return {
             "mode": "DRY_RUN" if self.dry_run else "LIVE",
@@ -758,6 +800,11 @@ class ReportingSurface:
             "world_discovery": (self.world_discovery_report()
                                 if hasattr(self, "world_discovery_report")
                                 else {}),
+            # Whether any candidate edge has survived, and how old that
+            # finding is. Surfaced because a survivor count that quietly went
+            # stale looks exactly like one that was never run, and only one of
+            # those is fixed by starting a timer.
+            "gauntlet": self.gauntlet_report(),
             "social": self.social_intel.get_stats() if self.social_intel else {},
             "public_coordination": self.public_coordination.get_stats() if self.public_coordination else {},
             "champions": self.champion_challenger.get_stats() if self.champion_challenger else {},

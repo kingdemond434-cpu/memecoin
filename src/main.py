@@ -3563,6 +3563,10 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         # trading authority, and it does it on measured evidence rather than
         # on anybody remembering to.
         try:
+            # Re-read every pass: the count comes from another process, and
+            # a desk up for three weeks would otherwise judge capital on
+            # whatever the gauntlet said the morning it booted.
+            self.forward_evidence.load_gauntlet(self.gauntlet_verdict_path)
             verdict = self.promotion_ledger.submit(self.forward_evidence.evidence())
             earned = self.promotion_ledger.current_stage()
             if earned is not self.forward_evidence.stage:

@@ -1,0 +1,20 @@
+[Unit]
+Description=Re-score the mechanism scoreboard weekly
+
+[Timer]
+# Sunday 02:00 UTC, ahead of the Monday review, so the audit pack reads a
+# verdict from this week rather than last.
+#
+# Weekly against ForwardEvidence.GAUNTLET_MAX_AGE_S, which is TEN days. The
+# three days of slack are not decoration: an interval equal to the expiry
+# would retire the verdict at the moment this run replaces it, so one missed
+# Sunday would silently block promotion on a number that was merely late.
+# Changing this interval means changing that constant.
+OnCalendar=Sun *-*-* 02:00:00 UTC
+# A box that was off on Sunday scores on Monday rather than skipping a week.
+Persistent=true
+RandomizedDelaySec=600
+Unit=memecoin-gauntlet.service
+
+[Install]
+WantedBy=timers.target
