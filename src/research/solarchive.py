@@ -50,9 +50,13 @@ than an import error at startup.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -326,7 +330,8 @@ class SolArchiveBackend:
                  scan_budget_bytes: int = DEFAULT_PARQUET_BUDGET_BYTES,
                  pad_days: int = DEFAULT_DATE_PAD_DAYS,
                  epoch: str = ARCHIVE_EPOCH,
-                 repo: str = DEFAULT_SOLARCHIVE_REPO):
+                 repo: str = DEFAULT_SOLARCHIVE_REPO,
+                 cache_dir: Optional[Path] = None):
         self.reader = reader
         self.clock = clock
         self.table = table
@@ -338,6 +343,15 @@ class SolArchiveBackend:
         self.bytes_scanned = 0
         self.selections: List[PartitionSelection] = []
         self._partitions: Optional[set] = None
+        #: Where a day's rows are kept once read. Windows overlap by
+        #: construction -- the date padding guarantees it, and consecutive
+        #: extractions share their boundary days -- so without a cache the
+        #: same partition is fetched over the network several times per run.
+        #: Absent, everything below behaves exactly as before.
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self._size_cache: Dict[str, int] = {}
 
     # -- verification ----------------------------------------------------
 
@@ -432,11 +446,58 @@ class SolArchiveBackend:
         return selection
 
     def _size(self, day: str) -> int:
+        # Memoised: `select` runs per window and per program, and a partition's
+        # compressed size does not change between two calls a second apart.
+        if day in self._size_cache:
+            return self._size_cache[day]
         try:
-            return int(self.reader.size_bytes(self.table, day) or 0)
+            size = int(self.reader.size_bytes(self.table, day) or 0)
         except Exception as exc:
             logger.debug("partition size unavailable for %s: %s", day, exc)
-            return 0
+            size = 0
+        self._size_cache[day] = size
+        return size
+
+    # -- the day cache ---------------------------------------------------
+
+    def _cache_path(self, day: str, program: str) -> Optional[Path]:
+        if self.cache_dir is None:
+            return None
+        digest = hashlib.sha256(
+            f"{self.table}|{day}|{program}".encode()).hexdigest()[:16]
+        return self.cache_dir / f"{day}-{digest}.json"
+
+    def _cached_rows(self, day: str, program: str
+                     ) -> Optional[List[Dict[str, Any]]]:
+        path = self._cache_path(day, program)
+        if path is None or not path.exists():
+            return None
+        try:
+            rows = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            # A half-written cache file is not evidence of an empty day.
+            # Delete it and re-read rather than returning [] and recording a
+            # coverage hole that never existed.
+            logger.warning("dropping unreadable cache %s: %s", path, exc)
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return None
+        return rows if isinstance(rows, list) else None
+
+    def _store_rows(self, day: str, program: str,
+                    rows: List[Dict[str, Any]]) -> None:
+        path = self._cache_path(day, program)
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            staging = path.with_suffix(".partial")
+            staging.write_text(json.dumps(rows, default=str))
+            os.replace(staging, path)
+        except OSError as exc:
+            logger.warning("could not cache %s: %s", day, exc)
 
     def estimate(self, window: Window, program: str) -> int:
         del program  # partition size is per day, not per program
@@ -462,12 +523,43 @@ class SolArchiveBackend:
                 "budget")
         if not selection.present:
             return []
-        rows = self.reader.scan(
-            self.table, selection.present,
-            start_slot=window.start_slot, end_slot=window.end_slot,
-            programs=[program])
-        self.bytes_scanned += selection.estimated_bytes
-        return [row for row in rows if isinstance(row, dict)]
+
+        # Days already read this run (or a previous one) come off disk. Only
+        # the rest reach the archive, and the estimate charged to the scan
+        # budget is reduced to match -- a cached day costs no egress and
+        # billing it again would exhaust the budget on reads that never
+        # happened.
+        rows: List[Dict[str, Any]] = []
+        to_read: List[str] = []
+        for day in selection.present:
+            cached = self._cached_rows(day, program)
+            if cached is None:
+                to_read.append(day)
+                continue
+            self.cache_hits += 1
+            rows.extend(item for item in cached if isinstance(item, dict))
+
+        if to_read:
+            fetched = self.reader.scan(
+                self.table, to_read,
+                start_slot=window.start_slot, end_slot=window.end_slot,
+                programs=[program])
+            fetched = [row for row in (fetched or []) if isinstance(row, dict)]
+            self.cache_misses += len(to_read)
+            self.bytes_scanned += sum(self._size(day) for day in to_read)
+            if self.cache_dir is not None and len(to_read) == 1:
+                # Only cacheable when one day was read: a multi-day scan
+                # returns rows without saying which partition each came from,
+                # and filing them all under one day would corrupt every later
+                # hit on the others.
+                self._store_rows(to_read[0], program, fetched)
+            rows.extend(fetched)
+
+        # The window predicate still applies to cached rows: a day cached for
+        # a wider window holds rows outside this one.
+        return [row for row in rows
+                if window.start_slot <= int(row.get("block_slot", -1) or -1)
+                <= window.end_slot]
 
     # -- repair ----------------------------------------------------------
 
@@ -494,6 +586,8 @@ class SolArchiveBackend:
             "days_missing": len(self.repair_windows()),
             "coverage_ratio": (present / requested) if requested else 0.0,
             "bytes_scanned": self.bytes_scanned,
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
             "repair_days": self.repair_windows(),
             "selections": [item.to_dict() for item in self.selections],
         }

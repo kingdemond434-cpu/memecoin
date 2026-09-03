@@ -28,6 +28,7 @@ from solders.transaction import VersionedTransaction
 from src.chains.pump_curve import quote_buy, quote_sell
 from src.execution.landing_router import LandingRouter, Route
 from src.execution.tx_kernel import TxKernel
+from src.execution.bid_curve import ConditionedLandingCurve
 from src.execution.landing_model import Attempt, LandingModel
 from src.chains.blockhash import BlockhashCache
 from src.execution.slot_value import urgency_adjusted_edge
@@ -873,6 +874,7 @@ class ExecutionEngine:
             "prepared_share": (prepared / total) if total else None,
             "outcomes": dict(self.native_route_attempts),
             "landing_model": self.landing_model.report(),
+            "bid_curve": self.bid_curve.report(),
             "last_bid": dict(self.last_bid),
             "reconciliation": {
                 "stream_confirmations": self.stream_confirmations,
@@ -1303,7 +1305,7 @@ class ExecutionEngine:
         if race.identifier:
             self.landing_router.record_landing(
                 race.identifier, landed=bool(fill.get("landed")))
-        self.landing_model.record(Attempt(
+        attempt = Attempt(
             bid_lamports=int(jito_tip if use_jito else 0),
             landed=bool(fill.get("landed")),
             route=route_type.value,
@@ -1345,7 +1347,12 @@ class ExecutionEngine:
             submitted_at=started,
             landed_at=(time.time() if fill.get("landed") else None),
             signature=str(signature or ""),
-            failure=("" if fill.get("filled") else str(fill.get("error", "") or ""))))
+            failure=("" if fill.get("filled") else str(fill.get("error", "") or "")))
+        self.landing_model.record(attempt)
+        # Same attempt, both curves. The conditioned one refuses paper
+        # attempts itself, so a dry-run desk feeds the pooled model and leaves
+        # the curve that prices real bids untouched.
+        self.bid_curve.record(attempt)
         return ExecutionResult(
             success=bool(fill.get("filled")), status=status, signature=signature,
             bundle_id=bundle_id, input_amount=amount,
@@ -1717,6 +1724,36 @@ class ExecutionEngine:
         raced = float(expected_value_usd)
         if slot_value is not None:
             raced = urgency_adjusted_edge(slot_value, expected_value_usd)
+
+        # The jointly-conditioned curve first, where it has support. It prices
+        # leader, contention and blockhash age together and reports the
+        # marginal value of the next lamport, rather than taking a pooled
+        # recommendation and scaling it once per conditioner -- which is what
+        # the block below does, and which double-counts whenever two
+        # conditioners move the same way.
+        if sol_price_usd > 0 and raced > 0:
+            edge_lamports = (raced / float(sol_price_usd)) * 1e9
+            # Blockhash age is an OPTIONAL conditioner: absent, the curve
+            # reports no survival term rather than assuming a fresh hash.
+            # Read through getattr because choose_bid is legitimately called
+            # on engines that have no transaction builder -- pricing a bid
+            # does not require the ability to build one.
+            conditioned = self.bid_curve.optimise(
+                edge_lamports=edge_lamports, leader=leader,
+                account_contention=account_contention, congestion=congestion,
+                blockhash_age_slots=getattr(
+                    getattr(self, "tx_builder", None),
+                    "last_blockhash_age_slots", None))
+            if conditioned.status == "OK":
+                return {"lamports": int(conditioned.bid_lamports),
+                        "measured": True, "source": "conditioned_curve",
+                        "slot_value": (slot_value.to_dict()
+                                       if slot_value is not None
+                                       and hasattr(slot_value, "to_dict")
+                                       else None),
+                        "raced_value_usd": raced,
+                        **conditioned.to_dict()}
+
         recommendation = self.landing_model.recommend(
             raced, sol_price_usd, congestion)
         urgency = ({"slot_value": slot_value.to_dict(), "raced_value_usd": raced}
@@ -1755,6 +1792,35 @@ class ExecutionEngine:
                     **urgency, **conditioning, **recommendation.to_dict()}
         return {"lamports": int(fallback_lamports), "measured": False,
                 **urgency, **recommendation.to_dict()}
+
+    @property
+    def bid_curve(self) -> ConditionedLandingCurve:
+        """The jointly-conditioned curve, created on first use.
+
+        A property rather than an `__init__` assignment because parts of this
+        codebase legitimately build an engine through `__new__` to exercise
+        one method without standing up the whole desk. An attribute assigned
+        only in `__init__` is absent there, and the alternatives are both
+        worse than lazily creating it: a `getattr(self, "bid_curve", None)`
+        guard at the record site silently stops recording, which is the exact
+        looks-wired-does-nothing failure this repository keeps finding, and
+        requiring every such caller to construct one makes the curve optional
+        in practice.
+
+        It is kept BESIDE the pooled `landing_model` rather than replacing it,
+        so the two can disagree visibly, and it takes only real attempts --
+        paper fills describe a simulator, and this is the curve that prices
+        real money.
+        """
+        curve = getattr(self, "_bid_curve", None)
+        if curve is None:
+            curve = ConditionedLandingCurve()
+            self._bid_curve = curve
+        return curve
+
+    @bid_curve.setter
+    def bid_curve(self, curve: ConditionedLandingCurve) -> None:
+        self._bid_curve = curve
 
     def _record(self, result: ExecutionResult, decision_id: Optional[str]):
         result_data = result.__dict__.copy()

@@ -316,3 +316,87 @@ def test_arun_still_drives_a_synchronous_backend():
     launches, report = asyncio.run(scenario())
     assert report.windows_done == 1
     assert [launch.token for launch in launches] == ["MINT"]
+
+
+# --- the partition cache -------------------------------------------------
+
+def test_a_day_read_twice_is_fetched_once(tmp_path):
+    days = _days_around(6)
+    rows = [{"block_slot": 1_000_500, "block_timestamp": DAY_ZERO + 250,
+             "signature": "sig-a", "signer": "dep", "accounts": [PUMP],
+             "instructions": []}]
+    reader = FakeReader(days, rows=rows)
+    backend = SolArchiveBackend(reader, SlotClock(ANCHORS), pad_days=0,
+                                cache_dir=tmp_path / "cache")
+    assert backend.verify()["verified"]
+    window = Window(1_000_000, 1_001_000)
+    first = backend.launches(window, PUMP)
+    scans_after_first = len(reader.scans)
+    second = backend.launches(window, PUMP)
+    assert first == second
+    assert len(reader.scans) == scans_after_first, "the archive was re-read"
+    assert backend.cache_hits >= 1
+
+
+def test_a_cached_day_costs_no_scan_budget(tmp_path):
+    days = _days_around(6)
+    reader = FakeReader(days, sizes={day: 10 ** 6 for day in days})
+    backend = SolArchiveBackend(reader, SlotClock(ANCHORS), pad_days=0,
+                                cache_dir=tmp_path / "cache")
+    assert backend.verify()["verified"]
+    window = Window(1_000_000, 1_001_000)
+    backend.launches(window, PUMP)
+    spent = backend.bytes_scanned
+    backend.launches(window, PUMP)
+    assert backend.bytes_scanned == spent, (
+        "billing a cached day again exhausts the budget on reads that never "
+        "happened")
+
+
+def test_the_window_predicate_still_applies_to_cached_rows(tmp_path):
+    days = _days_around(6)
+    rows = [{"block_slot": 1_000_500, "block_timestamp": DAY_ZERO + 250,
+             "signature": "in", "signer": "dep", "accounts": [PUMP],
+             "instructions": []},
+            {"block_slot": 1_050_000, "block_timestamp": DAY_ZERO + 25_000,
+             "signature": "out", "signer": "dep", "accounts": [PUMP],
+             "instructions": []}]
+    reader = FakeReader(days, rows=rows)
+    backend = SolArchiveBackend(reader, SlotClock(ANCHORS), pad_days=0,
+                                cache_dir=tmp_path / "cache")
+    assert backend.verify()["verified"]
+    wide = Window(1_000_000, 1_100_000)
+    backend.launches(wide, PUMP)
+    narrow = backend.launches(Window(1_000_000, 1_001_000), PUMP)
+    assert [row["signature"] for row in narrow] == ["in"]
+
+
+def test_a_corrupt_cache_file_is_re_read_not_reported_as_an_empty_day(tmp_path):
+    days = _days_around(6)
+    rows = [{"block_slot": 1_000_500, "block_timestamp": DAY_ZERO + 250,
+             "signature": "sig-a", "signer": "dep", "accounts": [PUMP],
+             "instructions": []}]
+    reader = FakeReader(days, rows=rows)
+    cache = tmp_path / "cache"
+    backend = SolArchiveBackend(reader, SlotClock(ANCHORS), pad_days=0,
+                                cache_dir=cache)
+    assert backend.verify()["verified"]
+    window = Window(1_000_000, 1_001_000)
+    backend.launches(window, PUMP)
+    for path in cache.glob("*.json"):
+        path.write_text("{truncated")
+    again = backend.launches(window, PUMP)
+    assert [row["signature"] for row in again] == ["sig-a"], (
+        "a half-written cache file is not evidence of a quiet day")
+
+
+def test_without_a_cache_dir_nothing_changes(tmp_path):
+    days = _days_around(6)
+    reader = FakeReader(days)
+    backend = SolArchiveBackend(reader, SlotClock(ANCHORS), pad_days=0)
+    assert backend.verify()["verified"]
+    window = Window(1_000_000, 1_001_000)
+    backend.launches(window, PUMP)
+    backend.launches(window, PUMP)
+    assert len(reader.scans) == 2
+    assert backend.cache_hits == 0
