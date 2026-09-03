@@ -534,15 +534,13 @@ sources:
     degraded_after_seconds: 21600
     dead_after_seconds: 259200
     options: {url: "https://coinpost.jp/?feed=rss2", language: ja}
-  - id: rss:jp-cointelegraph
-    kind: rss
-    tier: 2
-    language: ja
-    region: jp
-    poll_interval_seconds: 300
-    degraded_after_seconds: 21600
-    dead_after_seconds: 259200
-    options: {url: "https://jp.cointelegraph.com/rss", language: ja}
+  # rss:jp-cointelegraph REMOVED 2026-09-03. Three separate comments in this
+  # file already record that Cointelegraph's regional feeds answer 410 Gone,
+  # and rss:jp-neweconomy exists precisely because of it -- yet the declared
+  # source survived, so the manifest claimed Japanese coverage the mesh could
+  # not deliver. A declared-but-dead source is worse than an absent one: it
+  # makes a coverage count look adequate. Japanese coverage is carried by
+  # rss:jp-coinpost (tier 1) and rss:jp-neweconomy (tier 2), both measured.
   - id: rss:kr-blockmedia
     kind: rss
     # Verified from this node 2026-08-30: HTTP 200, 10 items. Verified
