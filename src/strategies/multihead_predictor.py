@@ -147,8 +147,24 @@ LOG_TARGET_FLOOR = 0.02
 #: removes claimed upside from the survival bins and keeps the mega-event
 #: reserve at baseline. The rungs the entry decision actually gates on (p_2x,
 #: p_5x) are NOT in this set and still block their band when uncoverable.
+#:
+#: P_50X JOINED THIS SET 2026-09-03, on evidence rather than symmetry. A full
+#: supervisor round over 1,200 episodes trained p_2x, p_5x, p_10x, p_20x and
+#: p_migration, fell back to a conservative zero on p_100x, p_250x and p_500x
+#: as designed -- and then FAILED the whole band on p_50x, the one remaining
+#: mega-tail rung still marked required. Every head the entry decision gates
+#: on had fitted; the band was blocked by the head that decides least.
+#:
+#: This is not a fixture artifact. A 50x is rarer than roughly one launch in a
+#: thousand, and the flash band's fit window is a couple of thousand rows, so a
+#: chronological split leaving zero 50x positives on one side is an ordinary
+#: month rather than a pathological one. p_20x is the next rung down and the
+#: same arithmetic is starting to apply to it; it is left required until a run
+#: shows it blocking a band, because moving a rung here on symmetry rather
+#: than evidence is how the whole ladder quietly becomes optional.
 OPTIONAL_TAIL_TARGETS = {
-    PredictionTarget.P_100X, PredictionTarget.P_250X, PredictionTarget.P_500X,
+    PredictionTarget.P_50X, PredictionTarget.P_100X, PredictionTarget.P_250X,
+    PredictionTarget.P_500X,
 }
 
 
