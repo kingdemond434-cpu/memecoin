@@ -284,3 +284,46 @@ def test_a_box_matching_the_repo_is_clean():
     report = audit(UNIT_DIR, show=show,
                    units=["memecoin-shadow-trainer.service"])
     assert report["status"] == "OK", report["drift"]
+
+
+# --- the direction of drift that kills a process -------------------------
+
+def test_a_box_cap_materially_tighter_than_the_repo_is_critical():
+    """Seen 2026-09-03 on the live desk: unit asks 2560M, box enforced 1341M.
+
+    A cgroup cap below what a process needs does not slow it down, it
+    terminates it. Reporting that as "cap differs" next to a Nice value is how
+    a fatal setting reads as tidy-up.
+    """
+    drifts = compare("memecoin-shadow.service", {"MemoryMax": ["2560M"]},
+                     {"MemoryMax": "1406140416"})
+    assert [item.severity for item in drifts] == ["CRITICAL"]
+    assert "52%" in drifts[0].detail
+    assert "drop-in" in drifts[0].detail
+
+
+def test_a_box_cap_more_generous_than_the_repo_is_only_a_warning():
+    drifts = compare("u", {"MemoryMax": ["1200M"]},
+                     {"MemoryMax": str(4 * 1024 ** 3)})
+    assert [item.severity for item in drifts] == ["WARN"]
+
+
+def test_rounding_slack_is_not_drift():
+    assert compare("u", {"MemoryMax": ["2560M"]},
+                   {"MemoryMax": str(2560 * 1024 ** 2)}) == []
+
+
+def test_cpuquota_is_not_reported_as_drift_on_every_unit():
+    """systemd reads CPUQuota= back as CPUQuotaPerSecUSec.
+
+    Asking for the name in the unit file returns empty for every unit, which
+    reported drift on all thirteen and buried the one line that mattered.
+    """
+    assert compare("u", {"CPUQuota": ["100%"]}, {"CPUQuota": ""}) == []
+    assert compare("u", {"CPUQuota": ["100%"]},
+                   {"CPUQuotaPerSecUSec": "1s"}) != []
+
+
+def test_a_box_default_the_repo_does_not_set_is_not_drift():
+    assert compare("u", {}, {"Nice": "0"}) == []
+    assert compare("u", {}, {"OOMScoreAdjust": "0"}) == []

@@ -46,6 +46,18 @@ WATCHED: Tuple[str, ...] = (
 #: because the whole point is that infinity looks like a setting.
 _UNSET = {"infinity", "[not set]", "", "0"}
 
+#: A box cap below this fraction of the repository's is CRITICAL rather than a
+#: difference. Ten per cent of slack is rounding and unit-suffix arithmetic;
+#: half is a process that will be killed.
+TIGHTER_CAP_RATIO = 0.9
+
+#: Properties systemd does not report under the name the unit file uses.
+#: `CPUQuota=` is read back as `CPUQuotaPerSecUSec`, so asking for `CPUQuota`
+#: returns empty for every unit and reports drift on all of them -- noise that
+#: buries the one line that matters. Compared through the reported name, or
+#: not at all.
+_REPORTED_AS = {"CPUQuota": "CPUQuotaPerSecUSec"}
+
 _SUFFIX = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4}
 
 
@@ -123,8 +135,19 @@ def compare(unit: str, repo: Dict[str, List[str]], box: Dict[str, str]
     for prop in WATCHED:
         wanted_values = repo.get(prop) or []
         wanted = wanted_values[-1] if wanted_values else ""
-        actual = (box.get(prop) or "").strip()
+        reported = _REPORTED_AS.get(prop, prop)
+        actual = (box.get(prop) or box.get(reported) or "").strip()
         if not wanted and not actual:
+            continue
+        if prop in _REPORTED_AS and reported not in box:
+            # Asked for under a name this systemd does not answer to. Silence
+            # is not agreement and it is not drift; it is an unanswered
+            # question, and reporting it as a difference on every unit is how
+            # a real finding gets lost in a wall of noise.
+            continue
+        if not wanted and actual in _UNSET:
+            # The repository does not set it and the box reports its default.
+            # Nothing has drifted.
             continue
         if prop in ("MemoryMax", "MemoryHigh"):
             want_bytes = parse_bytes(wanted)
@@ -137,6 +160,24 @@ def compare(unit: str, repo: Dict[str, List[str]], box: Dict[str, str]
                     "the repository sets a cap and the box has none; an "
                     "unbounded process on a 4 GB host is what the kernel OOM "
                     "killer resolves, and it does not have to pick this one"))
+                continue
+            if (want_bytes is not None and have_bytes is not None
+                    and have_bytes < want_bytes * TIGHTER_CAP_RATIO):
+                # The direction that kills a process rather than merely
+                # differing from a file. Seen 2026-09-03: the desk's unit
+                # asks for 2560M after measurement, and the box was enforcing
+                # 1341M -- about half. A cgroup cap below what a process needs
+                # does not slow it down, it terminates it, and reporting that
+                # as "cap differs" alongside a Nice value is how a fatal
+                # setting reads as tidy-up.
+                drifts.append(Drift(
+                    unit, prop, wanted, actual, "CRITICAL",
+                    f"the box enforces {have_bytes / want_bytes:.0%} of what "
+                    "the repository asks for; a cap below what the process "
+                    "needs terminates it rather than slowing it, and a "
+                    "value the unit file does not contain means a drop-in "
+                    "or slice is overriding it -- check "
+                    "`systemctl --user cat` for the unit"))
                 continue
             drifts.append(Drift(unit, prop, wanted, actual, "WARN",
                                 "cap differs"))
