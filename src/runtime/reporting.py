@@ -87,7 +87,12 @@ class ReportingSurface:
             cost = {"status": "DATA_BLOCKED"}
         landing = getattr(getattr(self, "execution_engine", None),
                           "landing_model", None)
-        attempts = getattr(landing, "attempts", None)
+        # The LIFETIME count of real-capital attempts, not the length of the
+        # retained window. `_attempts` is a bounded deque that pools paper
+        # with real: reading it would have the count fall once the desk
+        # outgrew the buffer, and climb during dry run toward a bar that only
+        # real submissions may satisfy.
+        real_fills = getattr(landing, "real_fills", None)
         return diagnose({
             "launches_seen": int(funnel.get("seen", 0) or 0),
             "resolved_episodes": int(training.get("resolved_episodes", 0) or 0),
@@ -99,7 +104,7 @@ class ReportingSurface:
             # SCHEDULE can price anything, not what this mint costs.
             "cost_model_ok": cost.get("status") == "OK",
             "entries": int(funnel.get("entered", 0) or 0),
-            "real_fills": len(attempts) if attempts is not None else 0,
+            "real_fills": int(real_fills) if real_fills is not None else 0,
             "dry_run": bool(self.dry_run),
         })
 

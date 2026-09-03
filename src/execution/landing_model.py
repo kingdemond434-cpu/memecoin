@@ -232,6 +232,29 @@ class LandingModel:
         self.path = Path(path) if path else None
         self.appended = 0
         self._log: Optional[Any] = None
+        #: Lifetime count of attempts made with REAL capital. Monotone, and
+        #: deliberately not derived from `_attempts`.
+        #:
+        #: The promotion ladder's CANARY->LIVE rung asks for 1,000 real fills,
+        #: and `_attempts` cannot answer that in two separate ways: it is a
+        #: bounded deque, so the count falls as soon as the desk has made more
+        #: attempts than the buffer holds, and it pools paper with real, so in
+        #: dry run it would climb toward a live-capital bar on submissions
+        #: that never happened.
+        self.real_fills = 0
+        self.paper_attempts = 0
+
+    @property
+    def attempts(self) -> Deque[Attempt]:
+        """The retained window, read-only by convention.
+
+        Public because `reporting.readiness()` reached for `landing.attempts`,
+        found nothing, and reported `real_fills: 0` for the life of the desk
+        -- a live-capital gate reading permanently zero while looking wired.
+        Callers wanting the LIFETIME count want `real_fills`; this deque is a
+        window and shrinks by design.
+        """
+        return self._attempts
 
     def record(self, attempt: Attempt) -> None:
         """One attempt. Landed or not -- both are evidence, and only one is fun.
@@ -245,6 +268,10 @@ class LandingModel:
             counts[0] = max(0, counts[0] - 1)
             counts[1] = max(0, counts[1] - int(evicted.landed))
         self._attempts.append(attempt)
+        if attempt.real:
+            self.real_fills += 1
+        else:
+            self.paper_attempts += 1
         key = (congestion_bucket(attempt.congestion), bid_bucket(attempt.bid_lamports))
         counts = self._counts[key]
         counts[0] += 1
@@ -319,6 +346,13 @@ class LandingModel:
                 restored += 1
         finally:
             self.path = saved_path
+        # Counted over the WHOLE log, not the replayed window. `record` above
+        # only saw the last `capacity` rows, so taking its totals would reset
+        # the lifetime count on every restart -- and a desk restarted a dozen
+        # times would report a live-capital bar it had already cleared as
+        # unmet, forever.
+        self.real_fills = sum(1 for row in rows if row.real)
+        self.paper_attempts = len(rows) - self.real_fills
         return restored
 
     def close(self) -> None:

@@ -371,3 +371,64 @@ def test_overrides_do_not_make_the_audit_status_warn():
                    units=["memecoin-shadow-trainer.service"])
     assert report["status"] == "OK", report["drift"]
     assert report["overrides"], "an override must still be visible"
+
+
+# --- the live-capital counter -------------------------------------------
+
+def test_real_fills_counts_only_real_capital_and_never_falls(tmp_path):
+    """`readiness()` read `landing.attempts`, which did not exist.
+
+    So `real_fills` reported 0 for the life of the desk while the CANARY->LIVE
+    rung waited for 1,000 of them -- a gate that could never be satisfied,
+    reading permanently zero while looking perfectly wired.
+    """
+    from src.execution.landing_model import Attempt, LandingModel
+
+    model = LandingModel(capacity=10)
+    for _ in range(50):
+        model.record(Attempt(bid_lamports=1_000, landed=True, real=True))
+    for _ in range(7):
+        model.record(Attempt(bid_lamports=1_000, landed=True, real=False))
+
+    # The retained window is a window; the count is a lifetime.
+    assert len(model.attempts) == 10
+    assert model.real_fills == 50
+    assert model.paper_attempts == 7
+
+
+def test_a_dry_run_desk_does_not_accrue_toward_a_live_capital_bar():
+    from src.execution.landing_model import Attempt, LandingModel
+
+    model = LandingModel()
+    for _ in range(1_000):
+        model.record(Attempt(bid_lamports=1_000, landed=True, real=False))
+    assert model.real_fills == 0, (
+        "paper submissions climbing toward a bar only real capital may "
+        "satisfy is the gate authorising money on trades that never happened")
+
+
+def test_the_lifetime_count_survives_a_restart(tmp_path):
+    from src.execution.landing_model import Attempt, LandingModel
+
+    path = tmp_path / "attempts.jsonl"
+    model = LandingModel(capacity=10, path=path)
+    for _ in range(50):
+        model.record(Attempt(bid_lamports=1_000, landed=True, real=True))
+    model.close()
+
+    reborn = LandingModel(capacity=10, path=path)
+    reborn.load()
+    assert reborn.real_fills == 50, (
+        "load replays only the last `capacity` rows; a desk restarted a dozen "
+        "times would report a bar it had already cleared as unmet")
+
+
+def test_readiness_reports_the_lifetime_count_not_the_window():
+    import inspect
+
+    from src.runtime.reporting import ReportingSurface
+    # `_promotion_readiness` is what assembles the promotion evidence; the
+    # public `readiness()` payload embeds it.
+    source = inspect.getsource(ReportingSurface._promotion_readiness)
+    assert 'getattr(landing, "real_fills"' in source
+    assert 'len(attempts)' not in source
