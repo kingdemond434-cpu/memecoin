@@ -42,6 +42,13 @@ WATCHED: Tuple[str, ...] = (
     "ExecStart", "SuccessExitStatus", "Nice",
 )
 
+#: Fetched but never compared. A unit with a drop-in is a unit somebody
+#: deliberately overrode on this box, and the difference that creates is a
+#: DECISION rather than drift -- the two must not read the same, or the tool
+#: reports a considered local override as an emergency on every run and stops
+#: being read at all.
+DROP_IN_PROPERTY = "DropInPaths"
+
 #: What systemd reports for "no limit". Compared as a value, not as absence,
 #: because the whole point is that infinity looks like a setting.
 _UNSET = {"infinity", "[not set]", "", "0"}
@@ -132,6 +139,8 @@ class Drift:
 def compare(unit: str, repo: Dict[str, List[str]], box: Dict[str, str]
             ) -> List[Drift]:
     drifts: List[Drift] = []
+    drop_ins = [path for path in (box.get(DROP_IN_PROPERTY) or "").split()
+                if path.strip()]
     for prop in WATCHED:
         wanted_values = repo.get(prop) or []
         wanted = wanted_values[-1] if wanted_values else ""
@@ -160,6 +169,21 @@ def compare(unit: str, repo: Dict[str, List[str]], box: Dict[str, str]
                     "the repository sets a cap and the box has none; an "
                     "unbounded process on a 4 GB host is what the kernel OOM "
                     "killer resolves, and it does not have to pick this one"))
+                continue
+            if (want_bytes is not None and have_bytes is not None
+                    and have_bytes < want_bytes * TIGHTER_CAP_RATIO
+                    and drop_ins):
+                # Tighter, and a drop-in explains why. That is somebody's
+                # decision on this box -- often a better-measured one than the
+                # repository's, since the repository cannot see this host's
+                # real working set. Reported so it is visible, never as an
+                # alarm.
+                drifts.append(Drift(
+                    unit, prop, wanted, actual, "OVERRIDE",
+                    f"a drop-in sets this: {', '.join(drop_ins)}. The box "
+                    "enforces "
+                    f"{have_bytes / want_bytes:.0%} of the repository's value "
+                    "deliberately; change the drop-in, not the unit file"))
                 continue
             if (want_bytes is not None and have_bytes is not None
                     and have_bytes < want_bytes * TIGHTER_CAP_RATIO):
@@ -221,7 +245,7 @@ def compare(unit: str, repo: Dict[str, List[str]], box: Dict[str, str]
 def systemctl_show(unit: str) -> Dict[str, str]:  # pragma: no cover - needs systemd
     result = subprocess.run(
         ["systemctl", "--user", "show", unit,
-         "--property=" + ",".join(WATCHED)],
+         "--property=" + ",".join(WATCHED + (DROP_IN_PROPERTY,))],
         capture_output=True, text=True, check=False, timeout=30)
     values: Dict[str, str] = {}
     for line in result.stdout.splitlines():
@@ -262,13 +286,16 @@ def audit(unit_dir: Path,
         checked.append(path.name)
         drifts.extend(compare(path.name, repo, box))
     critical = [item for item in drifts if item.severity == "CRITICAL"]
+    overrides = [item for item in drifts if item.severity == "OVERRIDE"]
+    genuine = [item for item in drifts if item.severity != "OVERRIDE"]
     return {
         "checked": checked,
         "unreadable": unreadable,
-        "drift": [item.to_dict() for item in drifts],
+        "drift": [item.to_dict() for item in genuine],
+        "overrides": [item.to_dict() for item in overrides],
         "critical": [item.to_dict() for item in critical],
         "status": ("CRITICAL" if critical else
-                   "WARN" if drifts else
+                   "WARN" if genuine else
                    "DATA_BLOCKED" if not checked else "OK"),
         "remedy": ("cp deploy/systemd/*.service ~/.config/systemd/user/ && "
                    "systemctl --user daemon-reload"),

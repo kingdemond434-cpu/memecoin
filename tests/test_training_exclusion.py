@@ -327,3 +327,47 @@ def test_cpuquota_is_not_reported_as_drift_on_every_unit():
 def test_a_box_default_the_repo_does_not_set_is_not_drift():
     assert compare("u", {}, {"Nice": "0"}) == []
     assert compare("u", {}, {"OOMScoreAdjust": "0"}) == []
+
+
+def test_a_deliberate_drop_in_is_an_override_not_an_emergency():
+    """The live box, 2026-09-03.
+
+    `10-blast-radius.conf` sets MemoryHigh=986M / MemoryMax=1341M against a
+    unit file asking 2560M -- and it does so with a dated measurement (peak
+    789M, sized 1.25x/1.7x) that the repository cannot make, because the
+    repository cannot see this host's working set.
+
+    Reporting that as CRITICAL on every run is how a tool that cries wolf
+    stops being read, which is the failure it exists to prevent.
+    """
+    drifts = compare(
+        "memecoin-shadow.service", {"MemoryMax": ["2560M"]},
+        {"MemoryMax": "1406140416",
+         "DropInPaths": "/home/q/.config/systemd/user/"
+                        "memecoin-shadow.service.d/10-blast-radius.conf"})
+    assert [item.severity for item in drifts] == ["OVERRIDE"]
+    assert "10-blast-radius.conf" in drifts[0].detail
+    assert "change the drop-in, not the unit file" in drifts[0].detail
+
+
+def test_a_tighter_cap_with_nothing_explaining_it_is_still_critical():
+    drifts = compare("u", {"MemoryMax": ["2560M"]},
+                     {"MemoryMax": "1406140416"})
+    assert [item.severity for item in drifts] == ["CRITICAL"]
+
+
+def test_overrides_do_not_make_the_audit_status_warn():
+    def show(unit):
+        directives = parse_unit_file(TRAINER)
+        values = {prop: (directives.get(prop) or [""])[-1]
+                  for prop in ("MemoryHigh", "OOMScoreAdjust",
+                               "SuccessExitStatus", "Nice")}
+        values["ExecStart"] = "{ argv[]=" + directives["ExecStart"][0] + " }"
+        values["MemoryMax"] = "1000000"          # far tighter than the repo
+        values["DropInPaths"] = "/etc/x.conf"    # and explained
+        return values
+
+    report = audit(UNIT_DIR, show=show,
+                   units=["memecoin-shadow-trainer.service"])
+    assert report["status"] == "OK", report["drift"]
+    assert report["overrides"], "an override must still be visible"
