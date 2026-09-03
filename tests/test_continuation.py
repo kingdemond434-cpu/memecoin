@@ -411,3 +411,45 @@ def test_the_ratchet_is_skipped_inside_the_policy_not_outside_it():
     # Without conviction the ratchet is exactly as it was.
     assert evaluate_exit(policy, 12.0, 100.0, 0.5, set(), 600.0)[0] == (
         "profit_ratchet_cost_recovery")
+
+
+# --- how far up the curve the model can see -------------------------------
+
+def test_the_report_says_what_the_model_can_actually_answer_about():
+    """The question after a training run is not 'did it train'.
+
+    A corpus with 94 tenx launches and 28 twentyx ones trains every head, and
+    the curve still stops at 10x -- so conviction is DATA_BLOCKED above 5x and
+    never engages on the runners it exists for.
+    """
+    predictor = FakePredictor(positives={
+        PredictionTarget.P_2X: 683, PredictionTarget.P_5X: 210,
+        PredictionTarget.P_10X: 94, PredictionTarget.P_20X: 28,
+        PredictionTarget.P_50X: 9})
+    report = ContinuationModel().report(predictor)
+    assert report["usable_rungs"] == [2.0, 5.0, 10.0]
+    assert report["answerable_up_to_multiple"] == 5.0
+    # And the model agrees with its own report.
+    model = ContinuationModel()
+    assert model.evaluate(predictor, power_law(), 4.0).ok
+    assert model.evaluate(predictor, power_law(), 8.0).status == "DATA_BLOCKED"
+
+
+def test_the_report_names_the_reason_when_nothing_is_usable():
+    report = ContinuationModel().report(FakePredictor(calibrated=()))
+    assert report["status"] == "DATA_BLOCKED"
+    assert "every runner exits on the ordinary trail" in report["detail"]
+
+
+def test_the_report_lists_every_rung_with_its_own_evidence():
+    report = ContinuationModel().report(FakePredictor(positives={
+        PredictionTarget.P_2X: 683, PredictionTarget.P_5X: 4}))
+    by_head = {row["head"]: row for row in report["rungs"]}
+    assert by_head["p_2x"]["usable"] and by_head["p_2x"]["positives"] == 683
+    assert not by_head["p_5x"]["usable"]
+    assert by_head["p_10x"]["positives"] is None
+
+
+def test_an_untrained_predictor_reports_data_blocked():
+    assert ContinuationModel().report(
+        FakePredictor(trained=False))["status"] == "DATA_BLOCKED"

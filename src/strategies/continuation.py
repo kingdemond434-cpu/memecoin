@@ -203,6 +203,47 @@ class ContinuationModel:
             return math.exp(log_y), basis
         return curve[-1][1], f"at {curve[-1][0]:g}x"
 
+    def report(self, predictor: Any) -> Dict[str, Any]:
+        """Which rungs are usable, and therefore what this can answer about.
+
+        The practical question after a training run is not "did it train" but
+        "how far up the curve can it see". A model whose last usable rung is
+        10x can answer for positions below 5x and is DATA_BLOCKED above them
+        -- so conviction never engages on exactly the runners it was built
+        for, and nothing else on the status page would say so.
+        """
+        if not getattr(predictor, "_is_trained", False):
+            return {"schema": CONTINUATION_SCHEMA_VERSION,
+                    "status": "DATA_BLOCKED", "detail": "predictor not trained"}
+        usable = self.usable_levels(predictor)
+        rungs = []
+        for target, level in SURVIVAL_LEVELS:
+            checker = getattr(predictor, "is_calibrated", None)
+            counter = getattr(predictor, "head_positives", None)
+            rungs.append({
+                "level": float(level), "head": target.value,
+                "calibrated": bool(callable(checker) and checker(target)),
+                "positives": (counter(target) if callable(counter) else None),
+                "usable": any(item[0] == float(level) for item in usable),
+            })
+        top = usable[-1][0] if usable else None
+        answerable = None if top is None else top / self.horizon
+        return {
+            "schema": CONTINUATION_SCHEMA_VERSION,
+            "status": "OK" if usable else "DATA_BLOCKED",
+            "usable_rungs": [item[0] for item in usable],
+            "highest_usable_multiple": top,
+            "answerable_up_to_multiple": answerable,
+            "min_positives": self.min_positives,
+            "horizon": self.horizon,
+            "rungs": rungs,
+            "detail": ("" if usable else
+                       "no survival head is both calibrated and above the "
+                       f"{self.min_positives}-positive floor; conviction "
+                       "cannot be granted and every runner exits on the "
+                       "ordinary trail"),
+        }
+
     # -- the reading -------------------------------------------------------
 
     def evaluate(self, predictor: Any, prediction: Any, multiple: float, *,

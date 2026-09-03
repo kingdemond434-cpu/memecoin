@@ -525,6 +525,15 @@ class ReportingSurface:
             # positions have quietly shrunk because early curves cannot
             # absorb the equity behind them looks identical, from every other
             # number on this page, to a book that stopped finding trades.
+            # How far up the survival curve the model can actually see. A
+            # model whose last usable rung is 10x is DATA_BLOCKED above 5x,
+            # so conviction never engages on the runners it exists for -- and
+            # no other number on this page would say so.
+            "continuation": (
+                self.continuation_model.report(self.predictor)
+                if getattr(self, "continuation_model", None) is not None
+                and self.predictor is not None
+                else {"status": "DATA_BLOCKED", "detail": "not wired"}),
             "capacity": (self.elogw_engine.capacity_report()
                          if self.elogw_engine is not None
                          else {"status": "DATA_BLOCKED"}),
