@@ -475,3 +475,95 @@ def test_the_expiry_leaves_slack_over_the_weekly_timer():
     assert ForwardEvidence.GAUNTLET_MAX_AGE_S > week
     unit = Path("deploy/systemd/memecoin-gauntlet.timer").read_text()
     assert "OnCalendar=Sun" in unit
+
+
+# --- enrichment counts what we bought, not what we were shown -------------
+
+def _seen(ledger, count, *, monster_from, entered_range, equity=1000.0):
+    for index in range(count):
+        monster = index >= monster_from
+        ledger.record(Outcome(
+            token=f"m{index}", entered=index in entered_range, regime="bull",
+            max_multiple=(50.0 if monster else 1.2),
+            realized_pnl_usd=-1.0, equity_at_decision_usd=equity))
+
+
+def test_entering_none_of_the_monsters_is_zero_enrichment_not_ten():
+    """The bug: the numerator counted monsters we SAW, over launches we took.
+
+    That cancels to scored/entered -- a selectivity ratio. A desk entering one
+    launch in ten reported 10x enrichment holding nothing, and CANARY's bar of
+    2.0 was cleared by being picky rather than by being right.
+    """
+    ledger = ForwardEvidence()
+    _seen(ledger, 100, monster_from=90, entered_range=range(0, 10))
+    assert ledger.evidence().monster_enrichment == 0.0
+
+
+def test_entering_every_monster_is_real_enrichment():
+    ledger = ForwardEvidence()
+    _seen(ledger, 100, monster_from=90, entered_range=range(90, 100))
+    assert ledger.evidence().monster_enrichment == pytest.approx(10.0)
+
+
+def test_being_picky_alone_does_not_move_enrichment():
+    """Ten times as selective, same hit rate, same enrichment.
+
+    Under the old arithmetic `picky` would have reported 10x purely for
+    entering a tenth as often.
+    """
+    everything = ForwardEvidence()
+    _seen(everything, 100, monster_from=90, entered_range=range(0, 100))
+    picky = ForwardEvidence()
+    # A tenth as many entries, and exactly the same one-in-ten hit rate.
+    _seen(picky, 100, monster_from=90,
+          entered_range=list(range(0, 9)) + [90])
+    assert everything.evidence().monster_enrichment == pytest.approx(1.0)
+    assert picky.evidence().monster_enrichment == pytest.approx(1.0)
+
+
+def test_picking_better_is_what_moves_enrichment():
+    """Same number of entries as `picky` above, three monsters instead of one."""
+    ledger = ForwardEvidence()
+    _seen(ledger, 100, monster_from=90,
+          entered_range=list(range(0, 7)) + [90, 91, 92])
+    assert ledger.evidence().monster_enrichment == pytest.approx(3.0)
+
+
+def test_an_unresolved_entry_is_not_a_missed_monster():
+    ledger = ForwardEvidence()
+    _seen(ledger, 100, monster_from=90, entered_range=range(90, 100))
+    before = ledger.evidence().monster_enrichment
+    ledger.record(Outcome(token="open", entered=True, regime="bull",
+                          max_multiple=None, realized_pnl_usd=0.0,
+                          equity_at_decision_usd=1000.0))
+    assert ledger.evidence().monster_enrichment == before
+
+
+def test_a_ledger_written_before_the_counter_reads_as_unmeasured(tmp_path):
+    """Zeroing it would divide a fresh numerator by an all-time denominator."""
+    path = tmp_path / "forward_evidence.json"
+    ledger = ForwardEvidence(path)
+    _seen(ledger, 100, monster_from=90, entered_range=range(90, 100))
+    ledger.save()
+    legacy = json.loads(path.read_text())
+    legacy.pop("entered_scored")
+    legacy.pop("entered_monsters")
+    path.write_text(json.dumps(legacy))
+
+    reborn = ForwardEvidence(path)
+    assert reborn.entered_scored is None
+    assert reborn.evidence().monster_enrichment is None
+    # And the gate fails closed on it rather than passing on a stale number.
+    verdict = evaluate(DEFAULT_CRITERIA[Stage.FORWARD_SHADOW],
+                       reborn.evidence())
+    assert "monster_enrichment" in verdict.unmeasured
+
+
+def test_the_counters_survive_a_restart(tmp_path):
+    path = tmp_path / "forward_evidence.json"
+    ledger = ForwardEvidence(path)
+    _seen(ledger, 100, monster_from=90, entered_range=range(90, 100))
+    ledger.save()
+    assert (ForwardEvidence(path).evidence().monster_enrichment
+            == pytest.approx(10.0))

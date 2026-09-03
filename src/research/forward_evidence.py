@@ -127,6 +127,13 @@ class ForwardEvidence:
         #: running sum cannot be resampled and the lower bound needs the
         #: sample, not the total.
         self._log_returns: List[float] = []
+        #: Monsters among the launches we ENTERED, and how many entered
+        #: launches were scored at all. Both None on a ledger written before
+        #: these existed, which reads as unmeasured rather than as zero: a
+        #: numerator restarted against an all-time denominator would report a
+        #: real desk as having caught nothing.
+        self.entered_scored: Optional[int] = 0
+        self.entered_monsters: Optional[int] = 0
         self._gauntlet_survivors: Optional[int] = None
         self._gauntlet_at: Optional[float] = None
         self.started_at = time.time()
@@ -157,13 +164,21 @@ class ForwardEvidence:
             self.real_fills += 1
         if outcome.catastrophic:
             self.catastrophic_failures += 1
+        monster = (outcome.max_multiple is not None
+                   and float(outcome.max_multiple) >= self.MONSTER_MULTIPLE)
         if outcome.max_multiple is not None:
             self.scored_launches += 1
-            if float(outcome.max_multiple) >= self.MONSTER_MULTIPLE:
+            if monster:
                 self.monsters += 1
         if not outcome.entered:
             return
         self.entered += 1
+        if outcome.max_multiple is not None:
+            if self.entered_scored is None:
+                self.entered_scored = 0
+                self.entered_monsters = 0
+            self.entered_scored += 1
+            self.entered_monsters += int(monster)
         pnl = float(outcome.realized_pnl_usd)
         if pnl < 0:
             self.total_losses_usd += -pnl
@@ -326,19 +341,34 @@ class ForwardEvidence:
         )
 
     def _enrichment(self) -> Optional[float]:
-        """Monsters among what we entered, over monsters among what we saw.
+        """Monsters among what we ENTERED, over monsters among what we saw.
+
+        The numerator counts monsters we actually bought. It used to reuse
+        `self.monsters` -- every monster the desk SAW, entered or not -- over
+        `self.entered`, which algebraically cancels to
+        `scored_launches / entered`: a selectivity ratio wearing enrichment's
+        name. A desk that entered one launch in ten reported 10x enrichment
+        while holding nothing, and the CANARY bar of 2.0 was cleared by being
+        picky rather than by being right. Measured on this repository
+        2026-09-03: ten monsters seen, ten launches entered, no overlap
+        whatsoever, reported as 10.0.
 
         None until both sides have been observed. An enrichment computed
         against a base rate of zero is division by an absence, and reporting
         it as infinite enrichment is the single most flattering number this
         module could produce.
         """
-        if not self.scored_launches or not self.entered:
+        if not self.scored_launches:
+            return None
+        if not self.entered_scored:
+            # Either nothing entered has resolved yet, or this ledger predates
+            # the counter. Both are "not measured", and the gate fails closed
+            # on that rather than passing on a number nobody computed.
             return None
         base_rate = self.monsters / self.scored_launches
         if base_rate <= 0:
             return None
-        entered_rate = self.monsters / self.entered
+        entered_rate = self.entered_monsters / self.entered_scored
         return entered_rate / base_rate
 
     def distance(self, criteria: Optional[PromotionCriteria] = None) -> Dict[str, Any]:
@@ -404,6 +434,8 @@ class ForwardEvidence:
             "execution_successes": self.execution_successes,
             "catastrophic_failures": self.catastrophic_failures,
             "monsters": self.monsters, "scored_launches": self.scored_launches,
+            "entered_scored": self.entered_scored,
+            "entered_monsters": self.entered_monsters,
             "cohorts": sorted(self._cohorts), "regimes": sorted(self._regimes),
             "log_returns": list(self._log_returns),
             "gauntlet_survivors": self._gauntlet_survivors,
@@ -452,6 +484,16 @@ class ForwardEvidence:
         self.catastrophic_failures = int(state.get("catastrophic_failures", 0))
         self.monsters = int(state.get("monsters", 0))
         self.scored_launches = int(state.get("scored_launches", 0))
+        # Absent on a ledger written before these existed. Restored as None,
+        # which reads as unmeasured: zeroing them would divide a fresh
+        # numerator by an all-time `entered` and report a working desk as
+        # having caught no monsters at all.
+        entered_scored = state.get("entered_scored")
+        entered_monsters = state.get("entered_monsters")
+        self.entered_scored = (None if entered_scored is None
+                               else int(entered_scored))
+        self.entered_monsters = (None if entered_monsters is None
+                                 else int(entered_monsters))
         self._cohorts = set(state.get("cohorts") or ())
         self._regimes = set(state.get("regimes") or ())
         self._log_returns = [float(value)
