@@ -746,6 +746,13 @@ class ReportingSurface:
             "rug_hazard": self.rug_hazard.get_stats() if self.rug_hazard else {},
             "dataset": self.dataset_builder.get_stats() if self.dataset_builder else {},
             "research": self.global_research.get_stats() if self.global_research else {},
+            # The hourly world crawler, its search backends, the canonical
+            # event ledger and the provider-terms watcher. On the health
+            # surface because a discovery organ nobody can see is a discovery
+            # organ nobody notices has stopped.
+            "world_discovery": (self.world_discovery_report()
+                                if hasattr(self, "world_discovery_report")
+                                else {}),
             "social": self.social_intel.get_stats() if self.social_intel else {},
             "public_coordination": self.public_coordination.get_stats() if self.public_coordination else {},
             "champions": self.champion_challenger.get_stats() if self.champion_challenger else {},

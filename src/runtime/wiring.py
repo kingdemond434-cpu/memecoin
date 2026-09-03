@@ -896,6 +896,11 @@ class SubsystemWiring:
         if hasattr(self.genealogy, "set_outcome_provider"):
             self.genealogy.set_outcome_provider(self.dataset_builder.get_outcome)
         self.global_research = GlobalResearchMiner(self.champion_challenger)
+        # World discovery: the hourly crawler, its keyless search fan-out, the
+        # canonical event ledger and the provider-terms watcher. Constructed
+        # here so the loop started in main() has something to drive; an
+        # unwired crawler is the exact failure this repository keeps finding.
+        self._setup_discovery()
         # Market and chain context, each source on its own clock. The program
         # stream is the fastest and most trustworthy data the desk has; what
         # it does not carry is why a price path looks the way it does, and

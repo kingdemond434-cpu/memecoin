@@ -50,6 +50,7 @@ from src.research.dataset_builder import (
     PUMP_INITIAL_VIRTUAL_TOKEN, PUMP_TOKEN_TOTAL_SUPPLY)
 from src.research.feature_engine import build_features
 from src.research.global_research_miner import GlobalResearchMiner
+from src.runtime.discovery import DeskDiscovery
 from src.research.calibration import CalibrationBook
 from src.research.counterfactual_corpus import (
     ActionOption, CounterfactualCorpus, RouteOption,
@@ -189,7 +190,7 @@ CAPACITY_REJECTIONS = frozenset({
 class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
                        DeskMaintenance, TaskSupervision, EvidenceRecording,
                        SubsystemWiring, SourceIntelligence, PositionForensics,
-                       DeskTraining):
+                       DeskTraining, DeskDiscovery):
     def __init__(self, config_path: str = "config/chains.yaml", *, dry_run_override: Optional[bool] = None,
                  offline: bool = False):
         self.config_path = config_path
@@ -581,6 +582,12 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         self._parity_task = self._start_runtime_task("parity", self._parity_loop())
         self._training_task = self._start_runtime_task(
             "training", self._training_loop())
+        # Hourly world discovery. Its own loop on its own long clock: a pass
+        # is dozens of HTTP requests, and it must never share a cadence with
+        # anything that decides, nor sit between process start and the health
+        # port being answerable.
+        self._discovery_task = self._start_runtime_task(
+            "discovery", self._discovery_loop())
         # Started only when the receiver is actually streaming, so a box
         # without the extension built does not carry a loop that wakes
         # twenty times a second to drain nothing.

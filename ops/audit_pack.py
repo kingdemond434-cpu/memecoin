@@ -246,7 +246,12 @@ def changes_section(repo_root: Path, since_days: int = 7) -> Section:
         result = subprocess.run(
             ["git", "log", f"--since={since_days} days ago", "--pretty=format:%h %ad %s",
              "--date=short", "--stat"],
-            cwd=repo_root, capture_output=True, text=True, timeout=30, check=False)
+            # `--stat` over a long period walks every tree in the range, and
+            # the audit pack runs on a loaded box while the suite is running.
+            # Thirty seconds was enough on an idle machine and reported
+            # DATA_BLOCKED under load, which reads as "no history" rather than
+            # "ask again".
+            cwd=repo_root, capture_output=True, text=True, timeout=180, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         return _blocked("recent_changes", f"git log failed: {exc}")
     if result.returncode != 0:
