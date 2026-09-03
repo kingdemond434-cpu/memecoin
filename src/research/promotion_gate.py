@@ -476,6 +476,119 @@ class PromotionLedger:
                     f"{criteria.min_decisions_at_stage} required")
         return failures
 
+    #: Requirements that arrive with VOLUME, and can therefore be projected
+    #: from an observed rate. Everything else on the ladder either arrives
+    #: with the market (regimes), or has to be earned by picking better
+    #: (enrichment, growth, the lower bound, the gauntlet) -- and projecting
+    #: a date for those would be forecasting the desk becoming good at its
+    #: job, which is not a thing a rate can say.
+    _COUNTING = ("decisions", "real_fills", "launch_cohorts")
+
+    def eta(self, evidence: Evidence, observed_days: float,
+            criteria: Optional[PromotionCriteria] = None) -> Dict[str, Any]:
+        """How long until the next rung, or what is stopping it entirely.
+
+        Two very different answers, kept apart on purpose. The counting
+        requirements have a rate and therefore a date. The rest do not: a
+        desk short of three regimes is waiting on the market, and a desk
+        below 2.0 monster enrichment is waiting on itself. Reporting one
+        number over both would put a confident date on the requirement least
+        likely to be met by waiting.
+        """
+        stage = self.current_stage()
+        criteria = criteria or DEFAULT_CRITERIA.get(stage)
+        if criteria is None:
+            return {"status": "DATA_BLOCKED", "detail": f"no criteria for {stage.value}"}
+        target = next_stage(stage)
+        if target is None:
+            return {"status": "OK", "stage": stage.value, "next_stage": None,
+                    "detail": "top of the ladder"}
+
+        observed_days = max(0.0, float(observed_days))
+        entered = self.entered_stage_at()
+        days_at_stage = ((time.time() - entered) / 86_400.0) if entered else 0.0
+        dwell_remaining = max(0.0, criteria.min_days_at_stage - days_at_stage)
+
+        counting: Dict[str, Any] = {}
+        projected = [dwell_remaining]
+        unrated: List[str] = []
+        for name, need in (
+                ("decisions", criteria.min_decisions),
+                ("real_fills", criteria.min_real_fills),
+                ("launch_cohorts", criteria.min_launch_cohorts)):
+            if need <= 0:
+                continue
+            have = int(getattr(evidence, name) or 0)
+            per_day = (have / observed_days) if observed_days > 0 else 0.0
+            short = max(0, need - have)
+            if short == 0:
+                days = 0.0
+            elif per_day > 0:
+                days = short / per_day
+            else:
+                # No observed rate. Not "arrives instantly", and not a number
+                # to average into a date -- named instead, so the answer says
+                # which count is not moving.
+                days = None
+                unrated.append(name)
+            counting[name] = {"have": have, "need": need,
+                              "per_day": round(per_day, 3),
+                              "days_remaining": (None if days is None
+                                                 else round(days, 1))}
+            if days is not None:
+                projected.append(days)
+
+        if criteria.min_decisions_at_stage > 0:
+            fresh = int(evidence.decisions or 0) - self.decisions_at_entry()
+            short = max(0, criteria.min_decisions_at_stage - fresh)
+            per_day = ((fresh / days_at_stage) if days_at_stage > 0 else 0.0)
+            days = (0.0 if short == 0 else
+                    (short / per_day) if per_day > 0 else None)
+            counting["decisions_at_stage"] = {
+                "have": fresh, "need": criteria.min_decisions_at_stage,
+                "per_day": round(per_day, 3),
+                "days_remaining": None if days is None else round(days, 1)}
+            if days is None:
+                unrated.append("decisions_at_stage")
+            else:
+                projected.append(days)
+
+        verdict = evaluate(criteria, evidence)
+        blocking = [failure for failure in verdict.failures
+                    if not any(failure.startswith(name) for name in self._COUNTING)]
+
+        days_needed = max(projected) if projected else 0.0
+        slowest = max(
+            (name for name, row in counting.items()
+             if row["days_remaining"] is not None),
+            key=lambda name: counting[name]["days_remaining"], default=None)
+        if dwell_remaining >= days_needed and dwell_remaining > 0:
+            slowest = "days_at_stage"
+        elif days_needed <= 0:
+            slowest = None
+
+        return {
+            "schema_version": PROMOTION_GATE_SCHEMA_VERSION,
+            "status": "OK",
+            "stage": stage.value, "next_stage": target.value,
+            "eligible_now": verdict.passed and dwell_remaining <= 0,
+            "days_at_stage": round(days_at_stage, 2),
+            "dwell_days_remaining": round(dwell_remaining, 2),
+            "observed_days": round(observed_days, 2),
+            "counting": counting,
+            "counting_without_a_rate": sorted(set(unrated)),
+            "days_until_counts_are_met": (
+                None if unrated else round(days_needed, 1)),
+            "slowest_count": slowest,
+            # What no amount of waiting fixes.
+            "blocking_regardless_of_time": blocking,
+            "detail": (
+                "eligible now" if verdict.passed and dwell_remaining <= 0 else
+                f"{len(blocking)} requirement(s) will not be met by waiting"
+                if blocking else
+                "only counts and elapsed time remain"),
+        }
+
     def demote(self, reason: str) -> Stage:
         """Drop one stage. The only thing that ever lowers trading authority.
 

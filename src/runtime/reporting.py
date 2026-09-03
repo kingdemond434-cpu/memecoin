@@ -756,7 +756,8 @@ class ReportingSurface:
             # says FAIL cannot distinguish a week away from a year away, and
             # that difference decides whether to keep running or change
             # something.
-            "forward_evidence": self.forward_evidence.report(),
+            "forward_evidence": self.forward_evidence.report(
+                getattr(self, "promotion_ledger", None)),
             # The ladder, and whether it currently authorises spending
             # anything. This is the field that answers "are we live" -- not
             # dry_run, which is only what an operator intended.

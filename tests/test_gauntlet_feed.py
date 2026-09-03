@@ -567,3 +567,153 @@ def test_the_counters_survive_a_restart(tmp_path):
     ledger.save()
     assert (ForwardEvidence(path).evidence().monster_enrichment
             == pytest.approx(10.0))
+
+
+# --- "how many days" ------------------------------------------------------
+
+def _ladder(tmp_path, stage, *, days_at_stage=0.0, decisions_at_entry=0):
+    from src.research.promotion_gate import PromotionLedger
+    ledger = PromotionLedger(tmp_path / "ledger.jsonl")
+    ledger._write_stage(stage, "test", decisions_at_entry=decisions_at_entry)
+    if days_at_stage:
+        record = json.loads(ledger._stage_path.read_text())
+        record["at"] = time.time() - days_at_stage * 86_400.0
+        ledger._stage_path.write_text(json.dumps(record))
+    return ledger
+
+
+def _shadow(tmp_path, ledger, *, decisions, cohorts, regimes, observed_days,
+            monsters_entered=True):
+    fe = ForwardEvidence(tmp_path / "fe.json", stage=Stage.FORWARD_SHADOW)
+    fe.started_at = time.time() - observed_days * 86_400.0
+    names = ["bull", "bear", "euphoria", "churn"][:regimes]
+    for index in range(decisions):
+        monster = index % 180 == 0
+        fe.record(Outcome(
+            token=f"t{index % cohorts}", entered=(monster if monsters_entered
+                                                  else index % 9 == 0),
+            regime=names[index % len(names)],
+            realized_pnl_usd=(30.0 if monster else -1.5),
+            equity_at_decision_usd=1_000.0,
+            max_multiple=(12.0 if monster else 1.1)))
+    return fe
+
+
+def test_the_eta_separates_what_waiting_fixes_from_what_it_does_not(tmp_path):
+    """Two very different answers, and merging them would put a confident
+    date on the requirement least likely to be met by waiting."""
+    ledger = _ladder(tmp_path, Stage.FORWARD_SHADOW, days_at_stage=5.0,
+                     decisions_at_entry=600)
+    fe = _shadow(tmp_path, ledger, decisions=2_600, cohorts=620, regimes=2,
+                 observed_days=20.0)
+    eta = fe.report(ledger)["eta"]
+    assert eta["eligible_now"] is False
+    assert eta["days_until_counts_are_met"] > 0
+    assert any("regimes_covered" in item
+               for item in eta["blocking_regardless_of_time"])
+
+
+def test_the_dwell_clock_is_reported_separately_from_the_counts(tmp_path):
+    ledger = _ladder(tmp_path, Stage.FORWARD_SHADOW, days_at_stage=5.0)
+    fe = _shadow(tmp_path, ledger, decisions=200, cohorts=100, regimes=3,
+                 observed_days=5.0)
+    eta = fe.report(ledger)["eta"]
+    assert eta["days_at_stage"] == pytest.approx(5.0, abs=0.1)
+    assert eta["dwell_days_remaining"] == pytest.approx(9.0, abs=0.1)
+
+
+def test_a_count_with_no_observed_rate_is_named_not_averaged_away(tmp_path):
+    """Zero real fills at CANARY has no rate; a date computed from it is a lie."""
+    ledger = _ladder(tmp_path, Stage.CANARY, days_at_stage=20.0)
+    fe = ForwardEvidence(tmp_path / "fe.json", stage=Stage.CANARY)
+    fe.started_at = time.time() - 20 * 86_400.0
+    for index in range(6_000):
+        fe.record(Outcome(token=f"t{index % 1200}", entered=False,
+                          regime=["bull", "bear", "euphoria"][index % 3],
+                          max_multiple=1.1))
+    eta = fe.report(ledger)["eta"]
+    assert "real_fills" in eta["counting_without_a_rate"]
+    assert eta["days_until_counts_are_met"] is None
+
+
+def test_the_slowest_count_is_named_so_the_wait_is_actionable(tmp_path):
+    ledger = _ladder(tmp_path, Stage.FORWARD_SHADOW, days_at_stage=14.0,
+                     decisions_at_entry=0)
+    fe = _shadow(tmp_path, ledger, decisions=2_600, cohorts=620, regimes=3,
+                 observed_days=20.0)
+    eta = fe.report(ledger)["eta"]
+    assert eta["slowest_count"] in {"decisions", "launch_cohorts"}
+    assert eta["counting"][eta["slowest_count"]]["days_remaining"] > 0
+
+
+def test_a_desk_that_has_met_everything_says_eligible_now(tmp_path):
+    ledger = _ladder(tmp_path, Stage.HISTORICAL, days_at_stage=1.0)
+    fe = ForwardEvidence(tmp_path / "fe.json", stage=Stage.HISTORICAL)
+    fe.started_at = time.time() - 9 * 86_400.0
+    for index in range(1_400):
+        monster = index % 140 == 0
+        # Losers are entered too. A book that only ever books winners leaves
+        # rug_loss_share unmeasured, and the gate correctly refuses to pass
+        # on a ratio nobody computed.
+        fe.record(Outcome(token=f"t{index % 900}", entered=monster or index % 20 == 0,
+                          regime="bull", rugged=(index % 100 == 20),
+                          realized_pnl_usd=(40.0 if monster else -2.0),
+                          equity_at_decision_usd=1_000.0,
+                          max_multiple=(12.0 if monster else 1.1)))
+    eta = fe.report(ledger)["eta"]
+    assert eta["eligible_now"] is True
+    assert eta["blocking_regardless_of_time"] == []
+    assert eta["slowest_count"] is None
+
+
+def test_the_report_still_works_without_the_ladder(tmp_path):
+    """A status page must not go down because one collaborator is absent."""
+    fe = ForwardEvidence(tmp_path / "fe.json")
+    report = fe.report()
+    assert "eta" not in report
+    assert "distance" in report
+
+
+def test_the_eta_tool_reads_the_same_ledger_the_desk_writes():
+    """A wrong filename here does not fail, it answers about the wrong rung.
+
+    `current_stage` reads a missing stage file as HISTORICAL, so a tool
+    pointed at `promotion_ledger.jsonl` when the desk writes
+    `promotion.jsonl` reports the bottom of the ladder with a confident date
+    beside it.
+    """
+    from pathlib import Path as _Path
+    desk = (_Path("src/runtime/wiring.py").read_text()
+            + _Path("src/main.py").read_text()
+            + _Path("src/runtime/reporting.py").read_text())
+    tool = _Path("tools/canary_eta.py").read_text()
+    for name in ('"promotion.jsonl"', '"forward_evidence.json"',
+                 '"gauntlet.json"'):
+        assert name in desk, name
+        assert name in tool, name
+
+
+def test_the_eta_tool_refuses_rather_than_guessing_the_bottom_rung(tmp_path):
+    from tools.canary_eta import EXIT_DATA_BLOCKED, main
+    (tmp_path / "forward_evidence.json").write_text(json.dumps(
+        {"stage": "forward_shadow", "decisions": 10}))
+    assert main(["--state-dir", str(tmp_path)]) == EXIT_DATA_BLOCKED
+
+
+def test_the_eta_tool_reports_a_real_state(tmp_path, capsys):
+    from tools.canary_eta import EXIT_WAITING, main
+    from src.research.promotion_gate import PromotionLedger
+    ledger = PromotionLedger(tmp_path / "promotion.jsonl")
+    ledger._write_stage(Stage.FORWARD_SHADOW, "test", decisions_at_entry=600)
+    record = json.loads(ledger._stage_path.read_text())
+    record["at"] = time.time() - 5 * 86_400.0
+    ledger._stage_path.write_text(json.dumps(record))
+
+    fe = _shadow(tmp_path, ledger, decisions=2_600, cohorts=620, regimes=2,
+                 observed_days=20.0)
+    fe.path = tmp_path / "forward_evidence.json"
+    fe.save()
+    assert main(["--state-dir", str(tmp_path)]) == EXIT_WAITING
+    printed = capsys.readouterr().out
+    assert "forward_shadow" in printed
+    assert "NOT fixed by waiting" in printed

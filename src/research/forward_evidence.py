@@ -410,16 +410,35 @@ class ForwardEvidence:
             "running_days": (time.time() - self.started_at) / 86_400.0,
         }
 
-    def report(self) -> Dict[str, Any]:
+    def observed_days(self) -> float:
+        """How long this ledger has been counting."""
+        return max(0.0, (time.time() - self.started_at) / 86_400.0)
+
+    def report(self, ledger: Any = None) -> Dict[str, Any]:
+        """The evidence, the distance, and -- given the ladder -- a date.
+
+        `ledger` is the `PromotionLedger`, which alone knows when this stage
+        was entered and therefore how much of the dwell requirement is left.
+        Optional, because the distance and the evidence are worth reporting
+        without it, and a report that raised when it was absent would take
+        the whole status page down with it.
+        """
         evidence = self.evidence()
-        return {
+        report = {
             "schema": FORWARD_EVIDENCE_SCHEMA_VERSION,
             "stage": self.stage.value,
             "status": "OK" if self.decisions else "DATA_BLOCKED",
             "evidence": evidence.to_dict(),
             "distance": self.distance(),
+            "observed_days": round(self.observed_days(), 2),
             "persisted_at": str(self.path) if self.path else None,
         }
+        if ledger is not None and hasattr(ledger, "eta"):
+            try:
+                report["eta"] = ledger.eta(evidence, self.observed_days())
+            except Exception as exc:  # pragma: no cover - reporting only
+                report["eta"] = {"status": "DATA_BLOCKED", "detail": str(exc)}
+        return report
 
     # -- persistence -------------------------------------------------------
 
