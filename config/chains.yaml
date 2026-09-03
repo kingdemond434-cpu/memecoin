@@ -132,6 +132,26 @@ chains:
       - "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
       - "https://solana-rpc.publicnode.com"
       - "https://solana.leorpc.com/?api_key=FREE"
+      # APPENDED 2026-09-03, last, with no paired ws_url -- see the note above
+      # about positional pairing. Solana Tracker's public endpoint: no account,
+      # no key, no card, and it accepts sendTransaction as well as reads.
+      #
+      # NOT measured from the build box: its egress proxy refuses the host, so
+      # unlike the four rungs above this one carries no measured method list.
+      # The per-method capability learner will fill that in on the first box
+      # that can reach it, and until then it is simply another rung the
+      # rotator may try -- which is the correct state for an endpoint nobody
+      # here has actually spoken to.
+      #
+      # Its role is repair and failover, not T0. The hot path is the
+      # Yellowstone stream into local state; this is what answers an ordinary
+      # account or status read when the free rungs above are refusing, so that
+      # paid RPC capacity is not spent on repairs.
+      #
+      # Do NOT read this as a new free Geyser source: Solana Tracker's
+      # Yellowstone gRPC is a paid product (EUR 200/month as of 2026-09), and
+      # confusing the two would have the desk plan a T0 feed it has not bought.
+      - "https://rpc.solanatracker.io/public"
     ws_urls:
       - "wss://api.mainnet-beta.solana.com"
       - "wss://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"

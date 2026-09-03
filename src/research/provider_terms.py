@@ -291,6 +291,27 @@ KNOWN_PROVIDERS: Tuple[Provider, ...] = (
             "whose verify() is that measurement."),
         note="Daily parquet partitions from Oct 2020, BigQuery-derived."),
     Provider(
+        name="solana_tracker_public_rpc",
+        terms_url="https://docs.solanatracker.io/",
+        rpc_url="https://rpc.solanatracker.io/public",
+        chains=("solana",),
+        support=Support.CANDIDATE,
+        blocking_reason=(
+            "Reported no-signup public Solana RPC -- no account, key or card, "
+            "and it accepts sendTransaction as well as reads. Recorded as a "
+            "candidate rather than VERIFIED because the build box's egress "
+            "proxy refuses the host, so nobody here has spoken to it; the "
+            "per-method capability learner measures it on the first box that "
+            "can. It belongs in the repair and failover pool, never on the "
+            "T0 path."),
+        watch_methods=("sendTransaction", "getAccountInfo",
+                       "getLatestBlockhash", "getSignaturesForAddress"),
+        note=("Keyed free plan is separate: ~500k credits/month, 5 RPS, 2 "
+              "websockets, archival calls 10 credits. Their Yellowstone gRPC "
+              "is a PAID product (EUR 200/month, 2026-09) and is not a free "
+              "Geyser source -- the watcher exists partly so that stops being "
+              "a thing anyone has to remember.")),
+    Provider(
         name="raptor",
         terms_url="https://docs.solanatracker.io/raptor/overview",
         rpc_url="http://127.0.0.1:8080",

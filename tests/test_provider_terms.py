@@ -244,3 +244,30 @@ def test_every_known_provider_states_why_it_is_not_yet_a_rung():
     for provider in KNOWN_PROVIDERS:
         if provider.support is not Support.VERIFIED:
             assert provider.blocking_reason, provider.name
+
+
+def test_the_solana_tracker_public_rpc_is_recorded_but_not_yet_a_rung():
+    watcher = ProviderTermsWatcher()
+    provider = watcher.provider("solana_tracker_public_rpc")
+    assert provider is not None
+    assert provider.serves("solana")
+    usable, reason = provider.usable_for("solana")
+    assert not usable, "nobody here has spoken to it"
+    assert "never been measured" in reason or "candidate" in reason.lower()
+    # And the paid-Yellowstone distinction is written down, so it does not get
+    # re-raised as a free Geyser source.
+    assert "PAID" in provider.note and "Yellowstone" in provider.note
+
+
+def test_the_config_ladder_appends_it_last_with_no_paired_websocket():
+    """rpc_urls and ws_urls are paired BY POSITION in this config.
+
+    Inserting anywhere but the end silently hands one provider another
+    provider's websocket, which is the failure the file's own comment warns
+    about.
+    """
+    import yaml
+    config = yaml.safe_load(open("config/chains.yaml"))
+    solana = config["chains"]["solana"]
+    assert solana["rpc_urls"][-1] == "https://rpc.solanatracker.io/public"
+    assert len(solana["ws_urls"]) < len(solana["rpc_urls"])
