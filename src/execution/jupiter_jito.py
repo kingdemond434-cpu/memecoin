@@ -52,6 +52,9 @@ class RouteType(Enum):
     ORCA_DIRECT = "orca_direct"
     METEORA_DLMM = "meteora_dlmm"
     JITO_BUNDLE = "jito_bundle"
+    #: Challenger aggregator, quoting in SHADOW until forward evidence on
+    #: realised fills promotes it. See `src/execution/raptor.py`.
+    RAPTOR = "raptor"
 
 
 class TransactionStatus(Enum):
