@@ -521,6 +521,13 @@ class ReportingSurface:
                             "policy": asdict(self.exit_policy)},
             "equity": {"status": self.equity_status, "wallet_equity_usd": self.wallet_equity_usd,
                        "sol_price_usd": self.sol_price_usd},
+            # Which ceiling is actually capping positions. A book whose
+            # positions have quietly shrunk because early curves cannot
+            # absorb the equity behind them looks identical, from every other
+            # number on this page, to a book that stopped finding trades.
+            "capacity": (self.elogw_engine.capacity_report()
+                         if self.elogw_engine is not None
+                         else {"status": "DATA_BLOCKED"}),
             "execution": {"dry_run": self.execution_engine.dry_run if self.execution_engine else True},
             "native_fastpath": NATIVE_FASTPATH_STATUS,
             "native_route": (self.execution_engine.native_route_report()

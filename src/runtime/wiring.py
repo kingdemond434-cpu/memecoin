@@ -65,6 +65,8 @@ from src.strategies.actor_graph import (
     aggregate_smart_flow, build_fingerprint,
 )
 from src.strategies.champion_challenger import ChampionChallengerFramework, HypothesisSpec, TrialResult
+from src.strategies.continuation import (
+    DEFAULT_HORIZON, DEFAULT_MIN_POSITIVES, ContinuationModel)
 from src.strategies.exit_policy import ExitPolicy, evaluate_exit, load_latest_exit_policy
 from src.strategies.genealogy_graph import GenealogyGraph
 from src.strategies.information_graph import (
@@ -424,6 +426,24 @@ class SubsystemWiring:
             ExitPolicy.default(),
             max_hold_seconds=float(self.global_config.get("max_hold_time_minutes", 60)) * 60,
         )
+        # The conviction ceiling is the operator's, not the trainer's, and it
+        # is applied to a trained policy too. A policy selected by replaying
+        # price paths has no way to price the operational risk of a position
+        # left open for days -- the box rebooting, the key rotating, the
+        # market closing around it -- so that ceiling stays where a human set
+        # it whatever the replay preferred.
+        self.exit_policy = dataclasses_replace(
+            self.exit_policy,
+            max_conviction_hold_seconds=float(self.global_config.get(
+                "max_conviction_hold_time_minutes", 0)) * 60,
+        )
+        #: One conditional continuation reading per cycle, shared by the
+        #: trail, the time stop and the monster machine.
+        self.continuation_model = ContinuationModel(
+            min_positives=int(self.global_config.get(
+                "continuation_min_head_positives", DEFAULT_MIN_POSITIVES)),
+            horizon=float(self.global_config.get(
+                "continuation_horizon_multiple", DEFAULT_HORIZON)))
         self.exit_policy_status = "OK" if trained_policy else "DATA_BLOCKED"
         self.exit_policy_detail = (
             policy_report.get("model_path", "") if trained_policy

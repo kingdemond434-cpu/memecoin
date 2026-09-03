@@ -59,6 +59,7 @@ from src.research.calibration import Provenance
 from src.research.fallback import FallbackResolver, Source
 from src.runtime.latency import LatencyLedger
 from src.runtime.serialisation import jsonable as _jsonable
+from src.runtime.regime import RegimeAndEvidence
 from src.runtime.reporting import ReportingSurface
 from src.runtime.ingestion import MinedRecordIngestion
 from src.runtime.evidence import EvidenceRecording
@@ -113,7 +114,9 @@ from src.strategies.actor_graph import (
     build_fingerprint,
 )
 from src.strategies.champion_challenger import ChampionChallengerFramework
-from src.strategies.exit_policy import ExitPolicy, evaluate_exit
+from src.strategies.continuation import read_position_continuation
+from src.strategies.exit_policy import (
+    NEVER_SUPPRESSED, ExitPolicy, evaluate_exit)
 from src.strategies.genealogy_graph import GenealogyGraph
 from src.strategies.information_graph import (
     AdversarialAdaptationDetector,
@@ -187,7 +190,8 @@ CAPACITY_REJECTIONS = frozenset({
 
 
 
-class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
+class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
+                       MinedRecordIngestion,
                        DeskMaintenance, TaskSupervision, EvidenceRecording,
                        SubsystemWiring, SourceIntelligence, PositionForensics,
                        DeskTraining, DeskDiscovery):
@@ -1558,8 +1562,15 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         # distinguishes a 20x from a distribution phase.
         await self._refresh_position_prediction(token, position)
         prediction = position.get("prediction") or {}
-        continuation = max(float(prediction.get("p_5x", 0)),
-                           float(prediction.get("p_10x", 0)))
+        # One reading, shared with the monster machine below, so the trail,
+        # the time stop and the conviction state cannot disagree about what
+        # the model believes. DATA_BLOCKED reads as zero on purpose: no
+        # conviction restores the ordinary trailing stop.
+        reading = read_position_continuation(
+            getattr(self, "continuation_model", None), self.predictor, position)
+        position["continuation"] = reading.to_dict()
+        position["continuation_reading"] = reading
+        continuation = float(reading.probability or 0.0)
         distribution = self._read_distribution(token)
         position["distribution"] = {
             "status": distribution.status, "evidence": distribution.evidence_score,
@@ -1622,10 +1633,24 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
 
         # Only unpriceable states reach here.
         self._unpriced_cycles += 1
-        decision = evaluate_exit(
-            self.exit_policy, multiple, float(position["high_water_multiple"]), continuation,
-            set(stages), time.time() - float(position["entry_time"]),
-        )
+        elapsed = time.time() - float(position["entry_time"])
+        high_water = float(position["high_water_multiple"])
+        conviction = self.monster_machine.overrides_ordinary_exit(token)
+        decision = evaluate_exit(self.exit_policy, multiple, high_water,
+                                 continuation, set(stages), elapsed,
+                                 conviction=conviction)
+        if conviction:
+            # What the policy WOULD have done without the conviction, written
+            # down. The ratchet is stood down inside `evaluate_exit` now, so
+            # the caller never sees it and the disagreement would otherwise
+            # vanish -- and a suppression nobody can count is a suppression
+            # nobody can audit when the position ends badly.
+            ordinary = evaluate_exit(self.exit_policy, multiple, high_water,
+                                     continuation, set(stages), elapsed)
+            if ordinary and ordinary != decision:
+                position.setdefault("suppressed_exits", []).append(
+                    {"reason": ordinary[0], "exit_pct": ordinary[1],
+                     "multiple": multiple, "at": time.time()})
         position["ratchet"] = ({"status": "OK", "reason": decision[0],
                                 "exit_pct": decision[1]} if decision
                                else {"status": "OK", "reason": "no threshold reached"})
@@ -1653,7 +1678,8 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
                         "; ".join(position.get("exit_mode_reasons", ())) or "no absorption")
             position.setdefault("cohort_vetoes", []).append(
                 {"reason": decision[0], "at": time.time()})
-        elif decision and self.monster_machine.overrides_ordinary_exit(token):
+        elif (decision and decision[0] not in NEVER_SUPPRESSED
+                and self.monster_machine.overrides_ordinary_exit(token)):
             # A ratchet banks harder the higher a position goes, which is
             # right for ordinary winners and exactly wrong for the rare one
             # that would carry the account: it sells that one first and
@@ -2608,9 +2634,20 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             # cannot sell is worse than missing it, because the capital is
             # still committed when the window closes.
             catastrophic = True
+        # Hardcoded None/False until 2026-09-03, so `overrides_ordinary_exit`
+        # returned False for the life of the desk however well the model was
+        # trained and the ratchet sold every runner. The reading certifies
+        # itself calibrated only when every head it touched was isotonically
+        # mapped and above its positive floor; a thin model grants nothing.
+        continuation = position.get("continuation_reading") or (
+            read_position_continuation(
+                getattr(self, "continuation_model", None), self.predictor,
+                position))
         evidence = MonsterEvidence(
-            monster_probability=None,
-            monster_probability_calibrated=False,
+            monster_probability=(continuation.probability
+                                 if continuation.ok else None),
+            monster_probability_calibrated=bool(
+                continuation.ok and continuation.calibrated),
             distribution_probability=distribution.probability(3.0),
             distribution_calibrated=distribution.calibrated,
             rug_probability=(float(getattr(hazard, "hazard_5m", 0.0)) if hazard else None),
@@ -4067,86 +4104,6 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         self.memory.register(Relief(
             name="mark_history", trim=trim_marks,
             detail="drop price paths for tokens we hold nothing in"))
-
-    @property
-    def current_regime(self) -> str:
-        """A coarse label for the market the desk is trading in right now.
-
-        Deliberately coarse and deliberately observable: launch rate and the
-        24h SOL move are things the desk already measures, and a finely
-        conditioned regime over a handful of observations is a worse label
-        that looks better.
-
-        Returns "unknown" when the inputs are missing, and "unknown" does not
-        count toward the promotion gate's diversity requirement -- a desk that
-        never measured the market must not satisfy it with one bucket.
-        """
-        builder = getattr(self, "dataset_builder", None)
-        stats = (builder.current_market_state()
-                 if builder is not None and hasattr(builder, "current_market_state")
-                 else {}) or {}
-        # Compatibility for isolated callers which provide the measurements
-        # directly through a research stub. The production miner is not used:
-        # it discovers mechanisms and does not collect market state.
-        if (stats.get("meme_launch_rate_1h") is None
-                or stats.get("sol_change_24h") is None):
-            research = getattr(self, "global_research", None)
-            fallback = (research.get_stats() if research else {}) or {}
-            if fallback.get("meme_launch_rate_1h") is not None:
-                stats = fallback
-        launch_rate = stats.get("meme_launch_rate_1h")
-        sol_change = stats.get("sol_change_24h")
-        if launch_rate is None or sol_change is None:
-            return "unknown"
-        hot = float(launch_rate) >= float(
-            self.global_config.get("regime_hot_launch_rate", 300))
-        rising = float(sol_change) >= 0
-        if hot and rising:
-            return "euphoria"
-        if hot:
-            return "churn"
-        return "bull" if rising else "bear"
-
-    def _record_forward_evidence(self, payload: Dict[str, Any]) -> None:
-        """Feed one trade outcome into the promotion ledger.
-
-        Declines are recorded too. A ledger fed only on entries measures the
-        trades we took and says nothing about the ones we passed on, which is
-        half of what a decision policy does and the half that hides its
-        mistakes.
-        """
-        try:
-            self.forward_evidence.record(ForwardOutcome(
-                token=str(payload.get("token", "")),
-                entered=bool(payload.get("entered")),
-                regime=str((payload.get("regime") or self.current_regime or "unknown")),
-                realized_pnl_usd=float(payload.get("realized_pnl_usd", 0.0) or 0.0),
-                equity_at_decision_usd=float(self.wallet_equity_usd or 0.0),
-                real_fill=bool(payload.get("entered") and not self.dry_run),
-                rugged=bool(payload.get("rugged")),
-                max_multiple=(float(payload["max_feasible_multiple"])
-                              if payload.get("max_feasible_multiple") is not None else None),
-                execution_attempted=bool(payload.get("attempted")),
-                execution_succeeded=bool(payload.get("entered")),
-                catastrophic=bool(payload.get("rugged")
-                                  and float(payload.get("realized_pnl_usd", 0.0) or 0.0)
-                                  <= -float(self.wallet_equity_usd or 0.0) * 0.5),
-            ))
-        except (TypeError, ValueError) as exc:
-            logger.debug("forward evidence record failed: %s", exc)
-        # Persisted on a cadence rather than every outcome: an fsync per trade
-        # is latency the decision path does not need to pay, and losing at
-        # most a minute of counts to a crash costs a minute of shadow running.
-        if time.time() - self._evidence_saved_at > 60.0:
-            self._evidence_saved_at = time.time()
-            self.forward_evidence.save()
-        # The census carries the denominator every ratio above is computed
-        # against; losing it to a restart would silently reset those ratios.
-        if time.time() - self._census_saved_at > 120.0:
-            self._census_saved_at = time.time()
-            self.launch_census.save()
-            self.calibration.save()
-
 
 
 async def _run(args: argparse.Namespace):

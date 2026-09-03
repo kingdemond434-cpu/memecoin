@@ -255,7 +255,25 @@ global:
   small_account_negligible_share: 0.002
   acceptable_exit_impact: 0.10
   min_profit_target_pct: 50
-  max_hold_time_minutes: 60
+  # Raised from 60 on 2026-09-03. Sixty minutes closed a runner at 11x on
+  # the clock alone while the hard stop, the trail, the ratchet and the
+  # hazard exit were all still saying hold, which is the most expensive
+  # thing an exit policy can do to a strategy whose whole return lives in
+  # the tail. This is a judgement, not a measurement; exit_policy_trainer
+  # may select a different value and is trusted over it.
+  max_hold_time_minutes: 240
+  # The ceiling for a position under LIVE, CALIBRATED conviction -- three
+  # days. Reached only when src/strategies/continuation.py returns an OK,
+  # calibrated reading AND the monster machine is in a monster state, which
+  # requires every survival head it touched to be isotonically calibrated and
+  # above its positive-count floor. An untrained or thin model never gets
+  # here and the ordinary hold above governs unchanged.
+  #
+  # Zero would disable the extension entirely. It is not a licence to ignore
+  # anything: the hard stop, the trail, the hazard exit and the ratchet all
+  # still apply for the whole three days, and past this the time stop fires
+  # whatever the model believes.
+  max_conviction_hold_time_minutes: 4320
   stop_loss_pct: 30
   trailing_stop_pct: 15
   gas_multiplier: 1.5

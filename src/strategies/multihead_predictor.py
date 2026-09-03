@@ -433,6 +433,11 @@ class MultiHeadPredictor:
         self.model_version = "1.0"
         self._training_data: Dict[PredictionTarget, List[Tuple[np.ndarray, float, float]]] = defaultdict(list)
         self._is_trained = False
+        #: Per-head training outcome, including how many positives each
+        #: classification head saw. Empty on a bundle saved before this
+        #: existed, which reads as "unknown" and refuses to certify a head --
+        #: fail-closed, and no forced retrain.
+        self.head_report: Dict[str, Dict[str, Any]] = {}
         self.validation_report: Dict[str, Any] = {}
 
     def initialize_models(self):
@@ -506,7 +511,7 @@ class MultiHeadPredictor:
                             self.models[target] = ConstantZeroClassifier()
                             results[target.value] = {
                                 "status": "untrained_conservative_zero",
-                                "samples": len(data),
+                                "samples": len(data), "positives": 0,
                                 "calibration": "constant_zero_no_positive_class",
                             }
                             continue
@@ -532,6 +537,15 @@ class MultiHeadPredictor:
                 results[target.value] = {
                     "status": "trained", "samples": len(data), "calibration": calibration,
                 }
+                if target in CLASSIFICATION_TARGETS:
+                    # How many times the head actually SAW its positive class.
+                    # A tail head fitted on eleven 50x launches produces a
+                    # number, and nothing downstream could previously tell
+                    # that number apart from one fitted on nine hundred. The
+                    # conditional continuation probability is a RATIO of two
+                    # of these, which is exactly where a handful of positives
+                    # turns into false conviction.
+                    results[target.value]["positives"] = int(np.sum(y))
                 logger.info(f"Trained {target.value} on {len(data)} samples")
                 
             except Exception as e:
@@ -544,8 +558,27 @@ class MultiHeadPredictor:
         }
         required = set(PredictionTarget)
         self._is_trained = required.issubset(trained_targets)
+        self.head_report = dict(results)
         self.model_version = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
         return results
+
+    def head_positives(self, target: PredictionTarget) -> Optional[int]:
+        """How many positives this head trained on, or None if unrecorded."""
+        entry = self.head_report.get(target.value)
+        if not isinstance(entry, dict):
+            return None
+        positives = entry.get("positives")
+        return None if positives is None else int(positives)
+
+    def is_calibrated(self, target: PredictionTarget) -> bool:
+        """Whether this head's output passed through a fitted isotonic map.
+
+        A raw gradient-boosting score is an ordering, not a probability, and
+        the whole point of a conditional survival RATIO is that both terms are
+        on a probability scale. Uncalibrated heads produce a number of the
+        right shape and the wrong meaning.
+        """
+        return self._is_trained and target in self.calibrators
 
     def predict(self, features: PredictionFeatures) -> Optional[MultiHeadPrediction]:
         if not self._is_trained:
@@ -657,6 +690,7 @@ class MultiHeadPredictor:
             # this; the explicit stamp means a future head joining or leaving
             # LOG_SPACE_TARGETS is caught too, when the version would not move.
             "log_space_targets": sorted(item.value for item in LOG_SPACE_TARGETS),
+            "head_report": dict(self.head_report),
         }
         joblib.dump(data, path)
         logger.info(f"Saved models to {path}")
@@ -680,6 +714,10 @@ class MultiHeadPredictor:
                 f"{expected_log_targets}")
         self.models = data["models"]
         self.calibrators = data["calibrators"]
+        # Optional rather than required, so a bundle predating it still
+        # loads. It then certifies no head, and the continuation model
+        # declines to grant an override rather than granting one blind.
+        self.head_report = dict(data.get("head_report") or {})
         self.model_version = data["model_version"]
         self.validation_report = dict(data["validation_report"])
         self._is_trained = True
@@ -796,6 +834,8 @@ class ElogwEngine:
         self.daily_giveback_arm_pct = daily_giveback_arm_pct
         self.min_edge_bps = min_edge_bps
         self.max_liquidity_fraction = max_liquidity_fraction
+        self._ceiling_counts: Dict[str, int] = {}
+        self._depth_bound_fractions: List[float] = []
         self.harvest_trigger_ratio = max(0.0, harvest_trigger_ratio)
         self.harvest_slope = max(0.0, harvest_slope)
         self.small_account_mode = bool(small_account_mode)
@@ -1032,15 +1072,83 @@ class ElogwEngine:
         value -= self.uncertainty_penalty * entropy * fraction
         return value / self.risk_aversion
 
+    #: Ceilings, and which one bound the last sizing. Counted because the
+    #: DEPTH ceiling is the one that ends compounding, and it does so silently.
+    #:
+    #: `liquidity_usd * max_liquidity_fraction / portfolio_value` already
+    #: falls as equity grows -- at $1k a 5% position needs a $5k pool, at
+    #: $100k it would need a $500k pool, and early Pump curves do not have
+    #: one in the minutes that produce the tail. Nothing is broken when that
+    #: binds; the book is correctly refusing to be a tenth of a pool. But a
+    #: desk whose positions have quietly shrunk from 5% of equity to 0.5%
+    #: looks exactly like a desk that stopped finding trades, and the two
+    #: need opposite responses: one wants more capital deployed elsewhere,
+    #: the other wants more edge.
+    #: How many depth-bound fractions to keep for the median. Bounded so a
+    #: long-running desk does not accumulate one float per sizing forever.
+    CEILING_SAMPLE = 512
+
+    CEILING_CONCENTRATION = "concentration"
+    CEILING_MAX_POSITION_USD = "max_position_usd"
+    CEILING_POOL_DEPTH = "pool_depth"
+
+    def exposure_ceilings(self, liquidity_usd: float) -> Dict[str, float]:
+        """Every ceiling, as a fraction of equity, before the min is taken."""
+        if self.portfolio_value <= 0 or liquidity_usd <= 0:
+            return {}
+        return {
+            self.CEILING_CONCENTRATION:
+                self.small_account_concentration(liquidity_usd),
+            self.CEILING_MAX_POSITION_USD:
+                self.max_position_usd / self.portfolio_value,
+            self.CEILING_POOL_DEPTH:
+                liquidity_usd * self.max_liquidity_fraction / self.portfolio_value,
+        }
+
+    def binding_ceiling(self, liquidity_usd: float) -> Tuple[str, float]:
+        """Which ceiling actually caps this position, and at what fraction."""
+        ceilings = self.exposure_ceilings(liquidity_usd)
+        if not ceilings:
+            return "", 0.0
+        name = min(ceilings, key=lambda key: ceilings[key])
+        return name, float(ceilings[name])
+
     def exposure_cap(self, liquidity_usd: float) -> float:
         """Largest fraction of equity this token may take, across all ceilings."""
-        if self.portfolio_value <= 0 or liquidity_usd <= 0:
+        name, cap = self.binding_ceiling(liquidity_usd)
+        if not name:
             return 0.0
-        return min(
-            self.small_account_concentration(liquidity_usd),
-            self.max_position_usd / self.portfolio_value,
-            liquidity_usd * self.max_liquidity_fraction / self.portfolio_value,
-        )
+        self._ceiling_counts[name] = self._ceiling_counts.get(name, 0) + 1
+        if name == self.CEILING_POOL_DEPTH:
+            self._depth_bound_fractions.append(cap)
+            del self._depth_bound_fractions[:-self.CEILING_SAMPLE]
+        return cap
+
+    def capacity_report(self) -> Dict[str, Any]:
+        """How often depth is what caps the book, and how hard.
+
+        Read alongside the promotion ladder: a rising depth share with a
+        falling median fraction is the capacity wall, and it is the point at
+        which adding capital stops raising the growth rate.
+        """
+        total = sum(self._ceiling_counts.values())
+        if not total:
+            return {"status": "DATA_BLOCKED", "detail": "nothing sized yet"}
+        depth = self._ceiling_counts.get(self.CEILING_POOL_DEPTH, 0)
+        fractions = sorted(self._depth_bound_fractions)
+        median = (fractions[len(fractions) // 2] if fractions else None)
+        return {
+            "status": "OK",
+            "sized": total,
+            "bound_by": dict(sorted(self._ceiling_counts.items())),
+            "depth_bound_share": depth / total,
+            "median_depth_bound_fraction": median,
+            "portfolio_value_usd": self.portfolio_value,
+            "detail": ("" if depth / total < 0.5 else
+                       "pool depth is capping most positions; equity is "
+                       "past what early curves can absorb, and more capital "
+                       "will not raise the growth rate"),
+        }
 
     def calculate_expected_log_growth(
         self,
