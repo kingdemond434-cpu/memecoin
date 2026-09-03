@@ -64,7 +64,19 @@ class _Fixture(unittest.TestCase):
             monster_enrichment=criteria.min_monster_enrichment + 1.0,
             execution_success=0.95,
             catastrophic_failures=0,
+            # Added when the two money stages started requiring them. A book
+            # that clears every count and every mean can still be
+            # indistinguishable from a book with no edge, so CANARY and LIVE
+            # ask for the lower bound and for mechanisms that survived the
+            # gauntlet.
+            net_log_growth_lower_bound=0.01,
+            gauntlet_survivors=criteria.min_gauntlet_survivors,
         )
+
+    def _passing_without_the_lower_bound(self, stage: Stage) -> Evidence:
+        evidence = self._passing(stage)
+        evidence.net_log_growth_lower_bound = None
+        return evidence
 
 
 class ItStartsUnauthorisedAndStaysThatWay(_Fixture):
@@ -386,3 +398,55 @@ class TheLadderCannotBeClimbedInOneAfternoon(_Fixture):
             self.assertEqual(0.0, DEFAULT_CRITERIA[stage].min_days_at_stage)
         for stage in (Stage.FORWARD_SHADOW, Stage.CANARY):
             self.assertGreater(DEFAULT_CRITERIA[stage].min_days_at_stage, 0.0)
+
+
+class TheMoneyStagesAskForMoreThanAMean(_Fixture):
+    """A point estimate is what happened. A lower bound is what to size on.
+
+    Every volume gate in this ladder can be satisfied by a book whose mean log
+    growth is +0.02 on a confidence bound of -0.31 -- that book has shown
+    nothing, and before these two criteria existed it could have reached LIVE.
+    """
+
+    def test_canary_cannot_be_left_without_a_measured_lower_bound(self):
+        self._climb(Stage.CANARY)
+        self._backdate()
+        stage = self.ledger.current_stage()
+        self.ledger.submit(self._passing_without_the_lower_bound(stage))
+        self.assertIs(Stage.CANARY, self.ledger.current_stage())
+        verdict = self.ledger.status()
+        self.assertIn("net_log_growth_lower_bound",
+                      json.dumps(verdict, default=str))
+
+    def test_a_negative_lower_bound_blocks_the_money_stages(self):
+        self._climb(Stage.CANARY)
+        self._backdate()
+        stage = self.ledger.current_stage()
+        evidence = self._passing(stage)
+        evidence.net_log_growth_lower_bound = -0.31
+        self.ledger.submit(evidence)
+        self.assertIs(Stage.CANARY, self.ledger.current_stage())
+
+    def test_live_wants_two_survivors_not_one(self):
+        self._climb(Stage.CANARY)
+        self._backdate()
+        stage = self.ledger.current_stage()
+        evidence = self._passing(stage)
+        evidence.gauntlet_survivors = 1
+        self.ledger.submit(evidence)
+        # One survivor clears CANARY's bar, which asks for one.
+        self.assertIs(Stage.LIVE, self.ledger.current_stage())
+        # And LIVE itself asks for two: a desk whose whole book is one
+        # mechanism has nothing on the day that mechanism decays.
+        self.assertEqual(2, DEFAULT_CRITERIA[Stage.LIVE].min_gauntlet_survivors)
+
+    def test_the_two_money_stages_both_demand_the_bound(self):
+        for stage in (Stage.CANARY, Stage.LIVE):
+            self.assertTrue(
+                DEFAULT_CRITERIA[stage].require_positive_lower_bound, stage)
+        for stage in (Stage.HISTORICAL, Stage.CHRONOLOGICAL_OOS,
+                      Stage.FORWARD_SHADOW):
+            self.assertFalse(
+                DEFAULT_CRITERIA[stage].require_positive_lower_bound,
+                f"{stage} spends nothing; demanding a bound there only "
+                "delays the forward observation that produces one")

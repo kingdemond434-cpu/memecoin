@@ -33,6 +33,11 @@ StartLimitBurst=0
 [Service]
 Type=notify
 NotifyAccess=main
+# The other half of the trainer's OOMScoreAdjust=500. Under memory
+# pressure the kernel should reach for the trainer, which can repeat
+# its round on the next tick, and not for the desk, whose forward
+# evidence is the one thing on this box that cannot be recreated.
+OOMScoreAdjust=-500
 # 90s measured 62 process kills in 7 days (2026-08-28's own MemoryMax
 # post-mortem) and, once that unrelated bug was fixed, 7 MORE kills in the
 # following 6 hours alone (2026-08-29) -- all "Failed with result 'watchdog'",

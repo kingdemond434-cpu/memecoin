@@ -79,6 +79,18 @@ class PromotionCriteria:
     min_monster_enrichment: float = 1.0
     min_execution_success: float = 0.0
     max_catastrophic_failures: int = 0
+    #: The point estimate is what happened; the lower bound is the worst the
+    #: evidence is consistent with, and only the second is a reason to size a
+    #: position. A book whose mean log growth is +0.02 on a bound of -0.31 has
+    #: not shown anything, and every volume gate above can be satisfied by
+    #: such a book. See `src/research/gauntlet.py`.
+    require_positive_lower_bound: bool = False
+    #: How many mechanisms must have passed the whole gauntlet -- lower bound,
+    #: latency headroom, cost headroom, regime and source-family holdouts,
+    #: decay, and probability of backtest overfitting. Zero survivors means the
+    #: desk has machinery rather than an edge, which is a fine place to be and
+    #: not a place to spend from.
+    min_gauntlet_survivors: int = 0
 
     @property
     def fingerprint(self) -> str:
@@ -136,6 +148,11 @@ DEFAULT_CRITERIA: Dict[Stage, PromotionCriteria] = {
         min_regimes=3, min_net_log_growth=0.0, max_rug_loss_share=0.15,
         min_monster_enrichment=2.0, min_execution_success=0.60,
         max_catastrophic_failures=0,
+        # Leaving CANARY means scaling real money. At minimum the book's
+        # lower bound must be positive and one mechanism must have survived
+        # the gauntlet -- otherwise the desk would be scaling a point
+        # estimate.
+        require_positive_lower_bound=True, min_gauntlet_survivors=1,
     ),
     Stage.LIVE: PromotionCriteria(
         stage=Stage.LIVE,
@@ -143,6 +160,11 @@ DEFAULT_CRITERIA: Dict[Stage, PromotionCriteria] = {
         min_regimes=4, min_net_log_growth=0.0, max_rug_loss_share=0.12,
         min_monster_enrichment=2.5, min_execution_success=0.70,
         max_catastrophic_failures=0,
+        # Two, not one. A single survivor is a desk whose entire book is one
+        # mechanism, and the day that mechanism decays -- and they all decay --
+        # the desk has nothing. Two independent survivors is the smallest
+        # number that is a book rather than a bet.
+        require_positive_lower_bound=True, min_gauntlet_survivors=2,
     ),
 }
 
@@ -161,6 +183,10 @@ class Evidence:
     monster_enrichment: Optional[float] = None
     execution_success: Optional[float] = None
     catastrophic_failures: Optional[int] = None
+    #: Bootstrap lower confidence bound on mean net log growth.
+    net_log_growth_lower_bound: Optional[float] = None
+    #: Mechanisms that cleared `gauntlet.Gauntlet`.
+    gauntlet_survivors: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {**asdict(self), "stage": self.stage.value}
@@ -233,6 +259,24 @@ def evaluate(criteria: PromotionCriteria, evidence: Evidence) -> Verdict:
     elif evidence.net_log_growth <= criteria.min_net_log_growth:
         failures.append(f"net_log_growth {evidence.net_log_growth} does not exceed "
                         f"{criteria.min_net_log_growth}")
+
+    # The lower bound, checked separately from the point estimate, because a
+    # book can clear every count and every mean while being indistinguishable
+    # from a book with no edge at all.
+    if criteria.require_positive_lower_bound:
+        if evidence.net_log_growth_lower_bound is None:
+            unmeasured.append("net_log_growth_lower_bound")
+            failures.append(
+                "net_log_growth_lower_bound was not measured; a point "
+                "estimate alone cannot authorise capital")
+        elif evidence.net_log_growth_lower_bound <= 0:
+            failures.append(
+                f"net_log_growth_lower_bound "
+                f"{evidence.net_log_growth_lower_bound:+.4f} is not positive; "
+                "the mean being positive is not evidence of an edge")
+
+    check_min("gauntlet_survivors", evidence.gauntlet_survivors,
+              criteria.min_gauntlet_survivors, ">=")
 
     check_max("rug_loss_share", evidence.rug_loss_share, criteria.max_rug_loss_share, "<=")
     check_max("catastrophic_failures", evidence.catastrophic_failures,

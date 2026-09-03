@@ -54,6 +54,7 @@ import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
+from src.runtime.training_lock import TrainingBusy, training_lock
 
 logger = logging.getLogger(__name__)
 
@@ -269,7 +270,26 @@ class TrainingSupervisor:
     # --- running ---------------------------------------------------------
 
     async def run_round(self) -> Dict[str, Any]:
-        """Fit everything that is worth fitting, one at a time."""
+        """Fit everything that is worth fitting, one at a time.
+
+        Under the cross-process training lock. The desk trains on its own
+        clock and a systemd timer trains every fifteen minutes; both invoke
+        these same trainers over the same corpus, and two shadow passes at
+        once is roughly twice the resident corpus on a 4 GB box. The kernel
+        resolves that by killing something, and what it kills may be the desk,
+        whose forward evidence cannot be backfilled.
+        """
+        try:
+            with training_lock(self.storage.parent
+                               if self.storage.name == "launch_episodes"
+                               else self.storage,
+                               owner="training_supervisor"):
+                return await self._run_round_locked()
+        except TrainingBusy as exc:
+            logger.info("TRAINING skipped: %s", exc)
+            return {"status": "SKIPPED_LOCKED", "detail": str(exc)}
+
+    async def _run_round_locked(self) -> Dict[str, Any]:
         self.rounds += 1
         self.last_round_at = time.time()
         self.episodes_at_last_round = self.resolved_episodes()

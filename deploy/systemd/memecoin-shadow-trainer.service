@@ -1,5 +1,5 @@
 [Unit]
-Description=Chronological memecoin shadow, rug-hazard, and exit-policy training
+Description=Chronological training: shadow, rug-hazard, exit-policy, action-value
 After=memecoin-shadow.service
 
 [Service]
@@ -8,17 +8,66 @@ WorkingDirectory=%h/.local/opt/memecoin-shadow
 EnvironmentFile=-%h/.config/memecoin-shadow/env
 Environment=ALLOW_LIVE_TRADING=
 Environment=SOLANA_PRIVATE_KEY=
+
 # Two gates, since the timer (2026-08-29) now asks every 15 minutes instead
 # of once an hour: --min-available-mib is the memory floor, and
 # --min-minutes-since-last-success (default 50) is what stops a 4x more
 # frequent ASK from becoming a 4x more frequent TRAIN once memory clears.
 ExecCondition=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.runtime.training_guard --min-available-mib 640
-ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.research.shadow_trainer --storage data/launch_episodes --model-dir models --min-samples 250
-ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.research.hazard_trainer --storage data/launch_episodes --model-dir models --min-rows 250
-ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.research.exit_policy_trainer
+
+# ONE ExecStart, not three. Revised 2026-09-03 after four OOM kills.
+#
+# The previous form invoked shadow_trainer, hazard_trainer and
+# exit_policy_trainer as three independent processes, and that was wrong in
+# three ways at once.
+#
+#   It could not be excluded. The desk trains in-process on its own clock
+#   (_training_loop in src/main.py) over the SAME corpus. Neither path took a
+#   lock, so both could hold the labelled corpus resident simultaneously --
+#   roughly twice the memory on a 4 GB box -- and the kernel resolves that by
+#   killing whichever process it likes least. That may be the desk, whose
+#   forward evidence cannot be backfilled. Four kills is what that looks like
+#   from the outside, and it looks identical to "the trainer is too big",
+#   which is why the memory cap kept being adjusted at the wrong thing.
+#
+#   It was missing a trainer. action_value_trainer was never listed, so the
+#   artifact the exit policy scores against could only ever be produced by the
+#   in-process path -- the one competing with this unit for memory.
+#
+#   It could not report a skip. Three exit codes, no shared notion of "the
+#   corpus has not grown; do not bother".
+#
+# train_once takes a real flock and runs one round through the same
+# TrainingSupervisor the desk uses. Exit 75 means another process is already
+# training, which is a correct outcome and not a unit failure.
+ExecStart=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.runtime.train_once --storage data/launch_episodes --model-dir models
+SuccessExitStatus=0 75
+
 NoNewPrivileges=true
 PrivateTmp=true
 UMask=0077
-MemoryMax=640M
+
+# MemoryHigh throttles before MemoryMax kills. A trainer that briefly exceeds
+# its budget should be slowed into reclaim and finish; only one that keeps
+# climbing should die. Without the soft limit the first byte over the cap is
+# fatal, which turns a slightly larger corpus into a failed unit.
+#
+# 1200M rather than 640M: the 640 figure came from a nine-run sample peaking
+# at 482 MB, measured when the corpus was a fraction of its current size. A
+# cap calibrated against a corpus that has since grown is not conservative,
+# it is a scheduled failure. The guard above still refuses to START without
+# 640 MiB available, so this raises the ceiling without letting the trainer
+# begin on a box that has no room for it.
+MemoryHigh=900M
+MemoryMax=1200M
 CPUQuota=100%
 Nice=10
+
+# If the box runs out of memory anyway, the kernel should take THIS process,
+# not the desk. A training round can be repeated on the next tick; a minute
+# of forward evidence cannot be recovered at any price.
+OOMScoreAdjust=500
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=memecoin-shadow-trainer
