@@ -58,6 +58,11 @@ UMask=0077
 # it is a scheduled failure. The guard above still refuses to START without
 # 640 MiB available, so this raises the ceiling without letting the trainer
 # begin on a box that has no room for it.
+# Inside the family budget. The slice caps the SUM of every memecoin unit;
+# these cap this one. Without the slice, three individually reasonable units
+# add up to the whole machine and the quant platform goes stale.
+Slice=memecoin.slice
+
 MemoryHigh=900M
 MemoryMax=1200M
 CPUQuota=100%

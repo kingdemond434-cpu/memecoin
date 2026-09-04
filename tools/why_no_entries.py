@@ -101,7 +101,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
           f"{screened / seen:>6.1%}")
     print(f"{'reached a decision':22s} {decided:>10d}  {decided / seen:>6.1%}")
     print(f"{'ENTERED':22s} {entered:>10d}  {entered / seen:>6.1%}")
+
+    # Launches that fell through the funnel without anything happening to
+    # them. Every screen reason below is a share of `seen`, so a large
+    # unaccounted block makes each of those percentages look small and the
+    # histogram look like it explains the desk when it explains a third of
+    # it. A rising number here is a pipeline defect, not a policy.
+    dispositions = dict(totals.get("dispositions") or {})
+    partitioned = sum(int(value or 0) for value in dispositions.values())
+    unaccounted = max(0, seen - partitioned)
+    if dispositions:
+        print(f"{'in flight or unfiled':22s} {partitioned - screened - decided:>10d}")
+        print(f"{'UNACCOUNTED':22s} {unaccounted:>10d}  "
+              f"{unaccounted / seen:>6.1%}")
+        if unaccounted > seen * 0.2:
+            print("  -> more than a fifth of launches reached no disposition "
+                  "at all. That is a pipeline defect, not a policy, and every")
+            print("     percentage below is computed against a denominator "
+                  "that includes them.")
     print()
+    if dispositions:
+        print("dispositions:")
+        for name, count in sorted(dispositions.items(),
+                                  key=lambda item: -int(item[1] or 0)):
+            if int(count or 0):
+                print(f"  {name:44s} {int(count):>10d}  "
+                      f"{int(count) / seen:>6.1%}")
+        print()
 
     reasons = dict(totals.get("screened_by_reason") or {})
     rejected = dict(totals.get("rejected_by_reason") or {})

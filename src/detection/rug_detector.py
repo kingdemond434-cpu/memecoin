@@ -128,11 +128,39 @@ class RugDetector:
         #: has a sell route by construction and the router has never heard
         #: of it -- see _check_sell_route.
         self.curve_state_provider = curve_state_provider
+        #: Why the native bonding-curve route was skipped, by cause. Every
+        #: entry here is a launch the ROUTER was asked about instead, and the
+        #: router's ignorance of a seconds-old mint is what hard-vetoes.
+        self.curve_route_skips: Dict[str, int] = {}
         self._cache: Dict[str, Tuple[TokenRiskReport, float]] = {}
         self._cache_ttl = 30
 
     def set_quote_provider(self, quote_provider: Any):
         self.quote_provider = quote_provider
+
+    def sell_route_report(self) -> Dict[str, Any]:
+        """How often the native curve route was skipped, and why.
+
+        Every skip is a launch the ROUTER was asked about instead. Jupiter has
+        not indexed a mint that is seconds old, and a hard veto built on that
+        ignorance rejects launches this desk can sell natively -- which is the
+        failure this whole method was rewritten to prevent on 2026-08-29, and
+        which recurred on 2026-09-04 with 678 decided launches vetoed and zero
+        entered. It recurred invisibly because nothing counted the skips.
+        """
+        skips = dict(sorted((getattr(self, "curve_route_skips", None) or {}).items(),
+                            key=lambda item: -item[1]))
+        total = sum(skips.values())
+        return {
+            "status": "OK" if total else "DATA_BLOCKED",
+            "curve_route_skips": skips,
+            "skipped_total": total,
+            "detail": ("" if not total else
+                       "these launches were priced by the router instead of "
+                       "the bonding curve; a hard veto from a router that has "
+                       "not indexed the mint is ignorance, not a property of "
+                       "the token"),
+        }
 
     def set_curve_state_provider(self, provider: Any):
         self.curve_state_provider = provider
@@ -520,12 +548,44 @@ class RugDetector:
         # that ignorance into {"status": "OK", "feasible": False} -- a
         # CONFIDENT false rather than a gap, which is why it hard-vetoed
         # instead of degrading to uncertainty.
+        # WHY the curve path was not taken, when it was not. Without this the
+        # fall-through is silent, and the router's opinion about a mint it has
+        # never indexed becomes a hard veto with no record of the fact that a
+        # native route existed and was simply not looked up. Measured
+        # 2026-09-04: 678 decided launches, every one hard-vetoed, with
+        # catastrophic_exit_price_impact in 301 of them -- and that reason
+        # requires a NUMERIC price impact, which the curve branch below never
+        # produces. So the router answered all 301, and this branch was
+        # skipped 301 times without leaving a trace anywhere.
         curve = None
-        if self.curve_state_provider is not None:
+        curve_status = "not_consulted"
+        if self.curve_state_provider is None:
+            curve_status = "no_curve_state_provider"
+        else:
             try:
                 curve = self.curve_state_provider(mint)
-            except Exception:
+            except Exception as exc:
+                # Swallowed silently before. An exception here is a wiring or
+                # lookup fault, and turning it into "no curve" reproduces
+                # exactly the confident-false this method exists to avoid.
+                curve_status = f"curve_lookup_raised:{type(exc).__name__}"
+                logger.warning("curve state lookup failed for %s: %s", mint, exc)
                 curve = None
+            else:
+                if curve is None:
+                    curve_status = "no_cached_curve_state"
+                elif not getattr(curve, "tradeable", False):
+                    curve_status = "curve_not_tradeable"
+        if curve_status != "not_consulted":
+            # Counted through a lazy accessor rather than a bare attribute:
+            # this method is exercised against detectors built by tests and
+            # by callers that predate the counter, and an AttributeError here
+            # would take down the safety report itself over bookkeeping.
+            skips = getattr(self, "curve_route_skips", None)
+            if skips is None:
+                skips = {}
+                self.curve_route_skips = skips
+            skips[curve_status] = skips.get(curve_status, 0) + 1
         if curve is not None and getattr(curve, "tradeable", False):
             return {
                 "status": "OK",
@@ -538,20 +598,26 @@ class RugDetector:
                 "price_impact_pct": None,
                 "detail": "native bonding-curve exit; router not consulted",
             }
+        # Everything below asks the ROUTER about a mint the desk may well be
+        # able to sell natively. The reason it came to that is carried on the
+        # result so a veto built from it can be read back to its cause.
+        router_note = {"curve_status": curve_status}
         if not self.quote_provider or not getattr(self.quote_provider, "_session", None):
-            return {"status": "DATA_BLOCKED", "feasible": None, "reason": "quote provider unavailable"}
+            return {"status": "DATA_BLOCKED", "feasible": None,
+                    "reason": "quote provider unavailable", **router_note}
         amount = min(max(1, mint_state["supply"] // 10_000), 1_000 * 10 ** mint_state["decimals"])
         try:
             quote = await self.quote_provider.get_quote(mint, USDC_MINT, amount, slippage_bps=500)
         except Exception as exc:
-            return {"status": "DATA_BLOCKED", "feasible": None, "error": str(exc)}
+            return {"status": "DATA_BLOCKED", "feasible": None,
+                    "error": str(exc), **router_note}
         if not quote:
             # The router has no route. For a mint it has never indexed that
             # is ignorance, not a property of the token, and the difference
             # decides whether this hard-vetoes or merely adds uncertainty.
             return {"status": "DATA_BLOCKED", "feasible": None,
                     "reason": "router returned no route; it may not have "
-                              "indexed this mint yet"}
+                              "indexed this mint yet", **router_note}
         return {
             "status": "OK",
             "feasible": quote.output_amount > 0,

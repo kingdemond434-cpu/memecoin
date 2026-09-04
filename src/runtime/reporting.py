@@ -808,6 +808,14 @@ class ReportingSurface:
             "mega_event_reserve": self.mega_event_reserve_state,
             "portfolio": self.elogw_engine.get_portfolio_state() if self.elogw_engine else {},
             "rug_hazard": self.rug_hazard.get_stats() if self.rug_hazard else {},
+            # Whether the safety veto is reading the bonding curve or the
+            # router. A router asked about a mint it has never indexed
+            # answers "no route", and that answer hard-vetoes launches the
+            # desk can sell natively.
+            "sell_route": (self.rug_detector.sell_route_report()
+                           if getattr(self, "rug_detector", None) is not None
+                           and hasattr(self.rug_detector, "sell_route_report")
+                           else {"status": "DATA_BLOCKED"}),
             "dataset": self.dataset_builder.get_stats() if self.dataset_builder else {},
             "research": self.global_research.get_stats() if self.global_research else {},
             # The hourly world crawler, its search backends, the canonical

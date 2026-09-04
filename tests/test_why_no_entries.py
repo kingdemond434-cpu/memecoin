@@ -19,6 +19,7 @@ from tools.why_no_entries import (
 def _census(tmp_path, **totals):
     payload = {"totals": {"seen": 100, "screened": 100, "decided": 0,
                           "entered": 0, **totals}}
+    payload["totals"].setdefault("dispositions", {})
     (tmp_path / "launch_census.json").write_text(json.dumps(payload))
     return tmp_path
 
@@ -129,3 +130,28 @@ def test_every_remedy_matches_a_reason_the_desk_actually_emits():
         assert marker in desk, marker
     assert _remedy("DATA_BLOCKED_prediction_model")
     assert _remedy("something_nobody_emits") == ""
+
+
+def test_launches_that_reached_no_disposition_are_shown(tmp_path, capsys):
+    """Every screen percentage is a share of `seen`.
+
+    With two thirds of launches unfiled, the histogram looks like it explains
+    the desk while explaining a third of it -- and the biggest number on the
+    page is the one that is not printed.
+    """
+    state = _census(tmp_path, seen=8757, screened=2340, decided=678,
+                    dispositions={"screened_out": 2340, "decided_reject": 678},
+                    screened_by_reason={"DATA_BLOCKED_prediction_model": 1288})
+    main(["--state-dir", str(state)])
+    printed = capsys.readouterr().out
+    assert "UNACCOUNTED" in printed
+    assert "5739" in printed
+    assert "pipeline defect" in printed
+
+
+def test_a_fully_accounted_census_does_not_cry_wolf(tmp_path, capsys):
+    state = _census(tmp_path, seen=100, screened=90, decided=10, entered=2,
+                    dispositions={"screened_out": 90, "decided_enter": 10})
+    main(["--state-dir", str(state)])
+    printed = capsys.readouterr().out
+    assert "pipeline defect" not in printed

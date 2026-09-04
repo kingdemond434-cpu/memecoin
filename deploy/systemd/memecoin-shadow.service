@@ -6,7 +6,11 @@ Wants=network-online.target
 OnFailure=memecoin-health-escalate.service
 # Not a crash loop. Five failures inside a minute means something restarting
 # will not fix, and hammering it buries the reason. These are [Unit]
-# directives -- under [Service] systemd silently ignores them, which is the
+# directives -- under [Service]
+# The box has carried this as a drop-in (20-memecoin-slice.conf) since
+# 2026-09-03; stated here so the repository and the box agree and
+# tools/unit_drift.py has something to compare.
+Slice=memecoin.slice systemd silently ignores them, which is the
 # same way the health unit's OnFailure was disarmed without anyone noticing.
 #
 # REVISED. The reasoning above is sound about not hammering and wrong about

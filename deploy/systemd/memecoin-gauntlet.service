@@ -26,15 +26,27 @@ NoNewPrivileges=true
 PrivateTmp=true
 UMask=0077
 
+# Inside the family budget, not beside it. Every memecoin unit shares
+# memecoin.slice, so these caps bound this run and the slice bounds the sum --
+# which is what stops memecoin work from starving the quant platform on a
+# shared 3814 MB box.
+Slice=memecoin.slice
+
 # The whole observation set is held resident for the bootstrap -- roughly a
 # kilobyte per launch per mechanism, so a thirty-thousand launch corpus across
-# six mechanisms sits in the low hundreds of megabytes. Capped in the same
-# shape as the trainer: throttle into reclaim first, kill only a run that
-# keeps climbing.
-MemoryHigh=900M
-MemoryMax=1200M
-CPUQuota=100%
-Nice=15
+# six mechanisms sits in the low hundreds of megabytes. Capped tight because
+# this is a WEEKLY BATCH job: a run that needs more than this should fail
+# visibly on a Sunday night rather than quietly widening the family's
+# footprint every week. Raise it on a measurement, never on a guess.
+MemoryHigh=400M
+MemoryMax=600M
+CPUQuota=50%
+Nice=19
+
+# Never start on a box that is already tight. A weekly scoreboard is worth
+# nothing next to the collector staying alive, and a skip retries next Sunday
+# at no cost. Same guard the trainer uses, at this unit's own ceiling.
+ExecCondition=%h/.local/opt/memecoin-shadow/.venv/bin/python -m src.runtime.training_guard --min-available-mib 600 --min-minutes-since-last-success 0
 
 # The desk is never the process the kernel takes. A gauntlet run repeats next
 # week; a minute of forward evidence cannot be recovered at any price.
