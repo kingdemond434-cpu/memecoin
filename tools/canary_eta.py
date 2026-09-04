@@ -21,11 +21,45 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from src.research.forward_evidence import ForwardEvidence
-from src.research.promotion_gate import DEFAULT_CRITERIA, PromotionLedger
+from src.research.promotion_gate import (
+    DEFAULT_CRITERIA, PromotionLedger, Stage)
 
 EXIT_ELIGIBLE = 0
 EXIT_WAITING = 3
 EXIT_DATA_BLOCKED = 4
+
+
+def _print_canary_path(ledger: PromotionLedger,
+                       forward: ForwardEvidence) -> None:
+    """The whole ladder to real money, not just the next rung.
+
+    The question is almost never about the next promotion. CANARY is the first
+    stage that may spend anything, and from the bottom it is three of them --
+    which do not overlap, because one rung is earned per passing verdict and
+    FORWARD_SHADOW cannot be left in under fourteen days however fast the
+    counts arrive.
+    """
+    if ledger.current_stage() is Stage.CANARY:
+        return
+    path = ledger.eta_to(Stage.CANARY, forward.evidence(),
+                         forward.observed_days())
+    if not path.get("rungs"):
+        return
+    print()
+    print(f"all the way to canary ({len(path['rungs'])} promotion(s)):")
+    for rung in path["rungs"]:
+        dwell = (f", {rung['dwell_required']:g}d dwell"
+                 if rung["dwell_required"] else "")
+        print(f"  {rung['stage']:20s} -> {rung['leaves_for']:20s} "
+              f"{rung['days']:>7.1f}d{dwell}")
+    if path["days"] is None:
+        print("  total: cannot be projected -- "
+              + ", ".join(path["counting_without_a_rate"]))
+    else:
+        print(f"  total: about {path['days']:.0f} days, and only if nothing "
+              "above is blocked on evidence rather than time")
+    for item in path["blocking_regardless_of_time"]:
+        print(f"  blocked now: {item}")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -41,15 +75,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               "not recorded a decision yet")
         return EXIT_DATA_BLOCKED
 
-    # `promotion.jsonl`, matching src/runtime/wiring.py. A wrong name here
-    # does not fail: `current_stage` reads a missing stage file as HISTORICAL,
-    # so this would confidently report the bottom rung and a date to match.
+    # `promotion.jsonl`, matching src/runtime/wiring.py.
+    #
+    # A missing stage file is NOT an error and must not refuse: `_write_stage`
+    # runs only on a promotion (and on arrival at the two rungs with a dwell
+    # requirement), so a desk that has never been promoted legitimately has
+    # none, and `current_stage` reading that as HISTORICAL is the truth --
+    # HISTORICAL is the bottom rung and carries no authorisation at all.
+    # Refusing here withheld the most useful answer there is: you are at the
+    # bottom, and here is what leaving it costs.
+    #
+    # The failure genuinely worth catching is a WRONG FILENAME, which looks
+    # identical from the stage file's absence alone. A stage record under some
+    # other basename in the same directory is that, and only that.
     ledger_path = state / "promotion.jsonl"
-    if not ledger_path.with_name(ledger_path.stem + "_stage.json").exists():
-        print(f"no stage record beside {ledger_path}; the ladder has not "
-              "recorded an arrival yet, so this would report the bottom rung "
-              "whatever the desk has actually earned")
-        return EXIT_DATA_BLOCKED
+    stage_path = ledger_path.with_name(ledger_path.stem + "_stage.json")
+    if not stage_path.exists():
+        stray = sorted(p.name for p in state.glob("*_stage.json"))
+        if stray:
+            print(f"expected {stage_path.name} but found {', '.join(stray)}; "
+                  "this tool and the desk disagree about where the ladder "
+                  "lives, and answering would describe the wrong rung")
+            return EXIT_DATA_BLOCKED
     ledger = PromotionLedger(ledger_path)
     forward = ForwardEvidence(evidence_path, stage=ledger.current_stage())
     forward.load_gauntlet(state / "gauntlet.json")
@@ -63,11 +110,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return EXIT_DATA_BLOCKED
 
     print(f"at {eta['stage']}, next rung {eta['next_stage']}")
+    if not stage_path.exists():
+        print("  (no promotion has ever been recorded, so this is the bottom "
+              "rung by construction, not by default)")
     print(f"observed {eta['observed_days']:g} days, "
           f"{eta['days_at_stage']:g} of them at this stage")
     print()
     if eta["eligible_now"]:
-        print("ELIGIBLE NOW -- the gate passes on the next sweep")
+        print(f"ELIGIBLE NOW for {eta['next_stage']} -- the gate passes on "
+              "the next sweep")
+        _print_canary_path(ledger, forward)
         return EXIT_ELIGIBLE
 
     print(f"{'requirement':22s} {'have':>9s} {'need':>9s} {'per day':>9s} "
@@ -98,6 +150,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("NOT fixed by waiting:")
         for item in blocking:
             print(f"  - {item}")
+
+    _print_canary_path(ledger, forward)
     return EXIT_WAITING
 
 

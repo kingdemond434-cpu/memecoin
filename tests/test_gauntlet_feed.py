@@ -693,11 +693,67 @@ def test_the_eta_tool_reads_the_same_ledger_the_desk_writes():
         assert name in tool, name
 
 
-def test_the_eta_tool_refuses_rather_than_guessing_the_bottom_rung(tmp_path):
+def test_a_missing_stage_record_is_answered_not_refused(tmp_path, capsys):
+    """`_write_stage` runs only on a promotion, so a never-promoted desk has
+    no stage file -- and HISTORICAL is then the truth, not a default.
+
+    Refusing here withheld the most useful answer there is: you are at the
+    bottom rung, and this is what leaving it costs.
+    """
+    from tools.canary_eta import main
+    fe = ForwardEvidence(tmp_path / "forward_evidence.json")
+    fe.started_at = time.time() - 12 * 86_400.0
+    for index in range(400):
+        fe.record(Outcome(token=f"t{index % 200}", entered=index % 5 == 0,
+                          regime="bull", realized_pnl_usd=-1.0,
+                          equity_at_decision_usd=1_000.0, max_multiple=1.1))
+    fe.save()
+    main(["--state-dir", str(tmp_path)])
+    printed = capsys.readouterr().out
+    assert "at historical" in printed
+    assert "bottom rung by construction" in printed
+
+
+def test_a_stage_record_under_the_wrong_name_still_refuses(tmp_path):
+    """The failure worth catching is a filename disagreement, not an absence."""
     from tools.canary_eta import EXIT_DATA_BLOCKED, main
     (tmp_path / "forward_evidence.json").write_text(json.dumps(
         {"stage": "forward_shadow", "decisions": 10}))
+    (tmp_path / "promotion_ledger_stage.json").write_text(
+        json.dumps({"stage": "canary"}))
     assert main(["--state-dir", str(tmp_path)]) == EXIT_DATA_BLOCKED
+
+
+def test_the_path_to_canary_sums_rungs_that_do_not_overlap(tmp_path):
+    """One rung per passing verdict, and FORWARD_SHADOW costs 14 days alone."""
+    from src.research.promotion_gate import PromotionLedger
+    ledger = PromotionLedger(tmp_path / "promotion.jsonl")
+    fe = ForwardEvidence(tmp_path / "forward_evidence.json")
+    fe.started_at = time.time() - 12 * 86_400.0
+    for index in range(3_100):
+        monster = index % 200 == 0
+        fe.record(Outcome(token=f"t{index % 1450}",
+                          entered=(monster or index % 25 == 0),
+                          regime=["bull", "bear"][index % 2],
+                          rugged=(index % 120 == 25),
+                          realized_pnl_usd=(35.0 if monster else -1.2),
+                          equity_at_decision_usd=1_000.0,
+                          max_multiple=(12.0 if monster else 1.1)))
+    path = ledger.eta_to(Stage.CANARY, fe.evidence(), fe.observed_days())
+    assert [rung["stage"] for rung in path["rungs"]] == [
+        "historical", "chronological_oos", "forward_shadow"]
+    # The dwell cannot be served in parallel with the rungs below it.
+    assert path["days"] >= 14.0
+
+
+def test_the_path_is_empty_once_the_target_is_reached(tmp_path):
+    from src.research.promotion_gate import PromotionLedger
+    ledger = PromotionLedger(tmp_path / "promotion.jsonl")
+    ledger._write_stage(Stage.LIVE, "test")
+    fe = ForwardEvidence(tmp_path / "fe.json")
+    result = ledger.eta_to(Stage.CANARY, fe.evidence(), 10.0)
+    assert result["days"] == 0.0
+    assert "already at or above" in result["detail"]
 
 
 def test_the_eta_tool_reports_a_real_state(tmp_path, capsys):

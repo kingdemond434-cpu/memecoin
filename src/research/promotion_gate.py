@@ -589,6 +589,95 @@ class PromotionLedger:
                 "only counts and elapsed time remain"),
         }
 
+    def eta_to(self, target: Stage, evidence: Evidence, observed_days: float
+               ) -> Dict[str, Any]:
+        """Days to a stage several rungs up, not just the next one.
+
+        `eta` answers about one promotion. "When is CANARY" from HISTORICAL is
+        three of them, and they do not overlap: one rung is earned per passing
+        verdict, and FORWARD_SHADOW alone cannot be left in under fourteen
+        days however fast the counts arrive. Summing the rungs is the only
+        honest answer to the question actually being asked.
+
+        Counts are cumulative lifetime totals, so they keep accruing during
+        each rung's dwell; dwell is sequential and adds. Requirements that no
+        rate can project are collected per rung and reported rather than
+        folded into the number.
+        """
+        stage = self.current_stage()
+        order = STAGE_ORDER
+        if order.index(target) <= order.index(stage):
+            return {"status": "OK", "stage": stage.value,
+                    "target": target.value, "days": 0.0,
+                    "detail": f"already at or above {target.value}"}
+
+        observed_days = max(0.0, float(observed_days))
+        rates = {}
+        for name in self._COUNTING:
+            have = int(getattr(evidence, name) or 0)
+            rates[name] = (have / observed_days) if observed_days > 0 else 0.0
+
+        elapsed = 0.0
+        rungs: List[Dict[str, Any]] = []
+        unrated: List[str] = []
+        blocking: List[str] = []
+        entered = self.entered_stage_at()
+        days_at_stage = ((time.time() - entered) / 86_400.0) if entered else 0.0
+
+        for index in range(order.index(stage), order.index(target)):
+            rung = order[index]
+            criteria = DEFAULT_CRITERIA.get(rung)
+            if criteria is None:
+                continue
+            # The dwell already served counts only on the rung standing on.
+            served = days_at_stage if index == order.index(stage) else 0.0
+            need_days = max(0.0, criteria.min_days_at_stage - served)
+            for name, need in (("decisions", criteria.min_decisions),
+                               ("real_fills", criteria.min_real_fills),
+                               ("launch_cohorts", criteria.min_launch_cohorts)):
+                if need <= 0:
+                    continue
+                have_now = int(getattr(evidence, name) or 0)
+                rate = rates[name]
+                projected = have_now + rate * elapsed
+                if projected >= need:
+                    continue
+                if rate <= 0:
+                    unrated.append(f"{rung.value}:{name}")
+                    continue
+                need_days = max(need_days, (need - projected) / rate)
+            if criteria.min_decisions_at_stage > 0 and rates["decisions"] > 0:
+                need_days = max(
+                    need_days,
+                    criteria.min_decisions_at_stage / rates["decisions"])
+            # Only the rung being stood on can be evaluated against real
+            # evidence; the ones above it have none yet, and inventing some
+            # would be forecasting the desk's future skill.
+            if index == order.index(stage):
+                blocking.extend(
+                    item for item in evaluate(criteria, evidence).failures
+                    if not any(item.startswith(name) for name in self._COUNTING))
+            elapsed += need_days
+            rungs.append({"stage": rung.value, "leaves_for": order[index + 1].value,
+                          "days": round(need_days, 1),
+                          "cumulative_days": round(elapsed, 1),
+                          "dwell_required": criteria.min_days_at_stage})
+
+        return {
+            "schema_version": PROMOTION_GATE_SCHEMA_VERSION,
+            "status": "OK",
+            "stage": stage.value, "target": target.value,
+            "rungs": rungs,
+            "days": None if unrated else round(elapsed, 1),
+            "counting_without_a_rate": sorted(set(unrated)),
+            "blocking_regardless_of_time": blocking,
+            "detail": (
+                "counts have no rate yet" if unrated else
+                f"{len(blocking)} requirement(s) at {stage.value} will not be "
+                "met by waiting" if blocking else
+                "only counts and elapsed time remain"),
+        }
+
     def demote(self, reason: str) -> Stage:
         """Drop one stage. The only thing that ever lowers trading authority.
 
