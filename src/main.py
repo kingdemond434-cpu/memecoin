@@ -954,8 +954,7 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
         self.latency.mark(token, "decode_to_dispatch")
         task = asyncio.create_task(self._candidate_pipeline(candidate))
         self._candidate_pipelines[token] = task
-        # Filed now, so a launch that dies during enrichment is not left
-        # sitting as merely SEEN.
+        # Filed now, so a launch dying during enrichment is still filed.
         if self.predictor is not None and not self.predictor._is_trained:
             self.launch_census.data_blocked(
                 token, "DATA_BLOCKED_prediction_model_enrichment_running")
@@ -1222,7 +1221,6 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
         self.latency.mark(token, "sign_to_submit")
         trace = self.latency.close(
             token, "entered" if result.success else "submit_failed")
-        # See src/runtime/execution_feedback.py: the optimiser's only evidence.
         self._record_fee_outcome(int(priority_fee), bool(result.success), trace)
         self.dataset_builder.record_execution_attempt(token, _jsonable(result))
         self._record_ops_event("execution_attempts", {
@@ -1380,9 +1378,8 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
         # on to do. A missed monster is invisible unless the rejection was
         # written down next to the outcome.
         #
-        # THREE dispositions, not one: a launch the desk could not price is
-        # not one it declined, and a hard safety reject is a terminal
-        # DECISION. Lost in the file split; see tests/test_funnel_wiring.py.
+        # THREE dispositions, not one; lost in the file split. See
+        # tests/test_funnel_wiring.py.
         if str(reason).upper().startswith("DATA_BLOCKED"):
             self.launch_census.data_blocked(token, reason)
         elif str(reason).startswith("safety_veto:"):
@@ -1990,10 +1987,12 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
             return False
         self._latest_curve_state[token] = state
         if state.creator:
-            self._curve_static[token] = {
+            # In place: the curve address from the creation event must
+            # survive a later account update.
+            self._curve_static.setdefault(token, {}).update({
                 "creator": state.creator,
                 "token_total_supply": int(state.token_total_supply or 0),
-            }
+            })
         self.state_sequencer.bump(token)
         # An account update is a market change like any other, and the
         # position holding it should think again on the same terms.
@@ -2246,12 +2245,10 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
         An open position is kept whatever the hot state says: a position we
         cannot quote an exit for is the one state we must never discard.
 
-        So is a candidate still being DECIDED: both need their exit priced.
-        A launch can leave `active_tokens` while its enrichment RPCs are in
-        flight, and dropping its curve state then sends the sell-route check
-        to the ROUTER for a mint the desk sells natively -- whose ignorance
-        hard-vetoed 678 of 678 decided launches on 2026-09-04. See
-        tests/test_sell_route_authority.py.
+        So is a candidate still being DECIDED: both need their exit
+        priced. Dropping its curve state mid-flight sent the sell-route
+        check to the ROUTER, whose ignorance hard-vetoed 678 of 678 decided
+        launches. See tests/test_sell_route_authority.py.
         """
         held = (set(self.elogw_engine.open_positions)
                 # Through getattr: this is a maintenance sweep, and an
@@ -3828,6 +3825,9 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
                                            or PUMP_TOKEN_TOTAL_SUPPLY),
                     complete=False, creator=str(event.get("creator", "") or ""),
                 )
+            if event.get("bonding_curve"):  # the venue, not a whale
+                self._curve_static.setdefault(token, {})["bonding_curve"] = str(
+                    event["bonding_curve"])
             self.dataset_builder.start_episode(
                 token, event.get("creator", ""), event.get("program", PumpFunMonitor.PUMP_FUN_PROGRAM),
                 event.get("bonding_curve", ""), WSOL_MINT, detected_at=event.get("timestamp", time.time()),

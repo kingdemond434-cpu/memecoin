@@ -889,6 +889,11 @@ class SubsystemWiring:
             # recorded as a confident "no route", which hard-vetoed 100% of
             # decided launches.
             curve_state_provider=self._latest_curve_state.get)
+        # The launch venue's account, from the creation event. Holder
+        # concentration counts the bonding curve as a holder without it, so
+        # every healthy new launch scores as maximally concentrated.
+        self.rug_detector.curve_account_provider = (
+            lambda mint: (self._curve_static.get(mint) or {}).get("bonding_curve"))
         # What a decision can know for free, and the ledger that decides how
         # much that is. The full audit is three to five sequential RPC round
         # trips; it now runs BESIDE the decision rather than in front of it,

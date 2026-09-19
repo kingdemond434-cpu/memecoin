@@ -128,6 +128,10 @@ class RugDetector:
         #: has a sell route by construction and the router has never heard
         #: of it -- see _check_sell_route.
         self.curve_state_provider = curve_state_provider
+        #: mint -> the launch venue's account (a pump.fun bonding curve).
+        #: Supplied so holder concentration can tell the AMM apart from a
+        #: whale; without it every new launch reads as 100% concentrated.
+        self.curve_account_provider: Any = None
         #: Why the native bonding-curve route was skipped, by cause. Every
         #: entry here is a launch the ROUTER was asked about instead, and the
         #: router's ignorance of a seconds-old mint is what hard-vetoes.
@@ -289,14 +293,25 @@ class RugDetector:
         checks["developer_balance"] = developer
         if holders.get("status") == "DATA_BLOCKED":
             blocked.append("holders")
-        top10 = float(holders.get("top_10_pct", 0))
+        raw_top10 = holders.get("top_10_pct")
         top20 = holders.get("top_20_pct")
-        if top10 > 80:
-            warnings.append(f"Top token accounts hold {top10:.1f}% of supply")
-            score -= 25
-        elif top10 > 50:
-            warnings.append(f"Top token accounts hold {top10:.1f}% of supply")
-            score -= 10
+        if raw_top10 is None:
+            # The launch venue still holds everything, so concentration is
+            # not measured rather than zero. Penalising it would fine every
+            # token for being new; crediting it would be reassurance about a
+            # measurement nobody made.
+            blocked.append("holder_concentration")
+            top10 = None
+        else:
+            top10 = float(raw_top10)
+            if top10 > 80:
+                warnings.append(
+                    f"Top accounts hold {top10:.1f}% of circulating supply")
+                score -= 25
+            elif top10 > 50:
+                warnings.append(
+                    f"Top accounts hold {top10:.1f}% of circulating supply")
+                score -= 10
 
         checks["sell_route"] = route
         route_feasible = route.get("feasible")
@@ -390,11 +405,36 @@ class RugDetector:
         }
 
     async def _solana_holder_concentration(self, mint: str, supply: int) -> Dict[str, Any]:
+        """Concentration among REAL holders, against CIRCULATING supply.
+
+        A pump.fun bonding curve holds essentially the whole supply the
+        instant a token is created -- that is what the curve IS, the AMM
+        every buy trades against. Counting it as a holder made every healthy
+        launch look maximally concentrated: `top_10_pct` near 100, which is
+        -25 on the risk score, on every single one, forever.
+
+        Excluding it alone would be the opposite error. With 79% of supply in
+        the curve, the real holders' shares all divide by a denominator that
+        is mostly unbuyable, and genuine concentration reads as trivial. So
+        the curve comes out of BOTH sides: its tokens are not a holding, and
+        they are not circulating either.
+
+        At T0 circulating is ~zero and this is DATA_BLOCKED, which is the
+        honest answer -- nobody holds anything yet, so nothing is
+        concentrated and nothing is diffuse.
+        """
         if supply <= 0:
             return {"status": "OK", "largest_account_count": 0,
                     "holder_count_status": "DATA_BLOCKED",
                     "top_10_pct": 100.0,
                     "top_20_pct": 100.0}
+        curve_account = ""
+        provider = getattr(self, "curve_account_provider", None)
+        if callable(provider):
+            try:
+                curve_account = str(provider(mint) or "")
+            except Exception as exc:
+                logger.debug("curve account lookup failed for %s: %s", mint, exc)
         try:
             result = await self.rpc.request("getTokenLargestAccounts", [mint, {"commitment": "confirmed"}])
             values = (result or {}).get("value", [])
@@ -403,22 +443,55 @@ class RugDetector:
             owners = await self._solana_token_account_owners(addresses)
             accounts = []
             resolved_amount = 0
+            held: List[int] = []
+            curve_amount = 0
             for address, amount in zip(addresses, amounts):
                 owner = owners.get("owners", {}).get(address)
                 if owner:
                     resolved_amount += amount
+                # The curve is the venue, not a holder. Matched on either the
+                # token account itself or its owner, because which of the two
+                # the launch event names varies by launchpad.
+                is_curve = bool(curve_account) and curve_account in (
+                    address, owner or "")
+                if is_curve:
+                    curve_amount += amount
+                else:
+                    held.append(amount)
                 accounts.append({
                     "token_account": address,
                     "owner": owner,
                     "amount_raw": amount,
                     "supply_pct": 100.0 * amount / supply,
+                    "is_launch_venue": is_curve,
                 })
+            circulating = max(0, supply - curve_amount)
+            if curve_account and circulating <= 0:
+                # Everything is still in the curve. Nobody holds anything, so
+                # nothing is concentrated -- and saying 0% would read as
+                # reassurance about a measurement nobody made.
+                return {
+                    "status": "OK",
+                    "largest_account_count": len(values),
+                    "holder_count_status": "DATA_BLOCKED",
+                    "concentration_status": "DATA_BLOCKED",
+                    "top_10_pct": None, "top_20_pct": None,
+                    "curve_held_pct": 100.0 * curve_amount / supply,
+                    "circulating_supply": 0,
+                    "accounts": accounts,
+                    "detail": "the launch venue still holds the entire supply",
+                }
+            denominator = circulating if curve_account else supply
             return {
                 "status": "OK",
                 "largest_account_count": len(values),
                 "holder_count_status": "DATA_BLOCKED",
-                "top_10_pct": 100.0 * sum(amounts[:10]) / supply,
-                "top_20_pct": 100.0 * sum(amounts) / supply,
+                "concentration_status": "OK",
+                "curve_held_pct": (100.0 * curve_amount / supply
+                                   if curve_account else None),
+                "circulating_supply": denominator,
+                "top_10_pct": 100.0 * sum(held[:10]) / denominator,
+                "top_20_pct": 100.0 * sum(held) / denominator,
                 "owner_enrichment_status": owners.get("status", "DATA_BLOCKED"),
                 "owner_enrichment_error": owners.get("error"),
                 "owner_resolved_accounts": sum(1 for item in accounts if item["owner"]),
