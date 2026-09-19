@@ -951,15 +951,11 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
         self.latency.mark(token, "decode_to_dispatch")
         task = asyncio.create_task(self._candidate_pipeline(candidate))
         self._candidate_pipelines[token] = task
-        # The launch has a disposition from this instant. Without it a
-        # candidate sits in the census as merely SEEN for the whole length of
-        # its enrichment RPCs, and one that dies in that window is never
-        # filed at all -- which is most of what the funnel was reporting as
-        # unaccounted.
+        # A disposition from this instant, so a launch that dies during its
+        # enrichment RPCs is still filed rather than sitting as merely SEEN.
         if self.predictor is not None and not self.predictor._is_trained:
-            # The absence of a validated action model is known immediately.
-            # Keep collecting native risk and outcome evidence in this task,
-            # but do not leave the launch looking lost behind enrichment.
+            # Known immediately. Keep collecting native risk and outcome
+            # evidence, but do not leave the launch looking lost.
             self.launch_census.data_blocked(
                 token, "DATA_BLOCKED_prediction_model_enrichment_running")
         else:
@@ -1378,18 +1374,12 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
         # on to do. A missed monster is invisible unless the rejection was
         # written down next to the outcome.
         #
-        # THREE dispositions, not one. Added 2026-08-28 across two commits and
-        # silently lost in `e2deedc`, the commit that split this file -- which
-        # left `screen()` as the only funnel call and `data_blocked()`,
-        # `reject()`, `awaiting_state()` and `decision_ready()` with no caller
-        # at all. The commit that added them was titled "Make launch funnel
-        # exhaustive"; the refactor undid it without touching a test.
-        #
-        # The distinction is not cosmetic. A launch the desk could not price
-        # is not a launch it looked at and declined, and a hard safety reject
-        # is a terminal DECISION rather than a pre-decision disappearance.
-        # Collapsing all three into "screened" is what made the funnel report
-        # two thirds of launches as reaching no disposition.
+        # THREE dispositions, not one. Added 2026-08-28 and silently lost in
+        # `e2deedc`, the commit that split this file, which left four funnel
+        # transitions with no caller at all. A launch the desk could not
+        # price is not one it looked at and declined, and a hard safety
+        # reject is a terminal DECISION rather than a disappearance.
+        # See tests/test_funnel_wiring.py.
         if str(reason).upper().startswith("DATA_BLOCKED"):
             self.launch_census.data_blocked(token, reason)
         elif str(reason).startswith("safety_veto:"):
@@ -2252,8 +2242,23 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
 
         An open position is kept whatever the hot state says: a position we
         cannot quote an exit for is the one state we must never discard.
+
+        So is a candidate still being DECIDED, for the same reason: both need
+        their exit priced. `_candidate_pipeline` makes several RPC round
+        trips and a launch can leave `active_tokens` -- hard-capped and
+        age-expiring -- while they are in flight. Dropping its curve state
+        then sends `_solana_sell_route` to the ROUTER for a mint the desk
+        sells natively, and the router's ignorance of a seconds-old mint
+        hard-vetoes it. Measured 2026-09-04: 678 of 678 decided launches
+        rejected, 359 on sell_route_unavailable, 301 on a price impact
+        quoted for a venue the desk would never have used.
         """
-        held = set(self.elogw_engine.open_positions)
+        held = (set(self.elogw_engine.open_positions)
+                # Through getattr: this is a maintenance sweep, and an
+                # AttributeError here would take down the pass that keeps
+                # these dicts bounded -- the leak that OOM-killed the
+                # service twelve times in one hour.
+                | set(getattr(self, "_candidate_pipelines", ()) or ()))
         dropped = 0
         for store in (self._curve_static, self._latest_curve_state,
                       self._latest_pool_state):

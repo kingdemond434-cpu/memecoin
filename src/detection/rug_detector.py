@@ -618,13 +618,37 @@ class RugDetector:
             return {"status": "DATA_BLOCKED", "feasible": None,
                     "reason": "router returned no route; it may not have "
                               "indexed this mint yet", **router_note}
+        # Whether the ROUTER is the right authority here at all.
+        #
+        # It is when the cached curve says this mint has migrated: the pool is
+        # then the only venue and the router prices it correctly. It is NOT
+        # when the curve state is merely unknown -- no provider, nothing
+        # cached, a lookup that raised -- because the desk may well sell this
+        # mint back to its own bonding curve and simply did not check. A
+        # confident "not feasible" from a router that has never indexed the
+        # mint is ignorance, and a price impact quoted for a route the desk
+        # would not take cannot hard-veto the launch.
+        authoritative = curve_status == "curve_not_tradeable"
+        feasible = quote.output_amount > 0
+        if not authoritative and not feasible:
+            return {"status": "DATA_BLOCKED", "feasible": None,
+                    "reason": "the router priced no exit, but the curve state "
+                              "was unknown, so the native route was never "
+                              "checked; this is unmeasured, not unsellable",
+                    "test_amount": amount, **router_note}
         return {
             "status": "OK",
-            "feasible": quote.output_amount > 0,
+            "feasible": feasible,
             "test_amount": amount,
             "output_usdc_raw": quote.output_amount,
-            "price_impact_pct": quote.price_impact_pct,
+            # Suppressed when the router is not the authority: the sizing
+            # engine prices the curve exit from reserves, and vetoing on a
+            # Jupiter impact for a route the desk never takes is measuring
+            # the wrong venue.
+            "price_impact_pct": (quote.price_impact_pct if authoritative
+                                 else None),
             "min_output_amount": quote.min_output_amount,
+            **router_note,
         }
 
     @staticmethod
