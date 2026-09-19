@@ -61,6 +61,7 @@ from src.runtime.latency import LatencyLedger
 from src.runtime.serialisation import jsonable as _jsonable
 from src.runtime.depth import (
     CopyBookBudgets, DepthResolution, FollowableTrades, TailLadder,
+    note_curve_state, note_entry_position, note_migration, note_pool_state,
     update_copy_budget)
 from src.runtime.prelaunch_feed import PrelaunchFeed
 from src.runtime.execution_feedback import (
@@ -1251,6 +1252,9 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
                     "execution": _jsonable(result),
                 })
                 return
+        note_entry_position(
+            self, token, int(result.output_amount),
+            int(float(trade_info["position_size_sol"]) * 1e9))
         position = {
             "token": token, "size_tokens": int(result.output_amount), "initial_size_tokens": int(result.output_amount),
             "remaining_cost_usd": acquisition_cost,
@@ -1995,6 +1999,7 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
             state.coin_creator = existing.coin_creator
             state.base_supply = existing.base_supply
         self._latest_pool_state[token] = state
+        note_migration(self, token, state)
         self.state_sequencer.bump(token)
         self._spawn_background(self._fetch_pool_account(token, pool))
 
@@ -2043,6 +2048,7 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
             state.base_supply = previous.base_supply
             state.coin_creator = previous.coin_creator
         self._latest_pool_state[token] = state
+        note_pool_state(self, token, state)
         # Reserves moved, so a decision priced against the old ones is stale.
         self.state_sequencer.bump(token)
         self.request_redecision(token)
@@ -3809,6 +3815,9 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
             if event.get("bonding_curve"):  # the venue, not a whale
                 self._curve_static.setdefault(token, {})["bonding_curve"] = str(
                     event["bonding_curve"])
+            note_curve_state(
+                self, token,
+                float(event.get("timestamp", time.time()) or time.time()))
             self.dataset_builder.start_episode(
                 token, event.get("creator", ""), event.get("program", PumpFunMonitor.PUMP_FUN_PROGRAM),
                 event.get("bonding_curve", ""), WSOL_MINT, detected_at=event.get("timestamp", time.time()),

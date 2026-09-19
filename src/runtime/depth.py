@@ -221,8 +221,61 @@ class TailLadder:
             curve = position.get("survival_curve")
             if curve:
                 survival = lambda multiple: continuation.survival(curve, multiple)
-        return capturable_upside(executable_tail_curve(
+        report = capturable_upside(executable_tail_curve(
             state, tokens, cost, survival=survival,
             pool=self._latest_pool_state.get(token),
             acceptable_impact=float(
                 self.global_config.get("acceptable_exit_impact", 0.10))))
+        # The projection beside the observation. One is what the curve
+        # arithmetic says a sale would fetch; the other is what the pool
+        # actually did while this position was open. They are recorded
+        # together so the first can eventually be calibrated against the
+        # second rather than trusted on the strength of being arithmetic.
+        lineage = getattr(self, "migration_lineage", None)
+        report["observed"] = (lineage.executable_path(token) if lineage
+                              else {"status": "DATA_BLOCKED",
+                                    "detail": "no lineage corpus"})
+        return report
+
+
+def _lineage_of(desk: Any) -> Any:
+    """The migration corpus, or None. Read through getattr on purpose.
+
+    Pool-state tracking must not depend on the corpus being wired, and these
+    hooks sit in handlers that tests drive as plain namespaces -- so a hard
+    attribute access turns a research feed into a crash in the price path.
+    Free functions rather than a mixin for the same reason: the handler should
+    not need the caller to be a particular class to record an observation.
+    """
+    return getattr(desk, "migration_lineage", None)
+
+
+def note_curve_state(desk: Any, token: str, at: float) -> None:
+    """The curve side of the crossing, so a migration has a before."""
+    lineage = _lineage_of(desk)
+    if lineage is not None:
+        lineage.observe_curve(token, desk._latest_curve_state.get(token), at)
+
+
+def note_migration(desk: Any, token: str, pool: Any) -> None:
+    """The crossing itself, from the pool the mint actually landed in."""
+    lineage = _lineage_of(desk)
+    if lineage is not None:
+        lineage.observe_migration(token, pool)
+
+
+def note_pool_state(desk: Any, token: str, pool: Any) -> None:
+    """One pool reading. The tail lives here: the curve completes at 14.4x
+    from a T0 entry, so every 20x and beyond is a pool event."""
+    lineage = _lineage_of(desk)
+    if lineage is not None:
+        lineage.observe_pool(token, pool)
+
+
+def note_entry_position(desk: Any, token: str, tokens: int,
+                        lamports: int) -> None:
+    """Register the size every later reading is priced for. Exitability is a
+    property of the pair, not of the pool."""
+    lineage = _lineage_of(desk)
+    if lineage is not None:
+        lineage.set_reference_position(token, tokens, lamports)

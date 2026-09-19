@@ -92,6 +92,7 @@ from src.strategies.monster import (
 )
 from src.strategies.opportunity_allocator import Opportunity, OpportunityAllocator
 from src.runtime.intelligence_manifest import CoverageTracker, audit as audit_intelligence
+from src.research.migration_lineage import MigrationLineage
 from src.research.prelaunch_corpus import PrelaunchCorpus
 from src.strategies.prelaunch_intent import PrelaunchIntentModel
 from src.strategies.authenticity import (
@@ -413,6 +414,16 @@ class SubsystemWiring:
             str(Path(self.global_config.get("state_dir", "data/state"))
                 / "prelaunch_corpus.json"))
         self.prelaunch_corpus.load()
+        # What a position could actually have realised after migration. The
+        # desk records that a token reached 100x and has never recorded
+        # whether anything could have been sold there, which is the gap
+        # between a tail corpus and a corpus of screenshots.
+        self.migration_lineage = MigrationLineage(
+            str(Path(self.global_config.get("state_dir", "data/state"))
+                / "migration_lineage.json"),
+            acceptable_impact=float(
+                self.global_config.get("acceptable_exit_impact", 0.10)))
+        self.migration_lineage.load()
         self.counterfactual_lab = CounterfactualExecutionLab()
         self.adversarial = AdversarialAdaptationDetector()
         for feature, fakeability in {

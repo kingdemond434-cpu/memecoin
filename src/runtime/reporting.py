@@ -21,6 +21,7 @@ from dataclasses import asdict, is_dataclass, replace as dataclasses_replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from aiohttp import web
+from src.research.funnel_invariant import check_desk
 from src.chains.yellowstone_grpc import (
     NATIVE_FASTPATH_STATUS, PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
     create_combined_subscription,
@@ -147,6 +148,15 @@ class ReportingSurface:
             "copy_book": (self.copy_book_report()
                           if hasattr(self, "copy_book_report") else
                           {"status": "DATA_BLOCKED", "detail": "not wired"}),
+            # Is the money path connected at all? Exactly zero downstream of
+            # a hundred upstream is a wire, not a policy, and nothing was
+            # asking -- which is how 150,278 decisions and no entry looked
+            # healthy for 8.76 days.
+            "funnel_invariant": check_desk(self).to_dict(),
+            "migration_lineage": (self.migration_lineage.report()
+                                  if getattr(self, "migration_lineage", None)
+                                  else {"status": "DATA_BLOCKED",
+                                        "detail": "not wired"}),
             "prelaunch": (self.prelaunch_report()
                           if hasattr(self, "prelaunch_report") else
                           {"status": "DATA_BLOCKED", "detail": "not wired"}),
