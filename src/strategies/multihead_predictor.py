@@ -50,6 +50,30 @@ SURVIVAL_LEVELS: Tuple[Tuple[PredictionTarget, float], ...] = (
     (PredictionTarget.P_500X, 500.0),
 )
 
+#: How far past the LAST measured survival rung the desk is ever willing to
+#: answer, as a multiple of that rung. The continuation model extrapolates
+#: along a fitted power law inside this reach, so the highest multiple the
+#: desk can produce a survival probability for is 500x * 8 = 4000x.
+TAIL_REACH_CAP = 8.0
+
+#: The ceiling on any predicted feasible multiple.
+#:
+#: This was `SURVIVAL_LEVELS[-1][1]` -- 500x -- and that made two parts of the
+#: system disagree about how large a launch can be. The survival curve already
+#: answers P(M >= 1000x) and P(M >= 4000x) by fitting the tail past its last
+#: rung, while the point estimate those probabilities are supposed to price
+#: was clipped at 500x. A 500x token, a 1000x token and a 4000x token
+#: collapsed into one number on the way to sizing, which is precisely the
+#: distinction a tail strategy exists to make.
+#:
+#: It is still a ceiling, and it still has to be: exp() of a boosted-tree
+#: output is unbounded, so without one an overflow would not raise, it would
+#: silently authorise an enormous claimed upside. But it is now the same
+#: horizon the survival curve is willing to speak about rather than a rung
+#: chosen for being last.
+FEASIBLE_MULTIPLE_CEILING = SURVIVAL_LEVELS[-1][1] * TAIL_REACH_CAP
+
+
 # What a launch IS, at the age the decision is being made.
 #
 # A pooled model trained across every horizon learns the average launch, and
@@ -193,7 +217,7 @@ def _from_log_space(value: float) -> float:
     raise, it would silently authorise an enormous claimed upside. Bounded at
     the top of the survival curve, which is the most any consumer may believe.
     """
-    ceiling = float(SURVIVAL_LEVELS[-1][1])
+    ceiling = FEASIBLE_MULTIPLE_CEILING
     if not np.isfinite(value):
         return LOG_TARGET_FLOOR
     return float(np.clip(np.exp(np.clip(value, -50.0, np.log(ceiling))),
@@ -627,7 +651,7 @@ class MultiHeadPredictor:
                     elif target == PredictionTarget.EXPECTED_HOLD_TIME:
                         val = max(0, val)
                     elif target == PredictionTarget.EXPECTED_FEASIBLE_MULTIPLE:
-                        val = np.clip(val, 0.02, SURVIVAL_LEVELS[-1][1])
+                        val = np.clip(val, 0.02, FEASIBLE_MULTIPLE_CEILING)
                     setattr(pred, target.value, float(val))
             except Exception as e:
                 logger.error(f"Prediction failed for {target.value}: {e}")
@@ -670,7 +694,7 @@ class MultiHeadPredictor:
                         elif target == PredictionTarget.EXPECTED_HOLD_TIME:
                             val = max(0, val)
                         elif target == PredictionTarget.EXPECTED_FEASIBLE_MULTIPLE:
-                            val = np.clip(val, 0.02, SURVIVAL_LEVELS[-1][1])
+                            val = np.clip(val, 0.02, FEASIBLE_MULTIPLE_CEILING)
                         setattr(pred, target.value, float(val))
                 except Exception as e:
                     logger.error(f"Batch prediction failed for {target.value}: {e}")
@@ -1040,7 +1064,7 @@ class ElogwEngine:
             survival.append((name, max(0.0, probability - higher), multiple - 1.0))
         if prediction.expected_feasible_multiple > 0:
             feasible_return = float(np.clip(prediction.expected_feasible_multiple - 1,
-                                            -0.98, SURVIVAL_LEVELS[-1][1] - 1.0))
+                                            -0.98, FEASIBLE_MULTIPLE_CEILING - 1.0))
             survival = [
                 (name, probability, min(outcome, feasible_return) if outcome > 0 else outcome)
                 for name, probability, outcome in survival

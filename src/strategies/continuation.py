@@ -72,6 +72,33 @@ DEFAULT_HORIZON = 2.0
 #: smallest number that can disagree with the model.
 MIN_TAIL_FIT_RUNGS = 3
 
+#: Tolerance on the standard error of an extrapolated log-survival, in log
+#: units. 0.7 is roughly a factor of two either way -- generous for a quantity
+#: whose measured rungs span orders of magnitude, and far tighter than the
+#: blanket permission a fixed reach handed out.
+DEFAULT_MAX_TAIL_LOG_SE = 0.7
+
+
+@dataclass(frozen=True)
+class TailRegression:
+    """The least-squares fit, kept so its own uncertainty can be asked about."""
+
+    alpha: float
+    residual: float
+    count: int
+    mean_log_x: float
+    #: Sum of squared deviations of log-multiple: how spread out the rungs
+    #: that produced this fit actually were.
+    sum_sq_log_x: float
+
+    def log_standard_error(self, multiple: float) -> Optional[float]:
+        """Standard error of the predicted log-survival at ``multiple``."""
+        if self.sum_sq_log_x <= 0 or self.count <= 0 or multiple <= 0:
+            return None
+        deviation = math.log(multiple) - self.mean_log_x
+        return self.residual * math.sqrt(
+            1.0 / self.count + deviation ** 2 / self.sum_sq_log_x)
+
 #: How far past the last MEASURED rung the fitted tail may be trusted, as a
 #: multiple of that rung. A launch tail is a power law over the range anyone
 #: has measured; eight times beyond the last observation is an opinion about
@@ -142,12 +169,15 @@ class ContinuationModel:
                  horizon: float = DEFAULT_HORIZON,
                  extrapolate_tail: bool = True,
                  tail_reach: float = DEFAULT_TAIL_REACH,
-                 max_tail_residual: float = DEFAULT_MAX_TAIL_RESIDUAL):
+                 max_tail_residual: float = DEFAULT_MAX_TAIL_RESIDUAL,
+                 max_tail_log_se: float = DEFAULT_MAX_TAIL_LOG_SE):
         self.min_positives = int(min_positives)
         self.min_conditioning_survival = float(min_conditioning_survival)
         self.horizon = float(horizon)
         self.extrapolate_tail = bool(extrapolate_tail)
         self.tail_reach = float(tail_reach)
+        self.max_tail_log_se = float(max_tail_log_se)
+        self._last_regression: Optional[TailRegression] = None
         self.max_tail_residual = float(max_tail_residual)
 
     # -- the fitted tail ---------------------------------------------------
@@ -199,7 +229,61 @@ class ContinuationModel:
         if alpha <= 0:
             # A curve that RISES with the multiple is not a survival curve.
             return None
+        # Kept so `fitted_reach` can ask how far this particular fit is
+        # entitled to speak, rather than everyone sharing one constant.
+        self._last_regression = TailRegression(
+            alpha=alpha, residual=residual, count=count,
+            mean_log_x=mean_x, sum_sq_log_x=variance)
         return alpha, residual
+
+    def fitted_reach(self, curve: Sequence[Tuple[float, float]]
+                     ) -> Optional[float]:
+        """The furthest multiple THIS fit may be extrapolated to.
+
+        `tail_reach` was 8.0 -- a constant, applied identically to a tail
+        fitted on seven tight rungs and one fitted on three scattered ones.
+        Those two fits do not deserve the same reach, and pretending they do
+        is how an extrapolation stops being a measurement.
+
+        A least-squares line's prediction uncertainty grows with distance from
+        the centre of its own data:
+
+            se(m) = residual * sqrt(1/n + (log m - mean_log_x)^2 / Sxx)
+
+        so the reach is simply the multiple at which that uncertainty hits the
+        tolerance, solved directly. A fit on many tightly-clustered rungs
+        earns a short reach; a fit on rungs spread across two decades earns a
+        long one. The constant survives only as a hard cap, because a
+        near-perfect fit on three points would otherwise claim an unbounded
+        horizon from almost no evidence.
+        """
+        if not curve:
+            return None
+        if self.fit_tail(curve) is None:
+            return None
+        regression = self._last_regression
+        if regression is None:
+            return None
+        last_x = float(curve[-1][0])
+        hard_cap = last_x * self.tail_reach
+        if regression.residual <= 0:
+            # A perfect fit still does not get an infinite horizon: three
+            # collinear points are collinear, not prophetic.
+            return hard_cap
+        slack = ((self.max_tail_log_se / regression.residual) ** 2
+                 - 1.0 / regression.count)
+        if slack <= 0:
+            # Uncertainty exceeds the tolerance even at the centre of the
+            # data. This fit may not be extrapolated at all.
+            return None
+        distance = math.sqrt(regression.sum_sq_log_x * slack)
+        # Compared in LOG space. A tight fit on well-spread rungs produces a
+        # distance large enough that exp() overflows outright, and the answer
+        # in that case is the cap rather than an exception.
+        log_reach = regression.mean_log_x + distance
+        if log_reach >= math.log(hard_cap):
+            return hard_cap
+        return min(hard_cap, math.exp(log_reach))
 
     # -- the curve ---------------------------------------------------------
 
@@ -353,9 +437,13 @@ class ContinuationModel:
         last_x, last_y = curve[-1]
         if not self.extrapolate_tail or multiple <= last_x or last_y <= 0:
             return None, basis, False
-        if multiple > last_x * self.tail_reach:
-            return None, (f"{multiple:g}x is more than {self.tail_reach:g}x "
-                          f"past the last measured rung ({last_x:g}x)"), False
+        reach = self.fitted_reach(curve)
+        if reach is None:
+            return None, (f"{basis}; this fit may not be extrapolated at "
+                          f"all"), False
+        if multiple > reach:
+            return None, (f"{multiple:g}x is past the {reach:.4g}x this fit "
+                          f"is entitled to reach from {last_x:g}x"), False
         if fit is None:
             fit = self.fit_tail(curve)
         if fit is None:
@@ -367,8 +455,18 @@ class ContinuationModel:
         # S(m) = S(last) * (m / last) ** -alpha, anchored on the last rung the
         # desk actually measured rather than on the fitted intercept, so the
         # extrapolation starts from an observation.
-        return (last_y * (multiple / last_x) ** -alpha,
-                f"fitted tail past {last_x:g}x (alpha {alpha:.2f})", True)
+        # An extrapolated number without its uncertainty reads exactly like a
+        # measured one. The standard error at THIS multiple is carried in the
+        # basis so a caller that is about to size on a 1000x probability can
+        # see how far past the evidence it is being asked to believe.
+        regression = self._last_regression
+        error = (regression.log_standard_error(multiple)
+                 if regression is not None else None)
+        detail = (f"fitted tail past {last_x:g}x (alpha {alpha:.2f})"
+                  if error is None else
+                  f"fitted tail past {last_x:g}x (alpha {alpha:.2f}, "
+                  f"log se {error:.2f})")
+        return last_y * (multiple / last_x) ** -alpha, detail, True
 
     # -- the reading -------------------------------------------------------
 

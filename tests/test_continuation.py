@@ -530,13 +530,42 @@ def test_the_extrapolation_matches_the_analytic_tail():
 
 
 def test_it_will_not_reach_arbitrarily_far_past_the_last_rung():
-    """Eight times beyond the last observation is an opinion about the model."""
+    """The reach is now FITTED, and capped. Eight times the last rung was a
+    constant applied identically to a tail fitted on seven tight rungs and one
+    fitted on three scattered ones; those two fits do not deserve the same
+    horizon. The constant survives only as the cap, which is what this
+    perfect four-rung fit runs into."""
     model = ContinuationModel()
     curve = [(1.0, 1.0)] + [(m, 0.0493 * m ** -1.23) for m in (2, 5, 10, 20)]
+    assert model.fitted_reach(curve) == pytest.approx(20.0 * model.tail_reach)
     assert model.survival(curve, 160.0)[0] is not None
     value, basis, _ = model.survival(curve, 200.0)
     assert value is None
-    assert "past the last measured rung" in basis
+    assert "entitled to reach" in basis
+
+
+def test_a_scattered_fit_earns_a_shorter_reach_than_a_tight_one():
+    """The whole point of fitting the reach rather than choosing it.
+
+    Prediction uncertainty for a least-squares line grows with distance from
+    the centre of its own data, so a fit whose rungs disagree with the power
+    law is entitled to say less about what lies beyond them.
+    """
+    model = ContinuationModel()
+    clean = [(1.0, 1.0)] + [(m, 0.0493 * m ** -1.23) for m in (2, 5, 10, 20)]
+    scattered = [(1.0, 1.0), (2.0, 0.35), (5.0, 0.02), (10.0, 0.11), (20.0, 0.004)]
+    assert model.fitted_reach(scattered) < model.fitted_reach(clean)
+
+
+def test_a_fit_too_uncertain_to_extrapolate_is_refused_outright():
+    """When the uncertainty exceeds the tolerance even at the centre of the
+    data, there is no multiple this fit may speak about."""
+    model = ContinuationModel(max_tail_log_se=0.01)
+    scattered = [(1.0, 1.0), (2.0, 0.35), (5.0, 0.02), (10.0, 0.11), (20.0, 0.004)]
+    assert model.fitted_reach(scattered) is None
+    value, basis, extrapolated = model.survival(scattered, 100.0)
+    assert value is None and not extrapolated
+    assert "may not be extrapolated" in basis
 
 
 def test_interpolation_inside_the_measured_range_is_untouched():

@@ -9249,7 +9249,11 @@ class TestExtendedTailLabels(unittest.TestCase):
         source = (Path(__file__).resolve().parents[1] / "src" / "research"
                   / "shadow_trainer.py").read_text()
         self.assertNotIn("np.clip(feasible, 0.02, 50)", source)
-        self.assertIn("SURVIVAL_LEVELS[-1][1]", source)
+        # The bound moved again: 500x was the last survival RUNG, and the
+        # survival curve already answers past it by fitting the tail. Clipping
+        # the LABEL there taught the model that a 1000x episode was a 500x
+        # episode.
+        self.assertIn("FEASIBLE_MULTIPLE_CEILING", source)
 
 
 class TestAgeBandedBrains(unittest.TestCase):
