@@ -61,6 +61,7 @@ from src.runtime.latency import LatencyLedger
 from src.runtime.serialisation import jsonable as _jsonable
 from src.runtime.depth import (
     CopyBookBudgets, DepthResolution, FollowableTrades, update_copy_budget)
+from src.runtime.prelaunch_feed import PrelaunchFeed
 from src.runtime.execution_feedback import (
     ExecutionFeedback, fee_competition)
 from src.runtime.regime import RegimeAndEvidence
@@ -196,7 +197,7 @@ CAPACITY_REJECTIONS = frozenset({
 
 class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
                        ExecutionFeedback, DepthResolution, FollowableTrades,
-                       CopyBookBudgets,
+                       CopyBookBudgets, PrelaunchFeed,
                        MinedRecordIngestion,
                        DeskMaintenance, TaskSupervision, EvidenceRecording,
                        SubsystemWiring, SourceIntelligence, PositionForensics,
@@ -3747,6 +3748,13 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
                 regime=str(self.current_regime or "unknown"))
             self.wallet_intel.record_token_lifecycle(token, launch_at=event.get("timestamp", time.time()))
             self._assess_identity(token, event)
+            # The pre-launch model's only feed. Every one of its seven public
+            # methods had no caller: the three that record signals, the three
+            # that read predictions, and the one that trains. It scored
+            # entities that had no signals with a model that could never be
+            # trained, and published a 0.0 launch probability that looked
+            # like a measurement.
+            self._record_prelaunch_launch(token, event)
             noter = getattr(self, "_note_launch_venue", None)
             if noter is not None:
                 noter(event)

@@ -90,14 +90,14 @@ def test_every_accepted_orphan_is_classified():
 def test_class_a_is_debt_and_is_counted():
     """Class A means the desk is believed to have a feature it does not have.
 
-    Not an assertion that the number is small -- it is 52 -- but that it is
+    Not an assertion that the number is small -- it is 46 -- but that it is
     VISIBLE. A capability list nobody counts is a capability list nobody
     fixes, and every one of the three bugs that made this file necessary sat
     in exactly this state.
     """
     rows = load_classified_baseline()
     debt = sorted(name for name, (klass, _) in rows.items() if klass == "A")
-    assert len(debt) <= 52, (
+    assert len(debt) <= 46, (
         f"class A grew to {len(debt)}: a capability was written and left "
         "unwired. Wire it, or justify a new class:\n  " + "\n  ".join(debt))
 

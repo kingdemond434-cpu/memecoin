@@ -92,6 +92,7 @@ from src.strategies.monster import (
 )
 from src.strategies.opportunity_allocator import Opportunity, OpportunityAllocator
 from src.runtime.intelligence_manifest import CoverageTracker, audit as audit_intelligence
+from src.research.prelaunch_corpus import PrelaunchCorpus
 from src.strategies.prelaunch_intent import PrelaunchIntentModel
 from src.strategies.authenticity import (
     AuthenticityResolver, EntityRegistry, ProofLevel, SourceSignal, load_entities,
@@ -405,6 +406,13 @@ class SubsystemWiring:
              "reddit_secret": os.getenv("REDDIT_CLIENT_SECRET", "")},
         )
         self.prelaunch = PrelaunchIntentModel(self.solana_config, self.solana_rpc, self.genealogy, self.wallet_intel, helius)
+        # The training rows the launch predictor never had. Without a
+        # producer `train_launch_predictor` could not be called at all, so
+        # the model stayed untrained for the life of the desk.
+        self.prelaunch_corpus = PrelaunchCorpus(
+            str(Path(self.global_config.get("state_dir", "data/state"))
+                / "prelaunch_corpus.json"))
+        self.prelaunch_corpus.load()
         self.counterfactual_lab = CounterfactualExecutionLab()
         self.adversarial = AdversarialAdaptationDetector()
         for feature, fakeability in {

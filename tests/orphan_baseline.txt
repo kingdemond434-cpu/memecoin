@@ -23,13 +23,7 @@
 # entities are about to launch is the earliest edge available, and the whole
 # module is dark: nothing records metadata creation, social creation or
 # infrastructure interaction, so nothing can be predicted from them.
-record_metadata_creation	A	prelaunch intent has no feed
-record_social_creation	A	prelaunch intent has no feed
-record_infrastructure_interaction	A	prelaunch intent has no feed
-predict_launch_probability	A	nothing asks who is about to launch
-get_imminent_launches	A	nothing asks who is about to launch
-get_top_entities	A	nothing asks who is about to launch
-train_launch_predictor	A	the prelaunch model is never trained
+record_social_creation	D	no verified wallet-to-social source exists; feeding it would fabricate identity links
 # The hypothesis ledger. Trials are the record that lets the gauntlet price
 # selection; none are recorded, so multiplicity is unpriced.
 record_trial	A	no trial is ever recorded

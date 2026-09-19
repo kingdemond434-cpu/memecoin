@@ -147,6 +147,9 @@ class ReportingSurface:
             "copy_book": (self.copy_book_report()
                           if hasattr(self, "copy_book_report") else
                           {"status": "DATA_BLOCKED", "detail": "not wired"}),
+            "prelaunch": (self.prelaunch_report()
+                          if hasattr(self, "prelaunch_report") else
+                          {"status": "DATA_BLOCKED", "detail": "not wired"}),
             "consensus": (self.wallet_consensus.report()
                           if getattr(self, "wallet_consensus", None) else
                           {"status": "DATA_BLOCKED", "detail": "not wired"}),

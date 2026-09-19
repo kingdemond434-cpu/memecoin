@@ -521,6 +521,16 @@ class DeskTraining:
         interval = float(self.global_config.get("training_check_seconds", 300.0))
         while self._running:
             await asyncio.sleep(interval)
+            # Independent of the episode-resolution gate below, and on the
+            # same clock: pre-launch rows resolve on an hour's horizon
+            # whether or not any LAUNCH has resolved, and gating them behind
+            # `should_train` would leave the corpus unharvested through every
+            # quiet night -- which is most of them.
+            try:
+                self.harvest_prelaunch_rows()
+                self.train_prelaunch_predictor()
+            except Exception as exc:  # pragma: no cover - accounting only
+                logger.debug("prelaunch harvest/train: %s", exc)
             if self.offline or not self.training.should_train():
                 continue
             try:
