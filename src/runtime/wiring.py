@@ -117,6 +117,7 @@ from src.research.promotion_gate import PromotionLedger
 from src.runtime.load_shedding import EconomicLoadShedder
 from src.chains.launchpad_discovery import LaunchpadDiscovery
 from src.execution.observed_bids import ObservedBidCorpus
+from src.execution.raptor import RaptorShadow
 from src.strategies.pre_event_anomaly import PreEventAnomaly
 from src.strategies.sniper_rings import SniperRingDetector
 from src.strategies.wallet_allocator import WalletAllocator
@@ -694,6 +695,10 @@ class SubsystemWiring:
         # and DRY_RUN makes none; this asks the same question of attempts the
         # desk did not have to make.
         self.observed_bids = ObservedBidCorpus()
+        # The paired route comparison. `should_route_through_challenger` is
+        # the only question the execution path may ask of it, and it answered
+        # nobody because nothing constructed the shadow.
+        self.raptor_shadow = RaptorShadow()
         # Three actor signals that all read events the desk was already
         # producing and that nothing was consuming: wallet sets that keep
         # opening launches together (so a First-25 that is really a First-3

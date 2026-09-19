@@ -570,6 +570,82 @@ class DeskTraining:
         self.elogw_engine.predictor = candidate
         self._model_artifact_mtime = latest_mtime
         self._register_model_validation(candidate.validation_report)
+        # The exit policy has its own artifact and its own loader, and nothing
+        # ever connected them: the trainer shipped a rule name, the policy
+        # wanted an object with `predict`, and every decision stayed analytic
+        # while the readiness surface reported a model.
+        self.action_value_adoption = adopt_action_value_artifact(
+            getattr(self, "action_policy", None),
+            Path(os.getenv("MODEL_DIR", "models")))
         logger.info("Activated chronologically validated shadow model %s",
                     candidate.model_version)
         return True
+
+
+#: Exit rules the trainer can ship that are expressible as a function of ONE
+#: position state. A trailing stop is not: it needs the peak, and
+#: `PositionState` carries `current_multiple` without any path memory.
+#: Approximating the peak by the current multiple would turn a trailing stop
+#: into a rule that never fires, which is worse than not adopting it.
+_STATELESS_EXIT_RULES = {"tp_2x": 2.0, "tp_5x": 5.0}
+
+
+class ShippedExitRuleModel:
+    """A shipped exit rule, in the shape `ActionValuePolicy.load_model` wants.
+
+    The action-value trainer ships the NAME of an exit rule that cleared its
+    tail-preservation gate, and `ActionValuePolicy.load_model` wants an object
+    with `predict(state) -> {Action: float}`. Nothing bridged them, so no
+    trainer output ever reached a decision and the policy stayed analytic for
+    the life of the desk while its readiness surface said a model existed.
+
+    Deliberately thin. A take-profit rule at m is "exit at or above m, hold
+    below", and the Q map says exactly that and nothing more -- it does not
+    invent preferences between the actions the rule is silent about, because
+    a fabricated ordering over ADD and BANK would be this adapter's opinion
+    wearing the trainer's authority.
+    """
+
+    def __init__(self, rule_name: str, threshold: float):
+        self.rule_name = str(rule_name)
+        self.threshold = float(threshold)
+
+    def predict(self, state: Any) -> Dict[Any, float]:
+        from src.strategies.action_value import Action
+        multiple = float(getattr(state, "current_multiple", 0.0) or 0.0)
+        exiting = multiple >= self.threshold
+        return {Action.EXIT: 1.0 if exiting else 0.0,
+                Action.HOLD: 0.0 if exiting else 1.0}
+
+
+def adopt_action_value_artifact(policy: Any, model_dir: Path) -> Dict[str, Any]:
+    """Load the shipped exit rule into the policy, or say why not.
+
+    Shipping nothing is the expected outcome most of the time -- a search that
+    always finds a winner has found overfitting -- so "no artifact" and "the
+    artifact shipped nothing" are reported apart from "the rule cannot be
+    expressed", which is a limitation of the adapter rather than of the
+    evidence.
+    """
+    path = Path(model_dir) / "last_action_value_report.json"
+    if policy is None or not path.exists():
+        return {"status": "DATA_BLOCKED", "detail": "no action-value artifact"}
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"status": "DATA_BLOCKED", "detail": f"artifact unreadable: {exc}"}
+    shipped = report.get("shipped")
+    if not shipped:
+        return {"status": "OK", "adopted": False,
+                "detail": report.get("detail",
+                                     "no candidate cleared the gate")}
+    threshold = _STATELESS_EXIT_RULES.get(str(shipped))
+    if threshold is None:
+        return {"status": "DATA_BLOCKED", "adopted": False, "shipped": shipped,
+                "detail": (f"{shipped} needs path memory (a peak) that "
+                           "PositionState does not carry; adopting it would "
+                           "mean approximating the peak by the current "
+                           "multiple, which never fires")}
+    adopted = policy.load_model(ShippedExitRuleModel(str(shipped), threshold),
+                                str(report.get("generated_at", "")))
+    return {"status": "OK", "adopted": bool(adopted), "shipped": shipped}

@@ -64,6 +64,7 @@ from src.runtime.depth import (
     note_curve_state, note_entry_position, note_migration, note_pool_state,
     update_copy_budget)
 from src.runtime.prelaunch_feed import PrelaunchFeed
+from src.runtime.execution_readiness import bid_floor, pre_trade_readiness
 from src.runtime.execution_feedback import (
     ExecutionFeedback, fee_competition)
 from src.runtime.regime import RegimeAndEvidence
@@ -1200,8 +1201,16 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
             return
         self.latency.mark(token, "decide_to_build")
         competition = fee_competition(getattr(self, "latency", None))
-        priority_fee = self.fee_optimizer.get_optimal_fee(
-            trade_info["position_value_usd"], competition)
+        age_s = float(trade_info.get("time_since_launch", 0.0) or 0.0)
+        # Raised to the observed market when it sits under it. Everything in
+        # that corpus LANDED, so it is a market quote and never a landing
+        # probability -- a floor, never a target. Bidding under what the
+        # competition demonstrably paid is choosing to lose the race.
+        priority_fee = bid_floor(self, age_s, self.fee_optimizer.get_optimal_fee(
+            trade_info["position_value_usd"], competition))
+        readiness = pre_trade_readiness(
+            self, token, int(trade_info.get("expected_tokens", 0) or 0), age_s)
+        trade_info = {**trade_info, "execution_readiness": readiness}
         result = await self.execution_engine.execute_swap(
             candidate.base_token or WSOL_MINT, token, int(trade_info["position_size_sol"] * 1e9),
             slippage_bps=100,

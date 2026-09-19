@@ -46,15 +46,7 @@ get_regime_performance	A	per-regime wallet performance is unused
 get_coordinated_activity	A	coordinated activity is never surfaced
 get_top_wallets_by_value	A	superseded in production by followable_wallets, kept for tools
 # Execution capability that is built and idle.
-impact_for	A	measured exit impact is not used for sizing
-ladder_for	A	staged exit ladders are never fetched
-template_for	A	prebuilt exit templates are never fetched
-node_for	A	leader-aware submission is not routed
-reference_bid	A	observed bids do not inform our bid
-should_route_through_challenger	A	the execution challenger never routes
-record_pair	A	challenger pairs are never recorded
-load_model	A	a trained action-value model is never loaded
-best_feed	A	the feed race picks no winner
+record_pair	C	the synchronous constructor for a comparison the desk cannot yet make: only one route is quoted per decision, and observe_both needs a live challenger endpoint
 # Research surfaces with no reader.
 scored_edges	A	scored source edges are never read
 regime_stability	A	edge stability across regimes is unused
