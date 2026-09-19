@@ -117,6 +117,7 @@ from src.chains.launchpad_discovery import LaunchpadDiscovery
 from src.execution.observed_bids import ObservedBidCorpus
 from src.strategies.pre_event_anomaly import PreEventAnomaly
 from src.strategies.sniper_rings import SniperRingDetector
+from src.strategies.wallet_allocator import WalletAllocator
 from src.strategies.wallet_consensus import WalletConsensus
 from src.strategies.wallet_signature import WalletSignatures
 from src.runtime.training import TrainingSupervisor
@@ -968,6 +969,13 @@ class SubsystemWiring:
                 lambda: self.wallet_intel.followable_wallets(limit=200),
                 FOLLOWABLE_CACHE_TTL_S),
             independence_provider=self.sniper_rings.independent_count)
+        # Wallets as alpha sources with their own budgets. The cluster comes
+        # from the ring detector, so ten addresses belonging to one operator
+        # draw on one budget rather than ten -- which is the difference
+        # between diversifying and multiplying one bet.
+        self.wallet_allocator = WalletAllocator(
+            cluster_provider=lambda wallet: (
+                getattr(self.sniper_rings.ring_for(wallet), "ring_id", None)))
         self.info_graph.set_outcome_provider(self.dataset_builder.get_outcome)
         if hasattr(self.genealogy, "set_outcome_provider"):
             self.genealogy.set_outcome_provider(self.dataset_builder.get_outcome)

@@ -43,7 +43,6 @@ get_source_ranking
 get_top_entities
 get_top_wallets_by_value
 get_wallet_signal
-get_wallet_value
 get_web3
 graveyard_entry
 impact_for
@@ -75,7 +74,6 @@ regime_stability
 reset
 resolve_many
 retrieve
-ring_for
 runtime_task_report
 score_gain
 scored_edges

@@ -10,6 +10,7 @@ never pricing cost. It was a guess at exit, in a system that can measure it.
 """
 
 import logging
+import math
 import time
 from typing import Any, Dict, Optional
 
@@ -142,3 +143,49 @@ class FollowableTrades:
             token,
             LeadEventType.ELITE_WALLET_BUY if is_buy else LeadEventType.SMART_WALLET_EXIT,
             wallet, "wallet", at, event)
+
+
+def update_copy_budget(desk: Any, wallet: str, multiple: float,
+                       accepted: bool) -> None:
+    """Keep one followed wallet's capital budget in step with its evidence.
+
+    A free function rather than a mixin method because it is called from the
+    follow-resolution loop, which test desks drive as plain namespaces. A
+    method here would make the loop depend on the caller's type to do
+    something the caller's type has nothing to do with.
+    """
+    allocator = getattr(desk, "wallet_allocator", None)
+    if allocator is None or not wallet:
+        return
+    value = desk.wallet_intel.get_wallet_value(wallet)
+    # Registered from the value measured BEFORE this outcome reached the
+    # model, and frozen there. The allocator refuses a re-freeze once live
+    # evidence exists, so this call is a no-op for a wallet already funded --
+    # which is what keeps the two estimates disjoint.
+    allocator.register(
+        wallet,
+        lower_bound=(value.lower_bound if value.ok else None),
+        verdict=("SURVIVOR" if value.followable else
+                 "KILL" if value.ok else "DATA_BLOCKED"))
+    if accepted:
+        allocator.record_live(wallet, math.log(max(1e-4, float(multiple))))
+
+
+class CopyBookBudgets:
+    """Reads the copy book: who is funded, at what weight, and for how much."""
+
+    def copy_book_report(self) -> Dict[str, Any]:
+        """The copy book: who is funded, at what weight, and the actual split.
+
+        The allocation is computed rather than described, because a weight
+        table and the dollars it produces are not the same statement -- the
+        cluster caps only bite in the second one.
+        """
+        allocator = getattr(self, "wallet_allocator", None)
+        if allocator is None:
+            return {"status": "DATA_BLOCKED", "detail": "no copy allocator wired"}
+        budget = float(self.global_config.get("copy_book_usd", 0.0) or 0.0)
+        report = allocator.report()
+        report["copy_book_usd"] = budget
+        report["allocation_usd"] = allocator.allocate(budget)
+        return report

@@ -59,7 +59,8 @@ from src.research.calibration import Provenance
 from src.research.fallback import FallbackResolver, Source
 from src.runtime.latency import LatencyLedger
 from src.runtime.serialisation import jsonable as _jsonable
-from src.runtime.depth import DepthResolution, FollowableTrades
+from src.runtime.depth import (
+    CopyBookBudgets, DepthResolution, FollowableTrades, update_copy_budget)
 from src.runtime.execution_feedback import (
     ExecutionFeedback, fee_competition)
 from src.runtime.regime import RegimeAndEvidence
@@ -195,6 +196,7 @@ CAPACITY_REJECTIONS = frozenset({
 
 class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
                        ExecutionFeedback, DepthResolution, FollowableTrades,
+                       CopyBookBudgets,
                        MinedRecordIngestion,
                        DeskMaintenance, TaskSupervision, EvidenceRecording,
                        SubsystemWiring, SourceIntelligence, PositionForensics,
@@ -2179,6 +2181,12 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
                     follow_latency_s=max(0.0, candidate["opened_at"]
                                          - candidate["observed_at"]),
                     data_status="OK"))
+                # The copy book's two estimates, kept disjoint. The budget is
+                # registered from the value measured BEFORE this outcome and
+                # freezes there; every resolution after that is live evidence
+                # judged against it. Registering afterwards would fold the
+                # live result into its own benchmark.
+                update_copy_budget(self, candidate["wallet"], multiple, accepted)
                 resolved += int(accepted)
                 self._follow_resolved += int(accepted)
                 self._follow_unresolved += int(not accepted)

@@ -141,6 +141,15 @@ class ReportingSurface:
             "horizon_seconds": float(self.global_config.get("follow_horizon_seconds", 300.0)),
             "reference_sol": float(self.global_config.get("follow_reference_sol", 0.5)),
             "model": self.wallet_intel.wallet_value.report(),
+            # Measured value is what a wallet is worth; the copy book is what
+            # it is currently being paid. They diverge on purpose, and the
+            # gap is where a wallet that stopped working shows up first.
+            "copy_book": (self.copy_book_report()
+                          if hasattr(self, "copy_book_report") else
+                          {"status": "DATA_BLOCKED", "detail": "not wired"}),
+            "consensus": (self.wallet_consensus.report()
+                          if getattr(self, "wallet_consensus", None) else
+                          {"status": "DATA_BLOCKED", "detail": "not wired"}),
         }
 
     def source_intelligence(self, token: str) -> Dict[str, Any]:

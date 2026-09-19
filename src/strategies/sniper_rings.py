@@ -36,6 +36,7 @@ data can support.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import time
@@ -91,6 +92,18 @@ class Ring:
     @property
     def size(self) -> int:
         return len(self.members)
+
+    @property
+    def ring_id(self) -> str:
+        """Stable identity for this set of wallets.
+
+        Derived from the membership rather than assigned, so the same ring
+        rediscovered after a restart keeps the budget it had. Membership does
+        drift as more co-openings are observed, and a ring that gains a member
+        is a different id -- correct, because it is also a different claim.
+        """
+        return "ring:" + hashlib.sha256(
+            "|".join(sorted(self.members)).encode("utf-8")).hexdigest()[:16]
 
     @property
     def usable(self) -> bool:
