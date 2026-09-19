@@ -26,14 +26,6 @@
 record_social_creation	D	no verified wallet-to-social source exists; feeding it would fabricate identity links
 # The hypothesis ledger. Trials are the record that lets the gauntlet price
 # selection; none are recorded, so multiplicity is unpriced.
-record_trial	A	no trial is ever recorded
-record_multiplicity_group	A	selection across a family is unpriced
-get_recent_trials	A	the trial ledger is never read
-get_family_stats	A	the trial ledger is never read
-get_family	A	hypothesis families are never enumerated
-find_similar	A	near-duplicate hypotheses are never detected
-graveyard_entry	A	killed hypotheses are never consulted
-get_champion_for_target	A	champion lookup by target is unused
 # Source-lead and adversarial adaptation: written, never consulted.
 predict_next_event	A	source lead times predict nothing
 get_source_ranking	A	sources are never ranked in production
