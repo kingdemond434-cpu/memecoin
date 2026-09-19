@@ -66,6 +66,52 @@ class RegimeAndEvidence:
             return "churn"
         return "bull" if rising else "bear"
 
+    #: One EVENT causes one demotion. A single rug can close several
+    #: positions and produce several catastrophic outcome rows within
+    #: seconds, and three stages of authority should not fall to what is
+    #: really one failure. This is not a softener on repeated catastrophes:
+    #: a second one after the window demotes again.
+    DEMOTION_COOLDOWN_S = 300.0
+
+    def _demote_on_catastrophe(self, token: str) -> bool:
+        """Lower trading authority after a catastrophic loss of real capital.
+
+        `PromotionLedger.demote` is the only thing in this system that can
+        reduce what the desk is allowed to spend, and until now NOTHING
+        called it -- it was written, tested, and never wired. A catastrophic
+        failure was counted, which blocks the NEXT promotion, and left the
+        authority the desk already had completely untouched. A desk at LIVE
+        that lost half its book to a rug stayed at LIVE.
+
+        Only at stages that spend real money. Demoting FORWARD_SHADOW for a
+        paper loss would be reacting to a number nobody paid, and the whole
+        point of the shadow rungs is that they are where losses are free.
+        """
+        ledger = getattr(self, "promotion_ledger", None)
+        if ledger is None:
+            return False
+        try:
+            authorised, _ = ledger.authorises_live_capital()
+            if not authorised:
+                return False
+            last = float(getattr(self, "_last_demotion_at", 0.0) or 0.0)
+            if time.time() - last < self.DEMOTION_COOLDOWN_S:
+                logger.error(
+                    "CATASTROPHIC loss on %s within the demotion cooldown; "
+                    "authority already lowered for this event", token)
+                return False
+            self._last_demotion_at = time.time()
+            earned = ledger.demote(f"catastrophic loss on {token}")
+            self.forward_evidence.stage = earned
+            logger.error(
+                "CATASTROPHIC loss on %s: trading authority lowered to %s. "
+                "Recovering it means passing the gate again on measured "
+                "evidence, not waiting.", token, earned.value)
+            return True
+        except Exception as exc:  # pragma: no cover - must never take the desk down
+            logger.exception("demotion after catastrophe failed: %s", exc)
+            return False
+
     def _record_forward_evidence(self, payload: Dict[str, Any]) -> None:
         """Feed one trade outcome into the promotion ledger.
 
@@ -74,6 +120,10 @@ class RegimeAndEvidence:
         half of what a decision policy does and the half that hides its
         mistakes.
         """
+        catastrophic = bool(
+            payload.get("rugged")
+            and float(payload.get("realized_pnl_usd", 0.0) or 0.0)
+            <= -float(self.wallet_equity_usd or 0.0) * 0.5)
         try:
             self.forward_evidence.record(ForwardOutcome(
                 token=str(payload.get("token", "")),
@@ -87,12 +137,12 @@ class RegimeAndEvidence:
                               if payload.get("max_feasible_multiple") is not None else None),
                 execution_attempted=bool(payload.get("attempted")),
                 execution_succeeded=bool(payload.get("entered")),
-                catastrophic=bool(payload.get("rugged")
-                                  and float(payload.get("realized_pnl_usd", 0.0) or 0.0)
-                                  <= -float(self.wallet_equity_usd or 0.0) * 0.5),
+                catastrophic=catastrophic,
             ))
         except (TypeError, ValueError) as exc:
             logger.debug("forward evidence record failed: %s", exc)
+        if catastrophic:
+            self._demote_on_catastrophe(str(payload.get("token", "")))
         # Persisted on a cadence rather than every outcome: an fsync per trade
         # is latency the decision path does not need to pay, and losing at
         # most a minute of counts to a crash costs a minute of shadow running.
