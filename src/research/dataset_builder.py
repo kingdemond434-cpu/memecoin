@@ -461,7 +461,11 @@ class PointInTimeDatasetBuilder:
         }
 
     async def _capture_wallet_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
-        smart_wallets = self.wallet_intel.get_top_wallets(limit=50)
+        # Measured followability, not the composite score. A wallet marked
+        # "smart" here becomes a training feature, so ranking it by a formula
+        # teaches the model the formula.
+        smart_wallets = self.wallet_intel.followable_wallets(
+            limit=50, include_unmeasured=False)
         
         initial_buyers = []
         smart_buyers = 0
@@ -474,8 +478,12 @@ class PointInTimeDatasetBuilder:
                 initial_buyers.append(buy)
                 total_sol_volume += buy["amount"] * buy["price"]
                 
-                ws = self.wallet_intel.get_wallet_score(buy["wallet"])
-                if ws and ws.overall_score > 0.7:
+                # Membership of the MEASURED followable set, not a composite
+                # score over a threshold. `overall_score > 0.7` was a formula
+                # compared against a number somebody picked, and this column
+                # is training data: a model trained on it learns the formula,
+                # including whatever the formula is wrong about.
+                if buy["wallet"] in smart_wallets:
                     smart_buyers += 1
                 # Insider status lives on the genealogy WalletProfile, not on
                 # WalletScore. Reading it off the score raised AttributeError

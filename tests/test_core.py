@@ -672,7 +672,9 @@ class TestSolanaParsing(unittest.IsolatedAsyncioTestCase):
 
 class TestOfficialSocialCollectors(unittest.IsolatedAsyncioTestCase):
     def make_engine(self, api_keys=None):
-        wallet_intel = SimpleNamespace(get_top_wallets=lambda limit=100: [], register_social_wallet=lambda wallet: None)
+        wallet_intel = SimpleNamespace(get_top_wallets=lambda limit=100: [],
+                                       followable_wallets=lambda limit=100, **kw: {},
+                                       register_social_wallet=lambda wallet: None)
         return SocialIntelligenceEngine(
             solana_chain(), SimpleNamespace(request=self._rpc_request), SimpleNamespace(), wallet_intel,
             api_keys or {},
@@ -1502,6 +1504,7 @@ class TestFeatureParity(unittest.IsolatedAsyncioTestCase):
         builder = PointInTimeDatasetBuilder(
             solana_chain(), FakeRpc(), FakeGenealogy(),
             SimpleNamespace(get_top_wallets=lambda limit=50: [],
+                            followable_wallets=lambda limit=50, **kw: {},
                             get_wallet_score=lambda wallet: None,
                             _recent_buys=[]),
             SimpleNamespace(get_token_social_signal=lambda token, as_of=None: {"mention_count": 0}),
@@ -2212,6 +2215,9 @@ class TestHazardTrainer(unittest.IsolatedAsyncioTestCase):
                 class WalletIntel:
                     def get_top_wallets(self, limit=50):
                         return []
+                    def followable_wallets(self, limit=50, regime=None,
+                                           include_unmeasured=True):
+                        return {}
                 class Adversarial:
                     def get_adaptive_weight(self, feature, base):
                         return base
@@ -2926,6 +2932,9 @@ class TestWalletAndCoordination(unittest.IsolatedAsyncioTestCase):
         class WalletIntel:
             def get_top_wallets(self, limit=50):
                 return []
+            def followable_wallets(self, limit=50, regime=None,
+                                   include_unmeasured=True):
+                return {}
         miner = PublicCoordinationMiner(FakeGenealogy(), WalletIntel())
         self.assertEqual(miner.get_features("token")["status"], "DATA_BLOCKED")
         for index in range(3):
@@ -2943,6 +2952,9 @@ class TestWalletAndCoordination(unittest.IsolatedAsyncioTestCase):
         class WalletIntel:
             def get_top_wallets(self, limit=50):
                 return []
+            def followable_wallets(self, limit=50, regime=None,
+                                   include_unmeasured=True):
+                return {}
         miner = PublicCoordinationMiner(FakeGenealogy(), WalletIntel())
         funding_transfers = [
             {"from": "operator", "to": f"buyer{i}", "lamports": 1_000_000_000} for i in range(3)
@@ -3354,6 +3366,9 @@ class TestHazardTracking(unittest.IsolatedAsyncioTestCase):
         class WalletIntel:
             def get_top_wallets(self, limit=50):
                 return []
+            def followable_wallets(self, limit=50, regime=None,
+                                   include_unmeasured=True):
+                return {}
         class Adversarial:
             def get_adaptive_weight(self, feature, base):
                 return base

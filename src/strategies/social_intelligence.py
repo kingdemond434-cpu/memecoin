@@ -226,9 +226,8 @@ class SocialIntelligenceEngine:
             await asyncio.sleep(300)
 
     async def _discover_accounts_from_successful_wallets(self):
-        smart_wallets = self.wallet_intel.get_top_wallets(limit=100)
-        for ws in smart_wallets:
-            await self._find_linked_social(ws.wallet)
+        for wallet in self.wallet_intel.followable_wallets(limit=100):
+            await self._find_linked_social(wallet)
 
     async def _setup_telegram(self):
         api_id = str(self.api_keys.get("telegram_api_id", "")).strip()
