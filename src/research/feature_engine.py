@@ -94,6 +94,11 @@ def build_features(episode: Dict[str, Any], snapshot: Dict[str, Any]) -> Predict
         sol_volume=number(wallet, "total_sol_volume"),
         organic_ratio=number(flow, "organic_ratio"),
         bundle_concentration=number(flow, "bundle_concentration"),
+        # 1.0 when unmeasured: the no-evidence answer, not the suspicious
+        # one. Penalising a launch for a ring nobody has detected would be
+        # inventing the ring, and the detector refuses to answer at all
+        # until it has seen 200 launches.
+        ring_compression=number(wallet, "ring_compression", default=1.0),
         liquidity_usd=number(liquidity, "liquidity_usd"),
         liquidity_locked=bool(liquidity.get("liquidity_locked")),
         ownership_renounced=bool(token.get("ownership_renounced")),

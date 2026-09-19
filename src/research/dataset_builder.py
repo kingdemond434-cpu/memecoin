@@ -8,7 +8,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import (Any, Callable, Dict, List, Optional, Sequence,
+                    Set, Tuple)
 import numpy as np
 import aiohttp
 
@@ -218,6 +219,10 @@ class PointInTimeDatasetBuilder:
         champion_challenger: ChampionChallengerFramework,
         storage_path: str = "data/launch_episodes",
         actor_provider: Optional[Callable[[str, Optional[float]], Dict[str, Any]]] = None,
+        #: wallets -> (independent decisions, detail). The sniper-ring
+        #: detector has been learning which wallets arrive together across
+        #: every observed launch, and nothing ever asked it anything.
+        independence_provider: Optional[Callable[[Sequence[str]], Tuple[int, Dict[str, Any]]]] = None,
         memecoin_state_provider: Optional[Callable[[str, Optional[float]], Dict[str, Any]]] = None,
     ):
         self.chain_config = chain_config
@@ -230,6 +235,7 @@ class PointInTimeDatasetBuilder:
         self.rug_hazard = rug_hazard
         self.champion_challenger = champion_challenger
         self.actor_provider = actor_provider
+        self.independence_provider = independence_provider
         self.memecoin_state_provider = memecoin_state_provider
         self.storage_path = storage_path
         
@@ -481,13 +487,41 @@ class PointInTimeDatasetBuilder:
                 if profile is not None and getattr(profile, "is_insider", False):
                     insider_buyers += 1
         
+        wallets = [buy["wallet"] for buy in initial_buyers if buy.get("wallet")]
+        independent, ring_detail = self._independent_buyers(wallets)
         return {
             "initial_buyer_count": len(initial_buyers),
             "smart_buyer_count": smart_buyers,
             "insider_buyer_count": insider_buyers,
             "total_sol_volume": total_sol_volume,
-            "buyer_diversity": len(set(b["wallet"] for b in initial_buyers)) / max(len(initial_buyers), 1)
+            "buyer_diversity": len(set(b["wallet"] for b in initial_buyers)) / max(len(initial_buyers), 1),
+            # Distinct wallets are not distinct DECIDERS. A ring that funds
+            # from one source and enters over several slots defeats both
+            # buyer_diversity and bundle_concentration, and is exactly what a
+            # competent bundler looks like.
+            "independent_buyer_count": independent,
+            "ring_compression": (independent / len(wallets)) if wallets and
+                                independent is not None else None,
+            "ring_detail": ring_detail,
         }
+
+    def _independent_buyers(self, wallets: Sequence[str]):
+        """How many independent decisions these wallets represent.
+
+        None when no ring detector is wired or it declines to answer, which
+        reads downstream as 1.0 -- full independence. That is the no-evidence
+        answer rather than the suspicious one: penalising a launch for a ring
+        nobody has detected would be inventing the ring.
+        """
+        provider = getattr(self, "independence_provider", None)
+        if not callable(provider) or not wallets:
+            return None, {"status": "DATA_BLOCKED", "reason": "no ring detector"}
+        try:
+            count, detail = provider(wallets)
+        except Exception as exc:  # pragma: no cover - measurement only
+            logger.debug("independence lookup failed: %s", exc)
+            return None, {"status": "DATA_BLOCKED", "error": str(exc)}
+        return int(count), dict(detail or {})
 
     async def _capture_flow_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
         observations = [

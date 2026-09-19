@@ -926,6 +926,12 @@ class SubsystemWiring:
         # constructor stays a data-collection concern and the ledger can be
         # driven directly by a test.
         self.dataset_builder.latency_value = self.latency_value
+        # The ring detector has been observing every launch's opening cohort
+        # and answering nobody. This is the first consumer: distinct wallets
+        # are not distinct DECIDERS, and a First-25 that is really a First-3
+        # was overcounted in the direction that says enter bigger.
+        self.dataset_builder.independence_provider = (
+            self.sniper_rings.independent_count)
         self.info_graph.set_outcome_provider(self.dataset_builder.get_outcome)
         if hasattr(self.genealogy, "set_outcome_provider"):
             self.genealogy.set_outcome_provider(self.dataset_builder.get_outcome)

@@ -224,6 +224,20 @@ class PredictionFeatures:
     sol_volume: float = 0
     organic_ratio: float = 0
     bundle_concentration: float = 0
+    #: Independent decisions among the opening buyers, over the raw count.
+    #: 1.0 is twenty-five separate people; 0.12 is one operator in
+    #: twenty-five hats. `organic_ratio` counts DISTINCT wallets and
+    #: `bundle_concentration` counts same-slot arrivals -- neither can see a
+    #: ring that funds from one source and enters over several slots, which
+    #: is what a competent bundler looks like. The ring detector has been
+    #: learning those sets across every observed launch and nothing ever
+    #: asked it, so this is the first time the model can tell a First-25
+    #: from a First-3 wearing hats.
+    #:
+    #: 1.0 when unmeasured, which is the no-evidence answer rather than the
+    #: suspicious one: penalising a launch for a ring nobody has detected
+    #: would be inventing the ring.
+    ring_compression: float = 1.0
     
     liquidity_usd: float = 0
     liquidity_locked: bool = False
@@ -301,6 +315,7 @@ class PredictionFeatures:
             min(self.sol_volume / 100, 1),
             self.organic_ratio,
             self.bundle_concentration,
+            float(np.clip(self.ring_compression, 0.0, 1.0)),
             min(self.liquidity_usd / 50000, 1),
             float(self.liquidity_locked),
             self.buy_tax / 100,
@@ -407,7 +422,8 @@ class MultiHeadPredictor:
             "wallet_quality_weighted_flow", "sybil_discount",
             "smart_wallet_sync_evidence", "initial_buyers",
             "smart_buyers", "insider_buyers", "buyer_acceleration", "buy_velocity",
-            "sol_volume", "organic_ratio", "bundle_concentration", "liquidity_usd",
+            "sol_volume", "organic_ratio", "bundle_concentration",
+            "ring_compression", "liquidity_usd",
             "liquidity_locked", "buy_tax", "sell_tax", "ownership_renounced",
             "can_mint", "can_freeze", "social_velocity", "social_acceleration",
             "social_price_disagreement",

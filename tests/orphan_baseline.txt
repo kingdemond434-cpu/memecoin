@@ -47,7 +47,6 @@ get_wallet_value
 get_web3
 graveyard_entry
 impact_for
-independent_count
 ingest_curve_account
 is_kol
 ladder_for
