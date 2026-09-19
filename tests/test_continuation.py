@@ -426,13 +426,16 @@ def test_the_report_says_what_the_model_can_actually_answer_about():
         PredictionTarget.P_2X: 683, PredictionTarget.P_5X: 210,
         PredictionTarget.P_10X: 94, PredictionTarget.P_20X: 28,
         PredictionTarget.P_50X: 9})
-    report = ContinuationModel().report(predictor)
+    report = ContinuationModel(extrapolate_tail=False).report(predictor)
     assert report["usable_rungs"] == [2.0, 5.0, 10.0]
     assert report["answerable_up_to_multiple"] == 5.0
     # And the model agrees with its own report.
-    model = ContinuationModel()
-    assert model.evaluate(predictor, power_law(), 4.0).ok
-    assert model.evaluate(predictor, power_law(), 8.0).status == "DATA_BLOCKED"
+    blind = ContinuationModel(extrapolate_tail=False)
+    assert blind.evaluate(predictor, power_law(), 4.0).ok
+    assert blind.evaluate(predictor, power_law(), 8.0).status == "DATA_BLOCKED"
+    # The fitted tail is what lifts that ceiling, and says it did.
+    seeing = ContinuationModel().evaluate(predictor, power_law(), 8.0)
+    assert seeing.ok and seeing.extrapolated
 
 
 def test_the_report_names_the_reason_when_nothing_is_usable():
@@ -453,3 +456,153 @@ def test_the_report_lists_every_rung_with_its_own_evidence():
 def test_an_untrained_predictor_reports_data_blocked():
     assert ContinuationModel().report(
         FakePredictor(trained=False))["status"] == "DATA_BLOCKED"
+
+
+# --- the fitted tail: seeing past the last rung the corpus supports -------
+
+def real_corpus_positives(episodes=32_542, alpha=1.23, k=0.0493):
+    """What a corpus of this size actually supports, rung by rung.
+
+    At 32,542 episodes: 683 positives at 2x, 221 at 5x, 94 at 10x, 40 at 20x,
+    13 at 50x, 5 at 100x. The last two fall below the positive floor, so the
+    curve ends at 20x and the conditional continuation -- which asks about
+    2m -- goes DATA_BLOCKED above 10x. That is where the tail begins.
+    """
+    return {target: int(episodes * min(1.0, k * level ** -alpha))
+            for target, level in SURVIVAL_LEVELS}
+
+
+def _real_predictor():
+    return FakePredictor(positives=real_corpus_positives())
+
+
+def test_the_corpus_runs_out_exactly_where_the_tail_starts():
+    """The problem, stated as a measurement rather than a worry."""
+    model = ContinuationModel(extrapolate_tail=False)
+    report = model.report(_real_predictor())
+    assert report["usable_rungs"] == [2.0, 5.0, 10.0, 20.0]
+    assert report["answerable_up_to_multiple"] == 10.0
+
+
+def test_the_fit_recovers_a_known_exponent():
+    model = ContinuationModel()
+    curve = [(1.0, 1.0)] + [(m, 0.0493 * m ** -1.23) for m in (2, 5, 10, 20)]
+    alpha, residual = model.fit_tail(curve)
+    assert alpha == pytest.approx(1.23, abs=1e-6)
+    assert residual == pytest.approx(0.0, abs=1e-9)
+
+
+def test_the_definitional_anchor_is_excluded_from_the_fit():
+    """S(1)=1 is not a point on the power law; including it fits 2.02."""
+    model = ContinuationModel()
+    curve = [(m, 0.0493 * m ** -1.23) for m in (2, 5, 10, 20)]
+    assert model.fit_tail(curve)[0] == pytest.approx(1.23, abs=1e-6)
+
+
+def test_two_rungs_are_not_enough_to_claim_a_line():
+    """Two points fit perfectly and cannot disagree with the model."""
+    model = ContinuationModel()
+    assert model.fit_tail([(1.0, 1.0), (2.0, 0.02), (5.0, 0.006)]) is None
+
+
+def test_a_curve_that_is_not_a_power_law_is_refused():
+    model = ContinuationModel()
+    bent = [(1.0, 1.0), (2.0, 0.5), (5.0, 0.49), (10.0, 0.48), (20.0, 1e-6)]
+    alpha, residual = model.fit_tail(bent)
+    assert residual > model.max_tail_residual
+    # And the refusal reaches the reading, not just the fit.
+    value, _basis, extrapolated = model.survival(bent, 60.0)
+    assert value is None and not extrapolated
+
+
+def test_a_rising_curve_is_not_a_survival_curve():
+    model = ContinuationModel()
+    assert model.fit_tail([(2.0, 0.1), (5.0, 0.2), (10.0, 0.4)]) is None
+
+
+def test_the_extrapolation_matches_the_analytic_tail():
+    model = ContinuationModel()
+    curve = [(1.0, 1.0)] + [(m, 0.0493 * m ** -1.23) for m in (2, 5, 10, 20)]
+    for multiple in (40.0, 100.0, 160.0):
+        value, _basis, extrapolated = model.survival(curve, multiple)
+        assert extrapolated
+        assert value == pytest.approx(0.0493 * multiple ** -1.23, rel=1e-9)
+
+
+def test_it_will_not_reach_arbitrarily_far_past_the_last_rung():
+    """Eight times beyond the last observation is an opinion about the model."""
+    model = ContinuationModel()
+    curve = [(1.0, 1.0)] + [(m, 0.0493 * m ** -1.23) for m in (2, 5, 10, 20)]
+    assert model.survival(curve, 160.0)[0] is not None
+    value, basis, _ = model.survival(curve, 200.0)
+    assert value is None
+    assert "past the last measured rung" in basis
+
+
+def test_interpolation_inside_the_measured_range_is_untouched():
+    model = ContinuationModel()
+    curve = [(1.0, 1.0)] + [(m, 0.0493 * m ** -1.23) for m in (2, 5, 10, 20)]
+    value, _basis, extrapolated = model.survival(curve, 15.0)
+    assert not extrapolated, "a measured reading must never be labelled fitted"
+    assert value == pytest.approx(0.0493 * 15.0 ** -1.23, rel=1e-9)
+
+
+# --- what it unlocks ------------------------------------------------------
+
+def _monster_state(model, multiple):
+    """Conviction for a position evaluated FRESH at this multiple."""
+    from src.strategies.monster import MonsterEvidence, MonsterStateMachine
+    machine = MonsterStateMachine()
+    reading = model.evaluate(_real_predictor(), power_law(), multiple)
+    machine.update("t", MonsterEvidence(
+        monster_probability=(reading.probability if reading.ok else None),
+        monster_probability_calibrated=bool(reading.ok and reading.calibrated),
+        independent_buyer_acceleration=0.4,
+        smart_wallet_net_accumulation=0.3))
+    return machine.overrides_ordinary_exit("t")
+
+
+def test_without_the_tail_conviction_dies_where_the_tail_begins():
+    blind = ContinuationModel(extrapolate_tail=False)
+    assert _monster_state(blind, 9.0) is True
+    for multiple in (12.0, 25.0, 60.0):
+        assert _monster_state(blind, multiple) is False, multiple
+
+
+def test_with_the_tail_conviction_survives_into_the_tail():
+    seeing = ContinuationModel()
+    for multiple in (9.0, 12.0, 25.0, 60.0):
+        assert _monster_state(seeing, multiple) is True, multiple
+
+
+def test_and_still_refuses_beyond_the_fitted_reach():
+    """120x doubles to 240x, which is past 8x the last measured rung."""
+    assert _monster_state(ContinuationModel(), 120.0) is False
+
+
+def test_every_extrapolated_reading_says_so():
+    """So the gauntlet can score decisions made on a fit separately from
+    decisions made on a measurement."""
+    reading = ContinuationModel().evaluate(_real_predictor(), power_law(), 25.0)
+    assert reading.ok and reading.extrapolated
+    assert reading.tail_alpha == pytest.approx(1.23, abs=0.05)
+    assert reading.to_dict()["extrapolated"] is True
+
+
+def test_a_measured_reading_is_not_labelled_extrapolated():
+    reading = ContinuationModel().evaluate(_real_predictor(), power_law(), 4.0)
+    assert reading.ok and not reading.extrapolated
+
+
+def test_the_report_states_how_far_the_fit_reaches():
+    report = ContinuationModel().report(_real_predictor(), power_law())
+    assert report["highest_usable_multiple"] == 20.0
+    assert report["highest_answerable_survival"] == pytest.approx(160.0)
+    assert report["answerable_up_to_multiple"] == pytest.approx(80.0)
+    assert report["tail_alpha"] == pytest.approx(1.23, abs=0.05)
+
+
+def test_the_extrapolation_can_be_turned_off_entirely():
+    off = ContinuationModel(extrapolate_tail=False)
+    assert off.evaluate(_real_predictor(), power_law(), 25.0).status == (
+        "DATA_BLOCKED")

@@ -66,7 +66,8 @@ from src.strategies.actor_graph import (
 )
 from src.strategies.champion_challenger import ChampionChallengerFramework, HypothesisSpec, TrialResult
 from src.strategies.continuation import (
-    DEFAULT_HORIZON, DEFAULT_MIN_POSITIVES, ContinuationModel)
+    DEFAULT_HORIZON, DEFAULT_MIN_POSITIVES, DEFAULT_TAIL_REACH,
+    ContinuationModel)
 from src.strategies.exit_policy import ExitPolicy, evaluate_exit, load_latest_exit_policy
 from src.strategies.genealogy_graph import GenealogyGraph
 from src.strategies.information_graph import (
@@ -443,7 +444,15 @@ class SubsystemWiring:
             min_positives=int(self.global_config.get(
                 "continuation_min_head_positives", DEFAULT_MIN_POSITIVES)),
             horizon=float(self.global_config.get(
-                "continuation_horizon_multiple", DEFAULT_HORIZON)))
+                "continuation_horizon_multiple", DEFAULT_HORIZON)),
+            # Above the last rung with enough positives the curve simply
+            # ends, and on a 32k corpus that is 20x -- so conviction goes
+            # blind at 10x, which is where the tail begins. The fitted power
+            # law extends it; every reading it produces is labelled.
+            extrapolate_tail=bool(self.global_config.get(
+                "continuation_extrapolate_tail", True)),
+            tail_reach=float(self.global_config.get(
+                "continuation_tail_reach", DEFAULT_TAIL_REACH)))
         self.exit_policy_status = "OK" if trained_policy else "DATA_BLOCKED"
         self.exit_policy_detail = (
             policy_report.get("model_path", "") if trained_policy

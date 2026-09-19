@@ -67,6 +67,23 @@ DEFAULT_MIN_CONDITIONING_SURVIVAL = 1e-4
 #: question is always "double from here" regardless of where here is.
 DEFAULT_HORIZON = 2.0
 
+#: Rungs needed before a power law may be fitted. Two points always fit a
+#: line perfectly and say nothing about whether it IS a line; three is the
+#: smallest number that can disagree with the model.
+MIN_TAIL_FIT_RUNGS = 3
+
+#: How far past the last MEASURED rung the fitted tail may be trusted, as a
+#: multiple of that rung. A launch tail is a power law over the range anyone
+#: has measured; eight times beyond the last observation is an opinion about
+#: the model rather than a reading from it.
+DEFAULT_TAIL_REACH = 8.0
+
+#: Worst root-mean-square residual, in log survival, that still counts as "a
+#: power law describes these rungs". Above it the curve is some other shape
+#: and extrapolating along a straight line would invent the part that
+#: matters most.
+DEFAULT_MAX_TAIL_RESIDUAL = 0.35
+
 
 @dataclass(frozen=True)
 class Continuation:
@@ -84,6 +101,13 @@ class Continuation:
     survival_target: Optional[float] = None
     basis: str = ""
     detail: str = ""
+    #: True when this came from a power law FITTED to the measured rungs
+    #: rather than read between two of them. Carried so a consumer can treat
+    #: it as the weaker evidence it is, and so the gauntlet can score
+    #: decisions made on it separately from decisions made on measurement.
+    extrapolated: bool = False
+    tail_alpha: Optional[float] = None
+    tail_residual: Optional[float] = None
 
     @property
     def ok(self) -> bool:
@@ -99,6 +123,9 @@ class Continuation:
             "survival_from": self.survival_from,
             "survival_target": self.survival_target,
             "basis": self.basis, "detail": self.detail,
+            "extrapolated": self.extrapolated,
+            "tail_alpha": self.tail_alpha,
+            "tail_residual": self.tail_residual,
         }
 
 
@@ -112,10 +139,67 @@ class ContinuationModel:
     def __init__(self, *,
                  min_positives: int = DEFAULT_MIN_POSITIVES,
                  min_conditioning_survival: float = DEFAULT_MIN_CONDITIONING_SURVIVAL,
-                 horizon: float = DEFAULT_HORIZON):
+                 horizon: float = DEFAULT_HORIZON,
+                 extrapolate_tail: bool = True,
+                 tail_reach: float = DEFAULT_TAIL_REACH,
+                 max_tail_residual: float = DEFAULT_MAX_TAIL_RESIDUAL):
         self.min_positives = int(min_positives)
         self.min_conditioning_survival = float(min_conditioning_survival)
         self.horizon = float(horizon)
+        self.extrapolate_tail = bool(extrapolate_tail)
+        self.tail_reach = float(tail_reach)
+        self.max_tail_residual = float(max_tail_residual)
+
+    # -- the fitted tail ---------------------------------------------------
+
+    def fit_tail(self, curve: Sequence[Tuple[float, float]]
+                 ) -> Optional[Tuple[float, float]]:
+        """(alpha, rms residual) for S(m) = k * m ** -alpha, or None.
+
+        The head of the curve is measured and the tail is where the money is,
+        and those are the same sentence read twice. On a 32,542-launch corpus
+        the 50x head sees thirteen positives and the 100x head sees five, so
+        both fall below the positive floor and the curve simply ends at 20x --
+        which means the conditional continuation goes DATA_BLOCKED above 10x,
+        and conviction can never engage on the runner it exists for. A 100x
+        passes that point and the model goes blind at exactly the wrong
+        instant.
+
+        More data does not fix it soon: thirty positives at 50x needs about
+        2.3x this corpus, and at 100x about 6.5x. That is months.
+
+        So the shape is fitted instead of the level being guessed. A launch
+        tail is a power law -- straight in log-log -- and the rungs that ARE
+        reliable determine its exponent by least squares. Refused on fewer
+        than three rungs, because two points fit a line perfectly and cannot
+        disagree with the model, and refused when the residual says these
+        rungs are not a straight line at all.
+        """
+        # The anchor is excluded. S(1) = 1 is definitional -- every launch
+        # reaches the price it opened at -- and it does not sit on the power
+        # law, so including it drags the exponent badly: on a curve whose
+        # true alpha is 1.23 it fits 2.02 with a residual of 0.85, which the
+        # guard below rejects outright.
+        points = [(math.log(level), math.log(value))
+                  for level, value in curve
+                  if level > CURVE_ANCHOR[0] and value > 0]
+        if len(points) < MIN_TAIL_FIT_RUNGS:
+            return None
+        count = len(points)
+        mean_x = sum(x for x, _ in points) / count
+        mean_y = sum(y for _, y in points) / count
+        variance = sum((x - mean_x) ** 2 for x, _ in points)
+        if variance <= 0:
+            return None
+        slope = sum((x - mean_x) * (y - mean_y) for x, y in points) / variance
+        intercept = mean_y - slope * mean_x
+        residual = math.sqrt(
+            sum((y - (slope * x + intercept)) ** 2 for x, y in points) / count)
+        alpha = -slope
+        if alpha <= 0:
+            # A curve that RISES with the multiple is not a survival curve.
+            return None
+        return alpha, residual
 
     # -- the curve ---------------------------------------------------------
 
@@ -185,6 +269,7 @@ class ContinuationModel:
             return curve[0][1], f"at or below {curve[0][0]:g}x"
         if multiple > curve[-1][0]:
             return None, f"beyond the last measured rung ({curve[-1][0]:g}x)"
+
         for (low_x, low_y), (high_x, high_y) in zip(curve, curve[1:]):
             if multiple > high_x:
                 continue
@@ -203,7 +288,7 @@ class ContinuationModel:
             return math.exp(log_y), basis
         return curve[-1][1], f"at {curve[-1][0]:g}x"
 
-    def report(self, predictor: Any) -> Dict[str, Any]:
+    def report(self, predictor: Any, prediction: Any = None) -> Dict[str, Any]:
         """Which rungs are usable, and therefore what this can answer about.
 
         The practical question after a training run is not "did it train" but
@@ -227,12 +312,20 @@ class ContinuationModel:
                 "usable": any(item[0] == float(level) for item in usable),
             })
         top = usable[-1][0] if usable else None
-        answerable = None if top is None else top / self.horizon
+        fit = self.fit_tail(self.curve(predictor, prediction)) if (
+            self.extrapolate_tail and prediction is not None) else None
+        reach = top if top is None else (
+            top * self.tail_reach
+            if fit and fit[1] <= self.max_tail_residual else top)
+        answerable = None if reach is None else reach / self.horizon
         return {
             "schema": CONTINUATION_SCHEMA_VERSION,
             "status": "OK" if usable else "DATA_BLOCKED",
             "usable_rungs": [item[0] for item in usable],
             "highest_usable_multiple": top,
+            "highest_answerable_survival": reach,
+            "tail_alpha": (fit[0] if fit else None),
+            "tail_residual": (fit[1] if fit else None),
             "answerable_up_to_multiple": answerable,
             "min_positives": self.min_positives,
             "horizon": self.horizon,
@@ -243,6 +336,39 @@ class ContinuationModel:
                        "cannot be granted and every runner exits on the "
                        "ordinary trail"),
         }
+
+    def survival(self, curve: Sequence[Tuple[float, float]], multiple: float,
+                 fit: Optional[Tuple[float, float]] = None
+                 ) -> Tuple[Optional[float], str, bool]:
+        """S(multiple), extending past the last rung along the fitted tail.
+
+        Returns (value, basis, extrapolated). Interpolation inside the
+        measured range is untouched and never marked extrapolated; the fitted
+        law is used only beyond the last rung, only when the fit describes
+        the measured rungs, and only as far as `tail_reach` past them.
+        """
+        value, basis = self.survival_at(curve, multiple)
+        if value is not None or not curve:
+            return value, basis, False
+        last_x, last_y = curve[-1]
+        if not self.extrapolate_tail or multiple <= last_x or last_y <= 0:
+            return None, basis, False
+        if multiple > last_x * self.tail_reach:
+            return None, (f"{multiple:g}x is more than {self.tail_reach:g}x "
+                          f"past the last measured rung ({last_x:g}x)"), False
+        if fit is None:
+            fit = self.fit_tail(curve)
+        if fit is None:
+            return None, f"{basis}; no power law could be fitted", False
+        alpha, residual = fit
+        if residual > self.max_tail_residual:
+            return None, (f"{basis}; the measured rungs are not a power law "
+                          f"(residual {residual:.2f})"), False
+        # S(m) = S(last) * (m / last) ** -alpha, anchored on the last rung the
+        # desk actually measured rather than on the fitted intercept, so the
+        # extrapolation starts from an observation.
+        return (last_y * (multiple / last_x) ** -alpha,
+                f"fitted tail past {last_x:g}x (alpha {alpha:.2f})", True)
 
     # -- the reading -------------------------------------------------------
 
@@ -268,12 +394,19 @@ class ContinuationModel:
                 "anchor")
 
         target_multiple = multiple * horizon
-        survival_from, from_basis = self.survival_at(curve, multiple)
-        survival_target, target_basis = self.survival_at(curve, target_multiple)
+        fit = self.fit_tail(curve) if self.extrapolate_tail else None
+        survival_from, from_basis, from_extrapolated = self.survival(
+            curve, multiple, fit)
+        survival_target, target_basis, target_extrapolated = self.survival(
+            curve, target_multiple, fit)
+        extrapolated = bool(from_extrapolated or target_extrapolated)
         common = dict(from_multiple=float(multiple),
                       target_multiple=float(target_multiple),
                       survival_from=survival_from,
                       survival_target=survival_target,
+                      extrapolated=extrapolated,
+                      tail_alpha=(fit[0] if fit else None),
+                      tail_residual=(fit[1] if fit else None),
                       basis=f"{from_basis} -> {target_basis}")
         if survival_from is None:
             return _blocked(
