@@ -59,6 +59,8 @@ from src.research.calibration import Provenance
 from src.research.fallback import FallbackResolver, Source
 from src.runtime.latency import LatencyLedger
 from src.runtime.serialisation import jsonable as _jsonable
+from src.runtime.execution_feedback import (
+    ExecutionFeedback, fee_competition)
 from src.runtime.regime import RegimeAndEvidence
 from src.runtime.reporting import ReportingSurface
 from src.runtime.ingestion import MinedRecordIngestion
@@ -191,6 +193,7 @@ CAPACITY_REJECTIONS = frozenset({
 
 
 class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
+                       ExecutionFeedback,
                        MinedRecordIngestion,
                        DeskMaintenance, TaskSupervision, EvidenceRecording,
                        SubsystemWiring, SourceIntelligence, PositionForensics,
@@ -951,11 +954,9 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
         self.latency.mark(token, "decode_to_dispatch")
         task = asyncio.create_task(self._candidate_pipeline(candidate))
         self._candidate_pipelines[token] = task
-        # A disposition from this instant, so a launch that dies during its
-        # enrichment RPCs is still filed rather than sitting as merely SEEN.
+        # Filed now, so a launch that dies during enrichment is not left
+        # sitting as merely SEEN.
         if self.predictor is not None and not self.predictor._is_trained:
-            # Known immediately. Keep collecting native risk and outcome
-            # evidence, but do not leave the launch looking lost.
             self.launch_census.data_blocked(
                 token, "DATA_BLOCKED_prediction_model_enrichment_running")
         else:
@@ -1192,14 +1193,17 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
             self.latency.close(token, "screened")
             return
         self.latency.mark(token, "decide_to_build")
+        competition = fee_competition(getattr(self, "latency", None))
+        priority_fee = self.fee_optimizer.get_optimal_fee(
+            trade_info["position_value_usd"], competition)
         result = await self.execution_engine.execute_swap(
             candidate.base_token or WSOL_MINT, token, int(trade_info["position_size_sol"] * 1e9),
             slippage_bps=100,
-            priority_fee=self.fee_optimizer.get_optimal_fee(trade_info["position_value_usd"], 0.5),
+            priority_fee=priority_fee,
             jito_tip=self.fee_optimizer.get_jito_tip(trade_info["position_value_usd"], "MEDIUM"),
             use_jito=True, decision_id=decision_id,
-            # The EDGE landing buys, not the position notional. A $500
-            # position is not $500 of expected value: E[log W] times the book
+            # The EDGE landing buys, not the notional. A $500 position is
+            # not $500 of expected value: E[log W] times the book
             # is what the fill is actually worth, and bidding against the
             # notional overpays for a marginal trade and underpays for a good
             # one -- the two errors that matter, in the two directions that
@@ -1214,10 +1218,12 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
         # Build, sign and submission happen inside the engine, which reports
         # its own split; from here the whole call is one stage. Marked before
         # the result is inspected so a rejected submission is timed the same
-        # as an accepted one -- the failure path is the one that has to be
-        # fast too, because a failed entry is a slot spent.
+        # as an accepted one: a failed entry is a slot spent.
         self.latency.mark(token, "sign_to_submit")
-        self.latency.close(token, "entered" if result.success else "submit_failed")
+        trace = self.latency.close(
+            token, "entered" if result.success else "submit_failed")
+        # See src/runtime/execution_feedback.py: the optimiser's only evidence.
+        self._record_fee_outcome(int(priority_fee), bool(result.success), trace)
         self.dataset_builder.record_execution_attempt(token, _jsonable(result))
         self._record_ops_event("execution_attempts", {
             "token": token, "side": "buy", "success": bool(result.success),
@@ -1374,12 +1380,9 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
         # on to do. A missed monster is invisible unless the rejection was
         # written down next to the outcome.
         #
-        # THREE dispositions, not one. Added 2026-08-28 and silently lost in
-        # `e2deedc`, the commit that split this file, which left four funnel
-        # transitions with no caller at all. A launch the desk could not
-        # price is not one it looked at and declined, and a hard safety
-        # reject is a terminal DECISION rather than a disappearance.
-        # See tests/test_funnel_wiring.py.
+        # THREE dispositions, not one: a launch the desk could not price is
+        # not one it declined, and a hard safety reject is a terminal
+        # DECISION. Lost in the file split; see tests/test_funnel_wiring.py.
         if str(reason).upper().startswith("DATA_BLOCKED"):
             self.launch_census.data_blocked(token, reason)
         elif str(reason).startswith("safety_veto:"):
@@ -2243,15 +2246,12 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
         An open position is kept whatever the hot state says: a position we
         cannot quote an exit for is the one state we must never discard.
 
-        So is a candidate still being DECIDED, for the same reason: both need
-        their exit priced. `_candidate_pipeline` makes several RPC round
-        trips and a launch can leave `active_tokens` -- hard-capped and
-        age-expiring -- while they are in flight. Dropping its curve state
-        then sends `_solana_sell_route` to the ROUTER for a mint the desk
-        sells natively, and the router's ignorance of a seconds-old mint
-        hard-vetoes it. Measured 2026-09-04: 678 of 678 decided launches
-        rejected, 359 on sell_route_unavailable, 301 on a price impact
-        quoted for a venue the desk would never have used.
+        So is a candidate still being DECIDED: both need their exit priced.
+        A launch can leave `active_tokens` while its enrichment RPCs are in
+        flight, and dropping its curve state then sends the sell-route check
+        to the ROUTER for a mint the desk sells natively -- whose ignorance
+        hard-vetoed 678 of 678 decided launches on 2026-09-04. See
+        tests/test_sell_route_authority.py.
         """
         held = (set(self.elogw_engine.open_positions)
                 # Through getattr: this is a maintenance sweep, and an
@@ -2836,7 +2836,8 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
         result = await self.execution_engine.execute_swap(
             candidate.base_token or WSOL_MINT, token, lamports,
             slippage_bps=slippage_bps,
-            priority_fee=self.fee_optimizer.get_optimal_fee(add_usd, 0.5),
+            priority_fee=self.fee_optimizer.get_optimal_fee(
+                add_usd, fee_competition(getattr(self, "latency", None))),
             jito_tip=self.fee_optimizer.get_jito_tip(add_usd, "MEDIUM"),
             use_jito=True, decision_id=position.get("decision_id"),
             # The same economics the entry bid uses, on the same axis. `gain`
