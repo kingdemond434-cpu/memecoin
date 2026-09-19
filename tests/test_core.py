@@ -338,6 +338,7 @@ def _desk_source() -> str:
     return "\n".join((root / name).read_text(encoding="utf-8")
                      for name in ("main.py", "runtime/reporting.py",
                                   "runtime/ingestion.py", "runtime/wiring.py",
+                                  "runtime/depth.py",
                                   "runtime/source_intelligence.py"))
 
 
@@ -14888,9 +14889,29 @@ class TestLocalLiquidity(unittest.TestCase):
             real_sol_reserves=12_000_000_000,
             token_total_supply=10 ** 15, complete=False, creator="c")
         desk = self._desk(state)
-        # Real reserves preferred: 12 SOL at $150.
+        # The VIRTUAL reserve: 30 SOL at $150. This assertion used to read the
+        # real reserve, and that was the bug. Real reserves start at zero and
+        # a fresh curve therefore reported its full virtual depth, then
+        # reported a thirtieth of it as soon as one person bought -- depth
+        # falling because a launch started working. Virtual reserves are
+        # monotone and are what the constant product prices impact from. What
+        # the curve can actually PAY OUT is a different question, answered by
+        # `_measured_depth_usd` rather than smuggled into this one.
         self.assertAlmostEqual(
-            MemecoinQuantDesk._local_liquidity(desk, "mint"), 12.0 * 150.0)
+            MemecoinQuantDesk._local_liquidity(desk, "mint"), 30.0 * 150.0)
+
+    def test_buying_never_shrinks_the_reported_depth(self):
+        """The regression this class now exists to hold down."""
+        def curve(real_sol):
+            return BondingCurveState(
+                virtual_token_reserves=1_000_000_000_000,
+                virtual_sol_reserves=30_000_000_000 + real_sol,
+                real_token_reserves=800_000_000_000,
+                real_sol_reserves=real_sol,
+                token_total_supply=10 ** 15, complete=False, creator="c")
+        readings = [MemecoinQuantDesk._local_liquidity(self._desk(curve(x)), "mint")
+                    for x in (0, 100_000_000, 12_000_000_000, 60_000_000_000)]
+        self.assertEqual(readings, sorted(readings))
 
     def test_a_reconstruction_falls_back_to_the_virtual_reserve(self):
         state = BondingCurveState(

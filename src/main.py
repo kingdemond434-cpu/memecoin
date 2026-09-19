@@ -59,6 +59,7 @@ from src.research.calibration import Provenance
 from src.research.fallback import FallbackResolver, Source
 from src.runtime.latency import LatencyLedger
 from src.runtime.serialisation import jsonable as _jsonable
+from src.runtime.depth import DepthResolution
 from src.runtime.execution_feedback import (
     ExecutionFeedback, fee_competition)
 from src.runtime.regime import RegimeAndEvidence
@@ -193,7 +194,7 @@ CAPACITY_REJECTIONS = frozenset({
 
 
 class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
-                       ExecutionFeedback,
+                       ExecutionFeedback, DepthResolution,
                        MinedRecordIngestion,
                        DeskMaintenance, TaskSupervision, EvidenceRecording,
                        SubsystemWiring, SourceIntelligence, PositionForensics,
@@ -1096,7 +1097,8 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
                                                    liquidity)
             trade_info = self.elogw_engine.size_candidate(
                 prediction, self.sol_price_usd, liquidity,
-                disagreement=disagreement)
+                disagreement=disagreement,
+                depth_usd=self._measured_depth_usd(token))
             # The screens' verdict, applied as size rather than as a gate.
             # Composed multiplicatively with the disagreement shrink already
             # in trade_info: two independent reasons to be smaller are two
@@ -1456,51 +1458,6 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
 
 
 
-    def _local_liquidity(self, token: str) -> float:
-        """Tradeable depth from the streamed curve, in USD. Zero when unknown.
-
-        A bonding curve's quote-side depth IS its SOL reserve: that is what a
-        seller can be paid out of, and no quote from anywhere makes it larger.
-        Reading it locally removes a network round trip from directly in front
-        of the T0 sizing decision.
-
-        Real reserves are preferred where an account update has supplied them.
-        Where only a trade event has been seen, the virtual reserve is used
-        and is an upper bound -- which is why the frontier built on it is
-        already labelled as one rather than treated as a measurement.
-        """
-        state = self._latest_curve_state.get(token)
-        if state is None or not state.tradeable or self.sol_price_usd <= 0:
-            return 0.0
-        lamports = int(state.real_sol_reserves or 0) or int(state.virtual_sol_reserves or 0)
-        if lamports <= 0:
-            return 0.0
-        return (lamports / 1e9) * float(self.sol_price_usd)
-
-    async def _resolve_liquidity(self, candidate: TokenCandidate) -> float:
-        explicit = candidate.initial_liquidity_usd or candidate.metadata.get("liquidity_usd")
-        if explicit and float(explicit) > 0:
-            return float(explicit)
-        # The curve already tells us this. Asking Jupiter meant a T0 decision
-        # paid a network round trip to learn something the streamed reserves
-        # state outright -- and the sizing engine cannot start until the
-        # answer arrives, so the round trip sat directly in front of the
-        # decision it was feeding.
-        local = self._local_liquidity(candidate.address)
-        if local > 0:
-            return local
-        if not self.jupiter or not self.jupiter._session or self.sol_price_usd <= 0:
-            return 0.0
-        quote = await self.jupiter.get_quote(WSOL_MINT, candidate.address, 100_000_000, slippage_bps=300)
-        if not quote or quote.output_amount <= 0:
-            return 0.0
-        impact = max(float(quote.price_impact_pct), 0.001)
-        estimate = (0.1 * self.sol_price_usd) / impact
-        observation = {"type": "liquidity", "liquidity_usd": estimate, "source": "quote_depth_estimate",
-                       "price_impact_pct": quote.price_impact_pct, "timestamp": time.time()}
-        self.dataset_builder.record_market_observation(candidate.address, observation)
-        self.rug_hazard.record_observation(candidate.address, observation)
-        return estimate
 
     async def _manage_positions(self):
         for token, position in list(self.elogw_engine.open_positions.items()):
@@ -1881,6 +1838,11 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
             position_value_usd=(float(trade_info["position_value_usd"])
                                 if trade_info.get("position_value_usd") is not None else None),
             liquidity_usd=liquidity if liquidity > 0 else None,
+            # The same measured depth the size was built on. Passing it means
+            # the veto cannot reject on a flat fraction a measurement has
+            # already cleared -- the two were answering one question with two
+            # instruments, and the blunter one was winning.
+            depth_usd=trade_info.get("measured_depth_usd"),
             connected_holder_pct=getattr(risk, "connected_cluster_pct", None))
         return {
             "safety": {"status": getattr(risk, "data_status", "DATA_BLOCKED"),

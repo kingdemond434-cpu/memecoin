@@ -1107,35 +1107,57 @@ class ElogwEngine:
     CEILING_CONCENTRATION = "concentration"
     CEILING_MAX_POSITION_USD = "max_position_usd"
     CEILING_POOL_DEPTH = "pool_depth"
+    #: The same ceiling, but from a measured exit frontier rather than from a
+    #: flat fraction of reserves. Named apart so the capacity report can say
+    #: which of the two actually bound the book -- "depth capped it" means
+    #: something very different when the depth was measured.
+    CEILING_MEASURED_DEPTH = "measured_exit_depth"
 
-    def exposure_ceilings(self, liquidity_usd: float) -> Dict[str, float]:
-        """Every ceiling, as a fraction of equity, before the min is taken."""
+    def exposure_ceilings(self, liquidity_usd: float,
+                          depth_usd: Optional[float] = None) -> Dict[str, float]:
+        """Every ceiling, as a fraction of equity, before the min is taken.
+
+        ``depth_usd`` is the notional a measured exit frontier says can really
+        be sold inside the acceptable impact. When it is supplied it REPLACES
+        the flat `liquidity * max_liquidity_fraction` rule rather than joining
+        it, because the two answer the same question and only one of them
+        answers it with evidence. The flat fraction survives as the fallback
+        for the case the frontier could not be measured -- notably a brand new
+        curve holding no real SOL, where exit depth is a forecast about flow
+        that has not arrived yet and no measurement exists to take.
+        """
         if self.portfolio_value <= 0 or liquidity_usd <= 0:
             return {}
-        return {
+        ceilings = {
             self.CEILING_CONCENTRATION:
                 self.small_account_concentration(liquidity_usd),
             self.CEILING_MAX_POSITION_USD:
                 self.max_position_usd / self.portfolio_value,
-            self.CEILING_POOL_DEPTH:
-                liquidity_usd * self.max_liquidity_fraction / self.portfolio_value,
         }
+        if depth_usd is not None and float(depth_usd) > 0:
+            ceilings[self.CEILING_MEASURED_DEPTH] = float(depth_usd) / self.portfolio_value
+        else:
+            ceilings[self.CEILING_POOL_DEPTH] = (
+                liquidity_usd * self.max_liquidity_fraction / self.portfolio_value)
+        return ceilings
 
-    def binding_ceiling(self, liquidity_usd: float) -> Tuple[str, float]:
+    def binding_ceiling(self, liquidity_usd: float,
+                        depth_usd: Optional[float] = None) -> Tuple[str, float]:
         """Which ceiling actually caps this position, and at what fraction."""
-        ceilings = self.exposure_ceilings(liquidity_usd)
+        ceilings = self.exposure_ceilings(liquidity_usd, depth_usd)
         if not ceilings:
             return "", 0.0
         name = min(ceilings, key=lambda key: ceilings[key])
         return name, float(ceilings[name])
 
-    def exposure_cap(self, liquidity_usd: float) -> float:
+    def exposure_cap(self, liquidity_usd: float,
+                     depth_usd: Optional[float] = None) -> float:
         """Largest fraction of equity this token may take, across all ceilings."""
-        name, cap = self.binding_ceiling(liquidity_usd)
+        name, cap = self.binding_ceiling(liquidity_usd, depth_usd)
         if not name:
             return 0.0
         self._ceiling_counts[name] = self._ceiling_counts.get(name, 0) + 1
-        if name == self.CEILING_POOL_DEPTH:
+        if name in (self.CEILING_POOL_DEPTH, self.CEILING_MEASURED_DEPTH):
             self._depth_bound_fractions.append(cap)
             del self._depth_bound_fractions[:-self.CEILING_SAMPLE]
         return cap
@@ -1150,7 +1172,8 @@ class ElogwEngine:
         total = sum(self._ceiling_counts.values())
         if not total:
             return {"status": "DATA_BLOCKED", "detail": "nothing sized yet"}
-        depth = self._ceiling_counts.get(self.CEILING_POOL_DEPTH, 0)
+        depth = (self._ceiling_counts.get(self.CEILING_POOL_DEPTH, 0)
+                 + self._ceiling_counts.get(self.CEILING_MEASURED_DEPTH, 0))
         fractions = sorted(self._depth_bound_fractions)
         median = (fractions[len(fractions) // 2] if fractions else None)
         return {
@@ -1171,12 +1194,13 @@ class ElogwEngine:
         prediction: MultiHeadPrediction,
         sol_price_usd: float,
         liquidity_usd: float,
+        depth_usd: Optional[float] = None,
     ) -> Tuple[float, float, float]:
         if self.portfolio_value <= 0 or sol_price_usd <= 0 or liquidity_usd <= 0:
             return -float("inf"), 0.0, 0.0
         if self._growth_inputs(prediction) is None:
             return -float("inf"), 0.0, 0.0
-        cap = self.exposure_cap(liquidity_usd)
+        cap = self.exposure_cap(liquidity_usd, depth_usd)
         if cap <= 0:
             return -float("inf"), 0.0, 0.0
         fractions = np.linspace(0, cap, 401)
@@ -1347,6 +1371,7 @@ class ElogwEngine:
         sol_price_usd: float,
         liquidity_usd: float,
         disagreement: Optional[Any] = None,
+        depth_usd: Optional[float] = None,
     ) -> Dict:
         """The size a candidate would take, and what that size is worth.
 
@@ -1363,7 +1388,7 @@ class ElogwEngine:
         unanimous or barely carried.
         """
         elogw, fraction, size_sol = self.calculate_expected_log_growth(
-            prediction, sol_price_usd, liquidity_usd)
+            prediction, sol_price_usd, liquidity_usd, depth_usd)
         shrink = 1.0
         if disagreement is not None and getattr(disagreement, "ok", False):
             shrink = float(getattr(disagreement, "shrink", 1.0))
@@ -1386,6 +1411,11 @@ class ElogwEngine:
             # halved deserves to say what halved it, and the forward ledger
             # needs it to ask whether shrinking was right.
             "disagreement_shrink": shrink,
+            # Which ceiling bound this size, and on what evidence. A position
+            # capped by a measured exit frontier and one capped by a flat
+            # fraction of reserves look identical downstream otherwise.
+            "binding_ceiling": self.binding_ceiling(liquidity_usd, depth_usd)[0],
+            "measured_depth_usd": depth_usd,
             "disagreement": (disagreement.to_dict()
                              if disagreement is not None
                              and hasattr(disagreement, "to_dict") else None),
