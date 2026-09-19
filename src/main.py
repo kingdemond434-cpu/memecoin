@@ -951,6 +951,19 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
         self.latency.mark(token, "decode_to_dispatch")
         task = asyncio.create_task(self._candidate_pipeline(candidate))
         self._candidate_pipelines[token] = task
+        # The launch has a disposition from this instant. Without it a
+        # candidate sits in the census as merely SEEN for the whole length of
+        # its enrichment RPCs, and one that dies in that window is never
+        # filed at all -- which is most of what the funnel was reporting as
+        # unaccounted.
+        if self.predictor is not None and not self.predictor._is_trained:
+            # The absence of a validated action model is known immediately.
+            # Keep collecting native risk and outcome evidence in this task,
+            # but do not leave the launch looking lost behind enrichment.
+            self.launch_census.data_blocked(
+                token, "DATA_BLOCKED_prediction_model_enrichment_running")
+        else:
+            self.launch_census.awaiting_state(token, "candidate_pipeline_running")
         self._background_tasks.add(task)
 
         def completed(done: asyncio.Task):
@@ -1051,6 +1064,12 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
         if prediction is None:
             self._record_blocked_decision(token, "DATA_BLOCKED_prediction_model", {})
             return
+        # Every fact the decision needs is now in hand. Recorded so the funnel
+        # can separate "we could not evaluate this" from "we evaluated it and
+        # said no" -- the two have opposite remedies and looked identical
+        # while this call was missing.
+        self.launch_census.decision_ready(
+            token, "safety_liquidity_and_prediction_ready")
         if not self.dry_run and not self.champion_challenger.is_live(MODEL_HYPOTHESIS_ID):
             self._record_blocked_decision(token, "champion_not_promoted_for_live_authority", _jsonable(prediction))
             return
@@ -1358,7 +1377,25 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
         # Recorded so the weekly audit can ask what the rejected launches went
         # on to do. A missed monster is invisible unless the rejection was
         # written down next to the outcome.
-        self.launch_census.screen(token, reason)
+        #
+        # THREE dispositions, not one. Added 2026-08-28 across two commits and
+        # silently lost in `e2deedc`, the commit that split this file -- which
+        # left `screen()` as the only funnel call and `data_blocked()`,
+        # `reject()`, `awaiting_state()` and `decision_ready()` with no caller
+        # at all. The commit that added them was titled "Make launch funnel
+        # exhaustive"; the refactor undid it without touching a test.
+        #
+        # The distinction is not cosmetic. A launch the desk could not price
+        # is not a launch it looked at and declined, and a hard safety reject
+        # is a terminal DECISION rather than a pre-decision disappearance.
+        # Collapsing all three into "screened" is what made the funnel report
+        # two thirds of launches as reaching no disposition.
+        if str(reason).upper().startswith("DATA_BLOCKED"):
+            self.launch_census.data_blocked(token, reason)
+        elif str(reason).startswith("safety_veto:"):
+            self.launch_census.reject(token, reason)
+        else:
+            self.launch_census.screen(token, reason)
         self._record_ops_event("trade_outcomes", {
             "token": token, "entered": False, "attempted": False,
             "rejection_reason": reason,

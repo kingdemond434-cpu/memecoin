@@ -132,21 +132,41 @@ def test_every_remedy_matches_a_reason_the_desk_actually_emits():
     assert _remedy("something_nobody_emits") == ""
 
 
-def test_launches_that_reached_no_disposition_are_shown(tmp_path, capsys):
-    """Every screen percentage is a share of `seen`.
+def test_launches_in_flight_are_not_reported_as_missing(tmp_path, capsys):
+    """`seen - screened - decided` counts every in-flight launch as lost.
 
-    With two thirds of launches unfiled, the histogram looks like it explains
-    the desk while explaining a third of it -- and the biggest number on the
-    page is the one that is not printed.
+    `see()` files a launch as AWAITING_STATE on sight, and DATA_BLOCKED and
+    DECISION_READY are dispositions too. Subtracting only the two visible
+    buckets reported two thirds of this funnel as unaccounted on 2026-09-04,
+    which was arithmetic the census does not use.
     """
     state = _census(tmp_path, seen=8757, screened=2340, decided=678,
-                    dispositions={"screened_out": 2340, "decided_reject": 678},
+                    dispositions={"screened_out": 2340, "decided_reject": 678,
+                                  "awaiting_state": 5000, "data_blocked": 739},
                     screened_by_reason={"DATA_BLOCKED_prediction_model": 1288})
     main(["--state-dir", str(state)])
     printed = capsys.readouterr().out
-    assert "UNACCOUNTED" in printed
-    assert "5739" in printed
-    assert "pipeline defect" in printed
+    in_flight = next(line for line in printed.splitlines()
+                     if line.startswith("in flight"))
+    unaccounted = next(line for line in printed.splitlines()
+                       if line.lstrip().startswith("unaccounted"))
+    # The 5,739 are in flight or blocked, which is a state, not a loss.
+    assert "5739" in in_flight
+    assert unaccounted.split()[1] == "0"
+    assert "accounting fault" not in printed
+
+
+def test_a_genuine_accounting_fault_is_still_called_out(tmp_path, capsys):
+    state = _census(tmp_path, seen=1000, screened=100, decided=50,
+                    dispositions={"screened_out": 100, "decided_reject": 50})
+    main(["--state-dir", str(state)])
+    assert "accounting fault" in capsys.readouterr().out
+
+
+def test_a_census_without_dispositions_says_it_cannot_check(tmp_path, capsys):
+    state = _census(tmp_path, seen=500, screened=100, decided=50)
+    main(["--state-dir", str(state)])
+    assert "predates disposition accounting" in capsys.readouterr().out
 
 
 def test_a_fully_accounted_census_does_not_cry_wolf(tmp_path, capsys):
