@@ -1,92 +1,122 @@
-# Public methods with no production caller, accepted for now.
-# Every line here is a method that was written and never wired.
-# Wire one and DELETE its line -- tests/test_no_new_orphans.py
-# fails on a stale entry, so this set can only shrink.
-add_chain
-arun
-as_event
-assess_launch_risk
-audit
-best_feed
-broadcast_request
-budget_report
-choose
-cohort_prior
-combined_confidence
-declare_canonical
-define_cluster
-delete
-deserialize
-enforce_budget
-exhausted
-fee_lamports
-find_similar
-funder_prior
-funders_of
-get_account_profile
-get_alerts
-get_all_weights
-get_best_policy
-get_champion_for_target
-get_coordinated_activity
-get_entity_graph_stats
-get_family
-get_family_stats
-get_feature_importance
-get_imminent_launches
-get_inflight_bundle_status
-get_recent_executions
-get_recent_trials
-get_regime_performance
-get_route_stats
-get_source_ranking
-get_top_entities
-get_top_wallets_by_value
-get_wallet_signal
-get_web3
-graveyard_entry
-impact_for
-ingest_curve_account
-is_kol
-ladder_for
-load_model
-loops
-node_for
-observe_exit
-owns_account
-peek
-plan
-predict_launch_probability
-predict_next_event
-prior_mints
-ready_share_or_zero
-record_balance
-record_feature_value
-record_infrastructure_interaction
-record_many
-record_metadata_creation
-record_multiplicity_group
-record_pair
-record_social_creation
-record_trial
-reference_bid
-regime_stability
-reset
-resolve_many
-retrieve
-runtime_task_report
-score_gain
-scored_edges
-serialize
-set_baseline
-set_curve_state_provider
-set_quote_provider
-shared_family
-should_route_through_challenger
-template_for
-total_slots
-train_launch_predictor
-trustworthy
-verified_programs
-watchdog_report
-watched_programs
+# Public methods with no production caller, and what is to be done about each.
+#
+# Every line here is a method that was written and never wired. Three live
+# bugs were found in one day with exactly this shape, so the set is tracked
+# rather than tolerated: a new orphan fails CI, and so does a stale entry, so
+# wiring one FORCES its line to be deleted.
+#
+# Format:  name <TAB> class <TAB> reason
+#
+#   A  production capability that should be running and is not. This is debt.
+#      Every A is a feature the desk is believed to have and does not.
+#   B  superseded or duplicated by something already wired. Delete the method.
+#   C  offline research or operator API, called by tools and notebooks rather
+#      than by the live desk. Correctly absent from the hot path.
+#   D  deliberately public and unused by design -- a reporting surface, a
+#      property read in tests, or a planning-only call that must never run.
+#
+# A is not allowed to be a permanent home. B is a deletion waiting for a
+# hand. C and D are stable.
+
+# --- A: capability that does not run ---------------------------------------
+# An entire pre-launch subsystem with nothing feeding it. Predicting which
+# entities are about to launch is the earliest edge available, and the whole
+# module is dark: nothing records metadata creation, social creation or
+# infrastructure interaction, so nothing can be predicted from them.
+record_metadata_creation	A	prelaunch intent has no feed
+record_social_creation	A	prelaunch intent has no feed
+record_infrastructure_interaction	A	prelaunch intent has no feed
+predict_launch_probability	A	nothing asks who is about to launch
+get_imminent_launches	A	nothing asks who is about to launch
+get_top_entities	A	nothing asks who is about to launch
+train_launch_predictor	A	the prelaunch model is never trained
+# The hypothesis ledger. Trials are the record that lets the gauntlet price
+# selection; none are recorded, so multiplicity is unpriced.
+record_trial	A	no trial is ever recorded
+record_multiplicity_group	A	selection across a family is unpriced
+get_recent_trials	A	the trial ledger is never read
+get_family_stats	A	the trial ledger is never read
+get_family	A	hypothesis families are never enumerated
+find_similar	A	near-duplicate hypotheses are never detected
+graveyard_entry	A	killed hypotheses are never consulted
+get_champion_for_target	A	champion lookup by target is unused
+# Source-lead and adversarial adaptation: written, never consulted.
+predict_next_event	A	source lead times predict nothing
+get_source_ranking	A	sources are never ranked in production
+record_feature_value	A	adaptation detector has no feed
+get_alerts	A	adaptation alerts reach nobody
+get_all_weights	A	adapted weights are never read
+get_best_policy	A	the counterfactual lab picks nothing
+# Actor and wallet intelligence reads with no consumer.
+funders_of	A	funder ancestry is never queried live
+prior_mints	A	a deployer's prior mints are never checked
+shared_family	A	shared-family detection is unused
+assess_launch_risk	A	genealogy risk never reaches a decision
+is_kol	A	KOL touches are recorded and never read
+define_cluster	A	behavioural clusters are never defined
+observe_exit	A	signature model never sees exits
+get_wallet_signal	A	per-regime wallet signal is unused
+get_regime_performance	A	per-regime wallet performance is unused
+get_coordinated_activity	A	coordinated activity is never surfaced
+get_top_wallets_by_value	A	superseded in production by followable_wallets, kept for tools
+# Execution capability that is built and idle.
+impact_for	A	measured exit impact is not used for sizing
+ladder_for	A	staged exit ladders are never fetched
+template_for	A	prebuilt exit templates are never fetched
+node_for	A	leader-aware submission is not routed
+reference_bid	A	observed bids do not inform our bid
+should_route_through_challenger	A	the execution challenger never routes
+record_pair	A	challenger pairs are never recorded
+load_model	A	a trained action-value model is never loaded
+best_feed	A	the feed race picks no winner
+# Research surfaces with no reader.
+scored_edges	A	scored source edges are never read
+regime_stability	A	edge stability across regimes is unused
+cohort_prior	A	cold-start cohort prior is unused
+funder_prior	A	cold-start funder prior is unused
+declare_canonical	A	identity collapse is never declared
+set_baseline	A	edge decay has no baseline to decay from
+trustworthy	A	calibration trust is never consulted
+combined_confidence	A	fallback confidence is never combined
+resolve_many	A	batch fallback resolution is unused
+exhausted	A	remaining-audience exhaustion is never read
+record_balance	A	dev wallet balances are never recorded
+
+
+# --- C: offline research and operator APIs ---------------------------------
+arun	C	warehouse entry point for tools
+total_slots	C	extraction planning, offline
+audit	C	archive audit, operator command
+enforce_budget	C	archive retention, operator command
+retrieve	C	archive read, offline
+delete	C	archive delete, operator command
+serialize	C	graph snapshot, offline
+deserialize	C	graph restore, offline
+get_entity_graph_stats	C	graph statistics, offline
+get_feature_importance	C	model inspection, offline
+record_many	C	bulk load for backfills
+get_account_profile	C	social lookup, offline
+broadcast_request	C	multi-node RPC, operator command
+get_web3	C	EVM handle for future chain adapters
+ingest_curve_account	C	replay entry point for fixtures
+
+# --- D: public by design, unused by the desk -------------------------------
+as_event	D	canonical event projection, read in tests
+verified_programs	D	registry reporting surface
+watched_programs	D	registry reporting surface
+fee_lamports	D	fee quote convenience property
+ready_share_or_zero	D	registry reporting surface
+score_gain	D	displacement reporting surface
+peek	D	cache inspection without touching TTL
+reset	D	sequencer reset, test affordance
+owns_account	D	entity membership predicate
+loops	D	loop inventory, reporting surface
+runtime_task_report	D	supervision reporting surface
+watchdog_report	D	supervision reporting surface
+budget_report	D	latency reporting surface
+plan	D	planning only; nothing may sign a sweep
+choose	D	bid exploration, reporting surface
+add_chain	D	multi-chain registration, awaits chain adapters
+get_route_stats	D	execution reporting surface
+get_recent_executions	D	execution reporting surface
+get_inflight_bundle_status	D	bundle inspection, operator command

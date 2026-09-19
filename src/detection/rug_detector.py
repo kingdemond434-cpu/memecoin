@@ -139,9 +139,6 @@ class RugDetector:
         self._cache: Dict[str, Tuple[TokenRiskReport, float]] = {}
         self._cache_ttl = 30
 
-    def set_quote_provider(self, quote_provider: Any):
-        self.quote_provider = quote_provider
-
     def sell_route_report(self) -> Dict[str, Any]:
         """How often the native curve route was skipped, and why.
 
@@ -165,9 +162,6 @@ class RugDetector:
                        "not indexed the mint is ignorance, not a property of "
                        "the token"),
         }
-
-    def set_curve_state_provider(self, provider: Any):
-        self.curve_state_provider = provider
 
     def cache_key(self, token_address: str,
                   deployer_address: Optional[str] = None) -> str:

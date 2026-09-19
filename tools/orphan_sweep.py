@@ -87,12 +87,40 @@ def sweep(roots: Sequence[str] = PRODUCTION_ROOTS) -> Dict[str, List[str]]:
             if name not in framework and not _referenced(name, blob)}
 
 
-def load_baseline() -> Set[str]:
+#: What an accepted orphan is, and whether it is allowed to stay one.
+#:   A  production capability that should be running and is not -- debt.
+#:   B  superseded by something already wired -- a deletion waiting for a hand.
+#:   C  offline research or operator API, correctly absent from the hot path.
+#:   D  deliberately public and unused by design.
+ORPHAN_CLASSES = ("A", "B", "C", "D")
+
+
+def load_classified_baseline() -> Dict[str, Tuple[str, str]]:
+    """name -> (class, reason). The class is mandatory.
+
+    An unclassified entry is how a parking lot forms: everything lands in it,
+    nothing is ever asked to leave, and the list stops meaning anything. A
+    line without a class fails the guard rather than being read as accepted.
+    """
     if not BASELINE.exists():
-        return set()
-    return {line.split("#")[0].strip()
-            for line in BASELINE.read_text(encoding="utf-8").splitlines()
-            if line.split("#")[0].strip()}
+        return {}
+    rows: Dict[str, Tuple[str, str]] = {}
+    for number, raw in enumerate(
+            BASELINE.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw.split("#")[0].strip()
+        if not line:
+            continue
+        parts = [part.strip() for part in line.split("\t") if part.strip()]
+        if len(parts) < 2 or parts[1] not in ORPHAN_CLASSES:
+            raise ValueError(
+                f"{BASELINE.name}:{number}: every entry needs a class "
+                f"({'/'.join(ORPHAN_CLASSES)}) and a reason, got {line!r}")
+        rows[parts[0]] = (parts[1], parts[2] if len(parts) > 2 else "")
+    return rows
+
+
+def load_baseline() -> Set[str]:
+    return set(load_classified_baseline())
 
 
 def main(argv: Sequence[str] | None = None) -> int:

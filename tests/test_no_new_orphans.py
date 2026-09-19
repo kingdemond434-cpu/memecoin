@@ -21,7 +21,8 @@ from pathlib import Path
 
 import pytest
 
-from tools.orphan_sweep import BASELINE, load_baseline, sweep
+from tools.orphan_sweep import (
+    BASELINE, ORPHAN_CLASSES, load_baseline, load_classified_baseline, sweep)
 
 
 @pytest.fixture(scope="module")
@@ -70,3 +71,49 @@ def test_the_baseline_file_explains_itself():
     text = BASELINE.read_text(encoding="utf-8")
     assert text.startswith("#"), "a bare list of names teaches nobody anything"
     assert "never wired" in text
+
+
+def test_every_accepted_orphan_is_classified():
+    """An unclassified entry is how a parking lot forms.
+
+    Everything lands in it, nothing is ever asked to leave, and the list stops
+    meaning anything -- which is the state this file was in at 88 entries
+    before the classes existed.
+    """
+    rows = load_classified_baseline()
+    assert rows, "the baseline is empty; that is not the same as classified"
+    for name, (klass, reason) in rows.items():
+        assert klass in ORPHAN_CLASSES, f"{name}: unknown class {klass!r}"
+        assert reason, f"{name}: a class without a reason teaches nobody"
+
+
+def test_class_a_is_debt_and_is_counted():
+    """Class A means the desk is believed to have a feature it does not have.
+
+    Not an assertion that the number is small -- it is 52 -- but that it is
+    VISIBLE. A capability list nobody counts is a capability list nobody
+    fixes, and every one of the three bugs that made this file necessary sat
+    in exactly this state.
+    """
+    rows = load_classified_baseline()
+    debt = sorted(name for name, (klass, _) in rows.items() if klass == "A")
+    assert len(debt) <= 52, (
+        f"class A grew to {len(debt)}: a capability was written and left "
+        "unwired. Wire it, or justify a new class:\n  " + "\n  ".join(debt))
+
+
+def test_class_b_entries_are_deletions_not_residents():
+    """B means something already wired supersedes it, so it gets deleted.
+
+    The two that were here -- `set_quote_provider` and
+    `set_curve_state_provider` on RugDetector -- were setters for providers
+    the constructor already takes. They looked like an injection point that
+    nobody used, which is indistinguishable at a glance from an injection
+    point somebody forgot to use, and that ambiguity is expensive on a class
+    whose unwired provider caused 678 launches to be vetoed.
+    """
+    rows = load_classified_baseline()
+    superseded = {name for name, (klass, _) in rows.items() if klass == "B"}
+    assert not superseded, (
+        "class B is a deletion waiting for a hand, not an address:\n  "
+        + "\n  ".join(sorted(superseded)))
