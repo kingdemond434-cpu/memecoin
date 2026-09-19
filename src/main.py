@@ -59,7 +59,7 @@ from src.research.calibration import Provenance
 from src.research.fallback import FallbackResolver, Source
 from src.runtime.latency import LatencyLedger
 from src.runtime.serialisation import jsonable as _jsonable
-from src.runtime.depth import DepthResolution
+from src.runtime.depth import DepthResolution, FollowableTrades
 from src.runtime.execution_feedback import (
     ExecutionFeedback, fee_competition)
 from src.runtime.regime import RegimeAndEvidence
@@ -194,7 +194,7 @@ CAPACITY_REJECTIONS = frozenset({
 
 
 class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
-                       ExecutionFeedback, DepthResolution,
+                       ExecutionFeedback, DepthResolution, FollowableTrades,
                        MinedRecordIngestion,
                        DeskMaintenance, TaskSupervision, EvidenceRecording,
                        SubsystemWiring, SourceIntelligence, PositionForensics,
@@ -3930,11 +3930,7 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
             if hasattr(self.wallet_intel, "record_live_trade"):
                 self.wallet_intel.record_live_trade(token, observation)
             self._open_follow_candidate(token, event)
-            score = self.wallet_intel.get_wallet_score(event.get("wallet", ""))
-            if score and score.overall_score >= 0.7:
-                event_type = LeadEventType.ELITE_WALLET_BUY if event.get("side") == "buy" else LeadEventType.SMART_WALLET_EXIT
-                self.info_graph.record_event(token, event_type, event.get("wallet", ""), "wallet",
-                                             event.get("timestamp", time.time()), event)
+            self._record_followable_trade(token, event)
         elif event.get("type") == "token_migrated":
             self.wallet_intel.record_token_lifecycle(token, migration_at=event.get("timestamp", time.time()))
             self.info_graph.record_event(token, LeadEventType.MIGRATION, "pump_fun", "program",

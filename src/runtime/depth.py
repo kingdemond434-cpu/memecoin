@@ -11,7 +11,7 @@ never pricing cost. It was a guess at exit, in a system that can measure it.
 
 import logging
 import time
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from src.detection.token_detector import TokenCandidate
 from src.execution.tradeability import curve_depth_usd
@@ -96,3 +96,49 @@ class DepthResolution:
             self._latest_curve_state.get(token),
             float(self.global_config.get("acceptable_exit_impact", 0.10)),
             float(self.sol_price_usd))
+
+
+class FollowableTrades:
+    """Trades by wallets whose followability has been measured.
+
+    Separated from the decode handler because the same three facts -- is this
+    wallet worth listening to, is this a buy or an exit, is the deployer
+    distributing -- feed three different consumers, and inlining them put a
+    composite score and a hand-picked threshold in the middle of the hot path.
+    """
+
+    #: Below this the wallet's followability is a formula's opinion rather
+    #: than a measurement, and it does not get to raise an elite-buy event.
+    MEASURED_FLOOR = 0.50
+
+    def _record_followable_trade(self, token: str, event: Dict[str, Any]) -> None:
+        wallet = str(event.get("wallet") or "")
+        if not wallet:
+            return
+        consensus = getattr(self, "wallet_consensus", None)
+        if consensus is None:
+            return
+        confidences = consensus.followable_provider() or {}
+        confidence = confidences.get(wallet)
+        if confidence is None:
+            return
+        at = float(event.get("timestamp", time.time()) or time.time())
+        is_buy = event.get("side") == "buy"
+        if is_buy:
+            consensus.observe_buy(token, wallet, at)
+        elif wallet and wallet == str(
+                getattr(self._latest_curve_state.get(token), "creator", "") or ""):
+            # The deployer taking the other side of the agreement. Several of
+            # the consensus rules exist precisely to refuse that case.
+            consensus.observe_deployer_sell(token, at)
+        # An elite-buy event used to require `overall_score >= 0.7`: a
+        # hand-weighted composite compared against a number somebody picked.
+        # A measured wallet is one whose followed outcomes have a positive
+        # lower bound, and only those raise the event.
+        if confidence < self.MEASURED_FLOOR:
+            return
+        from src.strategies.information_graph import LeadEventType
+        self.info_graph.record_event(
+            token,
+            LeadEventType.ELITE_WALLET_BUY if is_buy else LeadEventType.SMART_WALLET_EXIT,
+            wallet, "wallet", at, event)

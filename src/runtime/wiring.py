@@ -117,6 +117,7 @@ from src.chains.launchpad_discovery import LaunchpadDiscovery
 from src.execution.observed_bids import ObservedBidCorpus
 from src.strategies.pre_event_anomaly import PreEventAnomaly
 from src.strategies.sniper_rings import SniperRingDetector
+from src.strategies.wallet_consensus import WalletConsensus
 from src.strategies.wallet_signature import WalletSignatures
 from src.runtime.training import TrainingSupervisor
 from src.chains.native_ingress import NativeIngress
@@ -130,6 +131,31 @@ import logging
 MODEL_HYPOTHESIS_ID = "production_multihead_v1"
 
 logger = logging.getLogger(__name__)
+
+#: How long a followable-wallet ranking may be reused. The ranking is a
+#: function of accumulated followed outcomes, which move on the order of
+#: minutes; the reader is a chain-event handler that runs thousands of times a
+#: minute. Recomputing it per event would put a sort of every tracked wallet
+#: into the decode path to learn nothing new.
+FOLLOWABLE_CACHE_TTL_S = 30.0
+
+
+def _ttl_cache(producer, ttl_s):
+    """Memoise a zero-argument producer for `ttl_s` seconds.
+
+    Deliberately not functools.lru_cache: that would cache forever, and a
+    permanently frozen wallet ranking is worse than a slow one.
+    """
+    box = {"at": 0.0, "value": None}
+
+    def read():
+        now = time.time()
+        if box["value"] is None or now - box["at"] >= ttl_s:
+            box["value"] = producer()
+            box["at"] = now
+        return box["value"]
+
+    return read
 
 
 def _tagged_feed(callback, feed: str):
@@ -932,6 +958,16 @@ class SubsystemWiring:
         # was overcounted in the direction that says enter bigger.
         self.dataset_builder.independence_provider = (
             self.sniper_rings.independent_count)
+        # Agreement between wallets, as a grid of hypotheses rather than a
+        # rule. The followable set is cached because this is read from the
+        # trade-decode handler: ranking every tracked wallet per chain event
+        # would put a sort in the hot path to learn something that changes on
+        # the order of minutes.
+        self.wallet_consensus = WalletConsensus(
+            followable_provider=_ttl_cache(
+                lambda: self.wallet_intel.followable_wallets(limit=200),
+                FOLLOWABLE_CACHE_TTL_S),
+            independence_provider=self.sniper_rings.independent_count)
         self.info_graph.set_outcome_provider(self.dataset_builder.get_outcome)
         if hasattr(self.genealogy, "set_outcome_provider"):
             self.genealogy.set_outcome_provider(self.dataset_builder.get_outcome)
