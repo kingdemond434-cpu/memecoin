@@ -189,3 +189,40 @@ class CopyBookBudgets:
         report["copy_book_usd"] = budget
         report["allocation_usd"] = allocator.allocate(budget)
         return report
+
+
+class TailLadder:
+    """The executable tail curve for one open position, as recorded evidence."""
+
+    def executable_tail(self, token: str,
+                        position: Dict[str, Any]) -> Dict[str, Any]:
+        """P(reach m) x exitable fraction x net multiple, at every rung.
+
+        Recorded, not enforced. Whether capturable upside predicts anything is
+        a question for the gauntlet, and the way to find out is to write the
+        number down beside every decision for a few thousand launches -- not
+        to put an untested model in front of the sizing engine and discover
+        later that it was wrong in a direction nobody measured.
+        """
+        from src.execution.executable_tail import (
+            capturable_upside, executable_tail_curve)
+        state = self._latest_curve_state.get(token)
+        if state is None:
+            return {"status": "DATA_BLOCKED", "detail": "no curve state"}
+        tokens = int(position.get("size_tokens", 0) or 0)
+        cost = int(float(position.get("cost_basis_usd", 0.0) or 0.0)
+                   / max(1e-9, float(self.sol_price_usd)) * 1e9)
+        if tokens <= 0 or cost <= 0:
+            return {"status": "DATA_BLOCKED", "detail": "no priced position"}
+        continuation = getattr(self, "_continuation", None) or getattr(
+            self, "continuation", None)
+        survival = None
+        if continuation is not None:
+            curve = position.get("survival_curve")
+            if curve:
+                survival = lambda multiple: continuation.survival(curve, multiple)
+        return capturable_upside(executable_tail_curve(
+            state, tokens, cost, survival=survival,
+            pool=self._latest_pool_state.get(token),
+            acceptable_impact=float(
+                self.global_config.get("acceptable_exit_impact", 0.10))))

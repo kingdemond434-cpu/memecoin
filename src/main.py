@@ -60,7 +60,8 @@ from src.research.fallback import FallbackResolver, Source
 from src.runtime.latency import LatencyLedger
 from src.runtime.serialisation import jsonable as _jsonable
 from src.runtime.depth import (
-    CopyBookBudgets, DepthResolution, FollowableTrades, update_copy_budget)
+    CopyBookBudgets, DepthResolution, FollowableTrades, TailLadder,
+    update_copy_budget)
 from src.runtime.prelaunch_feed import PrelaunchFeed
 from src.runtime.execution_feedback import (
     ExecutionFeedback, fee_competition)
@@ -197,7 +198,7 @@ CAPACITY_REJECTIONS = frozenset({
 
 class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
                        ExecutionFeedback, DepthResolution, FollowableTrades,
-                       CopyBookBudgets, PrelaunchFeed,
+                       CopyBookBudgets, PrelaunchFeed, TailLadder,
                        MinedRecordIngestion,
                        DeskMaintenance, TaskSupervision, EvidenceRecording,
                        SubsystemWiring, SourceIntelligence, PositionForensics,
@@ -2520,6 +2521,8 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
                                      "held": state.held_fraction,
                                      "multiple": state.current_multiple,
                                      "capacity": state.exit_capacity_ratio,
+                                     "executable_tail": self.executable_tail(
+                                         token, position),
                                      "escape": state.escape_probability}),
             model_hash=self.model_feature_hash,
             expiry_seconds=float(self.global_config.get("decision_expiry_seconds", 1.5)),
