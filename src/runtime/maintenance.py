@@ -36,6 +36,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List
 
+from src.runtime.actor_intelligence import record_resolution_feedback
 from src.research import rug_mechanism
 
 from src.chains.pump_fee_config import fee_config_address, parse_fee_config
@@ -160,6 +161,14 @@ class DeskMaintenance:
             return
         self.launch_census.resolve(
             token, rugged=True, rug_mechanism=verdict.mechanism.value)
+        # The adversarial detector's only feed. A feature value that used to
+        # precede monsters and now precedes rugs is exactly what it exists to
+        # notice, and nothing was telling it how anything ended.
+        record_resolution_feedback(self, token, {
+            "rugged": True, "mechanism": verdict.mechanism.value,
+            "features": (self.dataset_builder.last_features(token)
+                         if hasattr(self.dataset_builder, "last_features")
+                         else {})})
         self._record_ops_event("rug_mechanisms", {
             "token": token, "at": "eviction", **verdict.to_dict()})
 

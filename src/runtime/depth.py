@@ -113,9 +113,20 @@ class FollowableTrades:
     MEASURED_FLOOR = 0.50
 
     def _record_followable_trade(self, token: str, event: Dict[str, Any]) -> None:
+        from src.runtime.actor_intelligence import (
+            note_wallet_first_seen, record_actor_feedback, record_buy_edge)
         wallet = str(event.get("wallet") or "")
         if not wallet:
             return
+        # The actor graph takes EVERY wallet, not only the followable ones:
+        # independence and family collapse are questions about the whole
+        # cohort, and a graph built from the wallets we already like would
+        # answer them about ourselves.
+        at = float(event.get("timestamp", 0) or time.time())
+        if event.get("side") == "buy":
+            record_buy_edge(self, token, wallet, at)
+            note_wallet_first_seen(self, token, wallet, at)
+        record_actor_feedback(self, token, event)
         consensus = getattr(self, "wallet_consensus", None)
         if consensus is None:
             return
@@ -138,6 +149,14 @@ class FollowableTrades:
         # lower bound, and only those raise the event.
         if confidence < self.MEASURED_FLOOR:
             return
+        # What this wallet does in THIS regime, rather than on average. A
+        # wallet excellent on early-curve launches and poor after migration
+        # has no single score, and averaging the two describes a wallet that
+        # does not exist.
+        from src.runtime.research_reads import wallet_regime_reading
+        from src.strategies.wallet_intelligence import WalletRegime
+        event["wallet_regime_reading"] = wallet_regime_reading(
+            self, wallet, token, WalletRegime.EARLY_CURVE)
         from src.strategies.information_graph import LeadEventType
         self.info_graph.record_event(
             token,
@@ -185,7 +204,12 @@ class CopyBookBudgets:
         if allocator is None:
             return {"status": "DATA_BLOCKED", "detail": "no copy allocator wired"}
         budget = float(self.global_config.get("copy_book_usd", 0.0) or 0.0)
+        # Name the funded clusters in the signature model on the way past, so
+        # a FRESH address running the same programme gets a prior instead of
+        # being unknown by construction.
         report = allocator.report()
+        report["clusters_published"] = allocator.publish_clusters(
+            getattr(self, "wallet_signatures", None))
         report["copy_book_usd"] = budget
         report["allocation_usd"] = allocator.allocate(budget)
         return report

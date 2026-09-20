@@ -284,6 +284,37 @@ class WalletAllocator:
         return {name: float(budget_usd * value / total)
                 for name, value in weights.items()}
 
+    def publish_clusters(self, signatures: Any) -> int:
+        """Name every funded cluster in the signature model, with its value.
+
+        A cluster is only worth matching a FRESH address against if following
+        it was worth something, and the number that says so is the measured
+        lower bound -- not a composite. `define_cluster` is how an unknown
+        wallet gets a prior from behaviour when its address has no history,
+        which is exactly what a competent operator's wallet rotation
+        produces, and nothing was ever naming a cluster for it to match.
+        """
+        define = getattr(signatures, "define_cluster", None)
+        if not callable(define):
+            return 0
+        members: Dict[str, List[str]] = {}
+        values: Dict[str, float] = {}
+        for budget in self._budgets.values():
+            if budget.status != "OK" or self.weight(budget.wallet) <= 0:
+                continue
+            members.setdefault(budget.cluster, []).append(budget.wallet)
+            values[budget.cluster] = max(
+                values.get(budget.cluster, 0.0),
+                float(budget.historical_lower_bound or 0.0))
+        defined = 0
+        for cluster, wallets in members.items():
+            try:
+                defined += int(bool(define(cluster, wallets,
+                                           values.get(cluster))))
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("define_cluster failed for %s: %s", cluster, exc)
+        return defined
+
     def report(self) -> Dict[str, Any]:
         active = [b for b in self._budgets.values() if self.weight(b.wallet) > 0]
         probation = [b for b in active if b.on_probation]

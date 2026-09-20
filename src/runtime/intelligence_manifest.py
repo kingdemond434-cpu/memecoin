@@ -74,6 +74,21 @@ class Contributor:
 # Everything that must reach an ENTRY decision. Ordered roughly by how early
 # in the pipeline it speaks, which is also the order an operator reads them.
 ENTRY_CONTRIBUTORS: Tuple[Contributor, ...] = (
+    Contributor("strategies.genealogy_graph", "genealogy_risk",
+                "Deployer rug history and funder cluster risk, recorded with "
+                "no vote: it is a hand-weighted composite and belongs in the "
+                "record for the gauntlet to price, not in the decision."),
+    Contributor("strategies.information_graph", "lead_forecast",
+                "Which source leads which event says what is likely to "
+                "happen to this token next, and how sure the graph is."),
+    Contributor("research.cold_distillation", "cold_start",
+                "In the first seconds there is no token history at all; the "
+                "venue-hour and funder priors are the only things the desk "
+                "has to say in the window that decides a snipe."),
+    Contributor("research.fallback", "evidence_confidence",
+                "A decision resting on three substituted facts is not as "
+                "good as one resting on primaries, and the weakest rung "
+                "dominates."),
     Contributor("chains.rug_detector", "safety",
                 "Mint and pool authorities decide whether the token can be "
                 "confiscated after we buy it."),

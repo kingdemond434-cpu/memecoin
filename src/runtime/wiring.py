@@ -92,6 +92,7 @@ from src.strategies.monster import (
 )
 from src.strategies.opportunity_allocator import Opportunity, OpportunityAllocator
 from src.runtime.intelligence_manifest import CoverageTracker, audit as audit_intelligence
+from src.research.actor_store import ActorStore
 from src.research.migration_lineage import MigrationLineage
 from src.research.prelaunch_corpus import PrelaunchCorpus
 from src.strategies.prelaunch_intent import PrelaunchIntentModel
@@ -425,6 +426,13 @@ class SubsystemWiring:
             acceptable_impact=float(
                 self.global_config.get("acceptable_exit_impact", 0.10)))
         self.migration_lineage.load()
+        # The point-in-time actor graph. It was never constructed at all, so
+        # `funders_of`, `prior_mints` and `shared_family` had no callers
+        # because they had no object to be called on.
+        self.actor_store = ActorStore(
+            Path(self.global_config.get("state_dir", "data/state"))
+            / "actor_edges.jsonl")
+        self.actor_store.load()
         self.counterfactual_lab = CounterfactualExecutionLab()
         self.adversarial = AdversarialAdaptationDetector()
         for feature, fakeability in {

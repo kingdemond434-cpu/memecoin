@@ -27,38 +27,12 @@ record_social_creation	D	no verified wallet-to-social source exists; feeding it 
 # The hypothesis ledger. Trials are the record that lets the gauntlet price
 # selection; none are recorded, so multiplicity is unpriced.
 # Source-lead and adversarial adaptation: written, never consulted.
-predict_next_event	A	source lead times predict nothing
-get_source_ranking	A	sources are never ranked in production
-record_feature_value	A	adaptation detector has no feed
-get_alerts	A	adaptation alerts reach nobody
-get_all_weights	A	adapted weights are never read
-get_best_policy	A	the counterfactual lab picks nothing
 # Actor and wallet intelligence reads with no consumer.
-funders_of	A	funder ancestry is never queried live
-prior_mints	A	a deployer's prior mints are never checked
-shared_family	A	shared-family detection is unused
-assess_launch_risk	A	genealogy risk never reaches a decision
-is_kol	A	KOL touches are recorded and never read
-define_cluster	A	behavioural clusters are never defined
-observe_exit	A	signature model never sees exits
-get_wallet_signal	A	per-regime wallet signal is unused
-get_regime_performance	A	per-regime wallet performance is unused
-get_coordinated_activity	A	coordinated activity is never surfaced
-get_top_wallets_by_value	A	superseded in production by followable_wallets, kept for tools
 # Execution capability that is built and idle.
 record_pair	C	the synchronous constructor for a comparison the desk cannot yet make: only one route is quoted per decision, and observe_both needs a live challenger endpoint
 # Research surfaces with no reader.
-scored_edges	A	scored source edges are never read
-regime_stability	A	edge stability across regimes is unused
-cohort_prior	A	cold-start cohort prior is unused
-funder_prior	A	cold-start funder prior is unused
-declare_canonical	A	identity collapse is never declared
-set_baseline	A	edge decay has no baseline to decay from
-trustworthy	A	calibration trust is never consulted
-combined_confidence	A	fallback confidence is never combined
-resolve_many	A	batch fallback resolution is unused
-exhausted	A	remaining-audience exhaustion is never read
-record_balance	A	dev wallet balances are never recorded
+declare_canonical	C	needs a figure to publish a token as theirs, which no observed source currently states
+exhausted	C	needs per-token AudienceTier observations, which nothing produces yet; the attention-diffusion feed is a separate project
 
 
 # --- C: offline research and operator APIs ---------------------------------

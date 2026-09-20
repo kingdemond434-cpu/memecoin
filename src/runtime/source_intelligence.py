@@ -140,7 +140,16 @@ class SourceIntelligence:
             root = Path(self.global_config.get("ops_state_dir", "data/state"))
             root.mkdir(parents=True, exist_ok=True)
             for mechanism, growth in self._mechanism_growth.items():
-                for value in growth:
+                values = list(growth)
+                # The baseline a mechanism was PROMOTED on, set from the
+                # first window that produced any. Decay is meaningless
+                # without it -- a monitor with no baseline compares every
+                # window against zero and calls a flat edge healthy -- and
+                # nothing was ever setting one.
+                if values and mechanism not in self.edge_decay._baseline:
+                    self.edge_decay.set_baseline(
+                        mechanism, sum(values) / len(values))
+                for value in values:
                     self.edge_decay.record(mechanism, value)
                 growth.clear()
             (root / "edge_decay.json").write_text(

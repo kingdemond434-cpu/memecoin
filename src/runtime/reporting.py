@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from aiohttp import web
 from src.research.funnel_invariant import check_desk
+from src.runtime.research_reads import research_report
 from src.chains.yellowstone_grpc import (
     NATIVE_FASTPATH_STATUS, PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
     create_combined_subscription,
@@ -153,6 +154,9 @@ class ReportingSurface:
             # asking -- which is how 150,278 decisions and no entry looked
             # healthy for 8.76 days.
             "funnel_invariant": check_desk(self).to_dict(),
+            # Diagnostic, dated, and deliberately without authority: twenty
+            # research surfaces that were built and answered nobody.
+            "research": research_report(self),
             "migration_lineage": (self.migration_lineage.report()
                                   if getattr(self, "migration_lineage", None)
                                   else {"status": "DATA_BLOCKED",

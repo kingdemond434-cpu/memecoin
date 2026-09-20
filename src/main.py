@@ -64,6 +64,8 @@ from src.runtime.depth import (
     note_curve_state, note_entry_position, note_migration, note_pool_state,
     update_copy_budget)
 from src.runtime.prelaunch_feed import PrelaunchFeed
+from src.runtime.actor_intelligence import (
+    entry_actor_block, ingest_launch_edges)
 from src.runtime.execution_readiness import bid_floor, pre_trade_readiness
 from src.runtime.execution_feedback import (
     ExecutionFeedback, fee_competition)
@@ -1202,15 +1204,13 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
         self.latency.mark(token, "decide_to_build")
         competition = fee_competition(getattr(self, "latency", None))
         age_s = float(trade_info.get("time_since_launch", 0.0) or 0.0)
-        # Raised to the observed market when it sits under it. Everything in
-        # that corpus LANDED, so it is a market quote and never a landing
-        # probability -- a floor, never a target. Bidding under what the
-        # competition demonstrably paid is choosing to lose the race.
+        # Raised to the observed market when it sits under it: that corpus
+        # holds only transactions that LANDED, so it is a market quote and
+        # never a landing probability -- a floor, never a target.
         priority_fee = bid_floor(self, age_s, self.fee_optimizer.get_optimal_fee(
             trade_info["position_value_usd"], competition))
-        readiness = pre_trade_readiness(
-            self, token, int(trade_info.get("expected_tokens", 0) or 0), age_s)
-        trade_info = {**trade_info, "execution_readiness": readiness}
+        trade_info = {**trade_info, "execution_readiness": pre_trade_readiness(
+            self, token, int(trade_info.get("expected_tokens", 0) or 0), age_s)}
         result = await self.execution_engine.execute_swap(
             candidate.base_token or WSOL_MINT, token, int(trade_info["position_size_sol"] * 1e9),
             slippage_bps=100,
@@ -1880,6 +1880,7 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
             "source_dna": self._source_dna(token),
             "authenticity": self._authenticity(token, candidate),
             "cost_model": self._cost_model(token),
+            **entry_actor_block(self, token, candidate),
             "prelaunch": (self._prelaunch_context(candidate.deployer or "", candidate.timestamp)
                           or {"status": "DATA_BLOCKED", "reason": "no deployer profile"}),
             "coordination": self.public_coordination.get_features(token),
@@ -3773,6 +3774,7 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
             # trained, and published a 0.0 launch probability that looked
             # like a measurement.
             self._record_prelaunch_launch(token, event)
+            ingest_launch_edges(self, token, event)
             noter = getattr(self, "_note_launch_venue", None)
             if noter is not None:
                 noter(event)
