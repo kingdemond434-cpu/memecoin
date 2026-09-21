@@ -699,6 +699,26 @@ def instruction_fields(instruction: Any) -> Tuple[int, List[int], bytes]:
 SYSTEM_PROGRAM = "11111111111111111111111111111111"
 
 
+def extract_compute_budget(keys: List[str], instructions: Iterable[Any]):
+    """What priority this transaction declared, from its own instructions.
+
+    Every transaction on the stream landed, and every one of them carries
+    the compute unit price its sender chose. That is a free corpus of what
+    the competition pays -- on exactly the launches this desk is deciding
+    about, at exactly the ages that matter -- and it was being walked past
+    on every single transaction.
+    """
+    from src.execution.observed_bids import decode_compute_budget
+
+    pairs = []
+    for instruction in instructions:
+        program_index, _accounts, data = instruction_fields(instruction)
+        if program_index < 0 or program_index >= len(keys) or not data:
+            continue
+        pairs.append((keys[program_index], data))
+    return decode_compute_budget(pairs)
+
+
 def extract_system_transfers(keys: List[str], instructions: Iterable[Any]) -> List[Dict[str, Any]]:
     """Decode native SystemProgram Transfer instructions from a transaction.
 
@@ -919,6 +939,10 @@ class PumpFunMonitor:
     async def _on_transaction(self, tx_data: Any):
         received_ns = time.time_ns()
         keys, instructions, signature, slot = transaction_parts(tx_data)
+        # Decoded once per transaction, not once per instruction: the budget
+        # belongs to the transaction, and re-walking the instruction list for
+        # every matched instruction would pay for it several times over.
+        budget = extract_compute_budget(keys, instructions)
         # The richer event wins. Decided once per transaction so the outer
         # instruction can stand down for the inner event that supersedes it.
         defer_to_cpi_trade = self._carries_cpi_trade(keys, instructions)
@@ -937,6 +961,13 @@ class PumpFunMonitor:
                     if event:
                         kind = str(event.get("type", "") or "cpi_event")
                         self.matched[kind] = self.matched.get(kind, 0) + 1
+                        # Carried on the event so the desk can bucket it by
+                        # the launch's age without re-reading the chain.
+                        if budget.stated:
+                            event["priority_lamports"] = budget.priority_lamports
+                            event["compute_unit_price"] = (
+                                budget.unit_price_micro_lamports)
+                            event["compute_unit_limit"] = budget.unit_limit
                         if kind == "token_created" and event.get("creator"):
                             transfers = extract_system_transfers(keys, instructions)
                             event["funding_transfers"] = transfers

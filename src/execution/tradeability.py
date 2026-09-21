@@ -25,7 +25,7 @@ DATA_BLOCKED and the caller has to decide what to do about not knowing.
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -266,3 +266,42 @@ def pool_tradeability(state, quote_buy_fn, quote_sell_fn,
     return TradeabilityReport(
         entry=build_frontier(buy_quote, quote_ceiling, "entry", bounds),
         exit=build_frontier(sell_quote, base_ceiling, "exit", bounds))
+
+
+def curve_depth_usd(state: Any, acceptable_impact: float,
+                    sol_price_usd: float) -> Optional[float]:
+    """Notional that can actually be SOLD out of a bonding curve, in USD.
+
+    This is the number a position ceiling should be built on, and it is not
+    "some fraction of liquidity". On a constant-product curve the round trip
+    costs the fee and nothing else at any size -- impact is fully reversible
+    if nothing happens in between -- so a flat `liquidity * 1%` cap is not
+    pricing cost. What it is crudely standing in for is EXIT: how much of this
+    can be turned back into SOL inside an impact we would accept, bounded by
+    the real SOL the curve is physically holding.
+
+    That question has an exact answer from state the desk already streams, so
+    it is answered rather than approximated. Returns None when the curve
+    cannot be measured -- never a permissive default, because an unmeasurable
+    exit is the case where assuming depth is most expensive.
+    """
+    if state is None or sol_price_usd <= 0 or acceptable_impact <= 0:
+        return None
+    if not getattr(state, "tradeable", False):
+        return None
+    # A curve holding no real SOL has no exit depth at all -- the virtual
+    # reserves are an accounting fiction that cannot pay anybody out. At T0
+    # that is the literal truth: the first buyer's exit liquidity is whatever
+    # flow arrives behind them, which is a forecast, not a measurement. So it
+    # is refused here rather than answered with a number, and the caller falls
+    # back to its declared assumption knowing that is what it is doing.
+    if int(getattr(state, "real_sol_reserves", 0) or 0) <= 0:
+        return None
+    from src.chains.pump_curve import quote_sell, sell_capacity_lamports
+    tokens = sell_capacity_lamports(state, max_impact_pct=float(acceptable_impact))
+    if tokens <= 0:
+        return None
+    quote = quote_sell(state, int(tokens))
+    if quote.data_status != "OK" or quote.output_amount <= 0:
+        return None
+    return (quote.output_amount / 1_000_000_000) * float(sol_price_usd)

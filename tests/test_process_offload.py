@@ -192,7 +192,7 @@ class ADyingChildIsNotRespawnedInATightLoop(unittest.TestCase):
         pool = ProcessOffloadedPool(FACTORY, {}, sink=lambda *_: None, name="ok")
         pool._running = True
         pool.consecutive_failures = 3
-        pool.delivered = 10
+        pool.delivered_this_generation = 10
 
         class _Live:
             exitcode = None
@@ -203,3 +203,118 @@ class ADyingChildIsNotRespawnedInATightLoop(unittest.TestCase):
         pool._process = _Live()
         pool._supervise()
         self.assertEqual(0, pool.consecutive_failures)
+
+    def test_an_earlier_generation_does_not_absolve_the_current_one(self):
+        """The pool's lifetime total is not evidence about THIS child.
+
+        Forgiving on `delivered` meant a first generation that ran for an
+        hour absolved every crash after it: the reset fired on any tick where
+        the newest child was still alive, `consecutive_failures` never
+        climbed, and the give-up point was unreachable. A child dying at
+        import was then respawned for ever, burying the reason under
+        identical tracebacks -- which is the failure this backoff exists to
+        prevent, reintroduced by the forgiveness rule.
+        """
+        pool = ProcessOffloadedPool(FACTORY, {}, sink=lambda *_: None, name="ok")
+        pool._running = True
+        pool.consecutive_failures = 3
+        pool.delivered = 10_000          # an earlier generation was healthy
+        pool.delivered_this_generation = 0
+
+        class _Live:
+            exitcode = None
+
+            def is_alive(self):
+                return True
+
+        pool._process = _Live()
+        pool._supervise()
+        self.assertEqual(3, pool.consecutive_failures)
+
+    def test_a_reader_retires_when_its_child_is_replaced(self):
+        """A reader is bound to the child it was started for.
+
+        Reading `self._queue` afresh each pass meant the old thread outlived
+        its child and then competed with the new reader for the NEW child's
+        records -- one leaked thread per restart, and one stream split
+        between two consumers.
+        """
+        import queue as queue_module
+        import threading
+
+        pool = ProcessOffloadedPool(FACTORY, {}, sink=lambda *_: None, name="ok")
+        pool._running = True
+        pool._generation = 1
+        old_queue = queue_module.Queue()
+        thread = threading.Thread(
+            target=pool._read_forever, args=(1, old_queue), daemon=True)
+        thread.start()
+        # The child is replaced.
+        pool._generation = 2
+        thread.join(timeout=3.0)
+        self.assertFalse(thread.is_alive(),
+                         "the reader for a retired child never exited")
+
+
+class OnlyWhatChangedCrossesThePipe(unittest.TestCase):
+    """The miners are polls, not streams.
+
+    `jupiter_tokens` returns the same 3,174 records every pass, and all of
+    them were pickled in the child, pushed through a pipe and unpickled in
+    the parent -- on the loop this whole class exists to keep free -- for
+    records the parent had already seen and would immediately discard.
+    """
+
+    def _filter(self, **kwargs):
+        from src.runtime.process_offload import _DeltaFilter
+        return _DeltaFilter(**kwargs)
+
+    def test_the_second_identical_pass_sends_nothing(self):
+        delta = self._filter(resync_every=0)
+        rows = [{"mint": f"M{index}", "price": 1.0} for index in range(3174)]
+        _, first = delta.filter("jupiter_tokens", rows)
+        self.assertEqual(3174, first["sent"])
+        fresh, second = delta.filter("jupiter_tokens", rows)
+        self.assertEqual([], fresh)
+        self.assertEqual(3174, second["suppressed"])
+
+    def test_a_changed_record_is_a_new_record(self):
+        # A token whose price moved must cross; the same token unchanged must
+        # not. The digest covers the content, and the identity only groups it.
+        delta = self._filter(resync_every=0)
+        delta.filter("m", [{"mint": "A", "price": 1.0}])
+        fresh, meta = delta.filter("m", [{"mint": "A", "price": 2.0}])
+        self.assertEqual(1, meta["sent"])
+        self.assertEqual(2.0, fresh[0]["price"])
+
+    def test_miners_do_not_suppress_each_other(self):
+        delta = self._filter(resync_every=0)
+        delta.filter("a", [{"x": 1}])
+        _, meta = delta.filter("b", [{"x": 1}])
+        self.assertEqual(1, meta["sent"])
+
+    def test_a_periodic_resync_bounds_a_lost_record_to_one_interval(self):
+        # The one failure a delta filter has: if the parent ever loses a
+        # record the child believes delivered, suppression makes the loss
+        # permanent. A resync makes it temporary.
+        delta = self._filter(resync_every=3)
+        rows = [{"x": 1}, {"x": 2}]
+        delta.filter("m", rows)
+        self.assertEqual(0, delta.filter("m", rows)[1]["sent"])
+        _, third = delta.filter("m", rows)
+        self.assertTrue(third["resync"])
+        self.assertEqual(2, third["sent"])
+
+    def test_memory_stays_bounded(self):
+        delta = self._filter(memory=100, resync_every=0)
+        for index in range(1000):
+            delta.filter("m", [{"x": index}])
+        self.assertLessEqual(len(delta._seen["m"]), 100)
+
+    def test_an_unpicklable_record_still_gets_a_digest(self):
+        # A record the child cannot serialise for hashing must still be
+        # forwarded once rather than crash the publish path.
+        delta = self._filter(resync_every=0)
+        fresh, meta = delta.filter("m", [object()])
+        self.assertEqual(1, meta["sent"])
+        self.assertEqual(1, len(fresh))

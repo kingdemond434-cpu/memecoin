@@ -13,7 +13,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
@@ -28,6 +28,7 @@ from solders.transaction import VersionedTransaction
 from src.chains.pump_curve import quote_buy, quote_sell
 from src.execution.landing_router import LandingRouter, Route
 from src.execution.tx_kernel import TxKernel
+from src.execution.bid_curve import ConditionedLandingCurve
 from src.execution.landing_model import Attempt, LandingModel
 from src.chains.blockhash import BlockhashCache
 from src.execution.slot_value import urgency_adjusted_edge
@@ -52,6 +53,9 @@ class RouteType(Enum):
     ORCA_DIRECT = "orca_direct"
     METEORA_DLMM = "meteora_dlmm"
     JITO_BUNDLE = "jito_bundle"
+    #: Challenger aggregator, quoting in SHADOW until forward evidence on
+    #: realised fills promotes it. See `src/execution/raptor.py`.
+    RAPTOR = "raptor"
 
 
 class TransactionStatus(Enum):
@@ -662,6 +666,16 @@ class ExecutionEngine:
         self.jupiter = jupiter
         self.jito = jito
         self.tx_builder = tx_builder
+        # Set by wiring. Turns `leader: ""` on every recorded attempt into an
+        # actual validator identity, which is what the landing model's
+        # per-leader accept rates have always been keyed on and never had.
+        self.leader_schedule: Optional[Any] = None
+        # Set by wiring. The ladder the desk has to climb before it may
+        # spend anything; see live_capital_authorised.
+        self.promotion_ledger: Optional[Any] = None
+        #: Why submissions were simulated, by reason. "dry_run" is an
+        #: operator's choice; anything else is the ladder refusing.
+        self.simulation_reasons: Dict[str, int] = {}
         self.counterfactual_lab = counterfactual_lab
         self.dry_run = bool(dry_run)
         self.confirmation_timeout = confirmation_timeout
@@ -860,6 +874,7 @@ class ExecutionEngine:
             "prepared_share": (prepared / total) if total else None,
             "outcomes": dict(self.native_route_attempts),
             "landing_model": self.landing_model.report(),
+            "bid_curve": self.bid_curve.report(),
             "last_bid": dict(self.last_bid),
             "reconciliation": {
                 "stream_confirmations": self.stream_confirmations,
@@ -928,7 +943,8 @@ class ExecutionEngine:
         # pre-graduation bucket, and the two are not the same market.
         route_type = (RouteType.PUMPSWAP_NATIVE if native.venue == "pumpswap"
                       else RouteType.PUMP_NATIVE)
-        if self.dry_run:
+        blocked = self._submission_blocked()
+        if blocked:
             # BUILD AND SIGN ANYWAY. This used to return here, which left the
             # whole build path -- account derivation, compute budget, the
             # blockhash cache, the signer -- as dead code for the entire
@@ -968,6 +984,18 @@ class ExecutionEngine:
                 # trade the desk was never capable of making.
                 error=build_error,
             )
+            # WHY it was simulated: an operator's flag, or an unearned stage.
+            # Those are different states and an operator staring at a desk
+            # that is not trading needs to know which one they are in.
+            #
+            # Resolved defensively because this is ACCOUNTING sitting inside
+            # a safety path, and accounting that can raise turns "we
+            # correctly refused to spend money" into a crashed decision loop.
+            reasons = getattr(self, "simulation_reasons", None)
+            if reasons is None:
+                reasons = {}
+                self.simulation_reasons = reasons
+            reasons[blocked] = reasons.get(blocked, 0) + 1
             self.native_route_attempts["simulated"] += 1
             self.native_route_attempts[f"simulated:{native.venue}"] += 1
             self._record(result, decision_id)
@@ -1124,7 +1152,7 @@ class ExecutionEngine:
         if not quote or quote.output_amount <= 0:
             return ExecutionResult(False, TransactionStatus.REJECTED, error="no executable quote")
 
-        if self.dry_run:
+        if self._submission_blocked():
             result = ExecutionResult(
                 success=True,
                 status=TransactionStatus.SIMULATED,
@@ -1277,7 +1305,7 @@ class ExecutionEngine:
         if race.identifier:
             self.landing_router.record_landing(
                 race.identifier, landed=bool(fill.get("landed")))
-        self.landing_model.record(Attempt(
+        attempt = Attempt(
             bid_lamports=int(jito_tip if use_jito else 0),
             landed=bool(fill.get("landed")),
             route=route_type.value,
@@ -1291,7 +1319,13 @@ class ExecutionEngine:
             # what compute limit we set, how stale the blockhash was -- so it
             # is recorded now and read later.
             region=self.region,
-            leader=str(fill.get("leader", "") or ""),
+            # Resolved from the schedule when the fill did not carry one,
+            # which until now was ALWAYS -- so every attempt the desk ever
+            # recorded went into a single empty-string bucket and the
+            # per-leader accept rates the landing model exists to learn have
+            # never had a leader to key on.
+            leader=(str(fill.get("leader", "") or "")
+                    or self._leader_for_slot(fill.get("slot"))),
             slot=fill.get("slot"),
             compute_units=int(compute_unit_limit or 0),
             tip_lamports=int(jito_tip if use_jito else 0),
@@ -1313,7 +1347,12 @@ class ExecutionEngine:
             submitted_at=started,
             landed_at=(time.time() if fill.get("landed") else None),
             signature=str(signature or ""),
-            failure=("" if fill.get("filled") else str(fill.get("error", "") or ""))))
+            failure=("" if fill.get("filled") else str(fill.get("error", "") or "")))
+        self.landing_model.record(attempt)
+        # Same attempt, both curves. The conditioned one refuses paper
+        # attempts itself, so a dry-run desk feeds the pooled model and leaves
+        # the curve that prices real bids untouched.
+        self.bid_curve.record(attempt)
         return ExecutionResult(
             success=bool(fill.get("filled")), status=status, signature=signature,
             bundle_id=bundle_id, input_amount=amount,
@@ -1597,6 +1636,58 @@ class ExecutionEngine:
             return 0
         return int(after[index]) - int(before[index])
 
+    def live_capital_authorised(self) -> Tuple[bool, str]:
+        """Whether the EARNED promotion stage permits spending real money.
+
+        This is the check `dry_run` never was. `dry_run` is an operator's
+        intent -- a flag somebody set -- and intent is not evidence. This
+        asks the ledger what the desk has actually demonstrated, and the
+        ledger only advances on a passing verdict against frozen criteria.
+
+        Fails CLOSED in every ambiguous case. No ledger, an unreadable
+        stage file, an exception while checking: all of them mean not
+        authorised. The direction of that default is the entire point --
+        a bug in this function must never be the reason money moves.
+        """
+        ledger = getattr(self, "promotion_ledger", None)
+        if ledger is None:
+            return False, ("no promotion ledger attached; live capital "
+                           "requires a recorded, earned stage")
+        try:
+            return ledger.authorises_live_capital()
+        except Exception as exc:  # pragma: no cover - defensive
+            return False, f"promotion ledger unreadable: {exc}"
+
+    def _submission_blocked(self) -> Optional[str]:
+        """Why this submission must not go out, or None to proceed.
+
+        Both conditions, not either. `dry_run=False` says an operator
+        intends to trade; the ledger says the desk has earned the right to.
+        Trading needs both, and the historical failure mode here is a flag
+        somebody flipped weeks ago on a desk whose evidence never arrived.
+        """
+        if self.dry_run:
+            return "dry_run"
+        authorised, reason = self.live_capital_authorised()
+        if not authorised:
+            return reason
+        return None
+
+    def _leader_for_slot(self, slot: Any) -> str:
+        """The validator that produced this slot, or "" when unknown.
+
+        Empty rather than a guess: a wrong leader puts one validator's
+        accept rate into another's bucket, and the landing model never
+        unlearns it.
+        """
+        schedule = getattr(self, "leader_schedule", None)
+        if schedule is None or not slot:
+            return ""
+        try:
+            return schedule.leader_for(int(slot))
+        except Exception:  # pragma: no cover - accounting only
+            return ""
+
     def current_congestion(self) -> Optional[float]:
         """Measured congestion, or None. Never a default.
 
@@ -1633,6 +1724,36 @@ class ExecutionEngine:
         raced = float(expected_value_usd)
         if slot_value is not None:
             raced = urgency_adjusted_edge(slot_value, expected_value_usd)
+
+        # The jointly-conditioned curve first, where it has support. It prices
+        # leader, contention and blockhash age together and reports the
+        # marginal value of the next lamport, rather than taking a pooled
+        # recommendation and scaling it once per conditioner -- which is what
+        # the block below does, and which double-counts whenever two
+        # conditioners move the same way.
+        if sol_price_usd > 0 and raced > 0:
+            edge_lamports = (raced / float(sol_price_usd)) * 1e9
+            # Blockhash age is an OPTIONAL conditioner: absent, the curve
+            # reports no survival term rather than assuming a fresh hash.
+            # Read through getattr because choose_bid is legitimately called
+            # on engines that have no transaction builder -- pricing a bid
+            # does not require the ability to build one.
+            conditioned = self.bid_curve.optimise(
+                edge_lamports=edge_lamports, leader=leader,
+                account_contention=account_contention, congestion=congestion,
+                blockhash_age_slots=getattr(
+                    getattr(self, "tx_builder", None),
+                    "last_blockhash_age_slots", None))
+            if conditioned.status == "OK":
+                return {"lamports": int(conditioned.bid_lamports),
+                        "measured": True, "source": "conditioned_curve",
+                        "slot_value": (slot_value.to_dict()
+                                       if slot_value is not None
+                                       and hasattr(slot_value, "to_dict")
+                                       else None),
+                        "raced_value_usd": raced,
+                        **conditioned.to_dict()}
+
         recommendation = self.landing_model.recommend(
             raced, sol_price_usd, congestion)
         urgency = ({"slot_value": slot_value.to_dict(), "raced_value_usd": raced}
@@ -1671,6 +1792,35 @@ class ExecutionEngine:
                     **urgency, **conditioning, **recommendation.to_dict()}
         return {"lamports": int(fallback_lamports), "measured": False,
                 **urgency, **recommendation.to_dict()}
+
+    @property
+    def bid_curve(self) -> ConditionedLandingCurve:
+        """The jointly-conditioned curve, created on first use.
+
+        A property rather than an `__init__` assignment because parts of this
+        codebase legitimately build an engine through `__new__` to exercise
+        one method without standing up the whole desk. An attribute assigned
+        only in `__init__` is absent there, and the alternatives are both
+        worse than lazily creating it: a `getattr(self, "bid_curve", None)`
+        guard at the record site silently stops recording, which is the exact
+        looks-wired-does-nothing failure this repository keeps finding, and
+        requiring every such caller to construct one makes the curve optional
+        in practice.
+
+        It is kept BESIDE the pooled `landing_model` rather than replacing it,
+        so the two can disagree visibly, and it takes only real attempts --
+        paper fills describe a simulator, and this is the curve that prices
+        real money.
+        """
+        curve = getattr(self, "_bid_curve", None)
+        if curve is None:
+            curve = ConditionedLandingCurve()
+            self._bid_curve = curve
+        return curve
+
+    @bid_curve.setter
+    def bid_curve(self, curve: ConditionedLandingCurve) -> None:
+        self._bid_curve = curve
 
     def _record(self, result: ExecutionResult, decision_id: Optional[str]):
         result_data = result.__dict__.copy()

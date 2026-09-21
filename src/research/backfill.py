@@ -247,6 +247,8 @@ class BackfillReport:
     blocked: int = 0
     reasons: Dict[str, int] = field(default_factory=dict)
     limitation_counts: Dict[str, int] = field(default_factory=dict)
+    #: Edges handed to the materialised actor graph, if one was attached.
+    actor_edges: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -265,14 +267,33 @@ def run_backfill(
     output_dir: Path,
     min_trades: int = 5,
     writer: Optional[Callable[[Path, Dict[str, Any]], None]] = None,
+    actor_store: Optional[Any] = None,
 ) -> BackfillReport:
     """Reconstruct a batch, writing one file per episode.
 
     Runs on whatever machine has the history, never on the trading node: a
     backfill competes for RAM, CPU, disk and file descriptors exactly when a
     launch arrives, and the trading node's job is to be boring and predictable.
+
+    `actor_store`, when given, is fed the SAME raw launches as edges stamped
+    with when each was observable. That is the only moment the graph can be
+    built correctly: the reconstruction path already has creation times, buy
+    order and funding transfers in hand, and a graph assembled later from the
+    episodes has to re-derive all three and gets the ordering wrong.
+
+    Every launch is offered, including the ones reconstruction rejects. A
+    launch too thin to be an episode is still a real deployment by a real
+    deployer, and dropping it would understate exactly the prior-launch counts
+    the store exists to answer.
     """
     report = BackfillReport()
+    if actor_store is not None:
+        try:
+            ingested = actor_store.ingest_raw_launches(raws)
+            report.actor_edges = int(ingested.get("edges", 0))
+        except Exception as exc:
+            logger.warning("actor store ingestion DATA_BLOCKED: %s", exc)
+            report.actor_edges = 0
     output_dir.mkdir(parents=True, exist_ok=True)
     write = writer or (lambda path, payload: path.write_text(
         json.dumps(payload, default=str)))

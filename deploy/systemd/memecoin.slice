@@ -1,0 +1,33 @@
+[Unit]
+Description=Everything memecoin, under one memory budget
+Before=slices.target
+
+# WHY A SLICE AND NOT PER-UNIT CAPS
+#
+# This box (3814 MB) is shared with the quant platform, which is the reason it
+# exists. Per-unit caps bound each memecoin process separately and bound the
+# FAMILY not at all: the desk at 1341M, the trainer at 1200M and the gauntlet
+# at 600M are individually reasonable and jointly 3.1 GB, which is the whole
+# machine. Reported 2026-09-04: memecoin work was leaving quant processes
+# stale. That is not one unit misbehaving, it is the absence of a total.
+#
+# A slice is the total. Everything memecoin runs inside it, the cap binds on
+# the SUM, and no combination of memecoin units can take the box regardless of
+# what each one is individually permitted.
+[Slice]
+# ~40% of the box for the whole family, leaving the rest to quant and the OS.
+# MemoryHigh throttles the slice into reclaim first; MemoryMax is the wall.
+# Sized from measured peaks rather than from the per-unit caps: desk 789M
+# (24h max, 2026-09-01), trainer 360M (2026-09-03, the run that finished),
+# gauntlet unmeasured and batch. 789 + 360 leaves room for the gauntlet and a
+# spike without reaching the wall.
+MemoryHigh=1500M
+MemoryMax=1800M
+
+# Quant wins CPU contention. This is a weight, not a cap: memecoin still uses
+# an idle box fully, and yields the moment quant wants it. A hard CPUQuota
+# here would leave the box idle while the desk waited, which helps nobody.
+CPUWeight=40
+
+# Disk is shared too, and the trainer and backfill are the heavy readers.
+IOWeight=40

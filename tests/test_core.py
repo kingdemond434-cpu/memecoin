@@ -203,6 +203,7 @@ from src.research.dataset_builder import (
     SNAPSHOT_OFFSETS_S, TAIL_THRESHOLDS, LaunchEpisode, LaunchSnapshot,
     PointInTimeDatasetBuilder, SnapshotTimepoint,
     PUMP_INITIAL_VIRTUAL_SOL, PUMP_INITIAL_VIRTUAL_TOKEN, PUMP_CURVE_K,
+    PUMP_TOKEN_TOTAL_SUPPLY,
     pump_curve_invariant_holds,
 )
 from src.research.shadow_trainer import (
@@ -337,6 +338,7 @@ def _desk_source() -> str:
     return "\n".join((root / name).read_text(encoding="utf-8")
                      for name in ("main.py", "runtime/reporting.py",
                                   "runtime/ingestion.py", "runtime/wiring.py",
+                                  "runtime/depth.py",
                                   "runtime/source_intelligence.py"))
 
 
@@ -670,7 +672,9 @@ class TestSolanaParsing(unittest.IsolatedAsyncioTestCase):
 
 class TestOfficialSocialCollectors(unittest.IsolatedAsyncioTestCase):
     def make_engine(self, api_keys=None):
-        wallet_intel = SimpleNamespace(get_top_wallets=lambda limit=100: [], register_social_wallet=lambda wallet: None)
+        wallet_intel = SimpleNamespace(get_top_wallets=lambda limit=100: [],
+                                       followable_wallets=lambda limit=100, **kw: {},
+                                       register_social_wallet=lambda wallet: None)
         return SocialIntelligenceEngine(
             solana_chain(), SimpleNamespace(request=self._rpc_request), SimpleNamespace(), wallet_intel,
             api_keys or {},
@@ -1500,6 +1504,7 @@ class TestFeatureParity(unittest.IsolatedAsyncioTestCase):
         builder = PointInTimeDatasetBuilder(
             solana_chain(), FakeRpc(), FakeGenealogy(),
             SimpleNamespace(get_top_wallets=lambda limit=50: [],
+                            followable_wallets=lambda limit=50, **kw: {},
                             get_wallet_score=lambda wallet: None,
                             _recent_buys=[]),
             SimpleNamespace(get_token_social_signal=lambda token, as_of=None: {"mention_count": 0}),
@@ -2210,6 +2215,9 @@ class TestHazardTrainer(unittest.IsolatedAsyncioTestCase):
                 class WalletIntel:
                     def get_top_wallets(self, limit=50):
                         return []
+                    def followable_wallets(self, limit=50, regime=None,
+                                           include_unmeasured=True):
+                        return {}
                 class Adversarial:
                     def get_adaptive_weight(self, feature, base):
                         return base
@@ -2469,6 +2477,21 @@ class FakeJito:
         raise AssertionError("dry-run must not submit a bundle")
 
 
+
+class _AuthorisedLedger:
+    """A promotion ledger that says the stage has been earned.
+
+    Live-path tests exercise SUBMISSION, and submission now requires an
+    earned stage as well as `dry_run=False`. Without this every live test
+    would pass for the wrong reason -- blocked by the ladder rather than
+    exercising the behaviour it was written to check.
+    """
+
+    @staticmethod
+    def authorises_live_capital():
+        return True, "authorised for test"
+
+
 class FakeRpc:
     async def request(self, method, params):
         raise AssertionError("dry-run must not submit or confirm a transaction")
@@ -2640,6 +2663,7 @@ class TestExecution(unittest.IsolatedAsyncioTestCase):
         keypair = Keypair()
         engine = ExecutionEngine(solana_chain(), FakeRpc(), FakeJupiter(), FakeJito(),
                                  SolanaTransactionBuilder(FakeRpc(), keypair), None, dry_run=False)
+        engine.promotion_ledger = _AuthorisedLedger()
         result = await engine.execute_swap("in", "out", 1000)
         self.assertEqual(result.status, TransactionStatus.REJECTED)
         self.assertIn("locked", result.error)
@@ -2674,6 +2698,7 @@ class TestExecution(unittest.IsolatedAsyncioTestCase):
             jito or LiveFakeJito(), builder, CounterfactualExecutionLab(),
             dry_run=False, confirmation_timeout=confirmation_timeout,
         )
+        engine.promotion_ledger = _AuthorisedLedger()
         return engine
 
     async def test_live_jito_bundle_fills_with_verified_output_balance_delta(self):
@@ -2907,6 +2932,9 @@ class TestWalletAndCoordination(unittest.IsolatedAsyncioTestCase):
         class WalletIntel:
             def get_top_wallets(self, limit=50):
                 return []
+            def followable_wallets(self, limit=50, regime=None,
+                                   include_unmeasured=True):
+                return {}
         miner = PublicCoordinationMiner(FakeGenealogy(), WalletIntel())
         self.assertEqual(miner.get_features("token")["status"], "DATA_BLOCKED")
         for index in range(3):
@@ -2924,6 +2952,9 @@ class TestWalletAndCoordination(unittest.IsolatedAsyncioTestCase):
         class WalletIntel:
             def get_top_wallets(self, limit=50):
                 return []
+            def followable_wallets(self, limit=50, regime=None,
+                                   include_unmeasured=True):
+                return {}
         miner = PublicCoordinationMiner(FakeGenealogy(), WalletIntel())
         funding_transfers = [
             {"from": "operator", "to": f"buyer{i}", "lamports": 1_000_000_000} for i in range(3)
@@ -3335,6 +3366,9 @@ class TestHazardTracking(unittest.IsolatedAsyncioTestCase):
         class WalletIntel:
             def get_top_wallets(self, limit=50):
                 return []
+            def followable_wallets(self, limit=50, regime=None,
+                                   include_unmeasured=True):
+                return {}
         class Adversarial:
             def get_adaptive_weight(self, feature, base):
                 return base
@@ -8955,6 +8989,24 @@ class TestOrphanIntelligence(unittest.IsolatedAsyncioTestCase):
                             "timestamp": 1_000.0 + index},
                 {"notional_usd": 100.0})
 
+        # The two things trade costing needs, both of which the live desk
+        # now has and this fixture previously did not: the fee tiers, which
+        # `_refresh_pump_fee_config` reads off the FeeConfig account at
+        # startup, and a curve to price the market cap the tiers are indexed
+        # on, which `_on_pump_event` seeds at T0. Without them `cost_model`
+        # answers DATA_BLOCKED, no expected value can be computed net of
+        # cost, and the desk cannot justify an entry -- which is not a
+        # missing field in a report, it is the reason nothing gets entered.
+        desk.fee_schedule.adopt_chain_config(
+            parse_fee_config(TestOnChainFeeConfig._account()),
+            source="chain:test")
+        desk._latest_curve_state[self.MINT] = BondingCurveState(
+            virtual_token_reserves=PUMP_INITIAL_VIRTUAL_TOKEN,
+            virtual_sol_reserves=PUMP_INITIAL_VIRTUAL_SOL,
+            real_token_reserves=0, real_sol_reserves=0,
+            token_total_supply=PUMP_TOKEN_TOTAL_SUPPLY,
+            complete=False, creator=candidate.deployer)
+
         prediction = MultiHeadPrediction(self.MINT, "solana", 0, p_2x=0.6, p_5x=0.4, p_10x=0.2)
         trade_info = {"position_size_sol": 0.5, "position_value_usd": 75.0,
                       "risk_contribution": 0.01}
@@ -8962,6 +9014,9 @@ class TestOrphanIntelligence(unittest.IsolatedAsyncioTestCase):
             self.MINT, candidate, None, prediction, trade_info, 50_000.0)
         report = audit_intelligence("entry", intelligence)
 
+        self.assertEqual("OK", intelligence["cost_model"]["status"],
+                         intelligence["cost_model"])
+        self.assertFalse(intelligence["cost_model"]["assumed"])
         self.assertEqual(report.orphans, [])
         for key in ("prediction", "sources", "coordination", "sizing", "cost_model"):
             self.assertIn(key, report.contributing,
@@ -9194,7 +9249,11 @@ class TestExtendedTailLabels(unittest.TestCase):
         source = (Path(__file__).resolve().parents[1] / "src" / "research"
                   / "shadow_trainer.py").read_text()
         self.assertNotIn("np.clip(feasible, 0.02, 50)", source)
-        self.assertIn("SURVIVAL_LEVELS[-1][1]", source)
+        # The bound moved again: 500x was the last survival RUNG, and the
+        # survival curve already answers past it by fitting the tail. Clipping
+        # the LABEL there taught the model that a 1000x episode was a 500x
+        # episode.
+        self.assertIn("FEASIBLE_MULTIPLE_CEILING", source)
 
 
 class TestAgeBandedBrains(unittest.TestCase):
@@ -14318,6 +14377,10 @@ class TestNativeRouteIsActuallyTaken(unittest.IsolatedAsyncioTestCase):
 
     def _engine(self, curve=None):
         engine = ExecutionEngine.__new__(ExecutionEngine)
+        # Submission now needs an earned stage as well as `dry_run`, and
+        # these engines skip __init__.
+        engine.promotion_ledger = None
+        engine.simulation_reasons = {}
         engine.pump_route = NativePumpRoute()
         engine.curve_state_provider = (lambda token: curve) if curve else None
         engine.pumpswap_route = None
@@ -14373,17 +14436,29 @@ class TestNativeRouteIsActuallyTaken(unittest.IsolatedAsyncioTestCase):
             return SimpleNamespace(output_amount=123, route_type=RouteType.JUPITER_V1)
         return get_quote
 
-    async def test_the_dry_run_gate_guards_the_native_path_too(self):
+    async def test_every_gate_guards_the_native_path_too(self):
         """A path whose safety gate is only on the other branch will one day
-        be the branch taken."""
+        be the branch taken.
+
+        Three gates now, not one: the operator's `dry_run` intent, the
+        EARNED promotion stage, and the live-trading acknowledgement. All
+        three have to be visible on this branch, because this is the branch
+        that spends money.
+        """
         source = Path("src/execution/jupiter_jito.py").read_text()
         tree = ast.parse(source)
         native = next(node for node in ast.walk(tree)
                       if isinstance(node, ast.AsyncFunctionDef)
                       and node.name == "_execute_native")
         text = ast.unparse(native)
-        self.assertIn("self.dry_run", text)
+        self.assertIn("self._submission_blocked()", text)
         self.assertIn("ALLOW_LIVE_TRADING", text)
+        blocker = next(node for node in ast.walk(tree)
+                       if isinstance(node, ast.FunctionDef)
+                       and node.name == "_submission_blocked")
+        blocker_text = ast.unparse(blocker)
+        self.assertIn("self.dry_run", blocker_text)
+        self.assertIn("live_capital_authorised", blocker_text)
 
     async def test_hard_invariants_still_run_before_any_route(self):
         engine = self._engine(curve=self._curve(creator=self.MINT))
@@ -14833,9 +14908,29 @@ class TestLocalLiquidity(unittest.TestCase):
             real_sol_reserves=12_000_000_000,
             token_total_supply=10 ** 15, complete=False, creator="c")
         desk = self._desk(state)
-        # Real reserves preferred: 12 SOL at $150.
+        # The VIRTUAL reserve: 30 SOL at $150. This assertion used to read the
+        # real reserve, and that was the bug. Real reserves start at zero and
+        # a fresh curve therefore reported its full virtual depth, then
+        # reported a thirtieth of it as soon as one person bought -- depth
+        # falling because a launch started working. Virtual reserves are
+        # monotone and are what the constant product prices impact from. What
+        # the curve can actually PAY OUT is a different question, answered by
+        # `_measured_depth_usd` rather than smuggled into this one.
         self.assertAlmostEqual(
-            MemecoinQuantDesk._local_liquidity(desk, "mint"), 12.0 * 150.0)
+            MemecoinQuantDesk._local_liquidity(desk, "mint"), 30.0 * 150.0)
+
+    def test_buying_never_shrinks_the_reported_depth(self):
+        """The regression this class now exists to hold down."""
+        def curve(real_sol):
+            return BondingCurveState(
+                virtual_token_reserves=1_000_000_000_000,
+                virtual_sol_reserves=30_000_000_000 + real_sol,
+                real_token_reserves=800_000_000_000,
+                real_sol_reserves=real_sol,
+                token_total_supply=10 ** 15, complete=False, creator="c")
+        readings = [MemecoinQuantDesk._local_liquidity(self._desk(curve(x)), "mint")
+                    for x in (0, 100_000_000, 12_000_000_000, 60_000_000_000)]
+        self.assertEqual(readings, sorted(readings))
 
     def test_a_reconstruction_falls_back_to_the_virtual_reserve(self):
         state = BondingCurveState(
@@ -19266,12 +19361,21 @@ class TestShadowExercisesTheExecutionPath(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(source.count("await self._build_native_signed("), 2)
         self.assertNotIn("await self.tx_builder.build_and_sign(", source)
 
-    def test_dry_run_never_submits(self):
+    def test_a_blocked_submission_never_submits(self):
+        """The guard is no longer `dry_run` alone.
+
+        Submission requires an operator's intent AND an earned promotion
+        stage, so the branch that must not touch the network is the one
+        `_submission_blocked` selects -- and it must still build and sign,
+        which is what keeps the live path exercised in shadow.
+        """
         source = inspect.getsource(ExecutionEngine._execute_native)
-        dry = source[source.index("if self.dry_run:"):
-                     source.index("TransactionStatus.SIMULATED")]
+        self.assertIn("blocked = self._submission_blocked()", source)
+        blocked = source[source.index("blocked = self._submission_blocked()"):
+                         source.index("TransactionStatus.SIMULATED")]
         for forbidden in ("_submit_signed", "send_transaction", "self.jito."):
-            self.assertNotIn(forbidden, dry)
+            self.assertNotIn(forbidden, blocked)
+        self.assertIn("_build_native_signed", blocked)
 
     def test_an_unexercised_path_reports_blocked(self):
         engine = ExecutionEngine.__new__(ExecutionEngine)

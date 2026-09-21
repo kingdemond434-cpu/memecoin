@@ -16,6 +16,8 @@ import numpy as np
 from src.strategies.multihead_predictor import (
     LOG_SPACE_TARGETS, LOG_TARGET_FLOOR, SURVIVAL_LEVELS, PredictionTarget,
     _from_log_space,
+    FEASIBLE_MULTIPLE_CEILING,
+    TAIL_REACH_CAP,
 )
 
 
@@ -26,10 +28,21 @@ class TheInverseIsBounded(unittest.TestCase):
                                    multiple, places=6)
 
     def test_a_runaway_prediction_cannot_authorise_more_than_the_curve(self):
-        """exp() is unbounded; this value caps claimed upside, so it must not be."""
-        ceiling = float(SURVIVAL_LEVELS[-1][1])
+        """exp() is unbounded; this value caps claimed upside, so it must not be.
+
+        The ceiling is the furthest multiple the survival curve will answer
+        for -- the last rung times the tail reach -- rather than the last rung
+        itself. Clipping at the rung made a 500x, a 1000x and a 4000x token
+        the same number on the way to sizing, which is exactly the
+        distinction a tail strategy exists to make.
+        """
         for wild in (20.0, 50.0, 1e6, 1e300):
-            self.assertLessEqual(_from_log_space(wild), ceiling)
+            self.assertLessEqual(_from_log_space(wild), FEASIBLE_MULTIPLE_CEILING)
+
+    def test_the_ceiling_is_the_curves_own_horizon_not_its_last_rung(self):
+        self.assertGreater(FEASIBLE_MULTIPLE_CEILING, float(SURVIVAL_LEVELS[-1][1]))
+        self.assertEqual(FEASIBLE_MULTIPLE_CEILING,
+                         float(SURVIVAL_LEVELS[-1][1]) * TAIL_REACH_CAP)
 
     def test_it_never_returns_a_non_finite_or_negative_cap(self):
         for broken in (float("nan"), float("inf"), float("-inf"), -1e9):

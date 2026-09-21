@@ -46,7 +46,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from src.chains.rpc_manager import ChainRegistry
+from src.chains.rpc_manager import RPCError, ChainRegistry
 from src.chains.yellowstone_grpc import (
     PumpFunMonitor, apply_event_timing, transaction_parts,
 )
@@ -129,6 +129,26 @@ def _group_into_launches(events: List[Dict[str, Any]]) -> List[RawLaunch]:
     return launches
 
 
+def _is_pruned_cursor(exc: "RPCError") -> bool:
+    """Is this "I do not have that transaction" rather than "you asked wrong"?
+
+    -32020 is Solana's long-term-storage miss. The message check is a fallback
+    for endpoints that return a bare -32603 with the same meaning; both are a
+    statement about the ENDPOINT's retention, not about the request, and the
+    difference decides whether a backfill loses hours of decoded events.
+    """
+    error = getattr(exc, "error", None)
+    code = None
+    message = str(error)
+    if isinstance(error, dict):
+        code = error.get("code")
+        message = str(error.get("message", ""))
+    if code == -32020:
+        return True
+    lowered = message.lower()
+    return "not found" in lowered and "transaction" in lowered
+
+
 async def _fetch_transactions(rpc: Any, signatures: List[str],
                               batch_size: int) -> List[Optional[Dict[str, Any]]]:
     """Batched with sequential fallback, mirroring the wallet-history path."""
@@ -193,6 +213,7 @@ async def extract(args: argparse.Namespace) -> int:
             # never ran. Retried with backoff here; if truly exhausted after
             # that, the loop ends but execution still reaches the write-out.
             page = None
+            pruned_cursor = False
             for backoff in (5, 15, 30, 60, 60):
                 try:
                     page = await rpc.request("getSignaturesForAddress",
@@ -204,9 +225,38 @@ async def extract(args: argparse.Namespace) -> int:
                     logger.warning("RPC pool exhausted for signatures "
                                    "(%s); retrying in %ds", exc, backoff)
                     await asyncio.sleep(backoff)
+                except RPCError as exc:
+                    # -32020 "Transaction not found" against the `before`
+                    # cursor. It is not a malformed request and it is not the
+                    # end of history: it means THIS endpoint has pruned the
+                    # signature we are paging back from. Every free rung in
+                    # the pool is non-archival, so a long backfill reaches
+                    # that boundary as a matter of course.
+                    #
+                    # Measured 2026-09-03: it escaped this loop entirely --
+                    # RPCError subclasses Exception, not RuntimeError, so the
+                    # handler above never saw it -- and killed the run with
+                    # every decoded event lost, exactly the failure the
+                    # comment above describes and the retry was written to
+                    # prevent.
+                    #
+                    # Retried, because a DIFFERENT endpoint may still hold it;
+                    # and if none does, the loop ends the same way an
+                    # exhausted pool does, so the write-out below still runs.
+                    if not _is_pruned_cursor(exc):
+                        raise
+                    pruned_cursor = True
+                    logger.warning(
+                        "cursor %s is beyond an endpoint's retention (%s); "
+                        "retrying in %ds in case another rung has it",
+                        (before or "")[:12] or "<head>", exc, backoff)
+                    await asyncio.sleep(backoff)
             if page is None:
-                logger.warning("RPC pool stayed exhausted; stopping here "
-                               "with %d events already decoded", len(collector.events))
+                logger.warning(
+                    "%s; stopping here with %d events already decoded",
+                    "no endpoint in the pool retains that far back"
+                    if pruned_cursor else "RPC pool stayed exhausted",
+                    len(collector.events))
                 exhausted = True
                 break
             page = [row for row in (page or []) if isinstance(row, dict)]

@@ -21,6 +21,8 @@ from dataclasses import asdict, is_dataclass, replace as dataclasses_replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from aiohttp import web
+from src.research.funnel_invariant import check_desk
+from src.runtime.research_reads import research_report
 from src.chains.yellowstone_grpc import (
     NATIVE_FASTPATH_STATUS, PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
     create_combined_subscription,
@@ -67,6 +69,47 @@ class ReportingSurface:
     #: on every request turns a page refresh into disk IO on the trading box.
     _dashboard_cache = None
 
+    def _promotion_readiness(self):
+        """The deepest thing that is not true yet, from facts already reported.
+
+        Named `_promotion_readiness` rather than `readiness` because this
+        class already has a `readiness()` -- the health-server payload -- and
+        two methods a letter apart, one of which is the liveness endpoint, is
+        a name collision waiting to be made at 3am.
+        """
+        from src.research.readiness import diagnose
+
+        census = self.launch_census.report()
+        funnel = census.get("funnel", {}) if isinstance(census, dict) else {}
+        training = (self.training.report()
+                    if getattr(self, "training", None) is not None else {})
+        try:
+            cost = self._cost_model("readiness-probe")
+        except Exception:  # pragma: no cover - defensive
+            cost = {"status": "DATA_BLOCKED"}
+        landing = getattr(getattr(self, "execution_engine", None),
+                          "landing_model", None)
+        # The LIFETIME count of real-capital attempts, not the length of the
+        # retained window. `_attempts` is a bounded deque that pools paper
+        # with real: reading it would have the count fall once the desk
+        # outgrew the buffer, and climb during dry run toward a bar that only
+        # real submissions may satisfy.
+        real_fills = getattr(landing, "real_fills", None)
+        return diagnose({
+            "launches_seen": int(funnel.get("seen", 0) or 0),
+            "resolved_episodes": int(training.get("resolved_episodes", 0) or 0),
+            "training_rounds": int(training.get("rounds", 0) or 0),
+            "model_trained": bool(
+                getattr(self.predictor, "_is_trained", False)
+                or any((getattr(self.predictor, "trained", None) or {}).values())),
+            # A probe on a token nobody holds: the question is whether the
+            # SCHEDULE can price anything, not what this mint costs.
+            "cost_model_ok": cost.get("status") == "OK",
+            "entries": int(funnel.get("entered", 0) or 0),
+            "real_fills": int(real_fills) if real_fills is not None else 0,
+            "dry_run": bool(self.dry_run),
+        })
+
     def pool_route_report(self) -> Dict[str, Any]:
         """Whether graduation actually keeps native execution.
 
@@ -100,6 +143,30 @@ class ReportingSurface:
             "horizon_seconds": float(self.global_config.get("follow_horizon_seconds", 300.0)),
             "reference_sol": float(self.global_config.get("follow_reference_sol", 0.5)),
             "model": self.wallet_intel.wallet_value.report(),
+            # Measured value is what a wallet is worth; the copy book is what
+            # it is currently being paid. They diverge on purpose, and the
+            # gap is where a wallet that stopped working shows up first.
+            "copy_book": (self.copy_book_report()
+                          if hasattr(self, "copy_book_report") else
+                          {"status": "DATA_BLOCKED", "detail": "not wired"}),
+            # Is the money path connected at all? Exactly zero downstream of
+            # a hundred upstream is a wire, not a policy, and nothing was
+            # asking -- which is how 150,278 decisions and no entry looked
+            # healthy for 8.76 days.
+            "funnel_invariant": check_desk(self).to_dict(),
+            # Diagnostic, dated, and deliberately without authority: twenty
+            # research surfaces that were built and answered nobody.
+            "research": research_report(self),
+            "migration_lineage": (self.migration_lineage.report()
+                                  if getattr(self, "migration_lineage", None)
+                                  else {"status": "DATA_BLOCKED",
+                                        "detail": "not wired"}),
+            "prelaunch": (self.prelaunch_report()
+                          if hasattr(self, "prelaunch_report") else
+                          {"status": "DATA_BLOCKED", "detail": "not wired"}),
+            "consensus": (self.wallet_consensus.report()
+                          if getattr(self, "wallet_consensus", None) else
+                          {"status": "DATA_BLOCKED", "detail": "not wired"}),
         }
 
     def source_intelligence(self, token: str) -> Dict[str, Any]:
@@ -172,7 +239,9 @@ class ReportingSurface:
             "depth": fingerprint.depth,
         }
 
-        flow = aggregate_smart_flow(entries, report, ancestry=ancestry)
+        flow = aggregate_smart_flow(
+            entries, report, ancestry=ancestry,
+            rings=getattr(self, "sniper_rings", None))
         intelligence["smart_flow"] = {
             "status": flow.status, "evidence": flow.evidence,
             "naive_evidence": flow.naive_evidence, "discount": flow.discount,
@@ -423,6 +492,48 @@ class ReportingSurface:
             "kol_reach_threshold": self.ignition.kol_reach,
         }
 
+    @property
+    def gauntlet_verdict_path(self) -> Path:
+        """Where `tools.run_gauntlet` leaves its verdict.
+
+        Its own file, never `forward_evidence.json`: the desk owns that ledger
+        and rewrites it whole on every save, so a second writer there either
+        loses the verdict or destroys the desk's decision counters depending
+        on which process saved last.
+        """
+        return (Path(self.global_config.get("ops_state_dir", "data/state"))
+                / "gauntlet.json")
+
+    def gauntlet_report(self) -> Dict[str, Any]:
+        """The mechanism scoreboard's last verdict, and whether it still counts.
+
+        Read from the sidecar `tools.run_gauntlet` writes rather than from the
+        forward evidence ledger, which is the desk's own file. Reports the age
+        as well as the count: CANARY needs one survivor and LIVE needs two,
+        and a verdict past its expiry contributes neither -- a distinction
+        that is invisible if only the number is shown.
+        """
+        ledger = getattr(self, "forward_evidence", None)
+        if ledger is None:
+            return {"status": "DATA_BLOCKED", "detail": "not wired"}
+        path = self.gauntlet_verdict_path
+        if not path.exists():
+            return {"status": "DATA_BLOCKED",
+                    "detail": "the gauntlet has never been run; CANARY and "
+                              "LIVE fail closed until it is",
+                    "remedy": "python -m tools.run_gauntlet --record"}
+        loaded = ledger.load_gauntlet(path)
+        counted = ledger.gauntlet_survivors()
+        age = ledger.gauntlet_age_s()
+        return {
+            "status": "OK" if counted is not None else "STALE",
+            "survivors": loaded,
+            "counted_by_the_gate": counted,
+            "age_days": None if age is None else round(age / 86_400.0, 2),
+            "expires_after_days": ledger.GAUNTLET_MAX_AGE_S / 86_400.0,
+            "path": str(path),
+        }
+
     def readiness(self) -> Dict[str, Any]:
         return {
             "mode": "DRY_RUN" if self.dry_run else "LIVE",
@@ -436,6 +547,22 @@ class ReportingSurface:
                             "policy": asdict(self.exit_policy)},
             "equity": {"status": self.equity_status, "wallet_equity_usd": self.wallet_equity_usd,
                        "sol_price_usd": self.sol_price_usd},
+            # Which ceiling is actually capping positions. A book whose
+            # positions have quietly shrunk because early curves cannot
+            # absorb the equity behind them looks identical, from every other
+            # number on this page, to a book that stopped finding trades.
+            # How far up the survival curve the model can actually see. A
+            # model whose last usable rung is 10x is DATA_BLOCKED above 5x,
+            # so conviction never engages on the runners it exists for -- and
+            # no other number on this page would say so.
+            "continuation": (
+                self.continuation_model.report(self.predictor)
+                if getattr(self, "continuation_model", None) is not None
+                and self.predictor is not None
+                else {"status": "DATA_BLOCKED", "detail": "not wired"}),
+            "capacity": (self.elogw_engine.capacity_report()
+                         if self.elogw_engine is not None
+                         else {"status": "DATA_BLOCKED"}),
             "execution": {"dry_run": self.execution_engine.dry_run if self.execution_engine else True},
             "native_fastpath": NATIVE_FASTPATH_STATUS,
             "native_route": (self.execution_engine.native_route_report()
@@ -497,6 +624,11 @@ class ReportingSurface:
                 else {"status": "DATA_BLOCKED"}),
             # The chain receive path in Rust, and whether it has yet
             # matched the Python client it runs beside.
+            "t0_risk": (
+                self.t0_risk.report()
+                if getattr(self, "t0_risk", None) is not None
+                else {"status": "MISSING"}),
+            "sol_price_age_s": round(float(getattr(self, "sol_price_age_s", 0.0)), 1),
             "native_ingress": (
                 self.native_ingress.report()
                 if getattr(self, "native_ingress", None) is not None
@@ -518,6 +650,48 @@ class ReportingSurface:
                            if getattr(self, "launchpads", None) is not None
                            else {"status": "DATA_BLOCKED"}),
             # Which inbound feed arrives first, and which one sees everything.
+            "sniper_rings": (
+                self.sniper_rings.report()
+                if getattr(self, "sniper_rings", None) is not None
+                else {"status": "MISSING"}),
+            "wallet_signatures": (
+                self.wallet_signatures.report()
+                if getattr(self, "wallet_signatures", None) is not None
+                else {"status": "MISSING"}),
+            "pre_event_anomaly": (
+                self.pre_event_anomaly.report()
+                if getattr(self, "pre_event_anomaly", None) is not None
+                else {"status": "MISSING"}),
+            "observed_bids": (
+                self.observed_bids.report()
+                if getattr(self, "observed_bids", None) is not None
+                else {"status": "MISSING"}),
+            "launchpad_discovery": (
+                self.launchpad_discovery.report()
+                if getattr(self, "launchpad_discovery", None) is not None
+                else {"status": "MISSING"}),
+            "training": (
+                self.training.report()
+                if getattr(self, "training", None) is not None
+                else {"status": "MISSING"}),
+            "leader_schedule": (
+                self.leader_schedule.report()
+                if getattr(self, "leader_schedule", None) is not None
+                else {"status": "MISSING"}),
+            "cold_distillate": (
+                self.cold_distillate.report()
+                if getattr(self, "cold_distillate", None) is not None
+                else {"status": "DATA_BLOCKED",
+                      "reason": "no distilled history on this box; run "
+                                "tools/distil_history.py to build one"}),
+            "latency_value": (
+                self.latency_value.report()
+                if getattr(self, "latency_value", None) is not None
+                else {"status": "MISSING"}),
+            "load_shedding": (
+                self.load_shedder.report()
+                if getattr(self, "load_shedder", None) is not None
+                else {"status": "MISSING"}),
             "feed_race": (self.feed_race.report()
                           if getattr(self, "feed_race", None) is not None
                           else {"status": "DATA_BLOCKED"}),
@@ -608,7 +782,22 @@ class ReportingSurface:
             # says FAIL cannot distinguish a week away from a year away, and
             # that difference decides whether to keep running or change
             # something.
-            "forward_evidence": self.forward_evidence.report(),
+            "forward_evidence": self.forward_evidence.report(
+                getattr(self, "promotion_ledger", None)),
+            # The ladder, and whether it currently authorises spending
+            # anything. This is the field that answers "are we live" -- not
+            # dry_run, which is only what an operator intended.
+            "promotion": (self.promotion_ledger.status()
+                          if getattr(self, "promotion_ledger", None) is not None
+                          else {"status": "MISSING"}),
+            "simulation_reasons": dict(
+                getattr(self.execution_engine, "simulation_reasons", {}) or {}),
+            # WHY the gate above cannot measure what it needs. The gate can
+            # only say "unmeasured", which is a symptom several levels above
+            # whatever has to be fixed -- and a list of seven failures where
+            # six are consequences of the seventh sends whoever reads it to
+            # fix the wrong thing.
+            "promotion_blocked_at": self._promotion_readiness().to_dict(),
             "regime": self.current_regime,
             # A queue silently shedding work looks exactly like a quiet market,
             # so both drop counters are surfaced rather than only logged.
@@ -645,8 +834,28 @@ class ReportingSurface:
             "mega_event_reserve": self.mega_event_reserve_state,
             "portfolio": self.elogw_engine.get_portfolio_state() if self.elogw_engine else {},
             "rug_hazard": self.rug_hazard.get_stats() if self.rug_hazard else {},
+            # Whether the safety veto is reading the bonding curve or the
+            # router. A router asked about a mint it has never indexed
+            # answers "no route", and that answer hard-vetoes launches the
+            # desk can sell natively.
+            "sell_route": (self.rug_detector.sell_route_report()
+                           if getattr(self, "rug_detector", None) is not None
+                           and hasattr(self.rug_detector, "sell_route_report")
+                           else {"status": "DATA_BLOCKED"}),
             "dataset": self.dataset_builder.get_stats() if self.dataset_builder else {},
             "research": self.global_research.get_stats() if self.global_research else {},
+            # The hourly world crawler, its search backends, the canonical
+            # event ledger and the provider-terms watcher. On the health
+            # surface because a discovery organ nobody can see is a discovery
+            # organ nobody notices has stopped.
+            "world_discovery": (self.world_discovery_report()
+                                if hasattr(self, "world_discovery_report")
+                                else {}),
+            # Whether any candidate edge has survived, and how old that
+            # finding is. Surfaced because a survivor count that quietly went
+            # stale looks exactly like one that was never run, and only one of
+            # those is fixed by starting a timer.
+            "gauntlet": self.gauntlet_report(),
             "social": self.social_intel.get_stats() if self.social_intel else {},
             "public_coordination": self.public_coordination.get_stats() if self.public_coordination else {},
             "champions": self.champion_challenger.get_stats() if self.champion_challenger else {},

@@ -7,6 +7,11 @@ Documentation=file:%h/.local/opt/memecoin-shadow/RUNBOOK.md
 Before=memecoin-shadow.service
 
 [Service]
+# Inside the family memory budget. memecoin.slice caps the SUM of every
+# memecoin unit, which is what keeps this work from starving the quant
+# platform that shares this box. A unit outside the slice is a unit outside
+# the budget, however modest its own caps look.
+Slice=memecoin.slice
 Type=simple
 WorkingDirectory=%h/.local/opt/memecoin-shadow
 # Only the key. Deliberately NOT the desk's env file: this process needs no

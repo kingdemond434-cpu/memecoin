@@ -219,7 +219,28 @@ start rather than hanging. Authorise once, by hand:
 ```bash
 cd ~/.local/opt/memecoin-shadow
 .venv/bin/python -m src.research.telegram_authorize
-systemctl --user restart memecoin-shadow.service
+systemctl --user restart --no-block memecoin-shadow.service
+
+> **Use `--no-block` to restart.** The unit is `Type=notify` with
+> `TimeoutStartSec=120s`, so a plain `systemctl --user restart` holds the
+> terminal for up to two minutes waiting for `READY=1` and looks frozen.
+> Interrupting it leaves you unsure whether the restart happened — observed
+> three times on 2026-09-04, each followed by an empty `curl` because the desk
+> was still starting. `--no-block` queues the job and returns immediately;
+> check the result separately:
+>
+> ```
+> systemctl --user restart --no-block memecoin-shadow.service
+> systemctl --user status memecoin-shadow.service --no-pager | head -20
+> ```
+>
+> And read health from disk rather than the port — it answers while the desk
+> is down, restarting, or wedged, and its mtime distinguishes "quiet" from
+> "stopped", which a dead port cannot:
+>
+> ```
+> .venv/bin/python -m tools.desk_status
+> ```
 ```
 
 It reads `~/.config/memecoin-shadow/env` itself, so it works from a plain
@@ -474,7 +495,7 @@ systemctl --user status memecoin-signer.service --no-pager | head -5
 # 3. Point the desk at it and remove the key from the desk's own env
 sed -i '/^SOLANA_PRIVATE_KEY=/d' ~/.config/memecoin-shadow/env
 echo "MEMECOIN_SIGNER_SOCKET=%t/memecoin/signer.sock" >> ~/.config/memecoin-shadow/env
-systemctl --user restart memecoin-shadow.service
+systemctl --user restart --no-block memecoin-shadow.service
 ```
 
 Confirm with `/status`: `signer.mode` should read `isolated` and

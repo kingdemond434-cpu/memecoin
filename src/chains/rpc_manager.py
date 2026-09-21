@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import time
+import weakref
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional, Set
@@ -103,8 +104,13 @@ class RPCManager:
         ]
         self.max_concurrent_total = max_concurrent_total
         self._session: Optional[aiohttp.ClientSession] = None
-        #: loop id -> that loop's session. See _session_for_loop.
-        self._sessions: Dict[int, aiohttp.ClientSession] = {}
+        #: loop -> that loop's session, keyed on the LOOP OBJECT. See
+        #: _session_for_loop for why not on its id.
+        self._sessions: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+        #: The one session that can have no loop object to key on: the
+        #: fallback used when nothing is running. Kept apart so it cannot
+        #: collide with a real loop's entry.
+        self._loopless_session: Optional[aiohttp.ClientSession] = None
         self._ws_connections: Dict[str, Any] = {}
         # Loop-local, because the miners run on their own loop and every
         # RPC call they make used to append a waiter to a semaphore bound to
@@ -125,22 +131,65 @@ class RPCManager:
         inside a task" on the first request. The miners run on their own
         loop and share this manager, so a single session could never have
         served them.
+
+        Keyed on the LOOP OBJECT, in a weak-keyed map, never on `id(loop)`.
+        CPython reuses ids: once a loop is collected the next allocation can
+        land on the same address, and a brand new loop then inherits the dead
+        one's session -- a closed connector, or worse an open one bound to a
+        loop that is gone. It is the same mistake the HttpClient fix made and
+        the same one the loop-local semaphore was written to avoid, and it
+        surfaces as an intermittent timeout-context error that nothing in the
+        logs explains. Weak keys also make eviction automatic: a loop that
+        goes away takes its entry with it.
         """
         import asyncio as _asyncio
 
         try:
-            key = id(_asyncio.get_running_loop())
+            loop = _asyncio.get_running_loop()
         except RuntimeError:
-            key = 0
-        existing = self._sessions.get(key)
+            loop = None
+        self._retire_closed_loops()
+        if loop is None:
+            existing = self._loopless_session
+        else:
+            existing = self._sessions.get(loop)
         if existing is not None and not existing.closed:
             return existing
         created = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=10),
             connector=aiohttp.TCPConnector(limit=100, limit_per_host=20),
         )
-        self._sessions[key] = created
+        if loop is None:
+            self._loopless_session = created
+        else:
+            self._sessions[loop] = created
         return created
+
+    def _retire_closed_loops(self) -> None:
+        """Drop the entry for any loop that has been closed.
+
+        Weak keys alone are not enough here, and it is worth saying why: an
+        `aiohttp.ClientSession` holds a reference to its own loop, so the
+        VALUE of each entry strongly references its KEY. A weak-keyed map
+        cannot collect a key its own value is pinning, so without this sweep
+        every loop the desk ever ran would keep its session alive for the
+        life of the process.
+
+        The weak keying is still the fix that matters -- it is what stops a
+        new loop inheriting a dead one's session when CPython reuses an
+        address -- and this is what makes the memory follow.
+        """
+        dead = [loop for loop in list(self._sessions) if loop.is_closed()]
+        for loop in dead:
+            session = self._sessions.pop(loop, None)
+            if session is not None and not session.closed:
+                # Its loop is gone, so it cannot be closed properly any more.
+                # Said out loud rather than dropped: an unclosed session is a
+                # socket, and a caller that closes loops without closing
+                # sessions should be told which one it was.
+                logger.debug(
+                    "retiring an RPC session whose loop closed under it")
+                session._connector = None
 
     @property
     def session(self):
@@ -161,13 +210,14 @@ class RPCManager:
                 pass
         for ws in self._ws_connections.values():
             await ws.close()
-        for session in list(self._sessions.values()):
-            if not session.closed:
+        for session in list(self._sessions.values()) + [self._loopless_session]:
+            if session is not None and not session.closed:
                 try:
                     await session.close()
                 except Exception:  # pragma: no cover - shutdown only
                     pass
         self._sessions.clear()
+        self._loopless_session = None
         if self._session and not self._session.closed:
             await self._session.close()
 

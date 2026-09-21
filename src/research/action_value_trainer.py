@@ -22,6 +22,8 @@ candidate is tested on a market it has not seen.
 import json
 import logging
 import math
+import argparse
+import gzip
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -30,7 +32,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from src.research.lifecycle_replay import (
-    Cell, Lifecycle, replay_lifecycle, sniper_scoreboard,
+    DEFAULT_EXIT_RULES, Cell, Lifecycle, Mark, replay_lifecycle,
+    sniper_scoreboard,
 )
 
 logger = logging.getLogger(__name__)
@@ -270,3 +273,96 @@ def save_report(model_dir: Path, report: Dict[str, Any]) -> Path:
                "generated_at": time.time(), **report}
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str))
     return path
+
+
+def lifecycles_from_storage(storage: Path) -> List[Lifecycle]:
+    """Rebuild launch lifecycles from the episodes on disk.
+
+    The trainer had no way in. Every other trainer in this package reads
+    `--storage` and turns it into rows; this one took `Sequence[Lifecycle]`
+    from a caller that did not exist, so `python -m` on it imported the
+    module, defined some functions and exited 0 having done nothing -- which
+    a supervisor reads as success followed by a missing report.
+    """
+    lifecycles: List[Lifecycle] = []
+    for path in sorted(storage.rglob("*.json.gz")):
+        try:
+            with gzip.open(path, "rt", encoding="utf-8") as handle:
+                episode = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        outcome = episode.get("final_outcome") or {}
+        if outcome.get("status") not in (None, "OK"):
+            continue
+        created = float(episode.get("created_at", 0) or 0)
+        if created <= 0:
+            continue
+        marks: List[Mark] = []
+        for item in episode.get("market_observations") or []:
+            try:
+                timestamp = float(item.get("timestamp", 0) or 0)
+                multiple = float(item.get("price_multiple", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if timestamp <= 0 or multiple <= 0:
+                continue
+            depth = item.get("executable_sol")
+            marks.append(Mark(
+                timestamp=timestamp, multiple=multiple,
+                executable_sol=(float(depth) if depth is not None else None),
+                feasible=bool(item.get("feasible", True))))
+        if len(marks) < 2:
+            # A lifecycle with one mark has no path to replay, and replaying
+            # the outcome alone would be scoring a decision nobody could
+            # have made.
+            continue
+        marks.sort(key=lambda mark: mark.timestamp)
+        rug_time = outcome.get("rug_time")
+        lifecycles.append(Lifecycle(
+            token=str(episode.get("token", "") or path.stem),
+            created_at=created, marks=marks,
+            migrated=bool(outcome.get("migrated")),
+            rugged=bool(outcome.get("rugged")),
+            rug_time=(float(rug_time) if rug_time is not None else None)))
+    return lifecycles
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--storage", default="data/launch_episodes")
+    parser.add_argument("--model-dir", default="models")
+    parser.add_argument("--min-lifecycles", type=int, default=200)
+    # The rule a candidate has to beat. "hold" is the honest incumbent: it is
+    # what the desk does when it has no policy, and a candidate that cannot
+    # beat doing nothing has not earned a promotion.
+    parser.add_argument("--incumbent", default="hold")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    lifecycles = lifecycles_from_storage(Path(args.storage))
+    model_dir = Path(args.model_dir)
+    if len(lifecycles) < args.min_lifecycles:
+        # DATA_BLOCKED is written, not merely returned. A supervisor that
+        # sees no report cannot tell "too little data" from "the trainer
+        # crashed", and it should never have to guess.
+        save_report(model_dir, {
+            "status": "DATA_BLOCKED",
+            "lifecycles": len(lifecycles),
+            "reason": (f"{len(lifecycles)} replayable lifecycle(s); "
+                       f"{args.min_lifecycles} required. A lifecycle needs at "
+                       "least two observed executable marks, so launches that "
+                       "died before anything traded contribute nothing"),
+        })
+        print(json.dumps({"status": "DATA_BLOCKED",
+                          "lifecycles": len(lifecycles)}, indent=1))
+        return 0
+
+    report = select_policy(lifecycles, DEFAULT_EXIT_RULES, args.incumbent)
+    save_report(model_dir, report)
+    print(json.dumps({"status": report.get("status"),
+                      "lifecycles": len(lifecycles)}, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -120,6 +120,16 @@ class ChampionChallengerFramework:
         self.decay_threshold = decay_threshold
         self.state_path = Path(state_path) if state_path else None
         
+        # The registry and the trial ledger. Both classes existed, neither
+        # was ever constructed, so every one of their methods was dead: no
+        # hypothesis was registered, no trial recorded, no multiplicity group
+        # declared. That matters more than it sounds -- the gauntlet's CSCV
+        # pass prices SELECTION, and selection is how many candidates were
+        # tried for the one that won. With nothing counting the candidates,
+        # the probability of backtest overfitting was being computed over a
+        # population nobody had enumerated.
+        self.registry = HypothesisRegistry()
+        self.trial_ledger = TrialLedger()
         self.hypotheses: Dict[str, HypothesisSpec] = {}
         self.trial_results: List[TrialResult] = []
         self.champions: Dict[str, ChampionModel] = {}
@@ -160,6 +170,18 @@ class ChampionChallengerFramework:
                 if result.hypothesis_id != hypothesis.hypothesis_id
             ]
         
+        # Registered before it is a challenger, and grouped with whatever it
+        # resembles. Two hypotheses over the same features tested on the same
+        # data are one trial repeated, and the multiplicity group is what says
+        # so to anything pricing selection later.
+        self.registry.register(hypothesis)
+        siblings = [
+            other.hypothesis_id
+            for other in self.registry.find_similar(hypothesis.features)
+            if other.hypothesis_id != hypothesis.hypothesis_id]
+        if siblings:
+            self.trial_ledger.record_multiplicity_group(
+                hypothesis.trial_family, siblings + [hypothesis.hypothesis_id])
         self.hypotheses[hypothesis.hypothesis_id] = hypothesis
         self.challengers[hypothesis.hypothesis_id] = {
             "hypothesis": hypothesis,
@@ -197,6 +219,15 @@ class ChampionChallengerFramework:
         return True
 
     def record_trial_result(self, result: TrialResult):
+        hypothesis = self.hypotheses.get(result.hypothesis_id)
+        self.trial_ledger.record_trial({
+            "hypothesis_id": result.hypothesis_id,
+            "family": (hypothesis.trial_family if hypothesis else ""),
+            "stage": result.stage, "samples": result.samples,
+            "passed": bool(result.passed),
+            "elogw": float(result.metrics.get("elogw", 0.0) or 0.0),
+            "portfolio_impact": float(result.portfolio_impact),
+            "timestamp": result.timestamp})
         self.trial_results.append(result)
         if len(self.trial_results) > 10000:
             self.trial_results = self.trial_results[-5000:]
@@ -292,6 +323,12 @@ class ChampionChallengerFramework:
     def _retire_hypothesis(self, hyp_id: str, reason: str):
         if hyp_id in self.hypotheses:
             self.hypotheses[hyp_id].status = ModelStatus.RETIRED.value
+            # What was tried and failed is evidence too. A graveyard nobody
+            # writes to means the same idea gets rediscovered, retested and
+            # recounted as a fresh trial every time.
+            self.registry.graveyard_entry(
+                hyp_id, reason, self.trial_ledger.get_family_stats(
+                    self.hypotheses[hyp_id].trial_family))
             logger.info(f"Retired {hyp_id}: {reason}")
 
     async def _monitor_champion_decay(self):
@@ -440,6 +477,29 @@ class ChampionChallengerFramework:
             "decaying_champions": len([c for c in self.champions.values() if c.status == "DECAYING"]),
             "hibernated_champions": len([c for c in self.champions.values() if c.status == "HIBERNATED"]),
             "retired": len([h for h in self.hypotheses.values() if h.status == ModelStatus.RETIRED.value]),
+            # How many candidates were tried, by family, and how many passed.
+            # This is the denominator selection has to be priced against: a
+            # family with one survivor out of forty is a different claim from
+            # a family with one out of two.
+            "trials_last_24h": len(self.trial_ledger.get_recent_trials(24)),
+            "families": {
+                family: self.trial_ledger.get_family_stats(family)
+                for family in sorted({
+                    h.trial_family for h in self.hypotheses.values()
+                    if h.trial_family})},
+            "family_members": {
+                family: len(self.registry.get_family(family))
+                for family in sorted({
+                    h.trial_family for h in self.hypotheses.values()
+                    if h.trial_family})},
+            "multiplicity_groups": {
+                group: len(set(members))
+                for group, members in sorted(
+                    self.trial_ledger.multiplicity_groups.items())},
+            "live_champion_targets": sorted({
+                champion.hypothesis.target
+                for champion in self.get_live_champions()
+                if self.get_champion_for_target(champion.hypothesis.target)}),
         }
 
 

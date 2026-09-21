@@ -12,7 +12,8 @@ import numpy as np
 
 from src.research.feature_engine import FEATURE_SCHEMA_VERSION, build_features
 from src.strategies.multihead_predictor import (
-    SURVIVAL_LEVELS, ElogwEngine, MultiHeadPredictor, PredictionFeatures,
+    FEASIBLE_MULTIPLE_CEILING, SURVIVAL_LEVELS, ElogwEngine,
+    MultiHeadPredictor, PredictionFeatures,
     PredictionTarget, band_for,
 )
 from src.strategies.age_banded import BAND_NAMES
@@ -81,9 +82,13 @@ def snapshot_labels(
     if isinstance(feasible, (int, float)) and np.isfinite(feasible) and feasible > 0:
         # Clipped at 50 this target told every consumer that the best
         # obtainable exit was 50x, which capped the one outcome the whole book
-        # depends on. The bound is now the top of the survival curve.
+        # depends on. Then it was clipped at 500x, the last survival rung,
+        # which did the same thing one order of magnitude further out -- and
+        # this is the LABEL, so a 1000x episode was taught to the model as a
+        # 500x episode. The bound is the furthest multiple the survival curve
+        # will answer for, so the label and the prediction share a horizon.
         result[PredictionTarget.EXPECTED_FEASIBLE_MULTIPLE] = float(
-            np.clip(feasible, 0.02, SURVIVAL_LEVELS[-1][1]))
+            np.clip(feasible, 0.02, FEASIBLE_MULTIPLE_CEILING))
     return result
 
 

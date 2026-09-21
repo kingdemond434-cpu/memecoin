@@ -132,6 +132,26 @@ chains:
       - "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
       - "https://solana-rpc.publicnode.com"
       - "https://solana.leorpc.com/?api_key=FREE"
+      # APPENDED 2026-09-03, last, with no paired ws_url -- see the note above
+      # about positional pairing. Solana Tracker's public endpoint: no account,
+      # no key, no card, and it accepts sendTransaction as well as reads.
+      #
+      # NOT measured from the build box: its egress proxy refuses the host, so
+      # unlike the four rungs above this one carries no measured method list.
+      # The per-method capability learner will fill that in on the first box
+      # that can reach it, and until then it is simply another rung the
+      # rotator may try -- which is the correct state for an endpoint nobody
+      # here has actually spoken to.
+      #
+      # Its role is repair and failover, not T0. The hot path is the
+      # Yellowstone stream into local state; this is what answers an ordinary
+      # account or status read when the free rungs above are refusing, so that
+      # paid RPC capacity is not spent on repairs.
+      #
+      # Do NOT read this as a new free Geyser source: Solana Tracker's
+      # Yellowstone gRPC is a paid product (EUR 200/month as of 2026-09), and
+      # confusing the two would have the desk plan a T0 feed it has not bought.
+      - "https://rpc.solanatracker.io/public"
     ws_urls:
       - "wss://api.mainnet-beta.solana.com"
       - "wss://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
@@ -173,11 +193,20 @@ global:
   context_miner_concurrency: 4
 
   # The chain receive path in Rust -- socket, decode, filter and dedupe --
-  # running BESIDE the grpc.aio client, which stays the reference. SHADOW
-  # means it decides nothing; it is counted against the Python client until
-  # it has agreed on `native_ingress_promote_after` events, and a single
-  # event the reference saw and it did not demotes it permanently.
-  native_ingress_mode: "SHADOW"
+  # running BESIDE the grpc.aio client, which stays the reference.
+  #
+  # AUTO does not mean trusted. It means ALLOWED TO EARN TRUST: the receiver
+  # starts in shadow deciding nothing, is counted against the Python client,
+  # and may become authoritative only after agreeing on
+  # `native_ingress_promote_after` events with no miss. A single event the
+  # reference saw and it did not demotes it permanently, for the rest of the
+  # run, and no amount of later agreement wins it back.
+  #
+  # SHADOW is the stronger setting and means never: it runs and is measured
+  # and is not promoted however well it agrees. That is a real choice, and
+  # it was the default -- which meant the promotion ladder existed, was
+  # tested, and could not be climbed by any desk running the shipped config.
+  native_ingress_mode: "AUTO"
   native_ingress_promote_after: 5000
   # Tokens the hazard model keeps RESIDENT. Not a limit on how many tokens
   # the desk observes: evictions spill their full history to the research
@@ -226,7 +255,25 @@ global:
   small_account_negligible_share: 0.002
   acceptable_exit_impact: 0.10
   min_profit_target_pct: 50
-  max_hold_time_minutes: 60
+  # Raised from 60 on 2026-09-03. Sixty minutes closed a runner at 11x on
+  # the clock alone while the hard stop, the trail, the ratchet and the
+  # hazard exit were all still saying hold, which is the most expensive
+  # thing an exit policy can do to a strategy whose whole return lives in
+  # the tail. This is a judgement, not a measurement; exit_policy_trainer
+  # may select a different value and is trusted over it.
+  max_hold_time_minutes: 240
+  # The ceiling for a position under LIVE, CALIBRATED conviction -- three
+  # days. Reached only when src/strategies/continuation.py returns an OK,
+  # calibrated reading AND the monster machine is in a monster state, which
+  # requires every survival head it touched to be isotonically calibrated and
+  # above its positive-count floor. An untrained or thin model never gets
+  # here and the ordinary hold above governs unchanged.
+  #
+  # Zero would disable the extension entirely. It is not a licence to ignore
+  # anything: the hard stop, the trail, the hazard exit and the ratchet all
+  # still apply for the whole three days, and past this the time stop fires
+  # whatever the model believes.
+  max_conviction_hold_time_minutes: 4320
   stop_loss_pct: 30
   trailing_stop_pct: 15
   gas_multiplier: 1.5
@@ -235,7 +282,24 @@ global:
   flashbots_relay: "https://relay.flashbots.net"
   jito_tip_lamports: 100000
   log_level: "INFO"
-  dry_run: true
+  # ARMED, AND GOVERNED BY THE LADDER RATHER THAN BY THIS FLAG.
+  #
+  # This used to be the whole live-trading mechanism: set it false, export
+  # ALLOW_LIVE_TRADING, and the desk submitted real transactions immediately
+  # -- at whatever stage, with or without a trained model, while the
+  # promotion gate sat in /status reporting REJECTED and gating nothing.
+  #
+  # Submission now requires THREE things, and this is only the first:
+  #   1. dry_run false            an operator intends to trade
+  #   2. an EARNED stage >= canary  the desk has demonstrated it should
+  #   3. ALLOW_LIVE_TRADING       the signer's own acknowledgement
+  #
+  # So false here does not mean trading. It means the desk will begin
+  # trading at the moment it climbs to CANARY on measured evidence, and not
+  # one launch before. The stage is persisted, advances by at most one rung
+  # per passing verdict against frozen criteria, and every ambiguous case --
+  # no ledger, an unreadable file, an exception -- reads as NOT authorised.
+  dry_run: false
   paper_equity_usd: 10000
   max_total_exposure_pct: 0.30
   # Broad shadow portfolio: many small independent trials capture rare tails

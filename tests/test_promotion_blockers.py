@@ -224,3 +224,25 @@ class BackfillSurvivesTransientRpcExhaustion(unittest.TestCase):
 
     def test_the_report_names_an_early_stop(self):
         self.assertIn('"stopped_early_rpc_exhausted": exhausted', self.source())
+
+    def test_p_50x_is_optional_and_the_decision_rungs_are_not(self):
+        """The exact split a full supervisor round produced on 1,200 episodes.
+
+        p_2x, p_5x, p_10x, p_20x and p_migration all fitted; p_100x, p_250x
+        and p_500x fell back to a conservative zero as designed; and the band
+        was then failed by p_50x alone -- the head that decides least. A 50x
+        is rarer than one launch in a thousand and the flash band's fit window
+        is a couple of thousand rows, so a chronological split with zero 50x
+        positives is an ordinary month.
+
+        This asserts the boundary in both directions, because the failure mode
+        of the fix is the whole ladder quietly becoming optional.
+        """
+        self.assertIn(PredictionTarget.P_50X, OPTIONAL_TAIL_TARGETS)
+        for target in (PredictionTarget.P_2X, PredictionTarget.P_5X,
+                       PredictionTarget.P_10X, PredictionTarget.P_20X,
+                       PredictionTarget.P_MIGRATION,
+                       PredictionTarget.P_RUG_30S, PredictionTarget.P_RUG_5M):
+            self.assertNotIn(target, OPTIONAL_TAIL_TARGETS,
+                             f"{target.value} gates a live decision and must "
+                             "still block its band when uncoverable")

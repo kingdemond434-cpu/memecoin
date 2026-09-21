@@ -1,0 +1,74 @@
+# Public methods with no production caller, and what is to be done about each.
+#
+# Every line here is a method that was written and never wired. Three live
+# bugs were found in one day with exactly this shape, so the set is tracked
+# rather than tolerated: a new orphan fails CI, and so does a stale entry, so
+# wiring one FORCES its line to be deleted.
+#
+# Format:  name <TAB> class <TAB> reason
+#
+#   A  production capability that should be running and is not. This is debt.
+#      Every A is a feature the desk is believed to have and does not.
+#   B  superseded or duplicated by something already wired. Delete the method.
+#   C  offline research or operator API, called by tools and notebooks rather
+#      than by the live desk. Correctly absent from the hot path.
+#   D  deliberately public and unused by design -- a reporting surface, a
+#      property read in tests, or a planning-only call that must never run.
+#
+# A is not allowed to be a permanent home. B is a deletion waiting for a
+# hand. C and D are stable.
+
+# --- A: capability that does not run ---------------------------------------
+# An entire pre-launch subsystem with nothing feeding it. Predicting which
+# entities are about to launch is the earliest edge available, and the whole
+# module is dark: nothing records metadata creation, social creation or
+# infrastructure interaction, so nothing can be predicted from them.
+record_social_creation	D	no verified wallet-to-social source exists; feeding it would fabricate identity links
+# The hypothesis ledger. Trials are the record that lets the gauntlet price
+# selection; none are recorded, so multiplicity is unpriced.
+# Source-lead and adversarial adaptation: written, never consulted.
+# Actor and wallet intelligence reads with no consumer.
+# Execution capability that is built and idle.
+record_pair	C	the synchronous constructor for a comparison the desk cannot yet make: only one route is quoted per decision, and observe_both needs a live challenger endpoint
+# Research surfaces with no reader.
+declare_canonical	C	needs a figure to publish a token as theirs, which no observed source currently states
+exhausted	C	needs per-token AudienceTier observations, which nothing produces yet; the attention-diffusion feed is a separate project
+
+
+# --- C: offline research and operator APIs ---------------------------------
+arun	C	warehouse entry point for tools
+total_slots	C	extraction planning, offline
+audit	C	archive audit, operator command
+enforce_budget	C	archive retention, operator command
+retrieve	C	archive read, offline
+delete	C	archive delete, operator command
+serialize	C	graph snapshot, offline
+deserialize	C	graph restore, offline
+get_entity_graph_stats	C	graph statistics, offline
+get_feature_importance	C	model inspection, offline
+record_many	C	bulk load for backfills
+get_account_profile	C	social lookup, offline
+broadcast_request	C	multi-node RPC, operator command
+get_web3	C	EVM handle for future chain adapters
+ingest_curve_account	C	replay entry point for fixtures
+
+# --- D: public by design, unused by the desk -------------------------------
+as_event	D	canonical event projection, read in tests
+verified_programs	D	registry reporting surface
+watched_programs	D	registry reporting surface
+fee_lamports	D	fee quote convenience property
+ready_share_or_zero	D	registry reporting surface
+score_gain	D	displacement reporting surface
+peek	D	cache inspection without touching TTL
+reset	D	sequencer reset, test affordance
+owns_account	D	entity membership predicate
+loops	D	loop inventory, reporting surface
+runtime_task_report	D	supervision reporting surface
+watchdog_report	D	supervision reporting surface
+budget_report	D	latency reporting surface
+plan	D	planning only; nothing may sign a sweep
+choose	D	bid exploration, reporting surface
+add_chain	D	multi-chain registration, awaits chain adapters
+get_route_stats	D	execution reporting surface
+get_recent_executions	D	execution reporting surface
+get_inflight_bundle_status	D	bundle inspection, operator command

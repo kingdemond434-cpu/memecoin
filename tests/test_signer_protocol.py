@@ -234,3 +234,168 @@ class BothProtocolsWorkAgainstARealSocket(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheProtocolIsDeclaredNotGuessed(unittest.TestCase):
+    """The first byte was a guess, and the guess was reachably wrong.
+
+    The server told the two protocols apart by calling anything that was not
+    `{` a binary frame. On a binary connection that byte is the LOW BYTE of a
+    little-endian u32 length, and 0x7B is `{` -- so a frame whose body is
+    123, 379, 635 or 891 bytes long opened with `{` and was handed to
+    `json.loads`. A Solana message of 378 or 634 bytes is an ordinary
+    transaction. This was not a theoretical collision on an exotic input; it
+    was roughly one signature in 256 on the path where being wrong means an
+    unsigned transaction or a stalled connection.
+    """
+
+    def test_the_lengths_that_used_to_look_like_json_really_do_occur(self):
+        from src.execution.signer_protocol import encode_request, OP_SIGN
+
+        # Every payload length whose frame header starts with `{`.
+        collisions = [size for size in range(1, 1300)
+                      if encode_request(OP_SIGN, b"\x00" * size)[0:1] == b"{"]
+        self.assertEqual([122, 378, 634, 890, 1146], collisions)
+        # And those are transaction-sized, which is the whole problem.
+        self.assertTrue(any(200 <= size <= 1232 for size in collisions))
+
+    def test_the_handshake_cannot_be_confused_with_json(self):
+        from src.execution.signer_protocol import HANDSHAKE, MAGIC
+
+        self.assertNotEqual(b"{", MAGIC[:1])
+        self.assertEqual(4, len(HANDSHAKE))
+
+    def test_a_wrong_version_is_stated_not_tolerated(self):
+        from src.execution.signer_protocol import (
+            MAGIC, PROTOCOL_VERSION, parse_handshake)
+
+        self.assertEqual(PROTOCOL_VERSION, parse_handshake(MAGIC + b"\x01"))
+        self.assertEqual(9, parse_handshake(MAGIC + b"\x09"))
+        with self.assertRaises(ValueError):
+            parse_handshake(b"HTTP")
+        with self.assertRaises(ValueError):
+            parse_handshake(b"MCS")
+
+
+class ItSurvivesWhateverArrivesOnTheSocket(BothProtocolsWorkAgainstARealSocket):
+    """A signer holds the only key. What reaches its socket is not always a
+    client of ours: a port scan, a half-deployed desk, a truncated write from
+    a process that died mid-frame. None of it may hang the server, crash the
+    handler, or -- above all -- get something signed."""
+
+    def _speak(self, payloads, read_reply=True):
+        async def body():
+            replies = []
+            for payload in payloads:
+                reader, writer = await asyncio.open_unix_connection(str(self.path))
+                writer.write(payload)
+                await writer.drain()
+                # EOF immediately. A frame that declares more than it sends
+                # must end the connection rather than leave the server
+                # waiting for bytes that will never arrive -- and without the
+                # EOF this test would itself sit through that wait.
+                if writer.can_write_eof():
+                    writer.write_eof()
+                if read_reply:
+                    try:
+                        replies.append(await asyncio.wait_for(
+                            reader.read(4096), timeout=1.0))
+                    except asyncio.TimeoutError:
+                        replies.append(None)
+                writer.close()
+            return replies
+
+        return self._run(body)
+
+    def test_garbage_first_bytes_are_refused_with_a_reason(self):
+        replies = self._speak([b"GET / HTTP/1.1\r\n\r\n", b"\x00\x00\x00\x00",
+                               b"\xff" * 16, b"MCX\x01"])
+        for reply in replies:
+            self.assertIsNotNone(reply, "the server hung on garbage")
+            self.assertTrue(reply, "the server closed without saying why")
+
+    def test_a_frame_length_that_never_arrives_does_not_hang_the_server(self):
+        from src.execution.signer_protocol import HANDSHAKE
+
+        # Declares 4096 bytes, sends three. The handler must give up on the
+        # connection rather than block a slot for ever.
+        truncated = HANDSHAKE + struct.pack("<IB", 4096, 2) + b"abc"
+        self._speak([truncated], read_reply=False)
+        # And the signer is still serving afterwards.
+        from src.execution.signer import SignerClient
+
+        async def body():
+            client = SignerClient(self.path)
+            try:
+                self.assertEqual(str(self.keypair.pubkey()), await client.pubkey())
+            finally:
+                await client.close()
+
+        self._run(body)
+
+    def test_fuzzed_frames_never_produce_a_signature(self):
+        import random
+
+        from src.execution.signer_protocol import (
+            HANDSHAKE, STATUS_OK, decode_header)
+
+        random.seed(20260901)
+        frames = []
+        for _ in range(60):
+            declared = random.choice([0, 1, 2, 7, 123, 379, 635,
+                                      random.randint(1, 2048), 10 ** 6])
+            op = random.randint(0, 255)
+            body = bytes(random.getrandbits(8) for _ in range(random.randint(0, 64)))
+            frames.append(HANDSHAKE + struct.pack("<IB", declared, op) + body)
+
+        signed_before = self.service.signed
+        replies = self._speak(frames)
+        # Nothing random gets signed. The only op that signs is OP_SIGN, and
+        # it signs only a message the policy parses and allows -- so a fuzzer
+        # that happens to pick op 2 still gets a refusal, not a signature.
+        self.assertEqual(signed_before, self.service.signed)
+        for reply in replies:
+            if not reply or len(reply) < 5:
+                continue
+            _length, status = decode_header(reply[:5])
+            if status == STATUS_OK:
+                # An OK reply to a fuzzed frame is only legitimate for the
+                # ops that carry no message: pubkey and ping.
+                self.assertNotEqual(64, len(reply) - 5,
+                                    "a fuzzed frame produced something "
+                                    "signature-shaped")
+
+    def test_a_transaction_sized_frame_that_starts_with_a_brace_still_works(self):
+        """The exact case the old detection got wrong, end to end.
+
+        378 payload bytes make a header of `{`, `\\x01`, `\\x00`, `\\x00`,
+        op -- so the server read `{`, called `json.loads` on the rest of the
+        "line", and answered with a JSON error on a stream the client was
+        reading as length-prefixed frames. The client then decoded `{"ok`
+        as a header and everything after it was garbage that decoded as
+        something.
+
+        A payload of arbitrary bytes is not a message the policy can parse,
+        so the correct answer is a REFUSAL. What this asserts is that it is a
+        refusal -- a well-formed frame carrying a reason -- and that the held
+        connection is still usable afterwards, which is exactly what the
+        misdetection destroyed.
+        """
+        from src.execution.signer import SignerClient
+        from src.execution.signer_protocol import encode_request, OP_SIGN
+
+        self.assertEqual(b"{", encode_request(OP_SIGN, b"\x00" * 378)[0:1])
+
+        async def body():
+            client = SignerClient(self.path)
+            try:
+                with self.assertRaises(PermissionError):
+                    await client.sign_message(b"\x00" * 378)
+                # The connection survived, and the next signature is real.
+                signature = await client.sign_message(self._message())
+                self.assertEqual(64, len(signature))
+                self.assertEqual(0, client.reconnects)
+            finally:
+                await client.close()
+
+        self._run(body)

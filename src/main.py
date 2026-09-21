@@ -47,9 +47,10 @@ from src.strategies.memecoin_state import (
 from src.research.trade_evidence import TradeEvidenceLedger
 from src.research.dataset_builder import (
     PointInTimeDatasetBuilder, PUMP_INITIAL_VIRTUAL_SOL,
-    PUMP_INITIAL_VIRTUAL_TOKEN)
+    PUMP_INITIAL_VIRTUAL_TOKEN, PUMP_TOKEN_TOTAL_SUPPLY)
 from src.research.feature_engine import build_features
 from src.research.global_research_miner import GlobalResearchMiner
+from src.runtime.discovery import DeskDiscovery
 from src.research.calibration import CalibrationBook
 from src.research.counterfactual_corpus import (
     ActionOption, CounterfactualCorpus, RouteOption,
@@ -58,11 +59,23 @@ from src.research.calibration import Provenance
 from src.research.fallback import FallbackResolver, Source
 from src.runtime.latency import LatencyLedger
 from src.runtime.serialisation import jsonable as _jsonable
+from src.runtime.depth import (
+    CopyBookBudgets, DepthResolution, FollowableTrades, TailLadder,
+    note_curve_state, note_entry_position, note_migration, note_pool_state,
+    update_copy_budget)
+from src.runtime.prelaunch_feed import PrelaunchFeed
+from src.runtime.actor_intelligence import (
+    entry_actor_block, ingest_launch_edges, start_social_claim_fetch)
+from src.runtime.execution_readiness import bid_floor, pre_trade_readiness
+from src.runtime.execution_feedback import (
+    ExecutionFeedback, fee_competition)
+from src.runtime.regime import RegimeAndEvidence
 from src.runtime.reporting import ReportingSurface
 from src.runtime.ingestion import MinedRecordIngestion
 from src.runtime.evidence import EvidenceRecording
 from src.runtime.supervision import TaskSupervision
 from src.runtime.maintenance import DeskMaintenance
+from src.runtime.training import DeskTraining
 from src.runtime.wiring import SubsystemWiring
 from src.runtime.source_intelligence import SourceIntelligence
 from src.runtime.loop_local import loop_local_semaphore
@@ -111,7 +124,9 @@ from src.strategies.actor_graph import (
     build_fingerprint,
 )
 from src.strategies.champion_challenger import ChampionChallengerFramework
-from src.strategies.exit_policy import ExitPolicy, evaluate_exit
+from src.strategies.continuation import read_position_continuation
+from src.strategies.exit_policy import (
+    NEVER_SUPPRESSED, ExitPolicy, evaluate_exit)
 from src.strategies.genealogy_graph import GenealogyGraph
 from src.strategies.information_graph import (
     AdversarialAdaptationDetector,
@@ -130,8 +145,9 @@ from src.chains.pumpswap_curve import PumpSwapPoolState
 from src.chains.pumpswap_curve import quote_buy as pool_quote_buy
 from src.chains.pumpswap_curve import quote_sell as pool_quote_sell
 from src.chains.pumpswap_route import PoolState, parse_pool
+from src.execution.observed_bids import ComputeBudget, ObservedBidCorpus
 from src.execution.pump_fees import (
-    DEFAULT_SCHEDULE as PUMP_FEE_SCHEDULE, VENUE_BONDING_CURVE,
+    DEFAULT_SCHEDULE as PUMP_FEE_SCHEDULE, VENUE_BONDING_CURVE, round_trip_cost,
 )
 from src.execution.tradeability import curve_tradeability, exit_capacity_ratio, pool_tradeability
 from src.strategies.distribution import DistributionDetector
@@ -184,9 +200,13 @@ CAPACITY_REJECTIONS = frozenset({
 
 
 
-class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
+class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
+                       ExecutionFeedback, DepthResolution, FollowableTrades,
+                       CopyBookBudgets, PrelaunchFeed, TailLadder,
+                       MinedRecordIngestion,
                        DeskMaintenance, TaskSupervision, EvidenceRecording,
-                       SubsystemWiring, SourceIntelligence, PositionForensics):
+                       SubsystemWiring, SourceIntelligence, PositionForensics,
+                       DeskTraining, DeskDiscovery):
     def __init__(self, config_path: str = "config/chains.yaml", *, dry_run_override: Optional[bool] = None,
                  offline: bool = False):
         self.config_path = config_path
@@ -339,6 +359,18 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         self._safety_task: Optional[asyncio.Task] = None
         self._intelligence_task: Optional[asyncio.Task] = None
         self._parity_task: Optional[asyncio.Task] = None
+        self._native_ingress_task: Optional[asyncio.Task] = None
+        self._training_task: Optional[asyncio.Task] = None
+        self._native_ingress_events = 0
+        self._fee_config_refreshed_at = 0.0
+        self.secondary_stream = None
+        # The full risk audit, running BESIDE the decision instead of in
+        # front of it. Keyed per token so a candidate re-checked five times
+        # on the ladder starts one fetch, not five.
+        self._risk_enrichment: Dict[str, asyncio.Task] = {}
+        self._portfolio_refresh_task: Optional[asyncio.Task] = None
+        self._portfolio_refreshed_at = 0.0
+        self.sol_price_age_s = 0.0
         self._source_task: Optional[asyncio.Task] = None
         # Coverage says a module was consulted; this says whether it mattered.
         # A component that is disconnected and one that is connected but inert
@@ -522,6 +554,11 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         # that starts first delivers events into a desk that has nothing
         # wired to handle them, and those launches are lost silently.
         await self._setup_yellowstone()
+        # Before anything can be costed, and therefore before anything can be
+        # entered. Without it `round_trip_bps` is DATA_BLOCKED for every trade
+        # after the dynamic schedule activated, and a decision that cannot
+        # price its own cost cannot clear an expected-value bar.
+        await self._refresh_pump_fee_config()
         await self._refresh_portfolio_state()
         logger.info("Desk initialized: mode=%s live_submission_locked=%s", "DRY_RUN" if self.dry_run else "LIVE",
                     os.getenv("ALLOW_LIVE_TRADING", "").lower() != "yes-i-understand")
@@ -559,6 +596,20 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         self._intelligence_task = self._start_runtime_task(
             "intelligence", self._intelligence_loop())
         self._parity_task = self._start_runtime_task("parity", self._parity_loop())
+        self._training_task = self._start_runtime_task(
+            "training", self._training_loop())
+        # Hourly world discovery. Its own loop on its own long clock: a pass
+        # is dozens of HTTP requests, and it must never share a cadence with
+        # anything that decides, nor sit between process start and the health
+        # port being answerable.
+        self._discovery_task = self._start_runtime_task(
+            "discovery", self._discovery_loop())
+        # Started only when the receiver is actually streaming, so a box
+        # without the extension built does not carry a loop that wakes
+        # twenty times a second to drain nothing.
+        if getattr(self, "native_ingress", None) is not None and self.native_ingress.running:
+            self._native_ingress_task = self._start_runtime_task(
+                "native_ingress", self._native_ingress_loop())
         self._register_memory_reliefs()
         self._health_task = self._start_runtime_task(
             "health", self._health_loop())
@@ -642,9 +693,23 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             task.cancel()
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        # The native stream holds a socket and an OS thread in Rust. Stopped
+        # before its drain task is cancelled, so the last events it matched
+        # are accounted for rather than discarded with the queue.
+        try:
+            if getattr(self, "secondary_stream", None) is not None:
+                await self.secondary_stream.stop()
+        except Exception as exc:  # pragma: no cover - shutdown only
+            logger.warning("secondary feed shutdown: %s", exc)
+        try:
+            if getattr(self, "native_ingress", None) is not None:
+                self.native_ingress.stop()
+        except Exception as exc:  # pragma: no cover - shutdown only
+            logger.warning("native ingress shutdown: %s", exc)
         for task in (self._main_task, self._health_task, self._market_task,
                      self._safety_task, self._intelligence_task, self._source_task,
                      self._parity_task, self._watchdog_task,
+                     self._native_ingress_task, self._training_task,
                      *self._redecision_tasks):
             if task:
                 task.cancel()
@@ -845,6 +910,18 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
                 await self._observe_active_markets()
             except Exception as exc:
                 logger.exception("Market observer error: %s", exc)
+            # The leader schedule, refreshed on need rather than on a clock:
+            # it is fixed for an epoch, so a desk that has consumed its
+            # lookahead should refresh and an idle one should not. Here
+            # rather than in the intelligence sweep because 120 slots is
+            # under a minute and that sweep runs every sixty seconds.
+            try:
+                if (getattr(self, "leader_schedule", None) is not None
+                        and not self.offline
+                        and self.leader_schedule.needs_refresh()):
+                    await self.leader_schedule.refresh()
+            except Exception as exc:
+                logger.debug("leader schedule refresh: %s", exc)
             await asyncio.sleep(float(self.global_config.get("market_observer_sleep_seconds", 0.25)))
 
     async def _process_new_tokens(self):
@@ -870,14 +947,28 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         token = candidate.address
         if not token or token in self._candidate_pipelines:
             return False
-        if len(self._candidate_pipelines) >= int(self.global_config.get("max_candidate_pipelines", 100)):
-            logger.warning("Candidate pipeline saturated; preserving DATA_BLOCKED decision for %s", token)
-            self._record_blocked_decision(token, "DATA_BLOCKED_candidate_pipeline_saturated", {})
+        # Shed by WORTH, not by arrival order. The old rule dropped whatever
+        # arrived once the queue was full, so during the exact minute when
+        # the best launch of the day is most likely to appear -- a burst --
+        # the desk's rule for handling it was "were you 99th or 101st".
+        shed = self.load_shedder.admit(
+            self._shedding_features(candidate), len(self._candidate_pipelines))
+        if not shed.admitted:
+            logger.warning("Candidate shed under load: %s (%s)", token, shed.reason)
+            self._record_blocked_decision(
+                token, "DATA_BLOCKED_candidate_pipeline_saturated",
+                shed.as_dict())
             self._candidate_drops += 1
             return False
         self.latency.mark(token, "decode_to_dispatch")
         task = asyncio.create_task(self._candidate_pipeline(candidate))
         self._candidate_pipelines[token] = task
+        # Filed now, so a launch dying during enrichment is still filed.
+        if self.predictor is not None and not self.predictor._is_trained:
+            self.launch_census.data_blocked(
+                token, "DATA_BLOCKED_prediction_model_enrichment_running")
+        else:
+            self.launch_census.awaiting_state(token, "candidate_pipeline_running")
         self._background_tasks.add(task)
 
         def completed(done: asyncio.Task):
@@ -902,6 +993,7 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             # episode/risk state; Yellowstone continues collecting outcomes.
             # Holding thousands of five-pass tasks here adds latency but no evidence.
             checkpoints = [0.0]
+        start_social_claim_fetch(self, candidate)
         started = time.monotonic()
         for delay in checkpoints:
             await asyncio.sleep(max(0.0, started + delay - time.monotonic()))
@@ -935,7 +1027,14 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             candidate.base_token or WSOL_MINT, detected_at=candidate.timestamp,
             prelaunch_context=self._prelaunch_context(candidate.deployer or "", candidate.timestamp),
         )
-        risk = await self.rug_detector.analyze(token, candidate.pair, candidate.base_token)
+        # NO NETWORK AWAIT HERE. `analyze` is three to five sequential RPC
+        # round trips, and it used to sit directly in front of the decision:
+        # one to five hundred milliseconds of the desk waiting, on the one
+        # launch it is trying to be first to, while it optimises signer IPC
+        # in microseconds behind it. The local view is taken now and the full
+        # audit is fetched concurrently; the checkpoint ladder re-runs this
+        # candidate a second later and finds the completed report cached.
+        risk = self._risk_for_decision(candidate)
         risk_data = _jsonable(risk)
         self.dataset_builder.record_risk_report(token, risk_data)
         self.rug_hazard.register_token(token, {"deployer": candidate.deployer or "", "pair": candidate.pair or ""})
@@ -971,10 +1070,21 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         if prediction is None:
             self._record_blocked_decision(token, "DATA_BLOCKED_prediction_model", {})
             return
+        # Every fact the decision needs is now in hand. Recorded so the funnel
+        # can separate "we could not evaluate this" from "we evaluated it and
+        # said no" -- the two have opposite remedies and looked identical
+        # while this call was missing.
+        self.launch_census.decision_ready(
+            token, "safety_liquidity_and_prediction_ready")
         if not self.dry_run and not self.champion_challenger.is_live(MODEL_HYPOTHESIS_ID):
             self._record_blocked_decision(token, "champion_not_promoted_for_live_authority", _jsonable(prediction))
             return
-        await self._refresh_portfolio_state()
+        # Refreshed on a cadence, not per candidate. This is a Jupiter quote
+        # for the SOL price and, when live, a getBalance -- another full
+        # network round trip in the middle of T0, taken once per candidate to
+        # learn a number that moves by fractions of a percent in the seconds
+        # between launches. Staleness is recorded rather than paid for.
+        self._ensure_portfolio_fresh()
         # Hard admissibility, then a size, then Q. NOT `should_trade`, which
         # composes all three plus four economic thresholds -- and those
         # thresholds are opinions about quantities the objective already
@@ -996,7 +1106,8 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
                                                    liquidity)
             trade_info = self.elogw_engine.size_candidate(
                 prediction, self.sol_price_usd, liquidity,
-                disagreement=disagreement)
+                disagreement=disagreement,
+                depth_usd=self._measured_depth_usd(token))
             # The screens' verdict, applied as size rather than as a gate.
             # Composed multiplicatively with the disagreement shrink already
             # in trade_info: two independent reasons to be smaller are two
@@ -1092,14 +1203,23 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             self.latency.close(token, "screened")
             return
         self.latency.mark(token, "decide_to_build")
+        competition = fee_competition(getattr(self, "latency", None))
+        age_s = float(trade_info.get("time_since_launch", 0.0) or 0.0)
+        # Raised to the observed market when it sits under it: that corpus
+        # holds only transactions that LANDED, so it is a market quote and
+        # never a landing probability -- a floor, never a target.
+        priority_fee = bid_floor(self, age_s, self.fee_optimizer.get_optimal_fee(
+            trade_info["position_value_usd"], competition))
+        trade_info = {**trade_info, "execution_readiness": pre_trade_readiness(
+            self, token, int(trade_info.get("expected_tokens", 0) or 0), age_s)}
         result = await self.execution_engine.execute_swap(
             candidate.base_token or WSOL_MINT, token, int(trade_info["position_size_sol"] * 1e9),
             slippage_bps=100,
-            priority_fee=self.fee_optimizer.get_optimal_fee(trade_info["position_value_usd"], 0.5),
+            priority_fee=priority_fee,
             jito_tip=self.fee_optimizer.get_jito_tip(trade_info["position_value_usd"], "MEDIUM"),
             use_jito=True, decision_id=decision_id,
-            # The EDGE landing buys, not the position notional. A $500
-            # position is not $500 of expected value: E[log W] times the book
+            # The EDGE landing buys, not the notional. A $500 position is
+            # not $500 of expected value: E[log W] times the book
             # is what the fill is actually worth, and bidding against the
             # notional overpays for a marginal trade and underpays for a good
             # one -- the two errors that matter, in the two directions that
@@ -1114,10 +1234,11 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         # Build, sign and submission happen inside the engine, which reports
         # its own split; from here the whole call is one stage. Marked before
         # the result is inspected so a rejected submission is timed the same
-        # as an accepted one -- the failure path is the one that has to be
-        # fast too, because a failed entry is a slot spent.
+        # as an accepted one: a failed entry is a slot spent.
         self.latency.mark(token, "sign_to_submit")
-        self.latency.close(token, "entered" if result.success else "submit_failed")
+        trace = self.latency.close(
+            token, "entered" if result.success else "submit_failed")
+        self._record_fee_outcome(int(priority_fee), bool(result.success), trace)
         self.dataset_builder.record_execution_attempt(token, _jsonable(result))
         self._record_ops_event("execution_attempts", {
             "token": token, "side": "buy", "success": bool(result.success),
@@ -1141,6 +1262,9 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
                     "execution": _jsonable(result),
                 })
                 return
+        note_entry_position(
+            self, token, int(result.output_amount),
+            int(float(trade_info["position_size_sol"]) * 1e9))
         position = {
             "token": token, "size_tokens": int(result.output_amount), "initial_size_tokens": int(result.output_amount),
             "remaining_cost_usd": acquisition_cost,
@@ -1273,7 +1397,15 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         # Recorded so the weekly audit can ask what the rejected launches went
         # on to do. A missed monster is invisible unless the rejection was
         # written down next to the outcome.
-        self.launch_census.screen(token, reason)
+        #
+        # THREE dispositions, not one; lost in the file split. See
+        # tests/test_funnel_wiring.py.
+        if str(reason).upper().startswith("DATA_BLOCKED"):
+            self.launch_census.data_blocked(token, reason)
+        elif str(reason).startswith("safety_veto:"):
+            self.launch_census.reject(token, reason)
+        else:
+            self.launch_census.screen(token, reason)
         self._record_ops_event("trade_outcomes", {
             "token": token, "entered": False, "attempted": False,
             "rejection_reason": reason,
@@ -1344,134 +1476,6 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
 
 
 
-    def _local_liquidity(self, token: str) -> float:
-        """Tradeable depth from the streamed curve, in USD. Zero when unknown.
-
-        A bonding curve's quote-side depth IS its SOL reserve: that is what a
-        seller can be paid out of, and no quote from anywhere makes it larger.
-        Reading it locally removes a network round trip from directly in front
-        of the T0 sizing decision.
-
-        Real reserves are preferred where an account update has supplied them.
-        Where only a trade event has been seen, the virtual reserve is used
-        and is an upper bound -- which is why the frontier built on it is
-        already labelled as one rather than treated as a measurement.
-        """
-        state = self._latest_curve_state.get(token)
-        if state is None or not state.tradeable or self.sol_price_usd <= 0:
-            return 0.0
-        lamports = int(state.real_sol_reserves or 0) or int(state.virtual_sol_reserves or 0)
-        if lamports <= 0:
-            return 0.0
-        return (lamports / 1e9) * float(self.sol_price_usd)
-
-    async def _resolve_liquidity(self, candidate: TokenCandidate) -> float:
-        explicit = candidate.initial_liquidity_usd or candidate.metadata.get("liquidity_usd")
-        if explicit and float(explicit) > 0:
-            return float(explicit)
-        # The curve already tells us this. Asking Jupiter meant a T0 decision
-        # paid a network round trip to learn something the streamed reserves
-        # state outright -- and the sizing engine cannot start until the
-        # answer arrives, so the round trip sat directly in front of the
-        # decision it was feeding.
-        local = self._local_liquidity(candidate.address)
-        if local > 0:
-            return local
-        if not self.jupiter or not self.jupiter._session or self.sol_price_usd <= 0:
-            return 0.0
-        quote = await self.jupiter.get_quote(WSOL_MINT, candidate.address, 100_000_000, slippage_bps=300)
-        if not quote or quote.output_amount <= 0:
-            return 0.0
-        impact = max(float(quote.price_impact_pct), 0.001)
-        estimate = (0.1 * self.sol_price_usd) / impact
-        observation = {"type": "liquidity", "liquidity_usd": estimate, "source": "quote_depth_estimate",
-                       "price_impact_pct": quote.price_impact_pct, "timestamp": time.time()}
-        self.dataset_builder.record_market_observation(candidate.address, observation)
-        self.rug_hazard.record_observation(candidate.address, observation)
-        return estimate
-
-    async def _build_prediction_features(self, candidate: TokenCandidate, risk: Any, liquidity: float) -> PredictionFeatures:
-        as_of = time.time()
-        episode = self.dataset_builder.active_episodes.get(candidate.address)
-        episode_meta = {
-            "token": candidate.address,
-            "chain": candidate.chain,
-            "created_at": float(getattr(episode, "created_at", candidate.timestamp or as_of)),
-        }
-
-        if episode is not None:
-            deployer_features = await self.dataset_builder._capture_deployer_features(episode, as_of)
-            wallet_features = await self.dataset_builder._capture_wallet_features(episode, as_of)
-            flow_features = await self.dataset_builder._capture_flow_features(episode, as_of)
-            graph_features = await self.dataset_builder._capture_entity_graph_features(episode, as_of)
-            social_features = await self.dataset_builder._capture_social_features(episode, as_of)
-            token_features = await self.dataset_builder._capture_token_features(episode, as_of)
-            market_features = await self.dataset_builder._capture_market_features(episode, as_of)
-        else:
-            # No episode yet: report every group DATA_BLOCKED rather than
-            # substituting zeros that would read as real observations.
-            blocked = {"status": "DATA_BLOCKED", "reason": "episode_not_started"}
-            deployer_features = {"has_profile": False}
-            wallet_features = {}
-            flow_features = dict(blocked)
-            graph_features = dict(blocked)
-            token_features = dict(blocked)
-            market_features = dict(blocked)
-            social_features = self.social_intel.get_token_social_signal(candidate.address, as_of=as_of)
-
-        # Actor intelligence is computed from live entries rather than from
-        # the episode snapshot, so it reaches the decision at the age it was
-        # measured. Its status travels with it: a launch with no scored buyers
-        # must not read as one whose buyers scored zero.
-        actors = self.actor_intelligence(candidate.address, as_of)
-        graph_features = {
-            **graph_features,
-            "actor_status": actors.get("status", "DATA_BLOCKED"),
-            "observed_buyers": actors.get("observed_buyers", 0),
-        }
-        flow = actors.get("smart_flow") or {}
-        if flow.get("status") == "OK":
-            graph_features["actor_adjusted_flow"] = flow.get("evidence")
-            graph_features["sybil_discount"] = flow.get("discount")
-        swarm = actors.get("swarm") or {}
-        if swarm.get("status") == "OK":
-            graph_features["swarm_probability"] = swarm.get("probability")
-        elif swarm:
-            graph_features["swarm_evidence_uncalibrated"] = swarm.get("evidence")
-        dna = actors.get("buyer_dna") or {}
-        if dna.get("status") == "OK":
-            graph_features["first25_label"] = dna.get("label")
-            graph_features["first25_confidence"] = dna.get("confidence")
-
-        # The safety report is fresher than the episode snapshot for the
-        # fields it owns, so it takes precedence where both are present.
-        token_features = {
-            **token_features,
-            "status": risk.data_status,
-            "ownership_renounced": bool(risk.ownership_renounced),
-            "can_mint": bool(risk.can_mint),
-            "can_freeze": bool(risk.can_freeze),
-            "top_10_pct": float(risk.top_10_pct),
-            "extension_risk": float(getattr(risk, "extension_risk", 0) or 0),
-            "sell_route_feasible": risk.sell_route_feasible,
-        }
-        liquidity_features = (
-            {"status": "OK", "liquidity_usd": liquidity, "liquidity_locked": bool(risk.liquidity_locked)}
-            if liquidity > 0 else {"status": "DATA_BLOCKED", "reason": "liquidity_not_observed"}
-        )
-
-        snapshot = {
-            "timestamp": as_of,
-            "deployer_features": deployer_features,
-            "wallet_features": wallet_features,
-            "flow_features": flow_features,
-            "liquidity_features": liquidity_features,
-            "social_features": social_features,
-            "token_features": token_features,
-            "market_features": market_features,
-            "entity_graph_features": graph_features,
-        }
-        return build_features(episode_meta, snapshot)
 
     async def _manage_positions(self):
         for token, position in list(self.elogw_engine.open_positions.items()):
@@ -1560,8 +1564,15 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         # distinguishes a 20x from a distribution phase.
         await self._refresh_position_prediction(token, position)
         prediction = position.get("prediction") or {}
-        continuation = max(float(prediction.get("p_5x", 0)),
-                           float(prediction.get("p_10x", 0)))
+        # One reading, shared with the monster machine below, so the trail,
+        # the time stop and the conviction state cannot disagree about what
+        # the model believes. DATA_BLOCKED reads as zero on purpose: no
+        # conviction restores the ordinary trailing stop.
+        reading = read_position_continuation(
+            getattr(self, "continuation_model", None), self.predictor, position)
+        position["continuation"] = reading.to_dict()
+        position["continuation_reading"] = reading
+        continuation = float(reading.probability or 0.0)
         distribution = self._read_distribution(token)
         position["distribution"] = {
             "status": distribution.status, "evidence": distribution.evidence_score,
@@ -1624,10 +1635,24 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
 
         # Only unpriceable states reach here.
         self._unpriced_cycles += 1
-        decision = evaluate_exit(
-            self.exit_policy, multiple, float(position["high_water_multiple"]), continuation,
-            set(stages), time.time() - float(position["entry_time"]),
-        )
+        elapsed = time.time() - float(position["entry_time"])
+        high_water = float(position["high_water_multiple"])
+        conviction = self.monster_machine.overrides_ordinary_exit(token)
+        decision = evaluate_exit(self.exit_policy, multiple, high_water,
+                                 continuation, set(stages), elapsed,
+                                 conviction=conviction)
+        if conviction:
+            # What the policy WOULD have done without the conviction, written
+            # down. The ratchet is stood down inside `evaluate_exit` now, so
+            # the caller never sees it and the disagreement would otherwise
+            # vanish -- and a suppression nobody can count is a suppression
+            # nobody can audit when the position ends badly.
+            ordinary = evaluate_exit(self.exit_policy, multiple, high_water,
+                                     continuation, set(stages), elapsed)
+            if ordinary and ordinary != decision:
+                position.setdefault("suppressed_exits", []).append(
+                    {"reason": ordinary[0], "exit_pct": ordinary[1],
+                     "multiple": multiple, "at": time.time()})
         position["ratchet"] = ({"status": "OK", "reason": decision[0],
                                 "exit_pct": decision[1]} if decision
                                else {"status": "OK", "reason": "no threshold reached"})
@@ -1655,7 +1680,8 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
                         "; ".join(position.get("exit_mode_reasons", ())) or "no absorption")
             position.setdefault("cohort_vetoes", []).append(
                 {"reason": decision[0], "at": time.time()})
-        elif decision and self.monster_machine.overrides_ordinary_exit(token):
+        elif (decision and decision[0] not in NEVER_SUPPRESSED
+                and self.monster_machine.overrides_ordinary_exit(token)):
             # A ratchet banks harder the higher a position goes, which is
             # right for ordinary winners and exactly wrong for the rare one
             # that would carry the account: it sells that one first and
@@ -1830,6 +1856,11 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             position_value_usd=(float(trade_info["position_value_usd"])
                                 if trade_info.get("position_value_usd") is not None else None),
             liquidity_usd=liquidity if liquidity > 0 else None,
+            # The same measured depth the size was built on. Passing it means
+            # the veto cannot reject on a flat fraction a measurement has
+            # already cleared -- the two were answering one question with two
+            # instruments, and the blunter one was winning.
+            depth_usd=trade_info.get("measured_depth_usd"),
             connected_holder_pct=getattr(risk, "connected_cluster_pct", None))
         return {
             "safety": {"status": getattr(risk, "data_status", "DATA_BLOCKED"),
@@ -1850,6 +1881,7 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             "source_dna": self._source_dna(token),
             "authenticity": self._authenticity(token, candidate),
             "cost_model": self._cost_model(token),
+            **entry_actor_block(self, token, candidate),
             "prelaunch": (self._prelaunch_context(candidate.deployer or "", candidate.timestamp)
                           or {"status": "DATA_BLOCKED", "reason": "no deployer profile"}),
             "coordination": self.public_coordination.get_features(token),
@@ -1936,10 +1968,12 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             return False
         self._latest_curve_state[token] = state
         if state.creator:
-            self._curve_static[token] = {
+            # In place: the curve address from the creation event must
+            # survive a later account update.
+            self._curve_static.setdefault(token, {}).update({
                 "creator": state.creator,
                 "token_total_supply": int(state.token_total_supply or 0),
-            }
+            })
         self.state_sequencer.bump(token)
         # An account update is a market change like any other, and the
         # position holding it should think again on the same terms.
@@ -1976,6 +2010,7 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             state.coin_creator = existing.coin_creator
             state.base_supply = existing.base_supply
         self._latest_pool_state[token] = state
+        note_migration(self, token, state)
         self.state_sequencer.bump(token)
         self._spawn_background(self._fetch_pool_account(token, pool))
 
@@ -2024,6 +2059,7 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             state.base_supply = previous.base_supply
             state.coin_creator = previous.coin_creator
         self._latest_pool_state[token] = state
+        note_pool_state(self, token, state)
         # Reserves moved, so a decision priced against the old ones is stale.
         self.state_sequencer.bump(token)
         self.request_redecision(token)
@@ -2164,6 +2200,12 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
                     follow_latency_s=max(0.0, candidate["opened_at"]
                                          - candidate["observed_at"]),
                     data_status="OK"))
+                # The copy book's two estimates, kept disjoint. The budget is
+                # registered from the value measured BEFORE this outcome and
+                # freezes there; every resolution after that is live evidence
+                # judged against it. Registering afterwards would fold the
+                # live result into its own benchmark.
+                update_copy_budget(self, candidate["wallet"], multiple, accepted)
                 resolved += int(accepted)
                 self._follow_resolved += int(accepted)
                 self._follow_unresolved += int(not accepted)
@@ -2191,8 +2233,18 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
 
         An open position is kept whatever the hot state says: a position we
         cannot quote an exit for is the one state we must never discard.
+
+        So is a candidate still being DECIDED: both need their exit
+        priced. Dropping its curve state mid-flight sent the sell-route
+        check to the ROUTER, whose ignorance hard-vetoed 678 of 678 decided
+        launches. See tests/test_sell_route_authority.py.
         """
-        held = set(self.elogw_engine.open_positions)
+        held = (set(self.elogw_engine.open_positions)
+                # Through getattr: this is a maintenance sweep, and an
+                # AttributeError here would take down the pass that keeps
+                # these dicts bounded -- the leak that OOM-killed the
+                # service twelve times in one hour.
+                | set(getattr(self, "_candidate_pipelines", ()) or ()))
         dropped = 0
         for store in (self._curve_static, self._latest_curve_state,
                       self._latest_pool_state):
@@ -2206,47 +2258,15 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
     def _cost_model(self, token: str, at_utc: Optional[float] = None) -> Dict[str, Any]:
         """The round-trip protocol cost of this token, priced rather than assumed.
 
-        The desk used two config constants for entry and exit cost. They were
-        right until 2026-09-01, when Pump replaced the flat 100 bps with a
-        market-cap tier schedule -- and a constant that silently stops being
-        true is worse than one that was never trusted, because every E[log W]
-        downstream keeps quoting it with full confidence.
-
-        Where the schedule can answer, it does. Where it cannot -- the tier
-        table is published as an image, so it is only loadable from an
-        operator transcription -- the config constant is used AND LABELLED as
-        an assumption, so a decision made on an unpriced fee is distinguishable
-        after the fact from one made on a measured one.
+        Thin on purpose: the pricing itself lives beside the fee schedule in
+        `src.execution.pump_fees`, where the tier logic it depends on is, and
+        all this supplies is the curve state that gives it a market cap.
         """
-        at_utc = time.time() if at_utc is None else float(at_utc)
-        market_cap = None
-        state = self._latest_curve_state.get(token)
-        if state is not None and state.virtual_sol_reserves > 0:
-            # Market cap in lamports at the marginal curve price: total supply
-            # priced off the virtual reserves, which is the quantity the tier
-            # table is indexed on.
-            market_cap = int(state.token_total_supply * state.virtual_sol_reserves
-                             // max(1, state.virtual_token_reserves))
-        status, round_trip_bps, detail = self.fee_schedule.round_trip_bps(
-            venue=VENUE_BONDING_CURVE,
-            entry_market_cap_lamports=market_cap, exit_market_cap_lamports=market_cap,
-            entry_utc=at_utc, exit_utc=at_utc,
-        )
-        if status == "OK":
-            leg = round_trip_bps / 2 / 10_000
-            return {"status": "OK", "assumed": False, "entry_cost": leg, "exit_cost": leg,
-                    "round_trip_bps": round_trip_bps,
-                    "schedule_version": detail["entry"].schedule_version,
-                    "market_cap_lamports": market_cap}
-        return {
-            "status": "DATA_BLOCKED_FEE_SCHEDULE", "assumed": True,
-            "entry_cost": float(self.global_config.get("assumed_entry_cost", 0.02)),
-            "exit_cost": float(self.global_config.get("assumed_exit_cost", 0.02)),
-            "reason": detail["entry"].reason or detail["exit"].reason,
-            "schedule_version": self.fee_schedule.version,
-            "market_cap_lamports": market_cap,
-        }
-
+        return round_trip_cost(
+            self.fee_schedule, self._latest_curve_state.get(token),
+            at_utc=at_utc,
+            assumed_entry_cost=float(self.global_config.get("assumed_entry_cost", 0.02)),
+            assumed_exit_cost=float(self.global_config.get("assumed_exit_cost", 0.02)))
 
 
     def _score_entry(self, token: str, prediction: Any, liquidity: float,
@@ -2518,6 +2538,8 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
                                      "held": state.held_fraction,
                                      "multiple": state.current_multiple,
                                      "capacity": state.exit_capacity_ratio,
+                                     "executable_tail": self.executable_tail(
+                                         token, position),
                                      "escape": state.escape_probability}),
             model_hash=self.model_feature_hash,
             expiry_seconds=float(self.global_config.get("decision_expiry_seconds", 1.5)),
@@ -2642,9 +2664,20 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             # cannot sell is worse than missing it, because the capital is
             # still committed when the window closes.
             catastrophic = True
+        # Hardcoded None/False until 2026-09-03, so `overrides_ordinary_exit`
+        # returned False for the life of the desk however well the model was
+        # trained and the ratchet sold every runner. The reading certifies
+        # itself calibrated only when every head it touched was isotonically
+        # mapped and above its positive floor; a thin model grants nothing.
+        continuation = position.get("continuation_reading") or (
+            read_position_continuation(
+                getattr(self, "continuation_model", None), self.predictor,
+                position))
         evidence = MonsterEvidence(
-            monster_probability=None,
-            monster_probability_calibrated=False,
+            monster_probability=(continuation.probability
+                                 if continuation.ok else None),
+            monster_probability_calibrated=bool(
+                continuation.ok and continuation.calibrated),
             distribution_probability=distribution.probability(3.0),
             distribution_calibrated=distribution.calibrated,
             rug_probability=(float(getattr(hazard, "hazard_5m", 0.0)) if hazard else None),
@@ -2791,7 +2824,8 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         result = await self.execution_engine.execute_swap(
             candidate.base_token or WSOL_MINT, token, lamports,
             slippage_bps=slippage_bps,
-            priority_fee=self.fee_optimizer.get_optimal_fee(add_usd, 0.5),
+            priority_fee=self.fee_optimizer.get_optimal_fee(
+                add_usd, fee_competition(getattr(self, "latency", None))),
             jito_tip=self.fee_optimizer.get_jito_tip(add_usd, "MEDIUM"),
             use_jito=True, decision_id=position.get("decision_id"),
             # The same economics the entry bid uses, on the same axis. `gain`
@@ -3472,6 +3506,7 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             self.equity_status = "DATA_BLOCKED"
             return
         self.sol_price_usd = quote.output_amount / 1_000_000
+        self._portfolio_refreshed_at = time.time()
         if self.dry_run:
             self.wallet_equity_usd = float(self.global_config.get("paper_equity_usd", 10_000)) + self.total_pnl
         else:
@@ -3586,6 +3621,29 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             return
         self.last_intelligence_update = time.time()
         await self._refresh_portfolio_state()
+        # Re-read rather than read once: Pump can change the tiers, and the
+        # desk's cost of trading is only as current as this account read.
+        if time.time() - self._fee_config_refreshed_at > float(
+                self.global_config.get("fee_config_refresh_seconds", 900.0)):
+            await self._refresh_pump_fee_config()
+        # The ladder, evaluated against frozen criteria and advanced by at
+        # most one stage. This is the ONLY thing that raises the desk's
+        # trading authority, and it does it on measured evidence rather than
+        # on anybody remembering to.
+        try:
+            # Re-read every pass: the count comes from another process, and
+            # a desk up for three weeks would otherwise judge capital on
+            # whatever the gauntlet said the morning it booted.
+            self.forward_evidence.load_gauntlet(self.gauntlet_verdict_path)
+            verdict = self.promotion_ledger.submit(self.forward_evidence.evidence())
+            earned = self.promotion_ledger.current_stage()
+            if earned is not self.forward_evidence.stage:
+                # Promoted. The accumulator must now be judged against the
+                # NEW stage's criteria, or it would keep clearing a bar it
+                # has already passed and never climb again.
+                self.forward_evidence.stage = earned
+        except Exception as exc:
+            logger.exception("Promotion evaluation error: %s", exc)
         await self.genealogy.build_clusters()
         self._prune_curve_static()
         self._sweep_rug_classification()
@@ -3593,24 +3651,17 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         # Checkpointed on the cadence follows are resolved on, so a restart
         # costs one cycle of measurement rather than every open follow.
         self.save_follow_candidates()
+        # Two hundred observations thrown away on every restart is two
+        # hundred that never accumulate -- the failure that kept the follow
+        # book empty, applied to the evidence that keeps T0 off the network.
+        self.invariant_ledger.save()
         self._resolve_follow_candidates()
         self._refresh_independence()
         self._refresh_cohorts()
         self._promote_benchmark_candidates()
         self._publish_attribution()
         if self.dry_run:
-            latest_mtime = self._latest_model_mtime()
-            if latest_mtime > self._model_artifact_mtime:
-                candidate = AgeBandedPredictor(
-                    os.getenv("MODEL_DIR", "models"),
-                    allow_pooled_fallback=bool(
-                        self.global_config.get("allow_pooled_model_fallback", True)))
-                if any(candidate.load_latest().values()):
-                    self.predictor = candidate
-                    self.elogw_engine.predictor = candidate
-                    self._model_artifact_mtime = latest_mtime
-                    self._register_model_validation(candidate.validation_report)
-                    logger.info("Activated chronologically validated shadow model %s", candidate.model_version)
+            self._reload_promoted_model()
 
     def _note_launch_venue(self, event: Dict[str, Any]) -> None:
         """Credit the venue that emitted this launch, and verify it by use.
@@ -3626,6 +3677,18 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         program = str(event.get("program", "") or "")
         spec = registry.specs.get(program)
         if spec is None:
+            # NOT dropped. The desk was being shown launches from venues it
+            # does not declare -- Bags, Believe, whatever launched this month
+            # -- and forgetting them on this line. A program that keeps
+            # producing mints becomes a candidate whose id this node
+            # MEASURED, which is the only kind of program id worth having.
+            discovery = getattr(self, "launchpad_discovery", None)
+            if discovery is not None:
+                discovery.observe(
+                    program, str(event.get("token", "") or ""),
+                    signature=str(event.get("signature", "") or ""),
+                    instruction=str(event.get("instruction", "") or ""),
+                    at=float(event.get("timestamp", 0) or time.time()))
             return
         from src.chains.launchpads import CanonicalLaunchEvent
 
@@ -3648,7 +3711,27 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         # healthy connection and an empty denominator.
         kind = str(event.get("type", "") or "unknown")
         self._stream_events[kind] = self._stream_events.get(kind, 0) + 1
+        # Free: the stream already carries the slot, and knowing which slot
+        # the chain is on is what makes the leader lookup answer about NOW
+        # rather than about whenever the last refresh happened.
+        schedule = getattr(self, "leader_schedule", None)
+        if schedule is not None and event.get("slot"):
+            schedule.observe_slot(event["slot"])
         token = event.get("token", "")
+        # What the competition paid to land this. Free: the transaction
+        # carried its own ComputeBudget instructions and the desk was walking
+        # past them. The landing model has almost no data because a bid model
+        # learns from ATTEMPTS and DRY_RUN makes none -- this is the same
+        # question asked of everybody else's attempts.
+        corpus = getattr(self, "observed_bids", None)
+        if corpus is not None and event.get("priority_lamports") is not None:
+            record = self.launch_census._records.get(token)
+            launched_at = getattr(record, "detected_at", 0.0) if record else 0.0
+            corpus.observe(
+                ComputeBudget(event.get("compute_unit_price"),
+                              event.get("compute_unit_limit")),
+                (float(event.get("timestamp", time.time())) - launched_at)
+                if launched_at else None)
         # Which feed reached this box first. Every feed delivering the same
         # launch calls this; only the first gets True and goes on to make a
         # decision, the rest are the measurement. Duplicates are also the
@@ -3685,6 +3768,14 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
                 regime=str(self.current_regime or "unknown"))
             self.wallet_intel.record_token_lifecycle(token, launch_at=event.get("timestamp", time.time()))
             self._assess_identity(token, event)
+            # The pre-launch model's only feed. Every one of its seven public
+            # methods had no caller: the three that record signals, the three
+            # that read predictions, and the one that trains. It scored
+            # entities that had no signals with a model that could never be
+            # trained, and published a 0.0 launch probability that looked
+            # like a measurement.
+            self._record_prelaunch_launch(token, event)
+            ingest_launch_edges(self, token, event)
             noter = getattr(self, "_note_launch_venue", None)
             if noter is not None:
                 noter(event)
@@ -3697,9 +3788,12 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
                 signature = event.get("signature")
                 if signature:
                     try:
-                        ingress.note_python_event(
-                            signature.encode() if isinstance(signature, str)
-                            else bytes(signature))
+                        # Passed in whatever form the decoder produced. The
+                        # ledger reduces base58 text and raw bytes to the
+                        # same identity itself -- doing the conversion here
+                        # is how the two sides came to be keyed on different
+                        # eight bytes and agreed on nothing.
+                        ingress.note_python_event(signature)
                     except Exception:  # pragma: no cover - accounting only
                         pass
             # Seed the curve at its protocol-defined starting depth. The
@@ -3722,9 +3816,20 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
                     virtual_token_reserves=PUMP_INITIAL_VIRTUAL_TOKEN,
                     virtual_sol_reserves=PUMP_INITIAL_VIRTUAL_SOL,
                     real_token_reserves=0, real_sol_reserves=0,
-                    token_total_supply=int(event.get("token_total_supply", 0) or 0),
+                    # The protocol's own initialisation, not a guess about
+                    # this mint: the CreateEvent carries no supply, and a
+                    # zero here makes market cap zero, which prices every
+                    # launch in the lowest fee tier for its whole life.
+                    token_total_supply=int(event.get("token_total_supply", 0)
+                                           or PUMP_TOKEN_TOTAL_SUPPLY),
                     complete=False, creator=str(event.get("creator", "") or ""),
                 )
+            if event.get("bonding_curve"):  # the venue, not a whale
+                self._curve_static.setdefault(token, {})["bonding_curve"] = str(
+                    event["bonding_curve"])
+            note_curve_state(
+                self, token,
+                float(event.get("timestamp", time.time()) or time.time()))
             self.dataset_builder.start_episode(
                 token, event.get("creator", ""), event.get("program", PumpFunMonitor.PUMP_FUN_PROGRAM),
                 event.get("bonding_curve", ""), WSOL_MINT, detected_at=event.get("timestamp", time.time()),
@@ -3865,11 +3970,7 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
             if hasattr(self.wallet_intel, "record_live_trade"):
                 self.wallet_intel.record_live_trade(token, observation)
             self._open_follow_candidate(token, event)
-            score = self.wallet_intel.get_wallet_score(event.get("wallet", ""))
-            if score and score.overall_score >= 0.7:
-                event_type = LeadEventType.ELITE_WALLET_BUY if event.get("side") == "buy" else LeadEventType.SMART_WALLET_EXIT
-                self.info_graph.record_event(token, event_type, event.get("wallet", ""), "wallet",
-                                             event.get("timestamp", time.time()), event)
+            self._record_followable_trade(token, event)
         elif event.get("type") == "token_migrated":
             self.wallet_intel.record_token_lifecycle(token, migration_at=event.get("timestamp", time.time()))
             self.info_graph.record_event(token, LeadEventType.MIGRATION, "pump_fun", "program",
@@ -4044,86 +4145,6 @@ class MemecoinQuantDesk(ReportingSurface, MinedRecordIngestion,
         self.memory.register(Relief(
             name="mark_history", trim=trim_marks,
             detail="drop price paths for tokens we hold nothing in"))
-
-    @property
-    def current_regime(self) -> str:
-        """A coarse label for the market the desk is trading in right now.
-
-        Deliberately coarse and deliberately observable: launch rate and the
-        24h SOL move are things the desk already measures, and a finely
-        conditioned regime over a handful of observations is a worse label
-        that looks better.
-
-        Returns "unknown" when the inputs are missing, and "unknown" does not
-        count toward the promotion gate's diversity requirement -- a desk that
-        never measured the market must not satisfy it with one bucket.
-        """
-        builder = getattr(self, "dataset_builder", None)
-        stats = (builder.current_market_state()
-                 if builder is not None and hasattr(builder, "current_market_state")
-                 else {}) or {}
-        # Compatibility for isolated callers which provide the measurements
-        # directly through a research stub. The production miner is not used:
-        # it discovers mechanisms and does not collect market state.
-        if (stats.get("meme_launch_rate_1h") is None
-                or stats.get("sol_change_24h") is None):
-            research = getattr(self, "global_research", None)
-            fallback = (research.get_stats() if research else {}) or {}
-            if fallback.get("meme_launch_rate_1h") is not None:
-                stats = fallback
-        launch_rate = stats.get("meme_launch_rate_1h")
-        sol_change = stats.get("sol_change_24h")
-        if launch_rate is None or sol_change is None:
-            return "unknown"
-        hot = float(launch_rate) >= float(
-            self.global_config.get("regime_hot_launch_rate", 300))
-        rising = float(sol_change) >= 0
-        if hot and rising:
-            return "euphoria"
-        if hot:
-            return "churn"
-        return "bull" if rising else "bear"
-
-    def _record_forward_evidence(self, payload: Dict[str, Any]) -> None:
-        """Feed one trade outcome into the promotion ledger.
-
-        Declines are recorded too. A ledger fed only on entries measures the
-        trades we took and says nothing about the ones we passed on, which is
-        half of what a decision policy does and the half that hides its
-        mistakes.
-        """
-        try:
-            self.forward_evidence.record(ForwardOutcome(
-                token=str(payload.get("token", "")),
-                entered=bool(payload.get("entered")),
-                regime=str((payload.get("regime") or self.current_regime or "unknown")),
-                realized_pnl_usd=float(payload.get("realized_pnl_usd", 0.0) or 0.0),
-                equity_at_decision_usd=float(self.wallet_equity_usd or 0.0),
-                real_fill=bool(payload.get("entered") and not self.dry_run),
-                rugged=bool(payload.get("rugged")),
-                max_multiple=(float(payload["max_feasible_multiple"])
-                              if payload.get("max_feasible_multiple") is not None else None),
-                execution_attempted=bool(payload.get("attempted")),
-                execution_succeeded=bool(payload.get("entered")),
-                catastrophic=bool(payload.get("rugged")
-                                  and float(payload.get("realized_pnl_usd", 0.0) or 0.0)
-                                  <= -float(self.wallet_equity_usd or 0.0) * 0.5),
-            ))
-        except (TypeError, ValueError) as exc:
-            logger.debug("forward evidence record failed: %s", exc)
-        # Persisted on a cadence rather than every outcome: an fsync per trade
-        # is latency the decision path does not need to pay, and losing at
-        # most a minute of counts to a crash costs a minute of shadow running.
-        if time.time() - self._evidence_saved_at > 60.0:
-            self._evidence_saved_at = time.time()
-            self.forward_evidence.save()
-        # The census carries the denominator every ratio above is computed
-        # against; losing it to a restart would silently reset those ratios.
-        if time.time() - self._census_saved_at > 120.0:
-            self._census_saved_at = time.time()
-            self.launch_census.save()
-            self.calibration.save()
-
 
 
 async def _run(args: argparse.Namespace):

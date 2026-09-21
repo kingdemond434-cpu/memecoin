@@ -42,7 +42,7 @@ import hashlib
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +81,15 @@ class LaunchpadSpec:
     note: str = ""
     observations: int = 0
     first_seen_signature: str = ""
+    #: Repeats rejected. Visible because a venue sitting at two observations
+    #: with two hundred duplicates is a racing artefact, not a quiet feed.
+    duplicate_observations: int = 0
+    #: The distinct signatures counted, so the same transaction arriving
+    #: twice cannot verify a program by itself. Bounded, because a venue that
+    #: never verifies would otherwise hold every signature it ever saw --
+    #: and only the first OBSERVATIONS_TO_VERIFY are ever consulted, so
+    #: anything beyond that bound is memory with no reader.
+    seen_signatures: Set[str] = field(default_factory=set)
 
     @property
     def discriminators(self) -> Dict[bytes, str]:
@@ -226,8 +235,27 @@ class LaunchpadRegistry:
         spec = self.specs.get(event.program_id)
         if spec is None or spec.trusted:
             return False
+        signature = str(event.signature or "")
+        if not signature:
+            # An observation with no identity cannot be shown to be distinct,
+            # and counting it would be counting the thing this guard exists
+            # to prevent.
+            return False
+        if signature in spec.seen_signatures:
+            # The docstring said distinct signatures; the code just
+            # incremented. One transaction redelivered by three racing feeds
+            # verified a program on its own, which is precisely the lucky
+            # byte alignment the observation count is meant to rule out.
+            spec.duplicate_observations += 1
+            return False
+        spec.seen_signatures.add(signature)
+        if len(spec.seen_signatures) > OBSERVATIONS_TO_VERIFY * 64:
+            # A venue that never verifies would otherwise accumulate every
+            # signature it ever saw. Once past this bound the set is only
+            # protecting against a repeat far older than any racing window.
+            spec.seen_signatures.pop()
         if not spec.first_seen_signature:
-            spec.first_seen_signature = event.signature
+            spec.first_seen_signature = signature
         spec.observations += 1
         if spec.observations < OBSERVATIONS_TO_VERIFY:
             return False
@@ -251,6 +279,7 @@ class LaunchpadRegistry:
             "venues": {
                 spec.name: {"program": spec.program_id, "status": spec.status,
                             "observations": spec.observations,
+                            "duplicate_observations": spec.duplicate_observations,
                             "instructions": list(spec.create_instructions),
                             "note": spec.note}
                 for spec in sorted(self.specs.values(), key=lambda s: s.name)},

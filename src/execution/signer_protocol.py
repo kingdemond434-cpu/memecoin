@@ -21,6 +21,7 @@ microseconds are the product.
 So: one connection held for the life of the process, and frames that are
 already the shape of the data.
 
+    handshake MCS[u8 version]          once, when the connection opens
     request   [u32 len][u8 op][payload]
     response  [u32 len][u8 status][payload]
 
@@ -42,6 +43,25 @@ import struct
 from typing import Optional, Tuple
 
 PROTOCOL_VERSION = 1
+
+#: The four bytes a binary connection opens with, before any frame.
+#:
+#: The server used to tell the two protocols apart by looking at the first
+#: byte and calling anything that was not ``{`` binary. That byte, on a
+#: binary connection, is the LOW BYTE of a little-endian u32 length -- and
+#: 0x7B is ``{``. So a frame whose body is 123 bytes long, or 379, or 635, or
+#: 891, opens with ``{`` and was parsed as JSON. Those are not exotic
+#: lengths: a Solana message of 378 or 634 bytes is an ordinary transaction,
+#: which means the detection was wrong roughly one signature in 256 on the
+#: one path where being wrong means an unsigned transaction or a hang.
+#:
+#: An explicit handshake removes the guess. ``MCS`` cannot begin a JSON
+#: object, and the version byte turns a protocol mismatch between separately
+#: deployed units into a stated error instead of a desynchronised stream
+#: that decodes as something.
+MAGIC = b"MCS"
+HANDSHAKE = MAGIC + bytes([PROTOCOL_VERSION])
+HANDSHAKE_SIZE = len(HANDSHAKE)
 
 #: Operations. Deliberately few: the surface a compromised desk could reach
 #: is the surface the signer has to defend, so it stays minimal.
@@ -103,3 +123,18 @@ async def read_frame(reader) -> Optional[Tuple[int, bytes]]:
     length, code = decode_header(header)
     payload = await reader.readexactly(length) if length else b""
     return code, payload
+
+
+def parse_handshake(handshake: bytes) -> int:
+    """The peer's protocol version, or ValueError with what was wrong.
+
+    Raising rather than returning a sentinel because every caller of this is
+    about to either serve or refuse a connection, and a version mismatch that
+    reads as "version 0" is exactly the silent desynchronisation the
+    handshake exists to prevent.
+    """
+    if len(handshake) != HANDSHAKE_SIZE:
+        raise ValueError(f"handshake must be {HANDSHAKE_SIZE} bytes")
+    if handshake[:len(MAGIC)] != MAGIC:
+        raise ValueError(f"not a signer connection: {handshake!r}")
+    return handshake[len(MAGIC)]

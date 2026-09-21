@@ -8,10 +8,15 @@ is sized, and the two stop sharing a merge surface.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 import logging
+from src.detection.token_detector import TokenCandidate
+from src.research.feature_engine import build_features
+from src.strategies.multihead_predictor import PredictionFeatures
+from src.runtime.serialisation import jsonable as _jsonable
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +36,300 @@ class MinedRecordIngestion:
     WHICH tokens and wallets are worth a miner pass lives here too, because
     it answers the same question from the other end -- what is worth
     collecting, and where does what we collected go."""
+
+    async def _build_prediction_features(self, candidate: TokenCandidate, risk: Any, liquidity: float) -> PredictionFeatures:
+        as_of = time.time()
+        episode = self.dataset_builder.active_episodes.get(candidate.address)
+        episode_meta = {
+            "token": candidate.address,
+            "chain": candidate.chain,
+            "created_at": float(getattr(episode, "created_at", candidate.timestamp or as_of)),
+        }
+
+        if episode is not None:
+            deployer_features = await self.dataset_builder._capture_deployer_features(episode, as_of)
+            wallet_features = await self.dataset_builder._capture_wallet_features(episode, as_of)
+            flow_features = await self.dataset_builder._capture_flow_features(episode, as_of)
+            graph_features = await self.dataset_builder._capture_entity_graph_features(episode, as_of)
+            social_features = await self.dataset_builder._capture_social_features(episode, as_of)
+            token_features = await self.dataset_builder._capture_token_features(episode, as_of)
+            market_features = await self.dataset_builder._capture_market_features(episode, as_of)
+        else:
+            # No episode yet: report every group DATA_BLOCKED rather than
+            # substituting zeros that would read as real observations.
+            blocked = {"status": "DATA_BLOCKED", "reason": "episode_not_started"}
+            deployer_features = {"has_profile": False}
+            wallet_features = {}
+            flow_features = dict(blocked)
+            graph_features = dict(blocked)
+            token_features = dict(blocked)
+            market_features = dict(blocked)
+            social_features = self.social_intel.get_token_social_signal(candidate.address, as_of=as_of)
+
+        # Actor intelligence is computed from live entries rather than from
+        # the episode snapshot, so it reaches the decision at the age it was
+        # measured. Its status travels with it: a launch with no scored buyers
+        # must not read as one whose buyers scored zero.
+        actors = self.actor_intelligence(candidate.address, as_of)
+        graph_features = {
+            **graph_features,
+            "actor_status": actors.get("status", "DATA_BLOCKED"),
+            "observed_buyers": actors.get("observed_buyers", 0),
+        }
+        flow = actors.get("smart_flow") or {}
+        if flow.get("status") == "OK":
+            graph_features["actor_adjusted_flow"] = flow.get("evidence")
+            graph_features["sybil_discount"] = flow.get("discount")
+        swarm = actors.get("swarm") or {}
+        if swarm.get("status") == "OK":
+            graph_features["swarm_probability"] = swarm.get("probability")
+        elif swarm:
+            graph_features["swarm_evidence_uncalibrated"] = swarm.get("evidence")
+        dna = actors.get("buyer_dna") or {}
+        if dna.get("status") == "OK":
+            graph_features["first25_label"] = dna.get("label")
+            graph_features["first25_confidence"] = dna.get("confidence")
+
+        # The safety report is fresher than the episode snapshot for the
+        # fields it owns, so it takes precedence where both are present.
+        token_features = {
+            **token_features,
+            "status": risk.data_status,
+            "ownership_renounced": bool(risk.ownership_renounced),
+            "can_mint": bool(risk.can_mint),
+            "can_freeze": bool(risk.can_freeze),
+            "top_10_pct": float(risk.top_10_pct),
+            "extension_risk": float(getattr(risk, "extension_risk", 0) or 0),
+            "sell_route_feasible": risk.sell_route_feasible,
+        }
+        liquidity_features = (
+            {"status": "OK", "liquidity_usd": liquidity, "liquidity_locked": bool(risk.liquidity_locked)}
+            if liquidity > 0 else {"status": "DATA_BLOCKED", "reason": "liquidity_not_observed"}
+        )
+
+        snapshot = {
+            "timestamp": as_of,
+            "deployer_features": deployer_features,
+            "wallet_features": wallet_features,
+            "flow_features": flow_features,
+            "liquidity_features": liquidity_features,
+            "social_features": social_features,
+            "token_features": token_features,
+            "market_features": market_features,
+            "entity_graph_features": graph_features,
+        }
+        return build_features(episode_meta, snapshot)
+
+    def _shedding_features(self, candidate: Any) -> Dict[str, Any]:
+        """The free priors the shedder ranks on. Nothing here may cost a call.
+
+        The whole point of shedding is to decide before the expensive path
+        begins, so anything requiring a network round trip is by definition
+        unavailable here. What IS available is everything the desk already
+        knows: the deployer's record, whether a source named this mint
+        before it launched, whether the venue's decoder has been verified.
+
+        Unknowns are omitted rather than defaulted. A launch from a deployer
+        never seen before must score the base rate, not a penalty -- most
+        launches are exactly that, and most of the ones worth catching are
+        too.
+        """
+        token = candidate.address
+        deployer = candidate.deployer or ""
+        features: Dict[str, Any] = {}
+        if deployer:
+            # The cold prior first: on a fresh box the desk has scored
+            # nobody, so without this every deployer is unknown and the
+            # ranking under load has nothing to rank on. A creator whose
+            # previous nineteen tokens all rugged inside a minute is exactly
+            # the launch a burst should shed.
+            cold = getattr(self, "cold_distillate", None)
+            if cold is not None:
+                prior = cold.deployer_prior(deployer)
+                if prior is not None and prior.get("status") == "OK":
+                    features["cold_deployer_prior"] = prior
+                    features["deployer_launches"] = prior.get("launches", 0)
+                    # Rug rate against the ran rate, on the same scale the
+                    # live score uses, so the two are combinable rather than
+                    # two units pretending to be one.
+                    # Ran rate against COLLAPSE rate, not rug rate: a
+                    # reconstruction cannot see who pushed a price to zero,
+                    # so its rug rate is usually absent and using collapses
+                    # states what was actually observed.
+                    features["deployer_score"] = (
+                        float(prior.get("ran_rate", 0.0) or 0.0)
+                        - float(prior.get("collapse_rate", 0.0) or 0.0))
+            try:
+                scored = self.wallet_intel.get_wallet_score(deployer)
+            except Exception:
+                scored = None
+            if scored is not None:
+                # Centred on the population mean, so a below-average deployer
+                # is worth a slot LESS than an unknown one rather than the
+                # same -- which is the whole difference between ranking and
+                # merely filtering.
+                #
+                # OVERRIDES the cold prior where both exist. What the desk
+                # observed itself is not systematically flattered by
+                # survivorship, latency or depth; a reconstruction is.
+                features["deployer_score"] = (
+                    float(scored.overall_score) - 0.5) * 2.0
+            try:
+                features["deployer_launches"] = len(
+                    self._tokens_deployed_by(deployer))
+            except Exception:
+                pass
+        if self._source_events.get(token):
+            features["named_by_source"] = True
+        if getattr(self, "_identity_claims", None) and token in self._identity_claims:
+            features["named_actor"] = True
+        registry = getattr(self, "launchpads", None)
+        if registry is not None:
+            spec = registry.specs.get(str(candidate.factory or ""))
+            if spec is not None:
+                features["venue_verified"] = spec.trusted
+        funders = candidate.metadata.get("funding_transfers") if candidate.metadata else None
+        if funders:
+            features["funding_wallets"] = funders
+        return features
+
+    def _risk_for_decision(self, candidate: Any) -> Any:
+        """The safety view this decision gets, without waiting for one.
+
+        Two answers, in order of preference and never in order of cost:
+
+        * the completed audit, when it is already in hand and fresh -- which
+          it is on every checkpoint after the first, because the enrichment
+          scheduled at T0 has landed by then;
+        * otherwise the local view, built from the streamed curve and the
+          launch program's measured invariants, with the full audit started
+          concurrently.
+
+        The second is not a shortcut past the safety checks. The screen
+        prices a DATA_BLOCKED report at 35% of size, so an unmeasured launch
+        is entered small or not at all, and the checkpoint one second later
+        re-decides on the completed report. What changes is only WHEN the
+        network is waited on: never in front of the decision, always beside
+        it.
+        """
+        token = candidate.address
+        cached = self.rug_detector.cached_report(token, candidate.deployer or None)
+        if cached is not None:
+            return cached
+        self._schedule_risk_enrichment(candidate)
+        return self.t0_risk.assess(
+            token, str(candidate.factory or candidate.source or ""),
+            chain=candidate.chain or "solana",
+            deployer=candidate.deployer or "",
+            launch_metadata=candidate.metadata)
+
+    def _schedule_risk_enrichment(self, candidate: Any) -> bool:
+        """Fetch the full audit BESIDE the decision. Deduped per token."""
+        token = candidate.address
+        if not token or token in self._risk_enrichment:
+            return False
+
+        async def enrich():
+            try:
+                report = await self.rug_detector.analyze(
+                    token, candidate.pair, candidate.base_token)
+            except Exception as exc:
+                logger.debug("risk enrichment failed for %s: %s", token, exc)
+                return
+            try:
+                self.dataset_builder.record_risk_report(token, _jsonable(report))
+                # Every completed audit settles what the launch program does,
+                # which is what lets the NEXT launch be decided without one.
+                # The evidence is free: this report was going to be computed
+                # anyway, and the ledger only reads it.
+                self.invariant_ledger.observe_report(
+                    str(candidate.factory or candidate.source or ""), report)
+            except Exception as exc:  # pragma: no cover - accounting only
+                logger.debug("risk enrichment accounting for %s: %s", token, exc)
+            # Only meaningful when a position is open; a candidate is
+            # re-decided by its own checkpoint ladder instead.
+            self.request_redecision(token)
+
+        task = asyncio.create_task(enrich())
+        self._risk_enrichment[token] = task
+        self._background_tasks.add(task)
+
+        def finished(done: asyncio.Task):
+            self._risk_enrichment.pop(token, None)
+            self._background_tasks.discard(done)
+
+        task.add_done_callback(finished)
+        return True
+
+    def _ensure_portfolio_fresh(self) -> bool:
+        """Keep the SOL price current WITHOUT blocking a decision on it.
+
+        `_refresh_portfolio_state` is a Jupiter quote and, when live, a
+        `getBalance`. It was awaited once per candidate, so every launch paid
+        a network round trip to re-learn a price that had moved by fractions
+        of a percent since the last launch a second earlier. The refresh now
+        runs on its own, and the decision reads whatever is current --
+        recording HOW current, so a decision taken on a stale price is
+        distinguishable afterwards from one taken on a fresh one.
+        """
+        age = time.time() - float(getattr(self, "_portfolio_refreshed_at", 0.0) or 0.0)
+        self.sol_price_age_s = age
+        max_age = float(self.global_config.get("portfolio_max_age_seconds", 30.0))
+        if age <= max_age or self._portfolio_refresh_task is not None:
+            return False
+
+        async def refresh():
+            try:
+                await self._refresh_portfolio_state()
+            except Exception as exc:  # pragma: no cover - network only
+                logger.debug("portfolio refresh failed: %s", exc)
+
+        task = asyncio.create_task(refresh())
+        self._portfolio_refresh_task = task
+        self._background_tasks.add(task)
+
+        def finished(done: asyncio.Task):
+            self._portfolio_refresh_task = None
+            self._background_tasks.discard(done)
+
+        task.add_done_callback(finished)
+        return True
+
+    async def _native_ingress_loop(self):
+        """Drain the Rust receiver, which is what makes the shadow REAL.
+
+        Without this loop the whole native path is a subscription nobody
+        reads: the Rust sink fills, evicts its oldest events at capacity and
+        reports a growing `dropped`, while the parity ledger sees one side
+        only and concludes -- correctly, and uselessly -- that the native
+        receiver missed everything. It was built, constructed, started, and
+        then never consumed. That is the orphan failure one level further in
+        than the one the orphan test was written to catch, which is why
+        `test_no_orphan_modules` now requires this call by name.
+
+        Draining also produces the number the promotion decision actually
+        needs. Agreement proves the native path is CORRECT; the lead time
+        between the two sightings of the same signature is the only evidence
+        that it is FASTER, and it can be measured for nothing here because
+        both timestamps already exist.
+        """
+        ingress = getattr(self, "native_ingress", None)
+        if ingress is None or not ingress.running:
+            return
+        interval = float(self.global_config.get("native_ingress_drain_seconds", 0.05))
+        budget = int(self.global_config.get("native_ingress_drain_budget", 512))
+        while self._running:
+            try:
+                events = ingress.drain(budget)
+            except Exception as exc:
+                logger.exception("Native ingress drain error: %s", exc)
+                events = []
+            if events:
+                self._native_ingress_events += len(events)
+            # A short sleep even after a full batch. This loop competes with
+            # the decision path for one interpreter, and a tight drain would
+            # spend the latency it exists to win.
+            await asyncio.sleep(0.0 if len(events) >= budget else interval)
 
     def _mineable_tokens(self) -> List[str]:
         """Which mints are worth spending a miner pass on, most urgent first.

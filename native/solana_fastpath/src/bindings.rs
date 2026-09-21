@@ -859,7 +859,87 @@ mod ingress_binding {
         endpoint: String,
     }
 
+    /// One decoded Pump event as a dict, or None when it is not one of ours.
+    ///
+    /// Reuses `crate::event::decode` -- the SAME decoder the standalone
+    /// `decode_pump_event` binding exposes and the same one its fixture
+    /// tests cover. A second implementation here would have been faster to
+    /// write and is exactly the shape that silently diverges: two copies of
+    /// the same Borsh layout in the same language, one of which gets updated.
+    ///
+    /// A decode failure that is not simply an unknown discriminator returns
+    /// None rather than raising. This runs inside a drain over a batch, and
+    /// one malformed payload must not cost the batch -- but it is counted on
+    /// the Python side as an event that arrived undecoded, so a stream that
+    /// has started producing payloads this cannot read shows up as a falling
+    /// decoded share rather than as silence.
+    fn pump_event_to_py<'py>(
+        py: Python<'py>,
+        data: &[u8],
+    ) -> Option<Bound<'py, PyDict>> {
+        use crate::event::{decode, PumpEvent};
+        let dict = PyDict::new(py);
+        match decode(data) {
+            Ok(PumpEvent::Trade {
+                mint,
+                user,
+                is_buy,
+                sol_amount,
+                token_amount,
+                timestamp,
+                virtual_sol_reserves,
+                virtual_token_reserves,
+            }) => {
+                dict.set_item("type", "token_trade").ok()?;
+                dict.set_item("token", mint).ok()?;
+                dict.set_item("wallet", user).ok()?;
+                dict.set_item("side", if is_buy { "buy" } else { "sell" }).ok()?;
+                dict.set_item("sol_amount", sol_amount).ok()?;
+                dict.set_item("token_amount", token_amount).ok()?;
+                dict.set_item("timestamp", timestamp).ok()?;
+                // None, not zero. An unknown reserve is not an empty curve.
+                dict.set_item("virtual_sol_reserves", virtual_sol_reserves).ok()?;
+                dict.set_item("virtual_token_reserves", virtual_token_reserves).ok()?;
+            }
+            Ok(PumpEvent::Create {
+                mint,
+                bonding_curve,
+                user,
+                creator,
+                name,
+                symbol,
+                uri,
+                timestamp,
+            }) => {
+                dict.set_item("type", "token_created").ok()?;
+                dict.set_item("token", mint).ok()?;
+                dict.set_item("bonding_curve", bonding_curve).ok()?;
+                dict.set_item("wallet", user).ok()?;
+                dict.set_item("creator", creator).ok()?;
+                dict.set_item("name", name).ok()?;
+                dict.set_item("symbol", symbol).ok()?;
+                dict.set_item("uri", uri).ok()?;
+                dict.set_item("timestamp", timestamp).ok()?;
+            }
+            Ok(PumpEvent::Complete {
+                mint,
+                user,
+                bonding_curve,
+                timestamp,
+            }) => {
+                dict.set_item("type", "token_migrated").ok()?;
+                dict.set_item("token", mint).ok()?;
+                dict.set_item("wallet", user).ok()?;
+                dict.set_item("bonding_curve", bonding_curve).ok()?;
+                dict.set_item("timestamp", timestamp).ok()?;
+            }
+            Err(_) => return None,
+        }
+        Some(dict)
+    }
+
     #[pymethods]
+
     impl NativeIngress {
         #[new]
         #[pyo3(signature = (endpoint, token=None, capacity=8192, seen_capacity=65536))]
@@ -944,6 +1024,24 @@ mod ingress_binding {
                         event.slot.into_pyobject(py)?.into_any(),
                         (event.received_ns as u64).into_pyobject(py)?.into_any(),
                         event.is_vote.into_pyobject(py)?.to_owned().into_any(),
+                        // The event DECODED, where it is one this side
+                        // understands. Python used to re-read the same
+                        // payload, unpack the same little-endian integers
+                        // and base58 the same keys -- work already done
+                        // here, on bytes already in cache. More importantly
+                        // it means Python can tell a launch from a trade
+                        // without decoding, so it stops decoding events it
+                        // is about to discard.
+                        //
+                        // None for anything not recognised, which is the
+                        // common case and a real answer: most instructions
+                        // on the program are the outer half of a buy or
+                        // sell whose inner CPI event is the one that
+                        // matters.
+                        match pump_event_to_py(py, &event.data) {
+                            Some(decoded) => decoded.into_any(),
+                            None => py.None().into_bound(py),
+                        },
                     ],
                 )?;
                 out.push(tuple.into_any());
