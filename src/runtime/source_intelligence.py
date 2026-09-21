@@ -299,6 +299,16 @@ class SourceIntelligence:
 
     def _index_source_event(self, event: Any) -> None:
         """One event into the per-token index and the lead-lag graph."""
+        # A post from an account this launch NAMED in its own metadata is the
+        # only verifiable social link available: the account controls what it
+        # publishes and the desk observed the publication. It says the account
+        # spoke about the token, never that it owns the deployer wallet.
+        claims = getattr(self, "social_claims", None)
+        if claims is not None:
+            try:
+                claims.observe_event(event)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("social corroboration failed: %s", exc)
         for token in event.token_addresses:
             observations = self._source_events.setdefault(token, [])
             observations.append(event)

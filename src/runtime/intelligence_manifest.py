@@ -89,6 +89,11 @@ ENTRY_CONTRIBUTORS: Tuple[Contributor, ...] = (
                 "A decision resting on three substituted facts is not as "
                 "good as one resting on primaries, and the weakest rung "
                 "dominates."),
+    Contributor("research.social_claims", "social_claims",
+                "A launch naming a large account that then stays silent is "
+                "the impersonation signature; under the old arrangement it "
+                "looked identical to a genuine influencer launch, because "
+                "neither produced any social evidence at all."),
     Contributor("chains.rug_detector", "safety",
                 "Mint and pool authorities decide whether the token can be "
                 "confiscated after we buy it."),

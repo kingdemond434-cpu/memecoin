@@ -65,7 +65,7 @@ from src.runtime.depth import (
     update_copy_budget)
 from src.runtime.prelaunch_feed import PrelaunchFeed
 from src.runtime.actor_intelligence import (
-    entry_actor_block, ingest_launch_edges)
+    entry_actor_block, ingest_launch_edges, start_social_claim_fetch)
 from src.runtime.execution_readiness import bid_floor, pre_trade_readiness
 from src.runtime.execution_feedback import (
     ExecutionFeedback, fee_competition)
@@ -993,6 +993,7 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
             # episode/risk state; Yellowstone continues collecting outcomes.
             # Holding thousands of five-pass tasks here adds latency but no evidence.
             checkpoints = [0.0]
+        start_social_claim_fetch(self, candidate)
         started = time.monotonic()
         for delay in checkpoints:
             await asyncio.sleep(max(0.0, started + delay - time.monotonic()))

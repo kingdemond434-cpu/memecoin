@@ -120,7 +120,8 @@ class TestTheEntryDecisionCarriesTheNewSlots:
         candidate = SimpleNamespace(deployer="dev", timestamp=T0, metadata={})
         block = entry_actor_block(desk, "mint", candidate)
         assert set(block) == {"actors", "genealogy_risk", "lead_forecast",
-                              "cold_start", "evidence_confidence"}
+                              "cold_start", "evidence_confidence",
+                              "social_claims"}
 
     def test_every_slot_answers_even_when_it_cannot_measure(self):
         desk = SimpleNamespace(actor_store=None, genealogy=None,

@@ -93,6 +93,7 @@ from src.strategies.monster import (
 from src.strategies.opportunity_allocator import Opportunity, OpportunityAllocator
 from src.runtime.intelligence_manifest import CoverageTracker, audit as audit_intelligence
 from src.research.actor_store import ActorStore
+from src.research.social_claims import SocialClaimLedger
 from src.research.migration_lineage import MigrationLineage
 from src.research.prelaunch_corpus import PrelaunchCorpus
 from src.strategies.prelaunch_intent import PrelaunchIntentModel
@@ -433,6 +434,15 @@ class SubsystemWiring:
             Path(self.global_config.get("state_dir", "data/state"))
             / "actor_edges.jsonl")
         self.actor_store.load()
+        # What a launch claims about itself, and whether anybody backed it up.
+        # The desk cannot link a wallet to a person and should not try; it CAN
+        # observe whether a named account published about the mint.
+        self.social_claims = SocialClaimLedger(
+            str(Path(self.global_config.get("state_dir", "data/state"))
+                / "social_claims.json"),
+            silence_window_s=float(self.global_config.get(
+                "social_silence_window_seconds", 3600.0)))
+        self.social_claims.load()
         self.counterfactual_lab = CounterfactualExecutionLab()
         self.adversarial = AdversarialAdaptationDetector()
         for feature, fakeability in {

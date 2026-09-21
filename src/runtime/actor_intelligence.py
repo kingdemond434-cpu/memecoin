@@ -20,6 +20,7 @@ silently does exactly that while looking correct.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -178,6 +179,14 @@ def entry_actor_block(desk: Any, token: str, candidate: Any) -> Dict[str, Any]:
         # computing that, so both were priced identically.
         "evidence_confidence": fallback_confidence(
             desk, ("holder_concentration", "liquidity", "sell_route")),
+        # What the launch claims about itself, and whether anybody backed it
+        # up. A declaration is free; a post from the declared account is
+        # evidence, and silence from it after a fair window is the
+        # impersonation signature the desk could never see.
+        "social_claims": (desk.social_claims.reading(token)
+                          if getattr(desk, "social_claims", None) is not None
+                          else {"status": "DATA_BLOCKED",
+                                "detail": "no social claim ledger"}),
     }
 
 
@@ -257,3 +266,77 @@ def record_resolution_feedback(desk: Any, token: str,
             logger.debug("record_feature_value failed for %s: %s", name, exc)
             break
     return written
+
+
+#: Public IPFS gateways, tried in order. A CID is content-addressed, so any
+#: gateway serving it returns the same bytes -- which is why several can be
+#: raced without trusting any of them.
+IPFS_GATEWAYS: Tuple[str, ...] = (
+    "https://ipfs.io/ipfs/", "https://cloudflare-ipfs.com/ipfs/")
+
+#: Metadata documents are small. A launch's JSON that is not is not a launch's
+#: JSON, and fetching it would be the useful part of a denial of service.
+MAX_METADATA_BYTES = 64 * 1024
+
+
+def _gateway_urls(uri: str) -> List[str]:
+    """Every way to fetch this metadata document, best first."""
+    text = str(uri or "").strip()
+    if not text:
+        return []
+    if text.startswith("ipfs://"):
+        cid = text[len("ipfs://"):].lstrip("/")
+        return [gateway + cid for gateway in IPFS_GATEWAYS]
+    if text.startswith(("http://", "https://")):
+        return [text]
+    return []
+
+
+async def declare_social_claims(desk: Any, token: str, uri: str,
+                                at: Optional[float] = None) -> int:
+    """Fetch a launch's metadata and record what it claims about itself.
+
+    OFF THE HOT PATH, always. This is a network round trip to a public
+    gateway, and the T0 decision may never wait on one -- which is also why
+    the claim is useless at T0 and valuable afterwards: an influencer wave
+    arrives after the mint, not before it, so the social claim informs
+    CONTINUATION rather than entry.
+
+    Returns claims recorded. Zero is the ordinary case: most launches declare
+    nothing, and that is an observation rather than a failure.
+    """
+    ledger = getattr(desk, "social_claims", None)
+    http = getattr(desk, "http_client", None)
+    urls = _gateway_urls(uri)
+    if ledger is None or http is None or not urls:
+        return 0
+    for url in urls:
+        try:
+            status, body, _headers = await http.get(url)
+        except Exception as exc:  # pragma: no cover - network
+            logger.debug("metadata fetch failed for %s: %s", url, exc)
+            continue
+        if status != 200 or not body or len(body) > MAX_METADATA_BYTES:
+            continue
+        try:
+            document = json.loads(body)
+        except Exception:
+            continue
+        return int(ledger.declare(token, document, at))
+    return 0
+
+
+def start_social_claim_fetch(desk: Any, candidate: Any) -> bool:
+    """Kick off the metadata fetch without awaiting it. Returns whether it ran.
+
+    Fire and forget, on the candidate pipeline rather than the decision path.
+    The claim is worthless at T0 and valuable afterwards, so nothing waits.
+    """
+    import asyncio
+    uri = (getattr(candidate, "metadata", None) or {}).get("uri")
+    if not uri:
+        return False
+    asyncio.create_task(declare_social_claims(
+        desk, str(getattr(candidate, "address", "")), str(uri),
+        float(getattr(candidate, "timestamp", 0.0) or time.time())))
+    return True

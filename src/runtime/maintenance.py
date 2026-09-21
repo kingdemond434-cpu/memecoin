@@ -183,6 +183,12 @@ class DeskMaintenance:
         """
         for token in self.launch_census.mints_pending_death_classification():
             self._resolve_census_death(token)
+        # An account that was named and had a fair window to speak, and did
+        # not, is an observation rather than a pending question -- and it is
+        # the one the desk could never make.
+        claims = getattr(self, "social_claims", None)
+        if claims is not None:
+            claims.settle()
 
     def _wallet_dna_seeds(self) -> List[str]:
         """Wallets worth watching, from distilled history. Never invented.
