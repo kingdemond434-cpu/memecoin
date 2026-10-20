@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import time
 from dataclasses import asdict, is_dataclass, replace as dataclasses_replace
@@ -22,7 +23,9 @@ from src.chains.yellowstone_grpc import (
     NATIVE_FASTPATH_STATUS, PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
     create_combined_subscription,
 )
-from src.detection.rug_detector import RugDetector
+from src.detection.rug_detector import RiskLevel, RugDetector
+from src.detection.t0_risk import LaunchInvariantLedger, T0RiskView
+from src.execution.leader_schedule import LeaderSchedule
 from src.detection.token_detector import DetectionSource, TokenCandidate, TokenDetectionEngine
 from src.execution.jupiter_jito import (
     ExecutionEngine,
@@ -35,6 +38,12 @@ from src.execution.jupiter_jito import (
 from src.research.trade_evidence import TradeEvidenceLedger
 from src.research.dataset_builder import PointInTimeDatasetBuilder
 from src.research.global_research_miner import GlobalResearchMiner
+from src.research.frontier import AuctionInputs, FrontierIndex
+from src.research.candidate_replay import CandidateReplayHandler
+from src.research.chain_opportunity import ChainOpportunityScout
+from src.chains.evm_observation import EVMObservationAdapter, FactoryContract
+from src.research.unknown_engine import UnknownOpportunityEngine
+from src.research.proposal_rounds import ProposalRoundRunner, build_providers
 from src.research.chain_miners import register_chain_miners
 from src.execution.signer import signer_from_env
 from src.runtime.offload import OffloadedPool, install_fast_event_loop
@@ -63,6 +72,9 @@ from src.strategies.actor_graph import (
     aggregate_smart_flow, build_fingerprint,
 )
 from src.strategies.champion_challenger import ChampionChallengerFramework, HypothesisSpec, TrialResult
+from src.strategies.continuation import (
+    DEFAULT_HORIZON, DEFAULT_MIN_POSITIVES, DEFAULT_TAIL_REACH,
+    ContinuationModel)
 from src.strategies.exit_policy import ExitPolicy, evaluate_exit, load_latest_exit_policy
 from src.strategies.genealogy_graph import GenealogyGraph
 from src.strategies.information_graph import (
@@ -87,6 +99,10 @@ from src.strategies.monster import (
 )
 from src.strategies.opportunity_allocator import Opportunity, OpportunityAllocator
 from src.runtime.intelligence_manifest import CoverageTracker, audit as audit_intelligence
+from src.research.actor_store import ActorStore
+from src.research.social_claims import SocialClaimLedger
+from src.research.migration_lineage import MigrationLineage
+from src.research.prelaunch_corpus import PrelaunchCorpus
 from src.strategies.prelaunch_intent import PrelaunchIntentModel
 from src.strategies.authenticity import (
     AuthenticityResolver, EntityRegistry, ProofLevel, SourceSignal, load_entities,
@@ -104,6 +120,19 @@ from src.chains.launchpads import LaunchpadRegistry
 from src.execution.exit_readiness import (
     ExcursionLedger, ExitReadinessLedger, choose_exit_mode)
 from src.runtime.feed_race import FeedRace
+from src.research.cold_distillation import ColdDistillate
+from src.research.latency_value import LatencyValueLedger
+from src.research.promotion_gate import PromotionLedger
+from src.runtime.load_shedding import EconomicLoadShedder
+from src.chains.launchpad_discovery import LaunchpadDiscovery
+from src.execution.observed_bids import ObservedBidCorpus
+from src.execution.raptor import RaptorShadow
+from src.strategies.pre_event_anomaly import PreEventAnomaly
+from src.strategies.sniper_rings import SniperRingDetector
+from src.strategies.wallet_allocator import WalletAllocator
+from src.strategies.wallet_consensus import WalletConsensus
+from src.strategies.wallet_signature import WalletSignatures
+from src.runtime.training import TrainingSupervisor
 from src.chains.native_ingress import NativeIngress
 from src.runtime.process_offload import ProcessOffloadedPool
 from src.research.benchmark_wallets import BenchmarkCorpus, load_roster
@@ -115,6 +144,46 @@ import logging
 MODEL_HYPOTHESIS_ID = "production_multihead_v1"
 
 logger = logging.getLogger(__name__)
+
+#: How long a followable-wallet ranking may be reused. The ranking is a
+#: function of accumulated followed outcomes, which move on the order of
+#: minutes; the reader is a chain-event handler that runs thousands of times a
+#: minute. Recomputing it per event would put a sort of every tracked wallet
+#: into the decode path to learn nothing new.
+FOLLOWABLE_CACHE_TTL_S = 30.0
+
+
+def _ttl_cache(producer, ttl_s):
+    """Memoise a zero-argument producer for `ttl_s` seconds.
+
+    Deliberately not functools.lru_cache: that would cache forever, and a
+    permanently frozen wallet ranking is worse than a slow one.
+    """
+    box = {"at": 0.0, "value": None}
+
+    def read():
+        now = time.time()
+        if box["value"] is None or now - box["at"] >= ttl_s:
+            box["value"] = producer()
+            box["at"] = now
+        return box["value"]
+
+    return read
+
+
+def _tagged_feed(callback, feed: str):
+    """Stamp which feed delivered an event, without touching the decoders.
+
+    The race ledger keys on `event["feed"]`, and every decoder is shared
+    between the two paths -- so the tag has to be applied where the paths
+    differ, which is here, at the callback each one was given.
+    """
+    async def tagged(event):
+        if isinstance(event, dict):
+            event.setdefault("feed", feed)
+        return await callback(event)
+
+    return tagged
 
 
 class SubsystemWiring:
@@ -135,12 +204,43 @@ class SubsystemWiring:
     dependency inside a call graph rather than stating it in one place."""
 
     async def _setup_keys(self):
+        """Load the signing key, or run on an ephemeral paper wallet.
+
+        The key is required when the desk can actually SPEND, not when a
+        flag says it intends to. Those came apart the moment the promotion
+        ladder became load-bearing: `dry_run: false` now means "armed, and
+        governed by the ladder", and a desk armed at stage HISTORICAL cannot
+        spend anything, so demanding a key from it would refuse to start a
+        desk that was only ever going to observe.
+
+        That refusal is not a small thing. It raises at startup, before the
+        health server binds, so a desk armed in config and left without a
+        key would crash-loop -- losing exactly the unbackfillable forward
+        evidence the ladder is waiting for. The requirement therefore
+        follows the EARNED stage: no key needed until CANARY, and a hard
+        refusal the moment the desk has earned the right to trade and has
+        nothing to sign with.
+        """
         encoded = os.getenv("SOLANA_PRIVATE_KEY", "").strip()
         if not encoded:
-            if not self.dry_run:
-                raise RuntimeError("SOLANA_PRIVATE_KEY is required for live mode")
+            authorised = False
+            try:
+                ledger = PromotionLedger(
+                    Path(self.global_config.get("ops_state_dir", "data/state"))
+                    / "promotion.jsonl")
+                authorised, _ = ledger.authorises_live_capital()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("promotion ledger unreadable at key setup: %s", exc)
+            if authorised:
+                raise RuntimeError(
+                    "SOLANA_PRIVATE_KEY is required: the promotion ladder has "
+                    "reached a stage that authorises live capital, so this "
+                    "desk is expected to sign and has nothing to sign with")
             self.keypair = Keypair()
-            logger.warning("Using an ephemeral paper wallet; no private key was loaded")
+            logger.warning(
+                "Using an ephemeral paper wallet; no private key was loaded. "
+                "The desk cannot spend at its current stage, and will refuse "
+                "to start without a real key once it reaches canary.")
             return
         try:
             if encoded.startswith("["):
@@ -185,18 +285,45 @@ class SubsystemWiring:
             self.yellowstone.status = "DATA_BLOCKED"
             self.yellowstone.status_detail = "YELLOWSTONE_GRPC_URL is missing; RPC fallback enabled"
         if connected:
-            await self.yellowstone.subscribe(create_combined_subscription())
-            # The native receiver comes up ALONGSIDE, not instead. Started
-            # here rather than at construction so it subscribes only when the
-            # reference client has a live stream to be compared against --
-            # a shadow with nothing to shadow proves nothing.
+            # HANDLERS FIRST, stream second. Each monitor registers its
+            # callbacks in its constructor, and `subscribe` starts consuming
+            # immediately -- so constructing them afterwards left a window in
+            # which decoded events found `self._handlers` empty and were
+            # dropped with no record anywhere. It is a short window, but it
+            # sits at exactly the moment the desk comes up after a restart,
+            # and every launch inside it is unbackfillable.
+            self.pump_monitor = PumpFunMonitor(self.yellowstone, self._on_pump_event)
+            self.pump_swap_monitor = PumpSwapMonitor(self.yellowstone, self._on_pump_event)
+            self.raydium_monitor = RaydiumMonitor(self.yellowstone, self._on_raydium_event)
+            # The native receiver comes up ALONGSIDE, not instead, and BEFORE
+            # the reference stream: a gRPC subscription takes a moment to be
+            # served, and if the reference starts first every event in that
+            # gap reads as a native miss, which under a permanent-demotion
+            # latch means the shadow can never be promoted however correct it
+            # is. Starting it first turns that skew into `native_only`, which
+            # is counted and not punished.
             ingress = getattr(self, "native_ingress", None)
             if ingress is not None and not ingress.start():
                 logger.info("NATIVE INGRESS not running: %s",
                             ingress.unavailable_reason)
-            self.pump_monitor = PumpFunMonitor(self.yellowstone, self._on_pump_event)
-            self.pump_swap_monitor = PumpSwapMonitor(self.yellowstone, self._on_pump_event)
-            self.raydium_monitor = RaydiumMonitor(self.yellowstone, self._on_raydium_event)
+            await self.yellowstone.subscribe(create_combined_subscription())
+            # A SECOND feed, running at the same time rather than instead.
+            #
+            # The RPC program stream existed only as a fallback for when
+            # Yellowstone would not connect, which means the desk's
+            # redundancy was conditional on total failure -- the shape of
+            # outage that never happens. What does happen is one feed being
+            # a hundred milliseconds slower on a particular launch, or
+            # dropping a single update, and against that a standby is worth
+            # nothing because it is not running.
+            #
+            # Racing is free here because the duplicate guard makes it safe:
+            # every feed delivering the same launch calls `FeedRace.observe`
+            # and only the first gets a decision. The rest are the
+            # measurement, and the measurement is what says whether the
+            # second feed is ever first.
+            if bool(self.global_config.get("race_secondary_feed", True)):
+                await self._start_secondary_feed()
         elif not self.offline:
             self.rpc_program_stream = SolanaRpcProgramStream(
                 self.solana_rpc, [PumpFunMonitor.PUMP_FUN_PROGRAM, PumpSwapMonitor.PUMP_AMM_PROGRAM,
@@ -207,6 +334,44 @@ class SubsystemWiring:
             self.pump_monitor = PumpFunMonitor(self.rpc_program_stream, self._on_pump_event)
             self.pump_swap_monitor = PumpSwapMonitor(self.rpc_program_stream, self._on_pump_event)
             self.raydium_monitor = RaydiumMonitor(self.rpc_program_stream, self._on_raydium_event)
+            # initialize() creates this stream after research setup. Start
+            # it here, after its handlers exist, rather than in the earlier
+            # phase where rpc_program_stream was still None.
+            await self.rpc_program_stream.start()
+
+    async def _start_secondary_feed(self) -> bool:
+        """Bring up the RPC program stream BESIDE Yellowstone, tagged.
+
+        Its events carry `feed: "rpc_ws"`, so the race ledger can say which
+        path was first per launch instead of attributing everything to the
+        one name the primary happens to use.
+        """
+        try:
+            stream = SolanaRpcProgramStream(
+                self.solana_rpc,
+                [PumpFunMonitor.PUMP_FUN_PROGRAM, PumpSwapMonitor.PUMP_AMM_PROGRAM,
+                 RaydiumMonitor.RAYDIUM_AMM_V4, RaydiumMonitor.RAYDIUM_CPMM,
+                 RaydiumMonitor.RAYDIUM_CLMM, RaydiumMonitor.METEORA_DLMM,
+                 RaydiumMonitor.METEORA_DYNAMIC_AMM, RaydiumMonitor.ORCA_WHIRLPOOL])
+            self.secondary_pump_monitor = PumpFunMonitor(
+                stream, _tagged_feed(self._on_pump_event, "rpc_ws"))
+            self.secondary_pump_swap_monitor = PumpSwapMonitor(
+                stream, _tagged_feed(self._on_pump_event, "rpc_ws"))
+            self.secondary_raydium_monitor = RaydiumMonitor(
+                stream, _tagged_feed(self._on_raydium_event, "rpc_ws"))
+            await stream.start()
+        except Exception as exc:
+            # A second feed is redundancy, not a dependency. Failing to bring
+            # it up must never stop the desk that already has a primary.
+            logger.warning("secondary feed not started: %s", exc)
+            self.secondary_stream = None
+            return False
+        self.secondary_stream = stream
+        if getattr(self, "feed_race", None) is not None:
+            self.feed_race.register_feed("yellowstone")
+            self.feed_race.register_feed("rpc_ws")
+        logger.info("SECONDARY FEED racing Yellowstone: RPC program stream")
+        return True
 
     def _optional(self, name, fallback, build):
         """Construct an OBSERVATIONAL subsystem, or run without it.
@@ -256,6 +421,39 @@ class SubsystemWiring:
              "reddit_secret": os.getenv("REDDIT_CLIENT_SECRET", "")},
         )
         self.prelaunch = PrelaunchIntentModel(self.solana_config, self.solana_rpc, self.genealogy, self.wallet_intel, helius)
+        # The training rows the launch predictor never had. Without a
+        # producer `train_launch_predictor` could not be called at all, so
+        # the model stayed untrained for the life of the desk.
+        self.prelaunch_corpus = PrelaunchCorpus(
+            str(Path(self.global_config.get("state_dir", "data/state"))
+                / "prelaunch_corpus.json"))
+        self.prelaunch_corpus.load()
+        # What a position could actually have realised after migration. The
+        # desk records that a token reached 100x and has never recorded
+        # whether anything could have been sold there, which is the gap
+        # between a tail corpus and a corpus of screenshots.
+        self.migration_lineage = MigrationLineage(
+            str(Path(self.global_config.get("state_dir", "data/state"))
+                / "migration_lineage.json"),
+            acceptable_impact=float(
+                self.global_config.get("acceptable_exit_impact", 0.10)))
+        self.migration_lineage.load()
+        # The point-in-time actor graph. It was never constructed at all, so
+        # `funders_of`, `prior_mints` and `shared_family` had no callers
+        # because they had no object to be called on.
+        self.actor_store = ActorStore(
+            Path(self.global_config.get("state_dir", "data/state"))
+            / "actor_edges.jsonl")
+        self.actor_store.load()
+        # What a launch claims about itself, and whether anybody backed it up.
+        # The desk cannot link a wallet to a person and should not try; it CAN
+        # observe whether a named account published about the mint.
+        self.social_claims = SocialClaimLedger(
+            str(Path(self.global_config.get("state_dir", "data/state"))
+                / "social_claims.json"),
+            silence_window_s=float(self.global_config.get(
+                "social_silence_window_seconds", 3600.0)))
+        self.social_claims.load()
         self.counterfactual_lab = CounterfactualExecutionLab()
         self.adversarial = AdversarialAdaptationDetector()
         for feature, fakeability in {
@@ -305,6 +503,32 @@ class SubsystemWiring:
             ExitPolicy.default(),
             max_hold_seconds=float(self.global_config.get("max_hold_time_minutes", 60)) * 60,
         )
+        # The conviction ceiling is the operator's, not the trainer's, and it
+        # is applied to a trained policy too. A policy selected by replaying
+        # price paths has no way to price the operational risk of a position
+        # left open for days -- the box rebooting, the key rotating, the
+        # market closing around it -- so that ceiling stays where a human set
+        # it whatever the replay preferred.
+        self.exit_policy = dataclasses_replace(
+            self.exit_policy,
+            max_conviction_hold_seconds=float(self.global_config.get(
+                "max_conviction_hold_time_minutes", 0)) * 60,
+        )
+        #: One conditional continuation reading per cycle, shared by the
+        #: trail, the time stop and the monster machine.
+        self.continuation_model = ContinuationModel(
+            min_positives=int(self.global_config.get(
+                "continuation_min_head_positives", DEFAULT_MIN_POSITIVES)),
+            horizon=float(self.global_config.get(
+                "continuation_horizon_multiple", DEFAULT_HORIZON)),
+            # Above the last rung with enough positives the curve simply
+            # ends, and on a 32k corpus that is 20x -- so conviction goes
+            # blind at 10x, which is where the tail begins. The fitted power
+            # law extends it; every reading it produces is labelled.
+            extrapolate_tail=bool(self.global_config.get(
+                "continuation_extrapolate_tail", True)),
+            tail_reach=float(self.global_config.get(
+                "continuation_tail_reach", DEFAULT_TAIL_REACH)))
         self.exit_policy_status = "OK" if trained_policy else "DATA_BLOCKED"
         self.exit_policy_detail = (
             policy_report.get("model_path", "") if trained_policy
@@ -492,11 +716,86 @@ class SubsystemWiring:
         # Every launchpad normalises to one launch event. Programs start as
         # HYPOTHESES and are promoted only by decoding cleanly on this node,
         # so coverage reports what was seen rather than what was hoped for.
+        # Venues the desk has WATCHED create mints and that the registry does
+        # not declare. Fed from the one line that used to drop them.
+        self.launchpad_discovery = LaunchpadDiscovery()
+        # What everybody else pays to land, off the same stream. The landing
+        # model has almost no data because a bid model learns from attempts
+        # and DRY_RUN makes none; this asks the same question of attempts the
+        # desk did not have to make.
+        self.observed_bids = ObservedBidCorpus()
+        # The paired route comparison. `should_route_through_challenger` is
+        # the only question the execution path may ask of it, and it answered
+        # nobody because nothing constructed the shadow.
+        self.raptor_shadow = RaptorShadow()
+        # Three actor signals that all read events the desk was already
+        # producing and that nothing was consuming: wallet sets that keep
+        # opening launches together (so a First-25 that is really a First-3
+        # stops being counted as 25 independent decisions), what a wallet
+        # DOES rather than who it is (so a rotated address is not
+        # automatically unknown), and whether a wallet beats the first
+        # public mention more often than its own timing predicts.
+        # The ladder, made load-bearing. It records every verdict, advances
+        # exactly one stage on a pass, and is the thing the execution path
+        # asks before it is allowed to spend real money. Persisted, because
+        # a stage that resets on restart is a desk that silently returns to
+        # trading without authorisation -- or forgets it earned the right to.
+        self.promotion_ledger = PromotionLedger(
+            Path(self.global_config.get("ops_state_dir", "data/state"))
+            / "promotion.jsonl")
+        # The evidence accumulator is evaluated against the criteria of the
+        # stage actually EARNED, not a constant. It was pinned to
+        # FORWARD_SHADOW by a constructor default that nothing ever changed,
+        # so the ladder could not have been climbed even in principle.
+        self.forward_evidence.stage = self.promotion_ledger.current_stage()
+        self.sniper_rings = SniperRingDetector()
+        self.wallet_signatures = WalletSignatures()
+        self.pre_event_anomaly = PreEventAnomaly()
         self.launchpads = self._optional(
             "launchpad registry", LaunchpadRegistry, LaunchpadRegistry)
+        # Seeded with what the registry already declares, so an adopted venue
+        # stops being proposed the moment it is added.
+        for program_id in self.launchpads.specs:
+            self.launchpad_discovery.note_known(program_id)
         # Which feed reaches this box first, measured. Coverage outranks
         # speed: a feed that misses events is blind on them, not slow.
         self.feed_race = self._optional("feed race", FeedRace, FeedRace)
+        # Under a burst the desk cannot look at every launch, and which ones
+        # it drops is a decision rather than a queue discipline. See
+        # src/runtime/load_shedding.py.
+        # Years of the chain, compressed to a lookup a T0 decision can
+        # afford. Absent on a fresh box, which is the honest state: a
+        # deployer nobody has history for is unknown, not safe.
+        self.cold_distillate = ColdDistillate.load(
+            Path(self.global_config.get("ops_state_dir", "data/state"))
+            / "cold_distillate.json")
+        if self.cold_distillate is not None:
+            logger.info(
+                "COLD DISTILLATE loaded: %d deployers (%d with a rate), "
+                "%d funders, covering to %s",
+                len(self.cold_distillate.deployers),
+                sum(1 for dna in self.cold_distillate.deployers.values()
+                    if dna.measurable),
+                len(self.cold_distillate.funders),
+                self.cold_distillate.covers_until)
+        # Everything done for speed has been done on the belief that earlier
+        # is better. That belief has never been priced, and the answer
+        # decides whether the next month goes to latency or to alpha.
+        self.latency_value = LatencyValueLedger()
+        # The thing that was missing. Every trainer in this repo is a
+        # complete, strictly gated __main__ that nothing called: the desk
+        # observed launches, resolved outcomes, wrote episodes to disk, and
+        # never fitted anything to them. That is why the report says
+        # DATA_BLOCKED and every age band says "no artifact" -- not a model
+        # that failed, a model that was never asked.
+        self.training = TrainingSupervisor(
+            Path(self.global_config.get("episode_storage", "data/launch_episodes")),
+            Path(os.getenv("MODEL_DIR", "models")),
+            new_episodes_required=int(self.global_config.get(
+                "training_new_episodes", 250)),
+            timeout_s=float(self.global_config.get("training_timeout_s", 1800.0)))
+        self.load_shedder = EconomicLoadShedder(
+            int(self.global_config.get("max_candidate_pipelines", 100)))
         # The sell must exist before it is needed, and be proven to.
         self.exit_readiness = self._optional(
             "exit readiness", ExitReadinessLedger, ExitReadinessLedger)
@@ -585,13 +884,20 @@ class SubsystemWiring:
         if not report or report.get("status") != "PASSED":
             return
         net_elogw = float(report.get("net_elogw_proxy", 0) or 0)
-        self.champion_challenger.record_trial_result(TrialResult(
+        accepted = self.champion_challenger.record_trial_result(TrialResult(
             hypothesis_id=MODEL_HYPOTHESIS_ID, stage="CHRONOLOGICAL_OOS",
             samples=int(report.get("oos_samples", 0) or 0), metrics={"brier_skill": float(report.get("mean_brier_skill", 0) or 0)},
             oos_metrics={"elogw": net_elogw}, portfolio_impact=net_elogw,
             passed=net_elogw > 0, timestamp=float(report.get("created_at", time.time()) or time.time()),
             notes="route-feasible OOS proxy; forward shadow remains mandatory",
+            spec_hash=str(report.get("spec_hash") or ""),
         ))
+        report["scientific_binding_status"] = "BOUND" if accepted else "DATA_BLOCKED"
+        if not accepted:
+            self.champion_challenger.mark_data_blocked(MODEL_HYPOTHESIS_ID,
+                "statistical model report lacks an exact pre-evaluation frozen strategy binding")
+            logger.warning("Model statistical validation is not canonical promotion evidence: unbound or nonexact strategy")
+        return accepted
 
     @staticmethod
     def _latest_model_mtime() -> float:
@@ -626,10 +932,22 @@ class SubsystemWiring:
             quote_token_program=str(self.global_config.get(
                 "pump_quote_token_program", TOKEN_PROGRAM)),
         ))
+        # Which validator produces which slot, and where it listens. Two
+        # free RPC calls whose answer is fixed for an epoch, refreshed in the
+        # background so a lookup at decision time is a dictionary hit.
+        self.leader_schedule = LeaderSchedule(self.solana_rpc)
         self.execution_engine = ExecutionEngine(self.solana_config, self.solana_rpc, self.jupiter, self.jito,
                                                 builder, self.counterfactual_lab, dry_run=self.dry_run,
                                                 pump_route=self.pump_route,
                                                 pumpswap_route=self.pumpswap_route)
+        # Attached after construction rather than passed in: the engine is
+        # already eight arguments deep, and the schedule is an OPTIONAL
+        # conditioner -- an engine without one records `leader: ""` exactly
+        # as it always has, rather than failing to start.
+        self.execution_engine.leader_schedule = self.leader_schedule
+        # The check `dry_run` never was. `dry_run` is an operator's intent;
+        # this is what the desk has demonstrated. Submission needs both.
+        self.execution_engine.promotion_ledger = self.promotion_ledger
         # The landing corpus is the only dataset real fills produce, and it
         # was held in memory alone -- so every restart destroyed it and a desk
         # restarted a dozen times in a day had none. A landing attempt cannot
@@ -667,17 +985,239 @@ class SubsystemWiring:
             # recorded as a confident "no route", which hard-vetoed 100% of
             # decided launches.
             curve_state_provider=self._latest_curve_state.get)
+        # The launch venue's account, from the creation event. Holder
+        # concentration counts the bonding curve as a holder without it, so
+        # every healthy new launch scores as maximally concentrated.
+        self.rug_detector.curve_account_provider = (
+            lambda mint: (self._curve_static.get(mint) or {}).get("bonding_curve"))
+        # What a decision can know for free, and the ledger that decides how
+        # much that is. The full audit is three to five sequential RPC round
+        # trips; it now runs BESIDE the decision rather than in front of it,
+        # and every completed report teaches this ledger what the launch
+        # program guarantees so the next launch needs fewer of them.
+        self.invariant_ledger = LaunchInvariantLedger(
+            Path(self.global_config.get("ops_state_dir", "data/state"))
+            / "launch_invariants.json")
+        self.t0_risk = T0RiskView(
+            self.invariant_ledger,
+            curve_state_provider=self._latest_curve_state.get,
+            risk_level_enum=RiskLevel)
         self.detection_engine = TokenDetectionEngine(self.chain_registry)
+
+    def _retain_opportunity_evidence(self, event_type: str, payload: Dict[str, Any], timestamp: float) -> str:
+        """Append to the desk's existing ledger before changing an index."""
+        ledger = self.trade_evidence
+        reference = ledger.record_reference(event_type, payload, timestamp=timestamp)
+        if reference is None:
+            raise RuntimeError("canonical opportunity evidence write failed")
+        return reference
+
+    def _retain_chain_scout_record(self, record: Dict[str, Any]) -> str:
+        kind = record.get("kind")
+        if kind == "source_response":
+            ref = self._retain_opportunity_evidence("unknown_public_source_response", record, record["observed_at"])
+            self.research_frontier.enqueue("DISCOVERY_RESPONSE", ref, evidence_refs=[ref],
+                                          exploration_tags=["new_source_classes"])
+            return ref
+        if kind not in ("chain", "protocol"):
+            raise ValueError("unsupported scout record")
+        ref = str(record["source_response_ref"])
+        axes = {"chain": record["chain_id"], "data_source": "dexscreener:public-api"}
+        self.research_frontier.observe_discovery(kind, str(record["identity"]), axes=axes,
+            family=str(record.get("chain_family") or "UNKNOWN"),
+            version=str(record.get("version") or "1"), metrics=record.get("metrics"),
+            contract=record.get("contract"), evidence_refs=[ref], now=record["observed_at"])
+        if kind == "protocol":
+            axes["protocol"] = record["identity"]
+        self.research_frontier.enqueue(f"{kind.upper()}_INTEGRATION", ref, axes=axes,
+            evidence_refs=[ref], exploration_tags=["unknown_chains" if kind == "chain" else "unknown_protocols"])
+        return ref
+
+    def _retain_native_observation(self, native: Any) -> str:
+        identity = f"native-observation-{native.event_id}"
+        previous = self.research_frontier.job(identity)
+        if previous is not None:
+            return previous["payload_ref"]
+        event = native.to_event()
+        ref = self._retain_opportunity_evidence("unknown_native_chain_observation", event.to_dict(), native.observed_at)
+        # The shared collector Event envelope is compatible; a two-token EVM
+        # factory observation is not a Solana launch episode. No trading or
+        # Solana dataset callback is invoked here.
+        axes = {"chain": native.chain_id, "chain_family": native.chain_family,
+                "protocol": native.protocol, "event_type": native.event_type,
+                "data_source": event.source_id}
+        self.research_frontier.register_chain(native.chain_id, native.chain_family, evidence_refs=[ref])
+        chain = self.research_frontier.chain(native.chain_id)
+        if chain["stage"] == "DISCOVERED":
+            self.research_frontier.advance_chain(native.chain_id, "OBSERVATION_ONLY", evidence_refs=[ref])
+        if native.protocol is not None:
+            contract = {"status": "OBSERVED", "observed_native_events": [native.event_type],
+                        "execution_support": None}
+            if native.decoder_ref is not None:
+                contract["abi_ref"] = native.decoder_ref
+            self.research_frontier.register_protocol(native.protocol, native.chain_id,
+                native.protocol_version or "UNKNOWN", contract=contract, evidence_refs=[ref])
+        self.research_frontier.observe_coordinate(axes,
+            state="DATA_BLOCKED" if native.event_type == "UNKNOWN" else "OBSERVED", evidence_refs=[ref])
+        self.research_frontier.enqueue("NATIVE_OBSERVATION", ref, axes=axes, job_id=identity,
+            evidence_refs=[ref], exploration_tags=["unknown_protocols"])
+        return ref
+
+    async def _setup_opportunity_observation(self, research_path: Path) -> None:
+        """Optional EVM observers reuse registry clients and this research loop.
+
+        global.evm_observation is a list of explicit chain/start_block/finality
+        declarations. Optional factories are FactoryContract dictionaries;
+        absent ABI/source provenance leaves native decoder support UNKNOWN.
+        This configuration never enables a detection-engine chain or signer.
+        """
+        self.chain_opportunity_scout = None
+        self.evm_observers = []
+        self.evm_observation_configuration = []
+        if self.offline:
+            self.evm_observation_configuration = [{"status": "DATA_BLOCKED", "reason": "offline"}]
+            return
+        if getattr(self, "http_client", None) is not None:
+            self.chain_opportunity_scout = ChainOpportunityScout(
+                self.http_client, self._retain_chain_scout_record,
+                max_rows=int(self.global_config.get("chain_scout_max_rows", 256)),
+                max_pair_requests=int(self.global_config.get("chain_scout_pair_budget", 4)))
+        declarations = self.global_config.get("evm_observation", [])
+        if not isinstance(declarations, list):
+            self.evm_observation_configuration = [{"status": "DATA_BLOCKED", "reason": "evm_observation must be a list"}]
+            return
+        for declaration in declarations:
+            name = str(declaration.get("chain", "")) if isinstance(declaration, dict) else ""
+            try:
+                if not isinstance(declaration, dict) or not name or "start_block" not in declaration:
+                    raise ValueError("native chain and historical start_block are required")
+                config = self.chain_registry.get_chain(name)
+                if config is None or getattr(config.chain_type, "value", None) != "evm":
+                    raise ValueError("configured native EVM chain is unavailable")
+                contracts = declaration.get("factories")
+                if contracts is not None:
+                    contracts = [FactoryContract(**values) for values in contracts]
+                rpc = self.chain_registry.get_rpc(name)
+                if rpc is None:
+                    # Existing registry manager owns endpoint health, retries
+                    # and shutdown. No second transport or observer task.
+                    rpc = RPCManager(config)
+                    self.chain_registry.rpc_managers[name] = rpc
+                    await rpc.start()
+                adapter = EVMObservationAdapter.from_registry(
+                    self.chain_registry, name, start_block=declaration["start_block"],
+                    factory_contracts=contracts, checkpoint_path=research_path / "frontier.sqlite",
+                    finality_tag=str(declaration.get("finality_tag", "finalized")),
+                    max_blocks_per_pass=int(declaration.get("max_blocks_per_pass", 8)))
+                self.evm_observers.append(adapter)
+                self.evm_observation_configuration.append({"chain": name, "status": "CONFIGURED_NOT_OBSERVED",
+                                                            "observation_only": True, "execution_eligible": False})
+            except Exception as exc:
+                # Configuration/transport exceptions may include provider URL
+                # secrets; expose type and chain, never exception text.
+                self.evm_observation_configuration.append({"chain": name, "status": "DATA_BLOCKED",
+                                                            "failure_type": type(exc).__name__})
+
+    def _canonical_replay_options(self) -> Dict[str, Any]:
+        """Configure existing replay only from an explicit corpus/split/budget."""
+        declaration = self.global_config.get("research_replay")
+        self.research_replay_configuration = {"status": "DATA_BLOCKED", "reason": "explicit replay configuration absent"}
+        if declaration is None:
+            return {}
+        try:
+            if not isinstance(declaration, dict):
+                raise ValueError("research_replay must be an object")
+            if declaration.get("enabled") is not True:
+                self.research_replay_configuration = {"status": "DISABLED", "reason": "replay not explicitly enabled"}
+                return {}
+            episode_path = Path(declaration["episode_path"])
+            manifest_path = Path(declaration["split_manifest_path"])
+            if not episode_path.is_dir() or not manifest_path.is_file():
+                raise ValueError("observed corpus or frozen split manifest unavailable")
+            split = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(split, dict) or not split.get("corpus_hash"):
+                raise ValueError("content-bound chronological split manifest required")
+            bounds = declaration["work_bound"]
+            keys = {"max_episodes", "max_family_variants", "max_bootstrap_draws"}
+            if (not isinstance(bounds, dict) or set(bounds) != keys
+                    or any(type(value) is not int or value <= 0 for value in bounds.values())):
+                raise ValueError("explicit positive integer replay work bounds required")
+            costs = declaration["resource_costs"]
+            auction = AuctionInputs(costs=costs)
+            if auction.total_cost is None or auction.total_cost <= 0:
+                raise ValueError("all replay resource costs must be explicitly declared")
+            pass_units = declaration["pass_resource_units"]
+            if (type(pass_units) not in (int, float) or not math.isfinite(pass_units)
+                    or pass_units < auction.total_cost):
+                raise ValueError("pass resource envelope must accommodate the declared replay")
+            handler = CandidateReplayHandler(self.champion_challenger, episode_path,
+                                             chronological_split=split, **bounds)
+            self.research_replay_configuration = {"status": "CONFIGURED_NOT_EVALUATED",
+                "scope": "L0-L4_ONLY", "resource_costs": auction.to_dict(), "work_bound": bounds,
+                "monetary_cost": None}
+            return {"gauntlet_handler": handler, "gauntlet_costs": costs,
+                    "gauntlet_work_bound": bounds, "research_pass_resource_units": pass_units}
+        except (ValueError, TypeError, KeyError, OSError) as exc:
+            # Deterministic research remains available when a replay corpus,
+            # manifest or resource declaration is not ready.
+            self.research_replay_configuration = {"status": "DATA_BLOCKED",
+                "reason": "explicit replay manifest/corpus/resource configuration invalid or unavailable",
+                "failure_type": type(exc).__name__}
+            return {}
 
     async def _setup_research(self):
         self.dataset_builder = PointInTimeDatasetBuilder(
             self.solana_config, self.solana_rpc, self.genealogy, self.wallet_intel, self.social_intel,
             self.prelaunch, self.info_graph, self.rug_hazard, self.champion_challenger,
         )
+        # Attached rather than constructed inside, so the builder's own
+        # constructor stays a data-collection concern and the ledger can be
+        # driven directly by a test.
+        self.dataset_builder.latency_value = self.latency_value
+        # The ring detector has been observing every launch's opening cohort
+        # and answering nobody. This is the first consumer: distinct wallets
+        # are not distinct DECIDERS, and a First-25 that is really a First-3
+        # was overcounted in the direction that says enter bigger.
+        self.dataset_builder.independence_provider = (
+            self.sniper_rings.independent_count)
+        # Agreement between wallets, as a grid of hypotheses rather than a
+        # rule. The followable set is cached because this is read from the
+        # trade-decode handler: ranking every tracked wallet per chain event
+        # would put a sort in the hot path to learn something that changes on
+        # the order of minutes.
+        self.wallet_consensus = WalletConsensus(
+            followable_provider=_ttl_cache(
+                lambda: self.wallet_intel.followable_wallets(limit=200),
+                FOLLOWABLE_CACHE_TTL_S),
+            independence_provider=self.sniper_rings.independent_count)
+        # Wallets as alpha sources with their own budgets. The cluster comes
+        # from the ring detector, so ten addresses belonging to one operator
+        # draw on one budget rather than ten -- which is the difference
+        # between diversifying and multiplying one bet.
+        self.wallet_allocator = WalletAllocator(
+            cluster_provider=lambda wallet: (
+                getattr(self.sniper_rings.ring_for(wallet), "ring_id", None)))
         self.info_graph.set_outcome_provider(self.dataset_builder.get_outcome)
         if hasattr(self.genealogy, "set_outcome_provider"):
             self.genealogy.set_outcome_provider(self.dataset_builder.get_outcome)
-        self.global_research = GlobalResearchMiner(self.champion_challenger)
+        research_path = Path(self.global_config.get("research_state_dir", "data/research"))
+        self.research_frontier = FrontierIndex(research_path / "frontier.sqlite")
+        self.unknown_engine = UnknownOpportunityEngine(
+            self.champion_challenger, self.research_frontier, self.trade_evidence,
+            proposal_runner=ProposalRoundRunner(self.trade_evidence, build_providers(
+                self.global_config.get("research_providers", []))), **self._canonical_replay_options())
+        self.unknown_engine.gauntlet_configuration = self.research_replay_configuration
+        await self._setup_opportunity_observation(research_path)
+        self.global_research = GlobalResearchMiner(
+            self.champion_challenger, ledger_path=str(research_path / "public_leads.jsonl"),
+            unknown_engine=self.unknown_engine, chain_scout=self.chain_opportunity_scout,
+            evm_observers=self.evm_observers, native_event_sink=self._retain_native_observation,
+            observation_configuration=self.evm_observation_configuration)
+        # World discovery: the hourly crawler, its keyless search fan-out, the
+        # canonical event ledger and the provider-terms watcher. Constructed
+        # here so the loop started in main() has something to drive; an
+        # unwired crawler is the exact failure this repository keeps finding.
+        self._setup_discovery()
         # Market and chain context, each source on its own clock. The program
         # stream is the fastest and most trustworthy data the desk has; what
         # it does not carry is why a price path looks the way it does, and
@@ -685,7 +1225,9 @@ class SubsystemWiring:
         # than only record it.
         self.data_miners = DataMinerPool(
             concurrency=int(self.global_config.get("data_miner_concurrency", 6)),
-            on_records=self._ingest_mined_records)
+            on_records=self._ingest_mined_records,
+            retain_batch=self._retain_mined_batch,
+            retain_disposition=self._retain_mined_disposition)
         self.miner_registration = dict(register_solana_miners(
             self.data_miners, rpc=self.solana_rpc, http=self.http_client,
             watched_tokens=self._mineable_tokens))
@@ -751,7 +1293,7 @@ class SubsystemWiring:
         self.miner_offload = OffloadedPool(
             self.data_miners, sink=self._ingest_mined_records,
             queue_depth=int(self.global_config.get("miner_queue_depth", 4096)),
-            name="miners")
+            name="miners", on_loop_stop=self._close_research_worker_resources)
         # The chain receive path in Rust: socket, HTTP/2, prost decode,
         # program filter and signature dedupe, with only what survives
         # crossing into Python. Runs in SHADOW beside the grpc.aio client,
@@ -768,7 +1310,7 @@ class SubsystemWiring:
                     ("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
                      "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"))),
                 mode=str(self.global_config.get(
-                    "native_ingress_mode", "SHADOW")).upper(),
+                    "native_ingress_mode", "AUTO")).upper(),
                 promote_after=int(self.global_config.get(
                     "native_ingress_promote_after", 5000))))
         # The heavy half, in its own INTERPRETER rather than its own thread.
@@ -814,7 +1356,3 @@ class SubsystemWiring:
                         started, len(self.miner_registration),
                         "offloaded thread" if self.miner_offload.report()["status"] != "OFF"
                         else "main loop")
-            # Event callbacks write to the PIT builder, hazard tracker, and
-            # research graphs. Start the stream only after all consumers exist.
-            if self.rpc_program_stream:
-                await self.rpc_program_stream.start()

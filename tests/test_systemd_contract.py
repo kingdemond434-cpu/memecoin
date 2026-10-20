@@ -42,6 +42,8 @@ class NotifierSpeaksTheProtocol(unittest.TestCase):
     """Against a real AF_UNIX socket, because the protocol is the point."""
 
     def setUp(self):
+        if not hasattr(socket, "AF_UNIX"):
+            self.skipTest("AF_UNIX is unavailable on this Python/OS")
         self.dir = tempfile.mkdtemp()
         self.path = os.path.join(self.dir, "notify")
         self.server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
@@ -102,6 +104,15 @@ class NotifierIsInertOffSystemd(unittest.TestCase):
     def test_a_socket_nobody_is_listening_on_is_also_survivable(self):
         notifier = SystemdNotifier(os.path.join(tempfile.mkdtemp(), "absent"))
         self.assertFalse(notifier.ready())
+
+    def test_missing_unix_socket_support_is_a_no_op(self):
+        from unittest.mock import patch
+
+        with patch.object(socket, "AF_UNIX", None, create=True):
+            notifier = SystemdNotifier("/a/systemd/notify/socket")
+        self.assertFalse(notifier.available)
+        self.assertFalse(notifier.ready())
+        self.assertFalse(notifier.watchdog())
 
 
 class WatchdogIntervalReadsTheEnvironment(unittest.TestCase):

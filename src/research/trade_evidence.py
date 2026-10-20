@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+import threading
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -30,6 +31,7 @@ class TradeEvidenceLedger:
         self.sequence = 0
         self.last_hash = GENESIS
         self.write_failures = 0
+        self._append_lock = threading.RLock()
         self._recover_tail()
 
     def _recover_tail(self) -> None:
@@ -50,6 +52,19 @@ class TradeEvidenceLedger:
 
     def record(self, event_type: str, payload: Dict[str, Any], *,
                timestamp: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        with self._append_lock:
+            return self._record_unlocked(event_type, payload, timestamp=timestamp)
+
+    def record_reference(self, event_type: str, payload: Dict[str, Any], *,
+                         timestamp: Optional[float] = None) -> Optional[str]:
+        """Append and locate a row atomically across this desk's threads."""
+        with self._append_lock:
+            offset = self.path.stat().st_size if self.path.exists() else 0
+            row = self.record(event_type, payload, timestamp=timestamp)
+            return f"evidence:{row['hash']}:{offset}" if row is not None else None
+
+    def _record_unlocked(self, event_type: str, payload: Dict[str, Any], *,
+                         timestamp: Optional[float] = None) -> Optional[Dict[str, Any]]:
         if not event_type or not self.last_hash:
             self.write_failures += 1
             return None

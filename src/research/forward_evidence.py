@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+from src.research.gauntlet import bootstrap_lower_bound
 from src.research.promotion_gate import (
     DEFAULT_CRITERIA, Evidence, PromotionCriteria, Stage, evaluate, next_stage,
 )
@@ -76,6 +77,36 @@ class ForwardEvidence:
     #: ratio that can be made to pass.
     MONSTER_MULTIPLE = 10.0
 
+    #: Below this many entered trades no lower bound is reported at all. A
+    #: percentile bootstrap resamples the sample it was given; on twenty
+    #: launches, four of which carried the return, it reports the confidence
+    #: of those four and calls it evidence. CANARY and LIVE require the bound
+    #: to be positive, and an unmeasured bound FAILS, so a shortfall here
+    #: holds promotion rather than granting it.
+    MIN_BOOTSTRAP_SAMPLE = 100
+
+    #: A gauntlet verdict older than this stops counting. Mechanisms decay --
+    #: that is the gauntlet's own finding about this market -- so a survivor
+    #: established in March is not evidence about capital deployed in
+    #: September, and letting it stand would make the freshest requirement on
+    #: the ladder the most stale number in it.
+    #:
+    #: Ten days against a WEEKLY timer, deliberately. Equal to the interval
+    #: would expire the verdict at the moment the next run replaces it, so a
+    #: box that was down for one Sunday, or a run that took an hour, would
+    #: silently block promotion; three days of slack absorbs that without
+    #: letting a fortnight-old verdict authorise capital. Changing
+    #: `memecoin-shadow-gauntlet.timer` means changing this.
+    GAUNTLET_MAX_AGE_S = 10 * 86_400.0
+
+    #: What a total loss of the book contributes to the bootstrap sample.
+    #: log(0) is -inf and would make every resampled mean -inf; dropping the
+    #: observation instead would delete the worst outcome the desk has ever
+    #: had from the only statistic that authorises capital, which is wrong in
+    #: the flattering direction. Floored at -99.9% of book, which still
+    #: dominates any bootstrap it appears in.
+    RUIN_RATIO_FLOOR = 1e-3
+
     def __init__(self, path: Optional[Path] = None, stage: Stage = Stage.FORWARD_SHADOW):
         self.path = Path(path) if path else None
         self.stage = stage
@@ -92,6 +123,19 @@ class ForwardEvidence:
         self.scored_launches = 0
         self._cohorts: Set[str] = set()
         self._regimes: Set[str] = set()
+        #: Per-trade log growth against the book at the time, kept because a
+        #: running sum cannot be resampled and the lower bound needs the
+        #: sample, not the total.
+        self._log_returns: List[float] = []
+        #: Monsters among the launches we ENTERED, and how many entered
+        #: launches were scored at all. Both None on a ledger written before
+        #: these existed, which reads as unmeasured rather than as zero: a
+        #: numerator restarted against an all-time denominator would report a
+        #: real desk as having caught nothing.
+        self.entered_scored: Optional[int] = 0
+        self.entered_monsters: Optional[int] = 0
+        self._gauntlet_survivors: Optional[int] = None
+        self._gauntlet_at: Optional[float] = None
         self.started_at = time.time()
         if self.path:
             self.load()
@@ -120,13 +164,21 @@ class ForwardEvidence:
             self.real_fills += 1
         if outcome.catastrophic:
             self.catastrophic_failures += 1
+        monster = (outcome.max_multiple is not None
+                   and float(outcome.max_multiple) >= self.MONSTER_MULTIPLE)
         if outcome.max_multiple is not None:
             self.scored_launches += 1
-            if float(outcome.max_multiple) >= self.MONSTER_MULTIPLE:
+            if monster:
                 self.monsters += 1
         if not outcome.entered:
             return
         self.entered += 1
+        if outcome.max_multiple is not None:
+            if self.entered_scored is None:
+                self.entered_scored = 0
+                self.entered_monsters = 0
+            self.entered_scored += 1
+            self.entered_monsters += int(monster)
         pnl = float(outcome.realized_pnl_usd)
         if pnl < 0:
             self.total_losses_usd += -pnl
@@ -141,14 +193,133 @@ class ForwardEvidence:
             ratio = 1.0 + pnl / equity
             if ratio > 0:
                 self.net_log_growth += math.log(ratio)
+                self._log_returns.append(math.log(ratio))
             else:
                 # A trade that took the whole book is not a large negative
                 # number, it is the end of the sequence. Recorded as
                 # catastrophic rather than as -inf, which would make every
-                # later average meaningless.
+                # later average meaningless -- but it still enters the
+                # bootstrap sample at the ruin floor, because a lower bound
+                # computed with the ruins removed is not a lower bound.
                 self.catastrophic_failures += 1
+                self._log_returns.append(math.log(self.RUIN_RATIO_FLOOR))
+
+    def record_gauntlet(self, report: Any, *, at: Optional[float] = None
+                        ) -> Optional[int]:
+        """Take a survivor count from a gauntlet run.
+
+        Accepts either `MechanismScoreboard.report()` output or a bare count,
+        because the caller that has the scoreboard and the caller that has a
+        stored number are different callers and neither should have to
+        reconstruct the other's shape.
+
+        A run that produced no rows at all is not zero survivors -- it is no
+        measurement -- and stays None, so the gate fails on "not measured"
+        rather than on "measured zero". The distinction matters because only
+        one of them is fixed by running the gauntlet.
+        """
+        count: Optional[int]
+        if isinstance(report, dict):
+            if not report.get("mechanisms"):
+                return None
+            count = report.get("survivors")
+        elif isinstance(report, (int, float)) and not isinstance(report, bool):
+            count = int(report)
+        else:
+            return None
+        if count is None:
+            return None
+        self._gauntlet_survivors = max(0, int(count))
+        self._gauntlet_at = float(at if at is not None else time.time())
+        return self._gauntlet_survivors
+
+    def load_gauntlet(self, path: Path) -> Optional[int]:
+        """Read a gauntlet verdict written by a separate process.
+
+        The verdict lives in its own file rather than in this ledger's state,
+        because the desk owns `forward_evidence.json` and rewrites it whole on
+        every save. A second process recording into that file would be
+        clobbered by the next save -- or would clobber the desk's counters,
+        depending on which wrote last -- and the failure would look like a
+        gauntlet that runs and never counts.
+
+        Loaded WITH the timestamp the run carried, so reading a stale verdict
+        does not make it fresh.
+        """
+        path = Path(path)
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            logger.warning("gauntlet verdict unreadable at %s: %s", path, exc)
+            return None
+        if not isinstance(payload, dict):
+            return None
+        at = payload.get("at")
+        try:
+            at = None if at is None else float(at)
+        except (TypeError, ValueError):
+            at = None
+        if at is None:
+            # A verdict with no timestamp cannot be aged, and an unageable
+            # verdict is one that never goes stale. Refused.
+            logger.warning("gauntlet verdict at %s carries no timestamp", path)
+            return None
+        return self.record_gauntlet(payload, at=at)
+
+    @staticmethod
+    def write_gauntlet(path: Path, report: Dict[str, Any],
+                       *, at: Optional[float] = None) -> bool:
+        """Persist a gauntlet run for `load_gauntlet`, atomically."""
+        payload = {
+            "schema": FORWARD_EVIDENCE_SCHEMA_VERSION,
+            "mechanisms": report.get("mechanisms"),
+            "survivors": report.get("survivors"),
+            "has_edge": report.get("has_edge"),
+            "coverage": report.get("coverage"),
+            "at": float(at if at is not None else time.time()),
+        }
+        path = Path(path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handle = tempfile.NamedTemporaryFile(
+                "w", dir=str(path.parent), delete=False, encoding="utf-8")
+            with handle:
+                json.dump(payload, handle, default=str)
+            os.replace(handle.name, path)
+            return True
+        except (OSError, ValueError) as exc:
+            logger.warning("gauntlet verdict save failed: %s", exc)
+            return False
 
     # -- reading -----------------------------------------------------------
+
+    def lower_bound(self) -> Optional[float]:
+        """Bootstrap lower confidence bound on mean per-trade log growth.
+
+        None until there are enough trades for the resampling to mean
+        anything. The gate reads None as unmeasured and therefore as failing,
+        which is the correct direction: a desk that has not traded enough to
+        bound its edge has not established one.
+        """
+        if len(self._log_returns) < self.MIN_BOOTSTRAP_SAMPLE:
+            return None
+        return bootstrap_lower_bound(self._log_returns)
+
+    def gauntlet_age_s(self) -> Optional[float]:
+        """How long ago the stored gauntlet verdict was produced."""
+        if self._gauntlet_at is None:
+            return None
+        return max(0.0, time.time() - self._gauntlet_at)
+
+    def gauntlet_survivors(self) -> Optional[int]:
+        """The survivor count, or None once it has gone stale."""
+        if self._gauntlet_survivors is None or self._gauntlet_at is None:
+            return None
+        if time.time() - self._gauntlet_at > self.GAUNTLET_MAX_AGE_S:
+            return None
+        return self._gauntlet_survivors
 
     def evidence(self) -> Evidence:
         """The gate's own shape. Unmeasured stays None."""
@@ -165,22 +336,39 @@ class ForwardEvidence:
             execution_success=(self.execution_successes / self.execution_attempts
                                if self.execution_attempts else None),
             catastrophic_failures=self.catastrophic_failures,
+            net_log_growth_lower_bound=self.lower_bound(),
+            gauntlet_survivors=self.gauntlet_survivors(),
         )
 
     def _enrichment(self) -> Optional[float]:
-        """Monsters among what we entered, over monsters among what we saw.
+        """Monsters among what we ENTERED, over monsters among what we saw.
+
+        The numerator counts monsters we actually bought. It used to reuse
+        `self.monsters` -- every monster the desk SAW, entered or not -- over
+        `self.entered`, which algebraically cancels to
+        `scored_launches / entered`: a selectivity ratio wearing enrichment's
+        name. A desk that entered one launch in ten reported 10x enrichment
+        while holding nothing, and the CANARY bar of 2.0 was cleared by being
+        picky rather than by being right. Measured on this repository
+        2026-09-03: ten monsters seen, ten launches entered, no overlap
+        whatsoever, reported as 10.0.
 
         None until both sides have been observed. An enrichment computed
         against a base rate of zero is division by an absence, and reporting
         it as infinite enrichment is the single most flattering number this
         module could produce.
         """
-        if not self.scored_launches or not self.entered:
+        if not self.scored_launches:
+            return None
+        if not self.entered_scored:
+            # Either nothing entered has resolved yet, or this ledger predates
+            # the counter. Both are "not measured", and the gate fails closed
+            # on that rather than passing on a number nobody computed.
             return None
         base_rate = self.monsters / self.scored_launches
         if base_rate <= 0:
             return None
-        entered_rate = self.monsters / self.entered
+        entered_rate = self.entered_monsters / self.entered_scored
         return entered_rate / base_rate
 
     def distance(self, criteria: Optional[PromotionCriteria] = None) -> Dict[str, Any]:
@@ -222,16 +410,35 @@ class ForwardEvidence:
             "running_days": (time.time() - self.started_at) / 86_400.0,
         }
 
-    def report(self) -> Dict[str, Any]:
+    def observed_days(self) -> float:
+        """How long this ledger has been counting."""
+        return max(0.0, (time.time() - self.started_at) / 86_400.0)
+
+    def report(self, ledger: Any = None) -> Dict[str, Any]:
+        """The evidence, the distance, and -- given the ladder -- a date.
+
+        `ledger` is the `PromotionLedger`, which alone knows when this stage
+        was entered and therefore how much of the dwell requirement is left.
+        Optional, because the distance and the evidence are worth reporting
+        without it, and a report that raised when it was absent would take
+        the whole status page down with it.
+        """
         evidence = self.evidence()
-        return {
+        report = {
             "schema": FORWARD_EVIDENCE_SCHEMA_VERSION,
             "stage": self.stage.value,
             "status": "OK" if self.decisions else "DATA_BLOCKED",
             "evidence": evidence.to_dict(),
             "distance": self.distance(),
+            "observed_days": round(self.observed_days(), 2),
             "persisted_at": str(self.path) if self.path else None,
         }
+        if ledger is not None and hasattr(ledger, "eta"):
+            try:
+                report["eta"] = ledger.eta(evidence, self.observed_days())
+            except Exception as exc:  # pragma: no cover - reporting only
+                report["eta"] = {"status": "DATA_BLOCKED", "detail": str(exc)}
+        return report
 
     # -- persistence -------------------------------------------------------
 
@@ -246,7 +453,12 @@ class ForwardEvidence:
             "execution_successes": self.execution_successes,
             "catastrophic_failures": self.catastrophic_failures,
             "monsters": self.monsters, "scored_launches": self.scored_launches,
+            "entered_scored": self.entered_scored,
+            "entered_monsters": self.entered_monsters,
             "cohorts": sorted(self._cohorts), "regimes": sorted(self._regimes),
+            "log_returns": list(self._log_returns),
+            "gauntlet_survivors": self._gauntlet_survivors,
+            "gauntlet_at": self._gauntlet_at,
             "started_at": self.started_at,
         }
 
@@ -291,7 +503,26 @@ class ForwardEvidence:
         self.catastrophic_failures = int(state.get("catastrophic_failures", 0))
         self.monsters = int(state.get("monsters", 0))
         self.scored_launches = int(state.get("scored_launches", 0))
+        # Absent on a ledger written before these existed. Restored as None,
+        # which reads as unmeasured: zeroing them would divide a fresh
+        # numerator by an all-time `entered` and report a working desk as
+        # having caught no monsters at all.
+        entered_scored = state.get("entered_scored")
+        entered_monsters = state.get("entered_monsters")
+        self.entered_scored = (None if entered_scored is None
+                               else int(entered_scored))
+        self.entered_monsters = (None if entered_monsters is None
+                                 else int(entered_monsters))
         self._cohorts = set(state.get("cohorts") or ())
         self._regimes = set(state.get("regimes") or ())
+        self._log_returns = [float(value)
+                             for value in (state.get("log_returns") or ())]
+        survivors = state.get("gauntlet_survivors")
+        self._gauntlet_survivors = None if survivors is None else int(survivors)
+        gauntlet_at = state.get("gauntlet_at")
+        # Restored WITH its timestamp, never stamped fresh on load. Reading a
+        # stale verdict back in and calling it current would make a restart
+        # the way to refresh a gauntlet result without running one.
+        self._gauntlet_at = None if gauntlet_at is None else float(gauntlet_at)
         self.started_at = float(state.get("started_at", time.time()))
         return True

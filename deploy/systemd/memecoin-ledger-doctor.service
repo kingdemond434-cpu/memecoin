@@ -4,6 +4,11 @@ After=memecoin-shadow.service
 Documentation=file:%h/.local/opt/memecoin-shadow/RUNBOOK.md
 
 [Service]
+# Inside the family memory budget. memecoin.slice caps the SUM of every
+# memecoin unit, which is what keeps this work from starving the quant
+# platform that shares this box. A unit outside the slice is a unit outside
+# the budget, however modest its own caps look.
+Slice=memecoin.slice
 Type=oneshot
 # 1 means "ran fine, found the chain broken and alerted" -- informational,
 # not a service defect. Same reasoning as memecoin-feed-doctor.service and

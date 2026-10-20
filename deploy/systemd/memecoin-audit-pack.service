@@ -3,6 +3,11 @@ Description=Build the weekly Claude audit evidence pack
 After=memecoin-shadow.service
 
 [Service]
+# Inside the family memory budget. memecoin.slice caps the SUM of every
+# memecoin unit, which is what keeps this work from starving the quant
+# platform that shares this box. A unit outside the slice is a unit outside
+# the budget, however modest its own caps look.
+Slice=memecoin.slice
 Type=oneshot
 WorkingDirectory=%h/.local/opt/memecoin-shadow
 EnvironmentFile=-%h/.config/memecoin-shadow/env

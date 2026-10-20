@@ -99,8 +99,8 @@ Windows PowerShell:
 
 ```powershell
 py -3.11 -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
-.venv\Scripts\python.exe -m unittest discover -s tests -v
+.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.venv\Scripts\python.exe -m pytest tests -q
 .venv\Scripts\python.exe -m src.main --dry-run --smoke-test
 .venv\Scripts\python.exe -m src.main --dry-run --run-seconds 60
 ```
@@ -109,8 +109,8 @@ Linux/macOS:
 
 ```bash
 python3.11 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest tests -q
 .venv/bin/python -m src.main --dry-run --smoke-test
 .venv/bin/python -m src.main --dry-run --run-seconds 60
 ```

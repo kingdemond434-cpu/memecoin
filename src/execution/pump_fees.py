@@ -34,6 +34,7 @@ What IS verified from the published docs and therefore hardcoded:
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -280,3 +281,53 @@ class PumpFeeSchedule:
 
 
 DEFAULT_SCHEDULE = PumpFeeSchedule.load()
+
+
+def round_trip_cost(schedule: "PumpFeeSchedule", state: Any = None, *,
+                    at_utc: Optional[float] = None,
+                    assumed_entry_cost: float = 0.02,
+                    assumed_exit_cost: float = 0.02) -> Dict[str, Any]:
+    """What one round trip costs, priced from the schedule or labelled assumed.
+
+    The desk used two config constants for entry and exit cost. They were
+    right until Pump replaced the flat 100 bps with a market-cap tier
+    schedule -- and a constant that silently stops being true is worse than
+    one that was never trusted, because every E[log W] downstream keeps
+    quoting it with full confidence.
+
+    Where the schedule can answer, it does. Where it cannot, the config
+    constant is used AND LABELLED as an assumption, so a decision made on an
+    unpriced fee stays distinguishable afterwards from one made on a measured
+    one.
+
+    Lives here rather than on the desk because the tier logic it depends on
+    is here, and because a pricing rule that needs a whole desk constructed
+    to be exercised is a pricing rule nobody tests directly.
+    """
+    at_utc = time.time() if at_utc is None else float(at_utc)
+    market_cap = None
+    if state is not None and getattr(state, "virtual_sol_reserves", 0) > 0:
+        # Market cap in lamports at the marginal curve price: total supply
+        # priced off the virtual reserves, which is the quantity the tier
+        # table is indexed on.
+        market_cap = int(state.token_total_supply * state.virtual_sol_reserves
+                         // max(1, state.virtual_token_reserves))
+    status, round_trip_bps, detail = schedule.round_trip_bps(
+        venue=VENUE_BONDING_CURVE,
+        entry_market_cap_lamports=market_cap, exit_market_cap_lamports=market_cap,
+        entry_utc=at_utc, exit_utc=at_utc,
+    )
+    if status == "OK":
+        leg = round_trip_bps / 2 / 10_000
+        return {"status": "OK", "assumed": False, "entry_cost": leg, "exit_cost": leg,
+                "round_trip_bps": round_trip_bps,
+                "schedule_version": detail["entry"].schedule_version,
+                "market_cap_lamports": market_cap}
+    return {
+        "status": "DATA_BLOCKED_FEE_SCHEDULE", "assumed": True,
+        "entry_cost": float(assumed_entry_cost),
+        "exit_cost": float(assumed_exit_cost),
+        "reason": detail["entry"].reason or detail["exit"].reason,
+        "schedule_version": schedule.version,
+        "market_cap_lamports": market_cap,
+    }

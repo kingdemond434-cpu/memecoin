@@ -79,13 +79,13 @@ class Opportunity:
             return "DATA_BLOCKED_ELOGW"
         if self.expected_hold_seconds is None:
             return "DATA_BLOCKED_HOLD_TIME"
-        if self.expected_hold_seconds <= 0:
+        if not math.isfinite(self.expected_hold_seconds) or self.expected_hold_seconds <= 0:
             return "DATA_BLOCKED_HOLD_TIME"
         if self.liquidity_usd is None:
             return "DATA_BLOCKED_LIQUIDITY"
-        if self.liquidity_usd <= 0:
+        if not math.isfinite(self.liquidity_usd) or self.liquidity_usd <= 0:
             return "DATA_BLOCKED_LIQUIDITY"
-        if self.capital_usd <= 0:
+        if not math.isfinite(self.capital_usd) or self.capital_usd <= 0:
             return "DATA_BLOCKED_CAPITAL"
         return None
 
@@ -133,6 +133,7 @@ class Slate:
     ranked: List[Opportunity]
     blocked: List[Tuple[Opportunity, str]]
     displacements: List[Displacement]
+    cash: Optional[Opportunity] = None
 
     @property
     def best(self) -> Optional[Opportunity]:
@@ -152,6 +153,10 @@ class Slate:
             "displacements": len(self.displacements),
             "best_token": self.best.token if self.best else None,
             "best_score": self.best.score if self.best else None,
+            "cash": ({"capital_usd": self.cash.capital_usd, "expected_log_growth": 0.0,
+                      "ranked_with_positions": True} if self.cash is not None else
+                     {"capital_usd": None, "expected_log_growth": 0.0,
+                      "status": "UNMEASURED_CASH_OR_HORIZON"}),
             "sleeves": {name: len(items) for name, items in self.by_sleeve().items()},
         }
 
@@ -178,7 +183,9 @@ class OpportunityAllocator:
         self.min_displacement_gain_ratio = max(1.0, min_displacement_gain_ratio)
         self.max_displacements_per_cycle = max(0, max_displacements_per_cycle)
 
-    def rank(self, opportunities: Sequence[Opportunity]) -> Slate:
+    def rank(self, opportunities: Sequence[Opportunity], *,
+             cash_available_usd: Optional[float] = None,
+             cash_horizon_seconds: Optional[float] = None) -> Slate:
         ranked: List[Opportunity] = []
         blocked: List[Tuple[Opportunity, str]] = []
         for opportunity in opportunities:
@@ -187,13 +194,23 @@ class OpportunityAllocator:
                 blocked.append((opportunity, reason))
             else:
                 ranked.append(opportunity)
+        cash = None
+        if (cash_available_usd is not None and cash_horizon_seconds is not None
+                and math.isfinite(cash_available_usd) and cash_available_usd > 0
+                and math.isfinite(cash_horizon_seconds) and cash_horizon_seconds > 0):
+            cash = Opportunity("__CASH__", 0.0, cash_available_usd,
+                cash_horizon_seconds, cash_available_usd, sleeve="CASH",
+                metadata={"kind": "CASH", "action": "WAIT", "yield_assumption": "zero"})
+            ranked.append(cash)
         ranked.sort(key=lambda item: (item.score, item.growth_velocity), reverse=True)
         displacements = self._propose_displacements(ranked)
-        return Slate(ranked=ranked, blocked=blocked, displacements=displacements)
+        return Slate(ranked=ranked, blocked=blocked, displacements=displacements, cash=cash)
 
     def _propose_displacements(self, ranked: Sequence[Opportunity]) -> List[Displacement]:
-        incumbents = [item for item in ranked if item.is_open_position]
-        challengers = [item for item in ranked if not item.is_open_position]
+        incumbents = [item for item in ranked if item.is_open_position
+                      and item.metadata.get("kind") != "CASH"]
+        challengers = [item for item in ranked if not item.is_open_position
+                       and item.metadata.get("kind") != "CASH"]
         if not incumbents or not challengers:
             return []
 

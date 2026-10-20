@@ -116,9 +116,16 @@ class SourceTouch:
     independence: float = 1.0
     role: KolRole = KolRole.UNKNOWN
 
-    @property
-    def is_kol(self) -> bool:
-        return bool(self.reach is not None and self.reach >= DEFAULT_KOL_REACH)
+    def is_kol(self, threshold: int = DEFAULT_KOL_REACH) -> bool:
+        """Whether this touch has the reach to start a wave.
+
+        A method rather than a property, and parameterised, because the model
+        carries a CONFIGURABLE `kol_reach` while this used the module default
+        -- so the two definitions could disagree, and `read` re-implemented
+        the predicate inline rather than calling this one. One definition,
+        with the threshold the caller is actually using.
+        """
+        return bool(self.reach is not None and self.reach >= int(threshold))
 
 
 @dataclass
@@ -218,8 +225,7 @@ class IgnitionModel:
         now = time.time() if now is None else now
         roles = {touch.source_id: touch.role.value for touch in touches}
         independent = sum(max(0.0, min(1.0, touch.independence)) for touch in touches)
-        kols = sum(1 for touch in touches
-                   if touch.reach is not None and touch.reach >= self.kol_reach)
+        kols = sum(1 for touch in touches if touch.is_kol(self.kol_reach))
 
         rate, acceleration = self._arrival(buyer_times, now)
 

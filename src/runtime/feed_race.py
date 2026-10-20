@@ -116,8 +116,18 @@ class FeedRace:
         self._settled: Deque[RacedEvent] = deque(maxlen=self.history)
         # Keys already handed downstream, so a duplicate never re-triggers a
         # decision. This is the property that makes racing safe at all.
-        self._delivered: Deque[str] = deque(maxlen=self.history * 2)
-        self._delivered_set: set = set()
+        #
+        # ONE structure, insertion-ordered. It used to be a bounded deque
+        # beside a set, and a bounded deque evicts its own leftmost item on
+        # append -- silently, without telling the set. So once at capacity
+        # every arrival dropped the oldest key from the deque while leaving
+        # it in the set for ever, and the explicit eviction that followed
+        # then removed a NEWER key from both. The set grew without bound and
+        # simultaneously lost keys it was still meant to be protecting, which
+        # means a duplicate could re-trigger a decision: exactly the one
+        # property this class exists to guarantee.
+        self._delivered: "Dict[str, None]" = {}
+        self._delivered_capacity = max(1, self.history * 2)
         self.duplicates = 0
 
     def register_feed(self, feed: str) -> None:
@@ -135,17 +145,18 @@ class FeedRace:
         self.register_feed(feed)
         event = self._open.get(key)
         if event is None:
-            if key in self._delivered_set:
+            if key in self._delivered:
                 # Arrived after the event already settled and was evicted.
                 self.duplicates += 1
                 return False
             event = RacedEvent(key=key, first_seen=moment)
             self._open[key] = event
             event.arrivals[feed] = moment
-            self._delivered.append(key)
-            self._delivered_set.add(key)
-            while len(self._delivered_set) > self._delivered.maxlen:
-                self._delivered_set.discard(self._delivered.popleft())
+            self._delivered[key] = None
+            while len(self._delivered) > self._delivered_capacity:
+                # Oldest first, and the eviction is the ONLY one: nothing
+                # else can drop a key behind this loop's back.
+                self._delivered.pop(next(iter(self._delivered)))
             self._sweep(moment)
             return True
         if feed not in event.arrivals:

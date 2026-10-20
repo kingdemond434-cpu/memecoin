@@ -140,7 +140,16 @@ class SourceIntelligence:
             root = Path(self.global_config.get("ops_state_dir", "data/state"))
             root.mkdir(parents=True, exist_ok=True)
             for mechanism, growth in self._mechanism_growth.items():
-                for value in growth:
+                values = list(growth)
+                # The baseline a mechanism was PROMOTED on, set from the
+                # first window that produced any. Decay is meaningless
+                # without it -- a monitor with no baseline compares every
+                # window against zero and calls a flat edge healthy -- and
+                # nothing was ever setting one.
+                if values and mechanism not in self.edge_decay._baseline:
+                    self.edge_decay.set_baseline(
+                        mechanism, sum(values) / len(values))
+                for value in values:
                     self.edge_decay.record(mechanism, value)
                 growth.clear()
             (root / "edge_decay.json").write_text(
@@ -190,6 +199,26 @@ class SourceIntelligence:
                          if notional and self.sol_price_usd > 0 else None),
         )
         self.wallet_independence.record_entries([entry])
+        # Three signals that all key on the SAME event and were being taken
+        # from nowhere: how this wallet behaves (so a rotated address is not
+        # automatically unknown), whether it beat the first public mention,
+        # and -- once the launch's cohort is complete -- which wallets keep
+        # arriving together.
+        record = self.launch_census._records.get(token)
+        launched_at = float(getattr(record, "detected_at", 0.0) or 0.0)
+        age_s = (entry.timestamp - launched_at) if launched_at else None
+        if age_s is not None and age_s >= 0:
+            signatures = getattr(self, "wallet_signatures", None)
+            if signatures is not None:
+                signatures.observe_entry(
+                    str(wallet), entry_age_s=age_s,
+                    size_sol=(float(notional) if notional else None),
+                    deployer=str(event.get("creator", "") or ""),
+                    at=entry.timestamp)
+            anomaly = getattr(self, "pre_event_anomaly", None)
+            if anomaly is not None:
+                anomaly.observe_entry(str(wallet), token, age_s,
+                                      at=entry.timestamp)
         # Retained so First25 DNA, actor-adjusted flow and swarm probability
         # have something to read. Bounded to the fingerprint depth: only the
         # opening sequence is what those models consume, and keeping every
@@ -197,6 +226,18 @@ class SourceIntelligence:
         entries = self._actor_entries.setdefault(token, [])
         if len(entries) < self.buyer_dna.depth:
             entries.append(entry)
+            if len(entries) == self.buyer_dna.depth:
+                # The opening cohort just completed. Fed ONCE per launch, and
+                # for every launch rather than only held ones: the question
+                # "which wallets keep arriving together" is answered across
+                # thousands of launches, and restricting it to the handful
+                # the desk entered would be asking it of a sample chosen by
+                # the very model it is meant to inform.
+                rings = getattr(self, "sniper_rings", None)
+                if rings is not None:
+                    rings.observe_launch(
+                        [item.wallet for item in entries],
+                        at=entries[0].timestamp)
         # A roster wallet entering is the only moment its decision can be
         # captured point-in-time. Recorded here, on the live stream, because
         # the follow verdict needs the price WE could have got after OUR
@@ -258,6 +299,16 @@ class SourceIntelligence:
 
     def _index_source_event(self, event: Any) -> None:
         """One event into the per-token index and the lead-lag graph."""
+        # A post from an account this launch NAMED in its own metadata is the
+        # only verifiable social link available: the account controls what it
+        # publishes and the desk observed the publication. It says the account
+        # spoke about the token, never that it owns the deployer wallet.
+        claims = getattr(self, "social_claims", None)
+        if claims is not None:
+            try:
+                claims.observe_event(event)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("social corroboration failed: %s", exc)
         for token in event.token_addresses:
             observations = self._source_events.setdefault(token, [])
             observations.append(event)
@@ -268,6 +319,15 @@ class SourceIntelligence:
             self.source_genealogy.record(SourcePost(
                 source_id=event.source_id, token=token,
                 posted_at=event.source_at, observed_at=event.observed_at))
+            # The instant this launch became PUBLIC, which is what a wallet's
+            # earliness has to be measured against. Without it the desk could
+            # only say a wallet buys early, which every sniper does.
+            anomaly = getattr(self, "pre_event_anomaly", None)
+            record = self.launch_census._records.get(token)
+            launched_at = float(getattr(record, "detected_at", 0.0) or 0.0)
+            if anomaly is not None and launched_at:
+                anomaly.note_public_mention(
+                    token, float(event.source_at) - launched_at)
             # A source naming a token we hold is new evidence about it.
             self.request_redecision(token)
 

@@ -467,14 +467,18 @@ class ContinuousRugHazardModel:
             elif event_type == "social" and float(item.get("velocity_change_pct", 0)) <= -0.70:
                 signals.append(self._signal(HazardTrigger.SOCIAL_VELOCITY_COLLAPSE, abs(float(item["velocity_change_pct"])), 0.50, item))
 
-        smart_wallets = {score.wallet: score for score in self.wallet_intel.get_top_wallets(limit=50)}
+        # address -> confidence, measured wallets first. The confidence goes
+        # straight into the hazard signal, so it has to mean "how much this
+        # wallet's exit is worth knowing about" rather than "how well it
+        # scored on a weighted sum".
+        smart_wallets = self.wallet_intel.followable_wallets(limit=50)
         for item in trades_recent:
             if item.get("side") != "sell":
                 continue
-            score = smart_wallets.get(item.get("wallet"))
-            if score:
+            confidence = smart_wallets.get(item.get("wallet"))
+            if confidence is not None:
                 strength = min(self._notional(item) / 1_000, 1) if self._notional(item) else 0.25
-                signals.append(self._signal(HazardTrigger.SMART_WALLET_EXIT, strength, score.overall_score, item))
+                signals.append(self._signal(HazardTrigger.SMART_WALLET_EXIT, strength, confidence, item))
             if item.get("is_insider"):
                 strength = min(self._notional(item) / 1_000, 1) if self._notional(item) else 0.25
                 signals.append(self._signal(HazardTrigger.INSIDER_SELL, strength, 0.90, item))

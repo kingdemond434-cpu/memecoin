@@ -87,7 +87,10 @@ class GlobalResearchMiner:
     }
 
     def __init__(self, framework: ChampionChallengerFramework, interval_seconds: int = 3600,
-                 ledger_path: str = "data/research/public_leads.jsonl"):
+                 ledger_path: str = "data/research/public_leads.jsonl", *,
+                 unknown_engine: Any = None, chain_scout: Any = None,
+                 evm_observers: Any = (), native_event_sink: Any = None,
+                 observation_configuration: Any = ()):
         self.framework = framework
         self.interval_seconds = interval_seconds
         self.leads: List[ResearchLead] = []
@@ -99,6 +102,13 @@ class GlobalResearchMiner:
         self._github_token = ""
         self.ledger_path = Path(ledger_path)
         self._query_cursor = 0
+        self.unknown_engine = unknown_engine
+        self.chain_scout = chain_scout
+        self.evm_observers = list(evm_observers)
+        self.native_event_sink = native_event_sink
+        self.observation_configuration = list(observation_configuration)
+        self._evm_cursor = 0
+        self.observation_status: Dict[str, Any] = {"status": "NOT_RUN", "observation_only": True}
 
     async def start(self):
         await self._load_ledger()
@@ -132,6 +142,9 @@ class GlobalResearchMiner:
             await asyncio.sleep(self.interval_seconds)
 
     async def run_once(self):
+        # Deterministic public/native collection is independent of proposal
+        # providers and uses this existing research pass, never a new task.
+        await self._run_observation_pass()
         # Anonymous GitHub search permits only 10 requests/minute. Rotate eight
         # queries per hourly cycle so a bad/expired token never exhausts the
         # fallback budget while all languages are still covered over time.
@@ -143,6 +156,39 @@ class GlobalResearchMiner:
         await self._mine_arxiv()
         for url, language, source in self.RSS_FEEDS:
             await self._mine_rss(url, language, source)
+        if self.unknown_engine is not None:
+            self.unknown_engine.run_pass()
+            await self.unknown_engine.run_proposal_pass()
+
+    async def _run_observation_pass(self):
+        result: Dict[str, Any] = {"observation_only": True, "execution_eligible": False,
+                                  "configuration": list(self.observation_configuration)}
+        if self.chain_scout is None:
+            result["chain_scout"] = {"status": "DATA_BLOCKED", "reason": "offline or no shared HTTP client"}
+        else:
+            try:
+                result["chain_scout"] = await self.chain_scout.run_once()
+            except Exception as exc:
+                result["chain_scout"] = {"status": "DATA_BLOCKED", "failure_type": type(exc).__name__}
+        observations = []
+        # More configured chains remain registered for later passes. A
+        # bounded rotation changes coverage without creating a scheduler.
+        count = min(4, len(self.evm_observers))
+        for offset in range(count):
+            adapter = self.evm_observers[(self._evm_cursor + offset) % len(self.evm_observers)]
+            if self.native_event_sink is None:
+                observations.append({"status": "DATA_BLOCKED", "reason": "no canonical native-event sink"})
+                continue
+            try:
+                observations.append(await adapter.poll_once(self.native_event_sink))
+            except Exception as exc:
+                observations.append({"status": "DATA_BLOCKED", "failure_type": type(exc).__name__})
+        if self.evm_observers:
+            self._evm_cursor = (self._evm_cursor + count) % len(self.evm_observers)
+        result["evm"] = observations or [{"status": "NOT_CONFIGURED", "observations": None}]
+        result["evm_deferred_this_pass"] = max(0, len(self.evm_observers) - count)
+        self.observation_status = result
+        return result
 
     async def _mine_github(self, query: str, language: str):
         try:
@@ -252,6 +298,16 @@ class GlobalResearchMiner:
                 lead.mechanism = mechanism
                 lead.candidate_features = list(features)
                 break
+        if self.unknown_engine is not None:
+            self.unknown_engine.ingest({
+                "source_id": lead.source_type, "source_url": lead.url,
+                "rights": "PUBLIC", "event_at": lead.discovered_at,
+                "available_at": lead.discovered_at, "observed_at": lead.discovered_at,
+                "region_language": lead.language, "title": lead.title,
+                "summary": lead.summary, "mechanism": lead.mechanism,
+                "candidate_features": list(lead.candidate_features),
+                "research_partition": "training",
+                "license_spdx": lead.license_spdx, "origin": "PUBLIC_SOURCE_OBSERVATION"})
         self.leads.append(lead)
         if len(self.leads) > 10_000:
             self.leads = self.leads[-5_000:]
@@ -304,7 +360,11 @@ class GlobalResearchMiner:
             "mechanisms": len([lead for lead in self.leads if lead.mechanism]),
             "languages": sorted({lead.language for lead in self.leads}),
             "data_status": dict(self.data_status),
+            "multi_chain_observation": dict(self.observation_status),
             "license_blocked": sum(lead.status == "DATA_BLOCKED_LICENSE" for lead in self.leads),
+            "unknown_opportunity_engine": (self.unknown_engine.report()
+                                           if self.unknown_engine is not None
+                                           else {"status": "NOT_CONFIGURED", "authority": "none"}),
             "top_sources": [
                 {"title": lead.title, "url": lead.url, "mechanism": lead.mechanism,
                  "quality": lead.source_quality, "license": lead.license_spdx, "status": lead.status}

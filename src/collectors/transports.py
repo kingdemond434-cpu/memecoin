@@ -202,6 +202,12 @@ class HttpClient:
                     logger.debug("cross-loop session close: %s", exc)
         self._sessions.clear()
 
+    async def close_current_loop(self) -> None:
+        """Release worker-owned sockets before their event loop is closed."""
+        session = self._sessions.pop(asyncio.get_running_loop(), None)
+        if session is not None and not session.closed:
+            await session.close()
+
 
 class Transport:
     """Base for anything that produces raw records for an adapter."""
@@ -295,10 +301,13 @@ class HttpTransport(Transport):
         if status == 429:
             raise TransportError(f"rate limited by {urlparse(self.url).netloc}")
         if status >= 400:
-            raise TransportError(f"HTTP {status} from {urlparse(self.url).netloc}")
+            raise self._http_error(status, text)
         self._etag = response_headers.get("ETag", "") or self._etag
         self._last_modified = response_headers.get("Last-Modified", "") or self._last_modified
         return text
+
+    def _http_error(self, status: int, text: str) -> TransportError:
+        return TransportError(f"HTTP {status} from {urlparse(self.url).netloc}")
 
     async def json_body(self) -> Optional[Any]:
         text = await self.body()
@@ -427,9 +436,9 @@ class YouTubeChannelTransport(RssTransport):
 class MastodonTimelineTransport(HttpTransport):
     """A Mastodon instance's PUBLIC timeline.
 
-    Public timelines are exactly that: served to anonymous readers by design.
-    Nothing here reads a follower-only post, a direct message, or anything an
-    account has not published openly.
+    Instance policy may disable anonymous public previews. That is an access
+    boundary reported as unavailable, never worked around or read as an empty
+    healthy timeline. This transport sends no account credentials.
     """
 
     kind = "mastodon"
@@ -440,6 +449,20 @@ class MastodonTimelineTransport(HttpTransport):
         super().__init__(source_id, f"{self.instance}/api/v1/timelines/public?limit={limit}",
                          client)
         self._since_id = ""
+
+    def _http_error(self, status: int, text: str) -> TransportError:
+        requires_user = False
+        if status == 422:
+            try:
+                payload = json.loads(text)
+                requires_user = "requires an authenticated user" in str(payload.get("error", "")).lower()
+            except (ValueError, TypeError, AttributeError):
+                pass
+        if status in (401, 403) or requires_user:
+            return TransportError(
+                f"UNAVAILABLE: HTTP {status} from {urlparse(self.url).netloc}; "
+                "instance public-preview access requires authorization")
+        return super()._http_error(status, text)
 
     async def fetch(self) -> List[Dict[str, Any]]:
         url = f"{self.instance}/api/v1/timelines/public?limit={self.limit}"
@@ -921,10 +944,11 @@ class TransportReport:
     pending_endpoint: List[Tuple[str, str]] = field(default_factory=list)
     unconfigured: List[Tuple[str, str]] = field(default_factory=list)
     unsupported: List[Tuple[str, str]] = field(default_factory=list)
+    unavailable: List[Tuple[str, str]] = field(default_factory=list)
 
     @property
     def unbuilt(self) -> List[Tuple[str, str]]:
-        return [*self.pending_endpoint, *self.unconfigured, *self.unsupported]
+        return [*self.pending_endpoint, *self.unconfigured, *self.unsupported, *self.unavailable]
 
     def to_dict(self) -> Dict[str, Any]:
         def rows(items: List[Tuple[str, str]]) -> List[Dict[str, str]]:
@@ -938,6 +962,7 @@ class TransportReport:
             "pending_endpoint": rows(self.pending_endpoint),
             "unconfigured": rows(self.unconfigured),
             "unsupported": rows(self.unsupported),
+            "unavailable": rows(self.unavailable),
             "unbuilt": rows(self.unbuilt),
         }
 
@@ -971,6 +996,8 @@ def build_transport(declaration: Any, client: HttpClient) -> Any:
     """
     kind = declaration.kind
     options = dict(declaration.options or {})
+    if str(options.get("availability", "")).upper() == "UNAVAILABLE":
+        raise TransportError("UNAVAILABLE: " + str(options.get("unavailable_reason") or "no verified public endpoint"))
     missing = [name for name in REQUIRED_OPTIONS.get(kind, ()) if not options.get(name)]
     if missing:
         raise TransportError(f"declaration is missing options: {', '.join(missing)}")
@@ -1030,8 +1057,8 @@ def build_transports(declarations: Sequence[Any], client: Optional[HttpClient] =
             transport = build_transport(declaration, client)
         except TransportError as exc:
             reason = str(exc)
-            bucket = (report.pending_endpoint if "missing options" in reason
-                      else report.unsupported)
+            bucket = (report.unavailable if reason.startswith("UNAVAILABLE:") else
+                      report.pending_endpoint if "missing options" in reason else report.unsupported)
             bucket.append((declaration.source_id, reason))
             continue
         transports[declaration.source_id] = transport

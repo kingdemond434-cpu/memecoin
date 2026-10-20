@@ -36,7 +36,7 @@ import logging
 import math
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Set, Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -159,6 +159,11 @@ class SmartFlow:
     # Counted, because a smart-flow number that quietly halved deserves to say
     # what halved it.
     ancestry_compressed: int = 0
+    # How many wallets a persistent sniper ring collapsed. Separate from the
+    # ancestry count because they catch different things: ancestry sees
+    # wallets funded from one place, rings see wallets that keep arriving
+    # together with no funding edge at all.
+    ring_collapsed: int = 0
     detail: str = ""
 
     @property
@@ -174,6 +179,7 @@ def aggregate_smart_flow(
     report: IndependenceReport,
     unmeasured_independence: float = 0.5,
     ancestry: Optional[Any] = None,
+    rings: Optional[Any] = None,
 ) -> SmartFlow:
     """sum(skill * capital * independence) over one token's skilled buyers.
 
@@ -198,6 +204,27 @@ def aggregate_smart_flow(
     # for this launch is invisible at exactly the moment it is used.
     compression = (getattr(ancestry, "compression", None) or {}
                    if getattr(ancestry, "status", "") == "OK" else {})
+    # The third case, which neither of the other two can see. Wallets that
+    # keep opening the same launches together may share no funder and no
+    # follow relationship -- they are not funding each other, they are
+    # running from one operator's list. On any single launch that is
+    # invisible; across four hundred launches the co-occurrence rate says so
+    # outright. A ring of twelve addresses is one buyer wearing twelve hats,
+    # and counting it as twelve is an overcount in the direction that says
+    # enter bigger.
+    ring_weight: Dict[str, float] = {}
+    ringed = 0
+    if rings is not None:
+        try:
+            for member_set in _ring_sets(rings, [entry.wallet for entry in scored]):
+                if len(member_set) < 2:
+                    continue
+                share = 1.0 / len(member_set)
+                for wallet in member_set:
+                    ring_weight[wallet] = share
+                ringed += len(member_set)
+        except Exception:  # pragma: no cover - the detector is optional
+            ring_weight = {}
     evidence = 0.0
     naive = 0.0
     measured = unmeasured = 0
@@ -217,13 +244,39 @@ def aggregate_smart_flow(
             # untraceable does not earn independence it has not shown.
             compressed += 1
             independence = float(ancestral)
+        ring_share = ring_weight.get(entry.wallet)
+        if ring_share is not None and ring_share < independence:
+            # Same rule: only ever lower. Twelve addresses in one ring share
+            # one buyer's worth of evidence between them.
+            independence = ring_share
         evidence += weight * independence
     detail = f"{len(scored)} skilled buyers, {unmeasured} unmeasured"
     if compressed:
         detail += f", {compressed} compressed by funding ancestry"
+    if ringed:
+        detail += f", {ringed} collapsed into persistent sniper rings"
     return SmartFlow(status="OK", evidence=float(evidence), naive_evidence=float(naive),
                      measured_wallets=measured, unmeasured_wallets=unmeasured,
-                     ancestry_compressed=compressed, detail=detail)
+                     ancestry_compressed=compressed,
+                     ring_collapsed=ringed, detail=detail)
+
+
+def _ring_sets(rings: Any, wallets: Sequence[str]) -> List[Set[str]]:
+    """Which of these wallets fall into the same usable ring.
+
+    Only USABLE rings: a component of four hundred addresses is a
+    description of the market rather than of a coordinated actor, and
+    discounting on it would zero every launch the desk ever sees.
+    """
+    present = {str(wallet) for wallet in wallets if wallet}
+    out: List[Set[str]] = []
+    for ring in rings.rings():
+        if not ring.usable:
+            continue
+        overlap = present & ring.members
+        if len(overlap) > 1:
+            out.append(overlap)
+    return out
 
 
 @dataclass

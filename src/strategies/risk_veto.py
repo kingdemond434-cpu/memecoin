@@ -49,6 +49,7 @@ class RiskVeto:
     def evaluate(self, report: Any, *, dev_state: Optional[Dict[str, Any]] = None,
                  position_value_usd: Optional[float] = None,
                  liquidity_usd: Optional[float] = None,
+                 depth_usd: Optional[float] = None,
                  exit_capacity_ratio: Optional[float] = None,
                  connected_holder_pct: Optional[float] = None,
                  max_connected_holder_pct: float = 80.0) -> RiskVetoResult:
@@ -98,7 +99,16 @@ class RiskVeto:
             reasons.append("extreme_connected_holder_concentration")
 
         if position_value_usd is not None:
-            if liquidity_usd is None or float(liquidity_usd) <= 0:
+            # A measured exit frontier answers "can this be sold" directly, so
+            # when one exists it is the limit. The flat fraction of reserves is
+            # a stand-in for the same question and must not be applied on top:
+            # doing that would veto positions the measurement had just cleared,
+            # which is how a better instrument makes a system more timid
+            # instead of more accurate.
+            if depth_usd is not None and float(depth_usd) > 0:
+                if float(position_value_usd) > float(depth_usd):
+                    reasons.append("position_exceeds_measured_exit_depth")
+            elif liquidity_usd is None or float(liquidity_usd) <= 0:
                 unmeasured.append("exit_liquidity")
             elif float(position_value_usd) > float(liquidity_usd) * self.max_liquidity_fraction:
                 reasons.append("position_exceeds_exit_liquidity_limit")
@@ -115,6 +125,7 @@ class RiskVeto:
                          "route_price_impact_pct": impact,
                          "position_value_usd": position_value_usd,
                          "liquidity_usd": liquidity_usd,
+                         "measured_exit_depth_usd": depth_usd,
                          "exit_capacity_ratio": exit_capacity_ratio,
                          "connected_holder_pct": connected_holder_pct})
         if reasons:

@@ -203,6 +203,7 @@ from src.research.dataset_builder import (
     SNAPSHOT_OFFSETS_S, TAIL_THRESHOLDS, LaunchEpisode, LaunchSnapshot,
     PointInTimeDatasetBuilder, SnapshotTimepoint,
     PUMP_INITIAL_VIRTUAL_SOL, PUMP_INITIAL_VIRTUAL_TOKEN, PUMP_CURVE_K,
+    PUMP_TOKEN_TOTAL_SUPPLY,
     pump_curve_invariant_holds,
 )
 from src.research.shadow_trainer import (
@@ -337,6 +338,7 @@ def _desk_source() -> str:
     return "\n".join((root / name).read_text(encoding="utf-8")
                      for name in ("main.py", "runtime/reporting.py",
                                   "runtime/ingestion.py", "runtime/wiring.py",
+                                  "runtime/depth.py",
                                   "runtime/source_intelligence.py"))
 
 
@@ -670,7 +672,9 @@ class TestSolanaParsing(unittest.IsolatedAsyncioTestCase):
 
 class TestOfficialSocialCollectors(unittest.IsolatedAsyncioTestCase):
     def make_engine(self, api_keys=None):
-        wallet_intel = SimpleNamespace(get_top_wallets=lambda limit=100: [], register_social_wallet=lambda wallet: None)
+        wallet_intel = SimpleNamespace(get_top_wallets=lambda limit=100: [],
+                                       followable_wallets=lambda limit=100, **kw: {},
+                                       register_social_wallet=lambda wallet: None)
         return SocialIntelligenceEngine(
             solana_chain(), SimpleNamespace(request=self._rpc_request), SimpleNamespace(), wallet_intel,
             api_keys or {},
@@ -1500,6 +1504,7 @@ class TestFeatureParity(unittest.IsolatedAsyncioTestCase):
         builder = PointInTimeDatasetBuilder(
             solana_chain(), FakeRpc(), FakeGenealogy(),
             SimpleNamespace(get_top_wallets=lambda limit=50: [],
+                            followable_wallets=lambda limit=50, **kw: {},
                             get_wallet_score=lambda wallet: None,
                             _recent_buys=[]),
             SimpleNamespace(get_token_social_signal=lambda token, as_of=None: {"mention_count": 0}),
@@ -2210,6 +2215,9 @@ class TestHazardTrainer(unittest.IsolatedAsyncioTestCase):
                 class WalletIntel:
                     def get_top_wallets(self, limit=50):
                         return []
+                    def followable_wallets(self, limit=50, regime=None,
+                                           include_unmeasured=True):
+                        return {}
                 class Adversarial:
                     def get_adaptive_weight(self, feature, base):
                         return base
@@ -2304,22 +2312,16 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
     async def test_promotion_evidence_survives_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = str(Path(directory) / "champion_state.json")
-            hypothesis = HypothesisSpec(
-                hypothesis_id="model-v1", mechanism="test", target="net_elogw",
-                features=["flow"], feature_hash="schema-1", model_type="test",
-                model_params={}, training_window="point-in-time", threshold=0.0,
-                sizing_rule={}, exit_rule={}, execution_policy={}, fakeability={},
-                cost_model={}, falsifier="negative oos", kill_thesis="decay",
-                source_provenance="fixture", trial_family="test", created_at=1.0,
-            )
+            hypothesis = self._hypothesis("model-v1")
             first = ChampionChallengerFramework(
                 min_oos_samples=1, min_portfolio_impact=0.0, state_path=state_path,
             )
             first.submit_hypothesis(hypothesis)
+            first.freeze_hypothesis("model-v1")
             first.record_trial_result(TrialResult(
                 hypothesis_id="model-v1", stage="CHRONOLOGICAL_OOS", samples=10,
                 metrics={}, oos_metrics={"elogw": 0.01}, portfolio_impact=0.01,
-                passed=True, timestamp=2.0,
+                passed=True, timestamp=time.time(), spec_hash=hypothesis.frozen_hash,
             ))
             await first._evaluate_challengers()
             await first.stop()
@@ -2331,6 +2333,9 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def _hypothesis(hypothesis_id: str) -> HypothesisSpec:
+        from test_scientific_core import exact_candidate
+        candidate = exact_candidate(hypothesis_id)
+        candidate["trial_family"] = "test"
         return HypothesisSpec(
             hypothesis_id=hypothesis_id, mechanism="test", target="net_elogw",
             features=["flow"], feature_hash="schema-1", model_type="test",
@@ -2338,6 +2343,7 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
             sizing_rule={}, exit_rule={}, execution_policy={}, fakeability={},
             cost_model={}, falsifier="negative oos", kill_thesis="decay",
             source_provenance="fixture", trial_family="test", created_at=1.0,
+            exact_candidate=candidate, agent_identity="fixture-agent",
         )
 
     async def test_full_promotion_pipeline_discovered_to_live_champion(self):
@@ -2346,12 +2352,13 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
             shadow_duration_hours=0, canary_duration_hours=0,
         )
         framework.submit_hypothesis(self._hypothesis("promo-1"))
+        framework.freeze_hypothesis("promo-1")
         self.assertEqual(framework.hypotheses["promo-1"].status, ModelStatus.DISCOVERED.value)
 
         framework.record_trial_result(TrialResult(
             hypothesis_id="promo-1", stage="CHRONOLOGICAL_OOS", samples=10,
             metrics={}, oos_metrics={"elogw": 0.02}, portfolio_impact=0.02,
-            passed=True, timestamp=2.0,
+            passed=True, timestamp=time.time(), spec_hash=framework.hypotheses["promo-1"].frozen_hash,
         ))
         await framework._evaluate_challengers()
         self.assertIn("promo-1", framework.shadow_models)
@@ -2359,14 +2366,16 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(framework.hypotheses["promo-1"].status, ModelStatus.FORWARD_SHADOW.value)
 
         for _ in range(5):
-            framework.record_forward_result("promo-1", {"elogw": 0.01, "pnl": 5.0})
+            framework.record_forward_result("promo-1", {"elogw": 0.01, "pnl": 5.0,
+                "spec_hash": framework.hypotheses["promo-1"].frozen_hash})
         await framework._evaluate_shadow_models()
         self.assertIn("promo-1", framework.canary_models)
         self.assertNotIn("promo-1", framework.shadow_models)
         self.assertEqual(framework.hypotheses["promo-1"].status, ModelStatus.CANARY.value)
 
         for _ in range(20):
-            framework.record_forward_result("promo-1", {"elogw": 0.01, "pnl": 5.0})
+            framework.record_forward_result("promo-1", {"elogw": 0.01, "pnl": 5.0,
+                "spec_hash": framework.hypotheses["promo-1"].frozen_hash})
         await framework._evaluate_canary_models()
         self.assertIn("promo-1", framework.champions)
         self.assertNotIn("promo-1", framework.canary_models)
@@ -2375,7 +2384,8 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(framework.get_stats()["live_champions"], 1)
 
         for _ in range(framework.decay_window):
-            framework.record_forward_result("promo-1", {"elogw": -0.01, "pnl": -5.0})
+            framework.record_forward_result("promo-1", {"elogw": -0.01, "pnl": -5.0,
+                "spec_hash": framework.hypotheses["promo-1"].frozen_hash})
         await framework._monitor_champion_decay()
         self.assertEqual(framework.champions["promo-1"].status, "HIBERNATED")
         self.assertEqual(framework.get_stats()["hibernated_champions"], 1)
@@ -2386,14 +2396,16 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
             shadow_duration_hours=0, canary_duration_hours=0,
         )
         shadow_framework.submit_hypothesis(self._hypothesis("shadow-fail"))
+        shadow_framework.freeze_hypothesis("shadow-fail")
         shadow_framework.record_trial_result(TrialResult(
             hypothesis_id="shadow-fail", stage="CHRONOLOGICAL_OOS", samples=10,
             metrics={}, oos_metrics={"elogw": 0.02}, portfolio_impact=0.02,
-            passed=True, timestamp=2.0,
+            passed=True, timestamp=time.time(), spec_hash=shadow_framework.hypotheses["shadow-fail"].frozen_hash,
         ))
         await shadow_framework._evaluate_challengers()
         for _ in range(5):
-            shadow_framework.record_forward_result("shadow-fail", {"elogw": -0.01, "pnl": -5.0})
+            shadow_framework.record_forward_result("shadow-fail", {"elogw": -0.01, "pnl": -5.0,
+                "spec_hash": shadow_framework.hypotheses["shadow-fail"].frozen_hash})
         await shadow_framework._evaluate_shadow_models()
         self.assertNotIn("shadow-fail", shadow_framework.shadow_models)
         self.assertNotIn("shadow-fail", shadow_framework.canary_models)
@@ -2405,19 +2417,22 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
             shadow_duration_hours=0, canary_duration_hours=0,
         )
         canary_framework.submit_hypothesis(self._hypothesis("canary-fail"))
+        canary_framework.freeze_hypothesis("canary-fail")
         canary_framework.record_trial_result(TrialResult(
             hypothesis_id="canary-fail", stage="CHRONOLOGICAL_OOS", samples=10,
             metrics={}, oos_metrics={"elogw": 0.02}, portfolio_impact=0.02,
-            passed=True, timestamp=2.0,
+            passed=True, timestamp=time.time(), spec_hash=canary_framework.hypotheses["canary-fail"].frozen_hash,
         ))
         await canary_framework._evaluate_challengers()
         for _ in range(5):
-            canary_framework.record_forward_result("canary-fail", {"elogw": 0.01, "pnl": 5.0})
+            canary_framework.record_forward_result("canary-fail", {"elogw": 0.01, "pnl": 5.0,
+                "spec_hash": canary_framework.hypotheses["canary-fail"].frozen_hash})
         await canary_framework._evaluate_shadow_models()
         self.assertIn("canary-fail", canary_framework.canary_models)
         # Fewer than 20 canary trades -> retired for insufficient evidence, not promoted.
         for _ in range(5):
-            canary_framework.record_forward_result("canary-fail", {"elogw": 0.01, "pnl": 5.0})
+            canary_framework.record_forward_result("canary-fail", {"elogw": 0.01, "pnl": 5.0,
+                "spec_hash": canary_framework.hypotheses["canary-fail"].frozen_hash})
         await canary_framework._evaluate_canary_models()
         self.assertNotIn("canary-fail", canary_framework.canary_models)
         self.assertNotIn("canary-fail", canary_framework.champions)
@@ -2467,6 +2482,21 @@ class FakeJupiter:
 class FakeJito:
     async def send_bundle(self, transactions):
         raise AssertionError("dry-run must not submit a bundle")
+
+
+
+class _AuthorisedLedger:
+    """A promotion ledger that says the stage has been earned.
+
+    Live-path tests exercise SUBMISSION, and submission now requires an
+    earned stage as well as `dry_run=False`. Without this every live test
+    would pass for the wrong reason -- blocked by the ladder rather than
+    exercising the behaviour it was written to check.
+    """
+
+    @staticmethod
+    def authorises_live_capital():
+        return True, "authorised for test"
 
 
 class FakeRpc:
@@ -2640,6 +2670,7 @@ class TestExecution(unittest.IsolatedAsyncioTestCase):
         keypair = Keypair()
         engine = ExecutionEngine(solana_chain(), FakeRpc(), FakeJupiter(), FakeJito(),
                                  SolanaTransactionBuilder(FakeRpc(), keypair), None, dry_run=False)
+        engine.promotion_ledger = _AuthorisedLedger()
         result = await engine.execute_swap("in", "out", 1000)
         self.assertEqual(result.status, TransactionStatus.REJECTED)
         self.assertIn("locked", result.error)
@@ -2674,6 +2705,7 @@ class TestExecution(unittest.IsolatedAsyncioTestCase):
             jito or LiveFakeJito(), builder, CounterfactualExecutionLab(),
             dry_run=False, confirmation_timeout=confirmation_timeout,
         )
+        engine.promotion_ledger = _AuthorisedLedger()
         return engine
 
     async def test_live_jito_bundle_fills_with_verified_output_balance_delta(self):
@@ -2907,6 +2939,9 @@ class TestWalletAndCoordination(unittest.IsolatedAsyncioTestCase):
         class WalletIntel:
             def get_top_wallets(self, limit=50):
                 return []
+            def followable_wallets(self, limit=50, regime=None,
+                                   include_unmeasured=True):
+                return {}
         miner = PublicCoordinationMiner(FakeGenealogy(), WalletIntel())
         self.assertEqual(miner.get_features("token")["status"], "DATA_BLOCKED")
         for index in range(3):
@@ -2924,6 +2959,9 @@ class TestWalletAndCoordination(unittest.IsolatedAsyncioTestCase):
         class WalletIntel:
             def get_top_wallets(self, limit=50):
                 return []
+            def followable_wallets(self, limit=50, regime=None,
+                                   include_unmeasured=True):
+                return {}
         miner = PublicCoordinationMiner(FakeGenealogy(), WalletIntel())
         funding_transfers = [
             {"from": "operator", "to": f"buyer{i}", "lamports": 1_000_000_000} for i in range(3)
@@ -3335,6 +3373,9 @@ class TestHazardTracking(unittest.IsolatedAsyncioTestCase):
         class WalletIntel:
             def get_top_wallets(self, limit=50):
                 return []
+            def followable_wallets(self, limit=50, regime=None,
+                                   include_unmeasured=True):
+                return {}
         class Adversarial:
             def get_adaptive_weight(self, feature, base):
                 return base
@@ -8508,7 +8549,8 @@ class TestSourceIntelligenceIsLiveWired(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(payload["declared"], 20)
         self.assertEqual(payload["ready"], 0)
         self.assertEqual(payload["by_state"].get("NO_FETCHER", 0)
-                         + payload["by_state"].get("UNCONFIGURED", 0),
+                         + payload["by_state"].get("UNCONFIGURED", 0)
+                         + payload["by_state"].get("UNAVAILABLE", 0),
                          payload["declared"])
 
 
@@ -8955,6 +8997,28 @@ class TestOrphanIntelligence(unittest.IsolatedAsyncioTestCase):
                             "timestamp": 1_000.0 + index},
                 {"notional_usd": 100.0})
 
+        # The two things trade costing needs, both of which the live desk
+        # now has and this fixture previously did not: the fee tiers, which
+        # `_refresh_pump_fee_config` reads off the FeeConfig account at
+        # startup, and a curve to price the market cap the tiers are indexed
+        # on, which `_on_pump_event` seeds at T0. Without them `cost_model`
+        # answers DATA_BLOCKED, no expected value can be computed net of
+        # cost, and the desk cannot justify an entry -- which is not a
+        # missing field in a report, it is the reason nothing gets entered.
+        # The real desk shares the process default. Synthetic tiers belong to
+        # this fixture; adopting them globally makes later fee tests depend on
+        # test order and leaves other desks pricing against invented tiers.
+        desk.fee_schedule = PumpFeeSchedule()
+        desk.fee_schedule.adopt_chain_config(
+            parse_fee_config(TestOnChainFeeConfig._account()),
+            source="chain:test")
+        desk._latest_curve_state[self.MINT] = BondingCurveState(
+            virtual_token_reserves=PUMP_INITIAL_VIRTUAL_TOKEN,
+            virtual_sol_reserves=PUMP_INITIAL_VIRTUAL_SOL,
+            real_token_reserves=0, real_sol_reserves=0,
+            token_total_supply=PUMP_TOKEN_TOTAL_SUPPLY,
+            complete=False, creator=candidate.deployer)
+
         prediction = MultiHeadPrediction(self.MINT, "solana", 0, p_2x=0.6, p_5x=0.4, p_10x=0.2)
         trade_info = {"position_size_sol": 0.5, "position_value_usd": 75.0,
                       "risk_contribution": 0.01}
@@ -8962,6 +9026,9 @@ class TestOrphanIntelligence(unittest.IsolatedAsyncioTestCase):
             self.MINT, candidate, None, prediction, trade_info, 50_000.0)
         report = audit_intelligence("entry", intelligence)
 
+        self.assertEqual("OK", intelligence["cost_model"]["status"],
+                         intelligence["cost_model"])
+        self.assertFalse(intelligence["cost_model"]["assumed"])
         self.assertEqual(report.orphans, [])
         for key in ("prediction", "sources", "coordination", "sizing", "cost_model"):
             self.assertIn(key, report.contributing,
@@ -9194,7 +9261,11 @@ class TestExtendedTailLabels(unittest.TestCase):
         source = (Path(__file__).resolve().parents[1] / "src" / "research"
                   / "shadow_trainer.py").read_text()
         self.assertNotIn("np.clip(feasible, 0.02, 50)", source)
-        self.assertIn("SURVIVAL_LEVELS[-1][1]", source)
+        # The bound moved again: 500x was the last survival RUNG, and the
+        # survival curve already answers past it by fitting the tail. Clipping
+        # the LABEL there taught the model that a 1000x episode was a 500x
+        # episode.
+        self.assertIn("FEASIBLE_MULTIPLE_CEILING", source)
 
 
 class TestAgeBandedBrains(unittest.TestCase):
@@ -10995,20 +11066,42 @@ class TestSourceTransports(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(shared.handlers, [])
 
     async def test_transport_startup_is_concurrent_and_bounded(self):
-        class Slow:
-            def __init__(self, delay):
-                self.delay = delay
+        entered = active = peak = 0
+        two_started, release = asyncio.Event(), asyncio.Event()
 
+        class Held:
             async def start(self):
-                await asyncio.sleep(self.delay)
+                nonlocal entered, active, peak
+                entered += 1
+                active += 1
+                peak = max(peak, active)
+                if entered == 2:
+                    two_started.set()
+                try:
+                    await release.wait()
+                finally:
+                    active -= 1
 
-        started = time.perf_counter()
-        failures = await start_transports(
-            {"one": Slow(0.05), "two": Slow(0.05)},
-            timeout_s=0.2, concurrency=2)
-        elapsed = time.perf_counter() - started
-        self.assertEqual(failures, {})
-        self.assertLess(elapsed, 0.09)
+        startup = asyncio.create_task(start_transports(
+            {"one": Held(), "two": Held(), "three": Held()},
+            timeout_s=5, concurrency=2))
+        try:
+            # Both must enter while neither can finish. Serial startup cannot
+            # reach this barrier; an unbounded startup would enter all three.
+            await asyncio.wait_for(two_started.wait(), timeout=5)
+            self.assertEqual(entered, 2)
+            self.assertEqual(peak, 2)
+            self.assertFalse(startup.done())
+            release.set()
+            failures = await asyncio.wait_for(startup, timeout=5)
+            self.assertEqual(failures, {})
+            self.assertEqual(entered, 3)
+            self.assertEqual(peak, 2)
+        finally:
+            release.set()
+            if not startup.done():
+                startup.cancel()
+            await asyncio.gather(startup, return_exceptions=True)
 
     async def test_one_hung_transport_does_not_stall_startup(self):
         class Slow:
@@ -13215,9 +13308,10 @@ class TestTheSourceUniverseIsActuallyWired(unittest.TestCase):
         self.assertEqual(transport_report.unsupported, [])
         self.assertEqual(report.by_state.get("UNKNOWN_KIND", 0), 0)
         # And every non-ready declaration is accounted for by name in exactly
-        # one of the two answerable buckets.
+        # one of the endpoint, credential or verified-unavailable buckets.
         named = {source for source, _ in transport_report.pending_endpoint}
         named |= {source for source, _ in transport_report.unconfigured}
+        named |= {source for source, _ in transport_report.unavailable}
         self.assertEqual(len(named), report.declared - report.ready)
 
     def test_the_registry_spans_regions_and_languages(self):
@@ -13411,8 +13505,8 @@ class TestTelegramNeverPromptsUnderSystemd(unittest.TestCase):
         Compared as values rather than matched as source text: a string check
         passes while the two drift, which is the failure it exists to catch.
         """
-        self.assertEqual(str(telegram_authorize.SESSION_PATH),
-                         TelegramChannelTransport.SESSION_PATH)
+        self.assertEqual(Path(telegram_authorize.SESSION_PATH),
+                         Path(TelegramChannelTransport.SESSION_PATH))
         self.assertEqual(TelegramChannelTransport.SESSION_PATH,
                          "data/telegram/collector")
 
@@ -13494,8 +13588,8 @@ class TestTelegramNeverPromptsUnderSystemd(unittest.TestCase):
         self.assertIn("EnvironmentFile=", message)
 
     def test_the_tool_and_the_transport_agree_on_the_session_path(self):
-        self.assertEqual(str(telegram_authorize.SESSION_PATH),
-                         TelegramChannelTransport.SESSION_PATH)
+        self.assertEqual(Path(telegram_authorize.SESSION_PATH),
+                         Path(TelegramChannelTransport.SESSION_PATH))
 
     def test_the_source_never_calls_the_prompting_entry_point(self):
         """Telethon's start() is the one that prompts; connect() is not."""
@@ -13667,7 +13761,8 @@ class TestEachSourceMinesOnItsOwnClock(unittest.IsolatedAsyncioTestCase):
         pool = DataMinerPool(on_records=explode)
         pool.register(self._spec(), self._fetch())
         result = (await pool.run_due(time.time() + 1_000))[0]
-        self.assertEqual(result.status, "OK")
+        self.assertEqual(result.status, "DATA_BLOCKED")
+        self.assertIn("consumer failed", result.detail)
         self.assertEqual(pool._health["m"].passes, 1)
 
     async def test_miners_are_staggered_rather_than_all_due_at_once(self):
@@ -14318,6 +14413,10 @@ class TestNativeRouteIsActuallyTaken(unittest.IsolatedAsyncioTestCase):
 
     def _engine(self, curve=None):
         engine = ExecutionEngine.__new__(ExecutionEngine)
+        # Submission now needs an earned stage as well as `dry_run`, and
+        # these engines skip __init__.
+        engine.promotion_ledger = None
+        engine.simulation_reasons = {}
         engine.pump_route = NativePumpRoute()
         engine.curve_state_provider = (lambda token: curve) if curve else None
         engine.pumpswap_route = None
@@ -14373,17 +14472,29 @@ class TestNativeRouteIsActuallyTaken(unittest.IsolatedAsyncioTestCase):
             return SimpleNamespace(output_amount=123, route_type=RouteType.JUPITER_V1)
         return get_quote
 
-    async def test_the_dry_run_gate_guards_the_native_path_too(self):
+    async def test_every_gate_guards_the_native_path_too(self):
         """A path whose safety gate is only on the other branch will one day
-        be the branch taken."""
+        be the branch taken.
+
+        Three gates now, not one: the operator's `dry_run` intent, the
+        EARNED promotion stage, and the live-trading acknowledgement. All
+        three have to be visible on this branch, because this is the branch
+        that spends money.
+        """
         source = Path("src/execution/jupiter_jito.py").read_text()
         tree = ast.parse(source)
         native = next(node for node in ast.walk(tree)
                       if isinstance(node, ast.AsyncFunctionDef)
                       and node.name == "_execute_native")
         text = ast.unparse(native)
-        self.assertIn("self.dry_run", text)
+        self.assertIn("self._submission_blocked()", text)
         self.assertIn("ALLOW_LIVE_TRADING", text)
+        blocker = next(node for node in ast.walk(tree)
+                       if isinstance(node, ast.FunctionDef)
+                       and node.name == "_submission_blocked")
+        blocker_text = ast.unparse(blocker)
+        self.assertIn("self.dry_run", blocker_text)
+        self.assertIn("live_capital_authorised", blocker_text)
 
     async def test_hard_invariants_still_run_before_any_route(self):
         engine = self._engine(curve=self._curve(creator=self.MINT))
@@ -14833,9 +14944,29 @@ class TestLocalLiquidity(unittest.TestCase):
             real_sol_reserves=12_000_000_000,
             token_total_supply=10 ** 15, complete=False, creator="c")
         desk = self._desk(state)
-        # Real reserves preferred: 12 SOL at $150.
+        # The VIRTUAL reserve: 30 SOL at $150. This assertion used to read the
+        # real reserve, and that was the bug. Real reserves start at zero and
+        # a fresh curve therefore reported its full virtual depth, then
+        # reported a thirtieth of it as soon as one person bought -- depth
+        # falling because a launch started working. Virtual reserves are
+        # monotone and are what the constant product prices impact from. What
+        # the curve can actually PAY OUT is a different question, answered by
+        # `_measured_depth_usd` rather than smuggled into this one.
         self.assertAlmostEqual(
-            MemecoinQuantDesk._local_liquidity(desk, "mint"), 12.0 * 150.0)
+            MemecoinQuantDesk._local_liquidity(desk, "mint"), 30.0 * 150.0)
+
+    def test_buying_never_shrinks_the_reported_depth(self):
+        """The regression this class now exists to hold down."""
+        def curve(real_sol):
+            return BondingCurveState(
+                virtual_token_reserves=1_000_000_000_000,
+                virtual_sol_reserves=30_000_000_000 + real_sol,
+                real_token_reserves=800_000_000_000,
+                real_sol_reserves=real_sol,
+                token_total_supply=10 ** 15, complete=False, creator="c")
+        readings = [MemecoinQuantDesk._local_liquidity(self._desk(curve(x)), "mint")
+                    for x in (0, 100_000_000, 12_000_000_000, 60_000_000_000)]
+        self.assertEqual(readings, sorted(readings))
 
     def test_a_reconstruction_falls_back_to_the_virtual_reserve(self):
         state = BondingCurveState(
@@ -16372,16 +16503,19 @@ class TestTheHazardModelIsMemoryBounded(unittest.TestCase):
 
     def test_a_failed_spill_is_counted_not_silent(self):
         """An invisible hole is what makes a research corpus quietly wrong."""
-        model = ContinuousRugHazardModel(
-            SimpleNamespace(name="solana"), None, None, None, None,
-            spill_path=Path("/proc/nonexistent-dir/hazard.jsonl"))
-        model.max_tracked_tokens = 1
-        model.record_observation("stale", {"type": "trade"})
-        model.record_observation("fresh", {"type": "trade"})
-        model._last_touched["stale"] = 0.0
-        model.prune()
-        self.assertEqual(model.spill_failures, 1)
-        self.assertEqual(model.tokens_spilled, 0)
+        with tempfile.TemporaryDirectory() as directory:
+            blocker = Path(directory) / "not-a-directory"
+            blocker.write_text("fixture prevents creating a child directory")
+            model = ContinuousRugHazardModel(
+                SimpleNamespace(name="solana"), None, None, None, None,
+                spill_path=blocker / "hazard.jsonl")
+            model.max_tracked_tokens = 1
+            model.record_observation("stale", {"type": "trade"})
+            model.record_observation("fresh", {"type": "trade"})
+            model._last_touched["stale"] = 0.0
+            model.prune()
+            self.assertEqual(model.spill_failures, 1)
+            self.assertEqual(model.tokens_spilled, 0)
 
 
 class TestTheCensusKnowsWhichLaunchesStillNeedADeathVerdict(unittest.TestCase):
@@ -17389,13 +17523,20 @@ class TestTheDeskShedsContextBeforeTheKernelShedsIt(unittest.TestCase):
         against 4 GB while its real cap was 900 MB, reported band CALM at
         11% of a ceiling it is killed long before reaching, and had never
         fired a single trim or shed."""
-        paths = _own_cgroup_paths()
+        # Supply the Linux proc record explicitly. The path derivation must
+        # remain testable on Windows and on CI without systemd/cgroups.
+        membership = "0::/user.slice/user-1000.slice/user@1000.service/memecoin-shadow.service\n"
+        with mock.patch("src.runtime.memory_governor.Path.read_text", return_value=membership):
+            paths = _own_cgroup_paths()
         self.assertTrue(paths, "no cgroup paths derived from /proc/self/cgroup")
+        base = Path("/sys/fs/cgroup")
+        self.assertEqual(Path(paths[0]), base / "user.slice" / "user-1000.slice"
+                         / "user@1000.service" / "memecoin-shadow.service" / "memory.max")
         # Most specific first, so a unit's own cap wins over its slice's.
         self.assertTrue(paths[0].endswith(("memory.max", "memory.limit_in_bytes")))
-        self.assertNotEqual(paths[0], "/sys/fs/cgroup/memory.max")
+        self.assertNotEqual(Path(paths[0]), base / "memory.max")
         for candidate in paths:
-            self.assertTrue(candidate.startswith("/sys/fs/cgroup"))
+            self.assertTrue(Path(candidate).is_relative_to(base))
         # Walks upward: later entries are ancestors of earlier ones.
         self.assertGreater(len(paths[0]), len(paths[-1]))
 
@@ -17638,6 +17779,9 @@ class TestTheIsolatedSignerWorksEndToEnd(unittest.IsolatedAsyncioTestCase):
     real trade."""
 
     async def _serve(self, tmp, **policy):
+        import socket
+        if not hasattr(socket, "AF_UNIX"):
+            self.skipTest("AF_UNIX is unavailable on this Python/OS")
         from solders.keypair import Keypair as KP
         from src.execution.signer import SignerServer, SignerService, SignerPolicy
         policy.setdefault("require_live_ack", False)
@@ -19266,12 +19410,21 @@ class TestShadowExercisesTheExecutionPath(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(source.count("await self._build_native_signed("), 2)
         self.assertNotIn("await self.tx_builder.build_and_sign(", source)
 
-    def test_dry_run_never_submits(self):
+    def test_a_blocked_submission_never_submits(self):
+        """The guard is no longer `dry_run` alone.
+
+        Submission requires an operator's intent AND an earned promotion
+        stage, so the branch that must not touch the network is the one
+        `_submission_blocked` selects -- and it must still build and sign,
+        which is what keeps the live path exercised in shadow.
+        """
         source = inspect.getsource(ExecutionEngine._execute_native)
-        dry = source[source.index("if self.dry_run:"):
-                     source.index("TransactionStatus.SIMULATED")]
+        self.assertIn("blocked = self._submission_blocked()", source)
+        blocked = source[source.index("blocked = self._submission_blocked()"):
+                         source.index("TransactionStatus.SIMULATED")]
         for forbidden in ("_submit_signed", "send_transaction", "self.jito."):
-            self.assertNotIn(forbidden, dry)
+            self.assertNotIn(forbidden, blocked)
+        self.assertIn("_build_native_signed", blocked)
 
     def test_an_unexercised_path_reports_blocked(self):
         engine = ExecutionEngine.__new__(ExecutionEngine)

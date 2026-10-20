@@ -1,4 +1,5 @@
 import asyncio
+import math
 import dataclasses
 import logging
 import time
@@ -1090,6 +1091,68 @@ class WalletIntelligenceEngine:
 
     def get_regime_performance(self, wallet: str, regime: WalletRegime) -> Optional[WalletRegimePerformance]:
         return self.regime_performances.get(wallet, {}).get(regime)
+
+    #: Ceiling on the confidence an UNMEASURED wallet can carry, and the floor
+    #: for a measured one. The gap is deliberate and structural: a wallet whose
+    #: followed outcomes have a positive lower bound has been shown to grow our
+    #: capital, and a wallet with a high composite score has been shown to
+    #: score highly on a formula. Those are not the same kind of fact, and no
+    #: amount of the second may outrank the first.
+    UNMEASURED_CONFIDENCE_CEILING = 0.49
+    MEASURED_CONFIDENCE_FLOOR = 0.50
+    #: Lower-bound log return at which a measured wallet's confidence is most
+    #: of the way to its ceiling. 0.10 per followed trade is already a strong
+    #: wallet; the map saturates so one outlier cannot buy certainty.
+    CONFIDENCE_SCALE = 0.10
+
+    def followable_wallets(self, limit: int = 50,
+                           regime: Optional[WalletRegime] = None,
+                           include_unmeasured: bool = True) -> Dict[str, float]:
+        """Wallets worth acting on, and how much each one's signal is worth.
+
+        This is the production read, and it exists because the alternative was
+        being used everywhere. `get_top_wallets` ranks by `overall_score`: a
+        hand-weighted composite of early-entry quality at 0.25, forward return
+        at 0.30, consistency at 0.20, independence at 0.15 and sample size at
+        0.10, times one minus half the rug exposure, times one minus three
+        tenths of a crowding estimate. Every one of those numbers was chosen
+        rather than measured, and none of them answers whether FOLLOWING the
+        wallet would have made money -- which is the only question a copier
+        has. A wallet can score beautifully on all five and be uncopyable
+        because its edge is being first, and by the time its fill is public the
+        information is in the price.
+
+        So measured value leads. `wallet_value` holds what following each
+        wallet actually returned at fills we could have got, and ranks on the
+        lower confidence bound rather than the mean. The composite survives
+        only as the fallback for wallets with no measurement yet, capped below
+        every measured wallet, and that is the whole of its remaining
+        authority.
+
+        ``include_unmeasured`` must be False wherever the answer becomes a
+        TRAINING FEATURE. Marking a buyer "smart" because a formula scored it
+        highly and then training a model on that column teaches the model the
+        formula, and the model will faithfully reproduce whatever the formula
+        was wrong about. For watching and discovery the fallback is harmless,
+        because watching a wallet costs a subscription rather than capital.
+        """
+        confidences: Dict[str, float] = {}
+        for value in self.wallet_value.rank(
+                limit=limit, regime=regime.value if regime else "",
+                followable_only=True):
+            saturated = 1.0 - math.exp(-max(0.0, value.lower_bound) / self.CONFIDENCE_SCALE)
+            confidences[value.wallet] = min(
+                0.99, self.MEASURED_CONFIDENCE_FLOOR + 0.49 * saturated)
+        if not include_unmeasured or len(confidences) >= limit:
+            return confidences
+        for score in self.get_top_wallets(regime=regime, limit=limit):
+            if len(confidences) >= limit:
+                break
+            if score.wallet in confidences:
+                continue
+            confidences[score.wallet] = min(self.UNMEASURED_CONFIDENCE_CEILING,
+                                            float(score.overall_score))
+        return confidences
 
     def get_top_wallets(self, regime: Optional[WalletRegime] = None, limit: int = 20) -> List[WalletScore]:
         scores = list(self.wallet_scores.values())

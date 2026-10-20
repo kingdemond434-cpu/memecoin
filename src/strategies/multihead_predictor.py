@@ -50,6 +50,30 @@ SURVIVAL_LEVELS: Tuple[Tuple[PredictionTarget, float], ...] = (
     (PredictionTarget.P_500X, 500.0),
 )
 
+#: How far past the LAST measured survival rung the desk is ever willing to
+#: answer, as a multiple of that rung. The continuation model extrapolates
+#: along a fitted power law inside this reach, so the highest multiple the
+#: desk can produce a survival probability for is 500x * 8 = 4000x.
+TAIL_REACH_CAP = 8.0
+
+#: The ceiling on any predicted feasible multiple.
+#:
+#: This was `SURVIVAL_LEVELS[-1][1]` -- 500x -- and that made two parts of the
+#: system disagree about how large a launch can be. The survival curve already
+#: answers P(M >= 1000x) and P(M >= 4000x) by fitting the tail past its last
+#: rung, while the point estimate those probabilities are supposed to price
+#: was clipped at 500x. A 500x token, a 1000x token and a 4000x token
+#: collapsed into one number on the way to sizing, which is precisely the
+#: distinction a tail strategy exists to make.
+#:
+#: It is still a ceiling, and it still has to be: exp() of a boosted-tree
+#: output is unbounded, so without one an overflow would not raise, it would
+#: silently authorise an enormous claimed upside. But it is now the same
+#: horizon the survival curve is willing to speak about rather than a rung
+#: chosen for being last.
+FEASIBLE_MULTIPLE_CEILING = SURVIVAL_LEVELS[-1][1] * TAIL_REACH_CAP
+
+
 # What a launch IS, at the age the decision is being made.
 #
 # A pooled model trained across every horizon learns the average launch, and
@@ -147,8 +171,24 @@ LOG_TARGET_FLOOR = 0.02
 #: removes claimed upside from the survival bins and keeps the mega-event
 #: reserve at baseline. The rungs the entry decision actually gates on (p_2x,
 #: p_5x) are NOT in this set and still block their band when uncoverable.
+#:
+#: P_50X JOINED THIS SET 2026-09-03, on evidence rather than symmetry. A full
+#: supervisor round over 1,200 episodes trained p_2x, p_5x, p_10x, p_20x and
+#: p_migration, fell back to a conservative zero on p_100x, p_250x and p_500x
+#: as designed -- and then FAILED the whole band on p_50x, the one remaining
+#: mega-tail rung still marked required. Every head the entry decision gates
+#: on had fitted; the band was blocked by the head that decides least.
+#:
+#: This is not a fixture artifact. A 50x is rarer than roughly one launch in a
+#: thousand, and the flash band's fit window is a couple of thousand rows, so a
+#: chronological split leaving zero 50x positives on one side is an ordinary
+#: month rather than a pathological one. p_20x is the next rung down and the
+#: same arithmetic is starting to apply to it; it is left required until a run
+#: shows it blocking a band, because moving a rung here on symmetry rather
+#: than evidence is how the whole ladder quietly becomes optional.
 OPTIONAL_TAIL_TARGETS = {
-    PredictionTarget.P_100X, PredictionTarget.P_250X, PredictionTarget.P_500X,
+    PredictionTarget.P_50X, PredictionTarget.P_100X, PredictionTarget.P_250X,
+    PredictionTarget.P_500X,
 }
 
 
@@ -177,7 +217,7 @@ def _from_log_space(value: float) -> float:
     raise, it would silently authorise an enormous claimed upside. Bounded at
     the top of the survival curve, which is the most any consumer may believe.
     """
-    ceiling = float(SURVIVAL_LEVELS[-1][1])
+    ceiling = FEASIBLE_MULTIPLE_CEILING
     if not np.isfinite(value):
         return LOG_TARGET_FLOOR
     return float(np.clip(np.exp(np.clip(value, -50.0, np.log(ceiling))),
@@ -208,6 +248,20 @@ class PredictionFeatures:
     sol_volume: float = 0
     organic_ratio: float = 0
     bundle_concentration: float = 0
+    #: Independent decisions among the opening buyers, over the raw count.
+    #: 1.0 is twenty-five separate people; 0.12 is one operator in
+    #: twenty-five hats. `organic_ratio` counts DISTINCT wallets and
+    #: `bundle_concentration` counts same-slot arrivals -- neither can see a
+    #: ring that funds from one source and enters over several slots, which
+    #: is what a competent bundler looks like. The ring detector has been
+    #: learning those sets across every observed launch and nothing ever
+    #: asked it, so this is the first time the model can tell a First-25
+    #: from a First-3 wearing hats.
+    #:
+    #: 1.0 when unmeasured, which is the no-evidence answer rather than the
+    #: suspicious one: penalising a launch for a ring nobody has detected
+    #: would be inventing the ring.
+    ring_compression: float = 1.0
     
     liquidity_usd: float = 0
     liquidity_locked: bool = False
@@ -285,6 +339,7 @@ class PredictionFeatures:
             min(self.sol_volume / 100, 1),
             self.organic_ratio,
             self.bundle_concentration,
+            float(np.clip(self.ring_compression, 0.0, 1.0)),
             min(self.liquidity_usd / 50000, 1),
             float(self.liquidity_locked),
             self.buy_tax / 100,
@@ -391,7 +446,8 @@ class MultiHeadPredictor:
             "wallet_quality_weighted_flow", "sybil_discount",
             "smart_wallet_sync_evidence", "initial_buyers",
             "smart_buyers", "insider_buyers", "buyer_acceleration", "buy_velocity",
-            "sol_volume", "organic_ratio", "bundle_concentration", "liquidity_usd",
+            "sol_volume", "organic_ratio", "bundle_concentration",
+            "ring_compression", "liquidity_usd",
             "liquidity_locked", "buy_tax", "sell_tax", "ownership_renounced",
             "can_mint", "can_freeze", "social_velocity", "social_acceleration",
             "social_price_disagreement",
@@ -417,6 +473,11 @@ class MultiHeadPredictor:
         self.model_version = "1.0"
         self._training_data: Dict[PredictionTarget, List[Tuple[np.ndarray, float, float]]] = defaultdict(list)
         self._is_trained = False
+        #: Per-head training outcome, including how many positives each
+        #: classification head saw. Empty on a bundle saved before this
+        #: existed, which reads as "unknown" and refuses to certify a head --
+        #: fail-closed, and no forced retrain.
+        self.head_report: Dict[str, Dict[str, Any]] = {}
         self.validation_report: Dict[str, Any] = {}
 
     def initialize_models(self):
@@ -490,7 +551,7 @@ class MultiHeadPredictor:
                             self.models[target] = ConstantZeroClassifier()
                             results[target.value] = {
                                 "status": "untrained_conservative_zero",
-                                "samples": len(data),
+                                "samples": len(data), "positives": 0,
                                 "calibration": "constant_zero_no_positive_class",
                             }
                             continue
@@ -516,6 +577,15 @@ class MultiHeadPredictor:
                 results[target.value] = {
                     "status": "trained", "samples": len(data), "calibration": calibration,
                 }
+                if target in CLASSIFICATION_TARGETS:
+                    # How many times the head actually SAW its positive class.
+                    # A tail head fitted on eleven 50x launches produces a
+                    # number, and nothing downstream could previously tell
+                    # that number apart from one fitted on nine hundred. The
+                    # conditional continuation probability is a RATIO of two
+                    # of these, which is exactly where a handful of positives
+                    # turns into false conviction.
+                    results[target.value]["positives"] = int(np.sum(y))
                 logger.info(f"Trained {target.value} on {len(data)} samples")
                 
             except Exception as e:
@@ -528,8 +598,27 @@ class MultiHeadPredictor:
         }
         required = set(PredictionTarget)
         self._is_trained = required.issubset(trained_targets)
+        self.head_report = dict(results)
         self.model_version = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
         return results
+
+    def head_positives(self, target: PredictionTarget) -> Optional[int]:
+        """How many positives this head trained on, or None if unrecorded."""
+        entry = self.head_report.get(target.value)
+        if not isinstance(entry, dict):
+            return None
+        positives = entry.get("positives")
+        return None if positives is None else int(positives)
+
+    def is_calibrated(self, target: PredictionTarget) -> bool:
+        """Whether this head's output passed through a fitted isotonic map.
+
+        A raw gradient-boosting score is an ordering, not a probability, and
+        the whole point of a conditional survival RATIO is that both terms are
+        on a probability scale. Uncalibrated heads produce a number of the
+        right shape and the wrong meaning.
+        """
+        return self._is_trained and target in self.calibrators
 
     def predict(self, features: PredictionFeatures) -> Optional[MultiHeadPrediction]:
         if not self._is_trained:
@@ -562,7 +651,7 @@ class MultiHeadPredictor:
                     elif target == PredictionTarget.EXPECTED_HOLD_TIME:
                         val = max(0, val)
                     elif target == PredictionTarget.EXPECTED_FEASIBLE_MULTIPLE:
-                        val = np.clip(val, 0.02, SURVIVAL_LEVELS[-1][1])
+                        val = np.clip(val, 0.02, FEASIBLE_MULTIPLE_CEILING)
                     setattr(pred, target.value, float(val))
             except Exception as e:
                 logger.error(f"Prediction failed for {target.value}: {e}")
@@ -605,7 +694,7 @@ class MultiHeadPredictor:
                         elif target == PredictionTarget.EXPECTED_HOLD_TIME:
                             val = max(0, val)
                         elif target == PredictionTarget.EXPECTED_FEASIBLE_MULTIPLE:
-                            val = np.clip(val, 0.02, SURVIVAL_LEVELS[-1][1])
+                            val = np.clip(val, 0.02, FEASIBLE_MULTIPLE_CEILING)
                         setattr(pred, target.value, float(val))
                 except Exception as e:
                     logger.error(f"Batch prediction failed for {target.value}: {e}")
@@ -641,6 +730,7 @@ class MultiHeadPredictor:
             # this; the explicit stamp means a future head joining or leaving
             # LOG_SPACE_TARGETS is caught too, when the version would not move.
             "log_space_targets": sorted(item.value for item in LOG_SPACE_TARGETS),
+            "head_report": dict(self.head_report),
         }
         joblib.dump(data, path)
         logger.info(f"Saved models to {path}")
@@ -664,6 +754,10 @@ class MultiHeadPredictor:
                 f"{expected_log_targets}")
         self.models = data["models"]
         self.calibrators = data["calibrators"]
+        # Optional rather than required, so a bundle predating it still
+        # loads. It then certifies no head, and the continuation model
+        # declines to grant an override rather than granting one blind.
+        self.head_report = dict(data.get("head_report") or {})
         self.model_version = data["model_version"]
         self.validation_report = dict(data["validation_report"])
         self._is_trained = True
@@ -780,6 +874,8 @@ class ElogwEngine:
         self.daily_giveback_arm_pct = daily_giveback_arm_pct
         self.min_edge_bps = min_edge_bps
         self.max_liquidity_fraction = max_liquidity_fraction
+        self._ceiling_counts: Dict[str, int] = {}
+        self._depth_bound_fractions: List[float] = []
         self.harvest_trigger_ratio = max(0.0, harvest_trigger_ratio)
         self.harvest_slope = max(0.0, harvest_slope)
         self.small_account_mode = bool(small_account_mode)
@@ -968,7 +1064,7 @@ class ElogwEngine:
             survival.append((name, max(0.0, probability - higher), multiple - 1.0))
         if prediction.expected_feasible_multiple > 0:
             feasible_return = float(np.clip(prediction.expected_feasible_multiple - 1,
-                                            -0.98, SURVIVAL_LEVELS[-1][1] - 1.0))
+                                            -0.98, FEASIBLE_MULTIPLE_CEILING - 1.0))
             survival = [
                 (name, probability, min(outcome, feasible_return) if outcome > 0 else outcome)
                 for name, probability, outcome in survival
@@ -1016,27 +1112,119 @@ class ElogwEngine:
         value -= self.uncertainty_penalty * entropy * fraction
         return value / self.risk_aversion
 
-    def exposure_cap(self, liquidity_usd: float) -> float:
-        """Largest fraction of equity this token may take, across all ceilings."""
+    #: Ceilings, and which one bound the last sizing. Counted because the
+    #: DEPTH ceiling is the one that ends compounding, and it does so silently.
+    #:
+    #: `liquidity_usd * max_liquidity_fraction / portfolio_value` already
+    #: falls as equity grows -- at $1k a 5% position needs a $5k pool, at
+    #: $100k it would need a $500k pool, and early Pump curves do not have
+    #: one in the minutes that produce the tail. Nothing is broken when that
+    #: binds; the book is correctly refusing to be a tenth of a pool. But a
+    #: desk whose positions have quietly shrunk from 5% of equity to 0.5%
+    #: looks exactly like a desk that stopped finding trades, and the two
+    #: need opposite responses: one wants more capital deployed elsewhere,
+    #: the other wants more edge.
+    #: How many depth-bound fractions to keep for the median. Bounded so a
+    #: long-running desk does not accumulate one float per sizing forever.
+    CEILING_SAMPLE = 512
+
+    CEILING_CONCENTRATION = "concentration"
+    CEILING_MAX_POSITION_USD = "max_position_usd"
+    CEILING_POOL_DEPTH = "pool_depth"
+    #: The same ceiling, but from a measured exit frontier rather than from a
+    #: flat fraction of reserves. Named apart so the capacity report can say
+    #: which of the two actually bound the book -- "depth capped it" means
+    #: something very different when the depth was measured.
+    CEILING_MEASURED_DEPTH = "measured_exit_depth"
+
+    def exposure_ceilings(self, liquidity_usd: float,
+                          depth_usd: Optional[float] = None) -> Dict[str, float]:
+        """Every ceiling, as a fraction of equity, before the min is taken.
+
+        ``depth_usd`` is the notional a measured exit frontier says can really
+        be sold inside the acceptable impact. When it is supplied it REPLACES
+        the flat `liquidity * max_liquidity_fraction` rule rather than joining
+        it, because the two answer the same question and only one of them
+        answers it with evidence. The flat fraction survives as the fallback
+        for the case the frontier could not be measured -- notably a brand new
+        curve holding no real SOL, where exit depth is a forecast about flow
+        that has not arrived yet and no measurement exists to take.
+        """
         if self.portfolio_value <= 0 or liquidity_usd <= 0:
+            return {}
+        ceilings = {
+            self.CEILING_CONCENTRATION:
+                self.small_account_concentration(liquidity_usd),
+            self.CEILING_MAX_POSITION_USD:
+                self.max_position_usd / self.portfolio_value,
+        }
+        if depth_usd is not None and float(depth_usd) > 0:
+            ceilings[self.CEILING_MEASURED_DEPTH] = float(depth_usd) / self.portfolio_value
+        else:
+            ceilings[self.CEILING_POOL_DEPTH] = (
+                liquidity_usd * self.max_liquidity_fraction / self.portfolio_value)
+        return ceilings
+
+    def binding_ceiling(self, liquidity_usd: float,
+                        depth_usd: Optional[float] = None) -> Tuple[str, float]:
+        """Which ceiling actually caps this position, and at what fraction."""
+        ceilings = self.exposure_ceilings(liquidity_usd, depth_usd)
+        if not ceilings:
+            return "", 0.0
+        name = min(ceilings, key=lambda key: ceilings[key])
+        return name, float(ceilings[name])
+
+    def exposure_cap(self, liquidity_usd: float,
+                     depth_usd: Optional[float] = None) -> float:
+        """Largest fraction of equity this token may take, across all ceilings."""
+        name, cap = self.binding_ceiling(liquidity_usd, depth_usd)
+        if not name:
             return 0.0
-        return min(
-            self.small_account_concentration(liquidity_usd),
-            self.max_position_usd / self.portfolio_value,
-            liquidity_usd * self.max_liquidity_fraction / self.portfolio_value,
-        )
+        self._ceiling_counts[name] = self._ceiling_counts.get(name, 0) + 1
+        if name in (self.CEILING_POOL_DEPTH, self.CEILING_MEASURED_DEPTH):
+            self._depth_bound_fractions.append(cap)
+            del self._depth_bound_fractions[:-self.CEILING_SAMPLE]
+        return cap
+
+    def capacity_report(self) -> Dict[str, Any]:
+        """How often depth is what caps the book, and how hard.
+
+        Read alongside the promotion ladder: a rising depth share with a
+        falling median fraction is the capacity wall, and it is the point at
+        which adding capital stops raising the growth rate.
+        """
+        total = sum(self._ceiling_counts.values())
+        if not total:
+            return {"status": "DATA_BLOCKED", "detail": "nothing sized yet"}
+        depth = (self._ceiling_counts.get(self.CEILING_POOL_DEPTH, 0)
+                 + self._ceiling_counts.get(self.CEILING_MEASURED_DEPTH, 0))
+        fractions = sorted(self._depth_bound_fractions)
+        median = (fractions[len(fractions) // 2] if fractions else None)
+        return {
+            "status": "OK",
+            "sized": total,
+            "bound_by": dict(sorted(self._ceiling_counts.items())),
+            "depth_bound_share": depth / total,
+            "median_depth_bound_fraction": median,
+            "portfolio_value_usd": self.portfolio_value,
+            "detail": ("" if depth / total < 0.5 else
+                       "pool depth is capping most positions; equity is "
+                       "past what early curves can absorb, and more capital "
+                       "will not raise the growth rate"),
+        }
 
     def calculate_expected_log_growth(
         self,
         prediction: MultiHeadPrediction,
         sol_price_usd: float,
         liquidity_usd: float,
+        depth_usd: Optional[float] = None,
     ) -> Tuple[float, float, float]:
         if self.portfolio_value <= 0 or sol_price_usd <= 0 or liquidity_usd <= 0:
             return -float("inf"), 0.0, 0.0
         if self._growth_inputs(prediction) is None:
             return -float("inf"), 0.0, 0.0
-        cap = self.exposure_cap(liquidity_usd)
+        cap = self.exposure_cap(liquidity_usd, depth_usd)
         if cap <= 0:
             return -float("inf"), 0.0, 0.0
         fractions = np.linspace(0, cap, 401)
@@ -1207,6 +1395,7 @@ class ElogwEngine:
         sol_price_usd: float,
         liquidity_usd: float,
         disagreement: Optional[Any] = None,
+        depth_usd: Optional[float] = None,
     ) -> Dict:
         """The size a candidate would take, and what that size is worth.
 
@@ -1223,7 +1412,7 @@ class ElogwEngine:
         unanimous or barely carried.
         """
         elogw, fraction, size_sol = self.calculate_expected_log_growth(
-            prediction, sol_price_usd, liquidity_usd)
+            prediction, sol_price_usd, liquidity_usd, depth_usd)
         shrink = 1.0
         if disagreement is not None and getattr(disagreement, "ok", False):
             shrink = float(getattr(disagreement, "shrink", 1.0))
@@ -1246,6 +1435,11 @@ class ElogwEngine:
             # halved deserves to say what halved it, and the forward ledger
             # needs it to ask whether shrinking was right.
             "disagreement_shrink": shrink,
+            # Which ceiling bound this size, and on what evidence. A position
+            # capped by a measured exit frontier and one capped by a flat
+            # fraction of reserves look identical downstream otherwise.
+            "binding_ceiling": self.binding_ceiling(liquidity_usd, depth_usd)[0],
+            "measured_depth_usd": depth_usd,
             "disagreement": (disagreement.to_dict()
                              if disagreement is not None
                              and hasattr(disagreement, "to_dict") else None),

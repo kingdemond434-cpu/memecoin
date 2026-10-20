@@ -128,14 +128,60 @@ class RugDetector:
         #: has a sell route by construction and the router has never heard
         #: of it -- see _check_sell_route.
         self.curve_state_provider = curve_state_provider
+        #: mint -> the launch venue's account (a pump.fun bonding curve).
+        #: Supplied so holder concentration can tell the AMM apart from a
+        #: whale; without it every new launch reads as 100% concentrated.
+        self.curve_account_provider: Any = None
+        #: Why the native bonding-curve route was skipped, by cause. Every
+        #: entry here is a launch the ROUTER was asked about instead, and the
+        #: router's ignorance of a seconds-old mint is what hard-vetoes.
+        self.curve_route_skips: Dict[str, int] = {}
         self._cache: Dict[str, Tuple[TokenRiskReport, float]] = {}
         self._cache_ttl = 30
 
-    def set_quote_provider(self, quote_provider: Any):
-        self.quote_provider = quote_provider
+    def sell_route_report(self) -> Dict[str, Any]:
+        """How often the native curve route was skipped, and why.
 
-    def set_curve_state_provider(self, provider: Any):
-        self.curve_state_provider = provider
+        Every skip is a launch the ROUTER was asked about instead. Jupiter has
+        not indexed a mint that is seconds old, and a hard veto built on that
+        ignorance rejects launches this desk can sell natively -- which is the
+        failure this whole method was rewritten to prevent on 2026-08-29, and
+        which recurred on 2026-09-04 with 678 decided launches vetoed and zero
+        entered. It recurred invisibly because nothing counted the skips.
+        """
+        skips = dict(sorted((getattr(self, "curve_route_skips", None) or {}).items(),
+                            key=lambda item: -item[1]))
+        total = sum(skips.values())
+        return {
+            "status": "OK" if total else "DATA_BLOCKED",
+            "curve_route_skips": skips,
+            "skipped_total": total,
+            "detail": ("" if not total else
+                       "these launches were priced by the router instead of "
+                       "the bonding curve; a hard veto from a router that has "
+                       "not indexed the mint is ignorance, not a property of "
+                       "the token"),
+        }
+
+    def cache_key(self, token_address: str,
+                  deployer_address: Optional[str] = None) -> str:
+        return f"{self.chain_config.name}:{token_address}:{deployer_address or ''}"
+
+    def cached_report(self, token_address: str,
+                      deployer_address: Optional[str] = None) -> Optional[TokenRiskReport]:
+        """The completed audit if one is in hand, WITHOUT awaiting anything.
+
+        `analyze` is three to five sequential RPC round trips, and awaiting
+        it to discover that the answer was already cached still costs a
+        coroutine hop through a hot path where the desk is otherwise counting
+        microseconds. More importantly it makes "do I have this yet?" and "go
+        and fetch this" the same call, so a T0 decision cannot ask the first
+        question without risking the second.
+        """
+        cached = self._cache.get(self.cache_key(token_address, deployer_address))
+        if cached and time.time() - cached[1] < self._cache_ttl:
+            return cached[0]
+        return None
 
     async def analyze(
         self,
@@ -241,14 +287,25 @@ class RugDetector:
         checks["developer_balance"] = developer
         if holders.get("status") == "DATA_BLOCKED":
             blocked.append("holders")
-        top10 = float(holders.get("top_10_pct", 0))
+        raw_top10 = holders.get("top_10_pct")
         top20 = holders.get("top_20_pct")
-        if top10 > 80:
-            warnings.append(f"Top token accounts hold {top10:.1f}% of supply")
-            score -= 25
-        elif top10 > 50:
-            warnings.append(f"Top token accounts hold {top10:.1f}% of supply")
-            score -= 10
+        if raw_top10 is None:
+            # The launch venue still holds everything, so concentration is
+            # not measured rather than zero. Penalising it would fine every
+            # token for being new; crediting it would be reassurance about a
+            # measurement nobody made.
+            blocked.append("holder_concentration")
+            top10 = None
+        else:
+            top10 = float(raw_top10)
+            if top10 > 80:
+                warnings.append(
+                    f"Top accounts hold {top10:.1f}% of circulating supply")
+                score -= 25
+            elif top10 > 50:
+                warnings.append(
+                    f"Top accounts hold {top10:.1f}% of circulating supply")
+                score -= 10
 
         checks["sell_route"] = route
         route_feasible = route.get("feasible")
@@ -342,11 +399,36 @@ class RugDetector:
         }
 
     async def _solana_holder_concentration(self, mint: str, supply: int) -> Dict[str, Any]:
+        """Concentration among REAL holders, against CIRCULATING supply.
+
+        A pump.fun bonding curve holds essentially the whole supply the
+        instant a token is created -- that is what the curve IS, the AMM
+        every buy trades against. Counting it as a holder made every healthy
+        launch look maximally concentrated: `top_10_pct` near 100, which is
+        -25 on the risk score, on every single one, forever.
+
+        Excluding it alone would be the opposite error. With 79% of supply in
+        the curve, the real holders' shares all divide by a denominator that
+        is mostly unbuyable, and genuine concentration reads as trivial. So
+        the curve comes out of BOTH sides: its tokens are not a holding, and
+        they are not circulating either.
+
+        At T0 circulating is ~zero and this is DATA_BLOCKED, which is the
+        honest answer -- nobody holds anything yet, so nothing is
+        concentrated and nothing is diffuse.
+        """
         if supply <= 0:
             return {"status": "OK", "largest_account_count": 0,
                     "holder_count_status": "DATA_BLOCKED",
                     "top_10_pct": 100.0,
                     "top_20_pct": 100.0}
+        curve_account = ""
+        provider = getattr(self, "curve_account_provider", None)
+        if callable(provider):
+            try:
+                curve_account = str(provider(mint) or "")
+            except Exception as exc:
+                logger.debug("curve account lookup failed for %s: %s", mint, exc)
         try:
             result = await self.rpc.request("getTokenLargestAccounts", [mint, {"commitment": "confirmed"}])
             values = (result or {}).get("value", [])
@@ -355,22 +437,55 @@ class RugDetector:
             owners = await self._solana_token_account_owners(addresses)
             accounts = []
             resolved_amount = 0
+            held: List[int] = []
+            curve_amount = 0
             for address, amount in zip(addresses, amounts):
                 owner = owners.get("owners", {}).get(address)
                 if owner:
                     resolved_amount += amount
+                # The curve is the venue, not a holder. Matched on either the
+                # token account itself or its owner, because which of the two
+                # the launch event names varies by launchpad.
+                is_curve = bool(curve_account) and curve_account in (
+                    address, owner or "")
+                if is_curve:
+                    curve_amount += amount
+                else:
+                    held.append(amount)
                 accounts.append({
                     "token_account": address,
                     "owner": owner,
                     "amount_raw": amount,
                     "supply_pct": 100.0 * amount / supply,
+                    "is_launch_venue": is_curve,
                 })
+            circulating = max(0, supply - curve_amount)
+            if curve_account and circulating <= 0:
+                # Everything is still in the curve. Nobody holds anything, so
+                # nothing is concentrated -- and saying 0% would read as
+                # reassurance about a measurement nobody made.
+                return {
+                    "status": "OK",
+                    "largest_account_count": len(values),
+                    "holder_count_status": "DATA_BLOCKED",
+                    "concentration_status": "DATA_BLOCKED",
+                    "top_10_pct": None, "top_20_pct": None,
+                    "curve_held_pct": 100.0 * curve_amount / supply,
+                    "circulating_supply": 0,
+                    "accounts": accounts,
+                    "detail": "the launch venue still holds the entire supply",
+                }
+            denominator = circulating if curve_account else supply
             return {
                 "status": "OK",
                 "largest_account_count": len(values),
                 "holder_count_status": "DATA_BLOCKED",
-                "top_10_pct": 100.0 * sum(amounts[:10]) / supply,
-                "top_20_pct": 100.0 * sum(amounts) / supply,
+                "concentration_status": "OK",
+                "curve_held_pct": (100.0 * curve_amount / supply
+                                   if curve_account else None),
+                "circulating_supply": denominator,
+                "top_10_pct": 100.0 * sum(held[:10]) / denominator,
+                "top_20_pct": 100.0 * sum(held) / denominator,
                 "owner_enrichment_status": owners.get("status", "DATA_BLOCKED"),
                 "owner_enrichment_error": owners.get("error"),
                 "owner_resolved_accounts": sum(1 for item in accounts if item["owner"]),
@@ -500,12 +615,44 @@ class RugDetector:
         # that ignorance into {"status": "OK", "feasible": False} -- a
         # CONFIDENT false rather than a gap, which is why it hard-vetoed
         # instead of degrading to uncertainty.
+        # WHY the curve path was not taken, when it was not. Without this the
+        # fall-through is silent, and the router's opinion about a mint it has
+        # never indexed becomes a hard veto with no record of the fact that a
+        # native route existed and was simply not looked up. Measured
+        # 2026-09-04: 678 decided launches, every one hard-vetoed, with
+        # catastrophic_exit_price_impact in 301 of them -- and that reason
+        # requires a NUMERIC price impact, which the curve branch below never
+        # produces. So the router answered all 301, and this branch was
+        # skipped 301 times without leaving a trace anywhere.
         curve = None
-        if self.curve_state_provider is not None:
+        curve_status = "not_consulted"
+        if self.curve_state_provider is None:
+            curve_status = "no_curve_state_provider"
+        else:
             try:
                 curve = self.curve_state_provider(mint)
-            except Exception:
+            except Exception as exc:
+                # Swallowed silently before. An exception here is a wiring or
+                # lookup fault, and turning it into "no curve" reproduces
+                # exactly the confident-false this method exists to avoid.
+                curve_status = f"curve_lookup_raised:{type(exc).__name__}"
+                logger.warning("curve state lookup failed for %s: %s", mint, exc)
                 curve = None
+            else:
+                if curve is None:
+                    curve_status = "no_cached_curve_state"
+                elif not getattr(curve, "tradeable", False):
+                    curve_status = "curve_not_tradeable"
+        if curve_status != "not_consulted":
+            # Counted through a lazy accessor rather than a bare attribute:
+            # this method is exercised against detectors built by tests and
+            # by callers that predate the counter, and an AttributeError here
+            # would take down the safety report itself over bookkeeping.
+            skips = getattr(self, "curve_route_skips", None)
+            if skips is None:
+                skips = {}
+                self.curve_route_skips = skips
+            skips[curve_status] = skips.get(curve_status, 0) + 1
         if curve is not None and getattr(curve, "tradeable", False):
             return {
                 "status": "OK",
@@ -518,27 +665,57 @@ class RugDetector:
                 "price_impact_pct": None,
                 "detail": "native bonding-curve exit; router not consulted",
             }
+        # Everything below asks the ROUTER about a mint the desk may well be
+        # able to sell natively. The reason it came to that is carried on the
+        # result so a veto built from it can be read back to its cause.
+        router_note = {"curve_status": curve_status}
         if not self.quote_provider or not getattr(self.quote_provider, "_session", None):
-            return {"status": "DATA_BLOCKED", "feasible": None, "reason": "quote provider unavailable"}
+            return {"status": "DATA_BLOCKED", "feasible": None,
+                    "reason": "quote provider unavailable", **router_note}
         amount = min(max(1, mint_state["supply"] // 10_000), 1_000 * 10 ** mint_state["decimals"])
         try:
             quote = await self.quote_provider.get_quote(mint, USDC_MINT, amount, slippage_bps=500)
         except Exception as exc:
-            return {"status": "DATA_BLOCKED", "feasible": None, "error": str(exc)}
+            return {"status": "DATA_BLOCKED", "feasible": None,
+                    "error": str(exc), **router_note}
         if not quote:
             # The router has no route. For a mint it has never indexed that
             # is ignorance, not a property of the token, and the difference
             # decides whether this hard-vetoes or merely adds uncertainty.
             return {"status": "DATA_BLOCKED", "feasible": None,
                     "reason": "router returned no route; it may not have "
-                              "indexed this mint yet"}
+                              "indexed this mint yet", **router_note}
+        # Whether the ROUTER is the right authority here at all.
+        #
+        # It is when the cached curve says this mint has migrated: the pool is
+        # then the only venue and the router prices it correctly. It is NOT
+        # when the curve state is merely unknown -- no provider, nothing
+        # cached, a lookup that raised -- because the desk may well sell this
+        # mint back to its own bonding curve and simply did not check. A
+        # confident "not feasible" from a router that has never indexed the
+        # mint is ignorance, and a price impact quoted for a route the desk
+        # would not take cannot hard-veto the launch.
+        authoritative = curve_status == "curve_not_tradeable"
+        feasible = quote.output_amount > 0
+        if not authoritative and not feasible:
+            return {"status": "DATA_BLOCKED", "feasible": None,
+                    "reason": "the router priced no exit, but the curve state "
+                              "was unknown, so the native route was never "
+                              "checked; this is unmeasured, not unsellable",
+                    "test_amount": amount, **router_note}
         return {
             "status": "OK",
-            "feasible": quote.output_amount > 0,
+            "feasible": feasible,
             "test_amount": amount,
             "output_usdc_raw": quote.output_amount,
-            "price_impact_pct": quote.price_impact_pct,
+            # Suppressed when the router is not the authority: the sizing
+            # engine prices the curve exit from reserves, and vetoing on a
+            # Jupiter impact for a route the desk never takes is measuring
+            # the wrong venue.
+            "price_impact_pct": (quote.price_impact_pct if authoritative
+                                 else None),
             "min_output_amount": quote.min_output_amount,
+            **router_note,
         }
 
     @staticmethod

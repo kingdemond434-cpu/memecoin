@@ -45,6 +45,8 @@ distinguish a complete window from a truncated one.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import logging
 import time
@@ -90,6 +92,10 @@ DEFAULT_SCAN_BUDGET_BYTES = 900 * 1024**3  # 900 GiB, inside a 1 TiB allowance
 class Backend(Enum):
     WAREHOUSE = "warehouse"
     INDEXER = "indexer"
+    #: Public columnar archive of the decoded chain, read with predicate
+    #: pushdown off object storage. Free like RPC, enumerable like a
+    #: warehouse. See ``src/research/solarchive.py``.
+    SOLARCHIVE = "solarchive"
     RPC = "rpc"
 
 
@@ -374,23 +380,72 @@ class HistoryWarehouse:
                 trades=trades))
         return launches
 
+    def _fetch(self, window: Window, program: str) -> List[Dict[str, Any]]:
+        """Ask the backend for a window, whether or not it is async.
+
+        `RpcBackend.launches` is a coroutine function -- it has to be, it makes
+        network calls -- while the warehouse and parquet backends are plain
+        functions reading through an injected client. Calling both the same way
+        used to hand `list.extend` a coroutine object, which raises TypeError,
+        which this loop scored as a failed window. The completeness backstop
+        was therefore incapable of extracting anything, and said so only as an
+        opaque per-window failure.
+        """
+        result = self.backend.launches(window, program)
+        if not inspect.isawaitable(result):
+            return list(result or [])
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return list(asyncio.run(result) or [])
+        result.close()
+        raise ExtractionError(
+            f"{type(self.backend).__name__}.launches is async and run() was "
+            "called from inside an event loop; await arun() instead")
+
+    async def _afetch(self, window: Window, program: str) -> List[Dict[str, Any]]:
+        result = self.backend.launches(window, program)
+        if inspect.isawaitable(result):
+            result = await result
+        return list(result or [])
+
     def verify(self) -> Dict[str, Any]:
         return self.backend.verify()
+
+    def _skip(self, window: Window, report: ExtractionReport) -> bool:
+        if window.key() not in self.done:
+            return False
+        report.windows_done += 1
+        report.covered.append(window.key())
+        return True
+
+    def _absorb(self, window: Window, rows: List[Dict[str, Any]],
+                report: ExtractionReport,
+                launches: List[RawLaunch]) -> None:
+        report.rows += len(rows)
+        built = self.build(rows)
+        launches.extend(built)
+        report.launches_built += len(built)
+        report.windows_done += 1
+        report.covered.append(window.key())
+        self.done.add(window.key())
+
+    def _finish(self, report: ExtractionReport) -> None:
+        report.bytes_scanned = int(getattr(self.backend, "bytes_scanned", 0))
+        self._save_checkpoint()
 
     def run(self, plan: ExtractionPlan) -> Tuple[List[RawLaunch], ExtractionReport]:
         """Extract every window not already checkpointed."""
         report = ExtractionReport(windows_planned=len(plan.windows))
         launches: List[RawLaunch] = []
         for window in plan.windows:
-            if window.key() in self.done:
-                report.windows_done += 1
-                report.covered.append(window.key())
+            if self._skip(window, report):
                 continue
             rows: List[Dict[str, Any]] = []
             failed = False
             for program in plan.programs:
                 try:
-                    rows.extend(self.backend.launches(window, program))
+                    rows.extend(self._fetch(window, program))
                 except Exception as exc:
                     failed = True
                     report.failures.append(
@@ -400,15 +455,38 @@ class HistoryWarehouse:
             if failed:
                 report.windows_failed += 1
                 continue
-            report.rows += len(rows)
-            built = self.build(rows)
-            launches.extend(built)
-            report.launches_built += len(built)
-            report.windows_done += 1
-            report.covered.append(window.key())
-            self.done.add(window.key())
-        report.bytes_scanned = int(getattr(self.backend, "bytes_scanned", 0))
-        self._save_checkpoint()
+            self._absorb(window, rows, report, launches)
+        self._finish(report)
+        return launches, report
+
+    async def arun(self, plan: ExtractionPlan
+                   ) -> Tuple[List[RawLaunch], ExtractionReport]:
+        """The same extraction from inside a running event loop.
+
+        The async backends are the ones that talk to the network, so this is
+        the form a live runtime uses; `run` remains for offline batch work.
+        """
+        report = ExtractionReport(windows_planned=len(plan.windows))
+        launches: List[RawLaunch] = []
+        for window in plan.windows:
+            if self._skip(window, report):
+                continue
+            rows: List[Dict[str, Any]] = []
+            failed = False
+            for program in plan.programs:
+                try:
+                    rows.extend(await self._afetch(window, program))
+                except Exception as exc:
+                    failed = True
+                    report.failures.append(
+                        {"window": window.key(), "program": program,
+                         "error": f"{type(exc).__name__}: {exc}"})
+                    break
+            if failed:
+                report.windows_failed += 1
+                continue
+            self._absorb(window, rows, report, launches)
+        self._finish(report)
         return launches, report
 
 

@@ -49,9 +49,10 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from src.execution.signer_protocol import (
-    HEADER_SIZE, OP_PING, OP_PUBKEY, OP_SIGN, STATUS_ERROR,
-    STATUS_OK, STATUS_REFUSED, decode_header, encode_request,
-    encode_response, read_frame)
+    HANDSHAKE, HANDSHAKE_SIZE, HEADER_SIZE, MAGIC, OP_PING, OP_PUBKEY,
+    OP_SIGN, PROTOCOL_VERSION, STATUS_ERROR, STATUS_OK, STATUS_REFUSED,
+    decode_header, encode_request, encode_response, parse_handshake,
+    read_frame)
 from src.runtime.loop_local import loop_local_lock
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
@@ -307,6 +308,12 @@ class SignerServer:
         # and asyncio reports "coroutine ignored GeneratorExit" -- noise
         # beside a real fault, in the log an operator reads during one.
         self._connections: "set" = set()
+        # Counted rather than merely logged. A client that cannot complete a
+        # handshake is a deployment fault -- a version skew, or something
+        # else entirely on the socket -- and it is invisible in a log nobody
+        # is reading at 3am but obvious in /status.
+        self.bad_handshakes = 0
+        self.version_mismatches = 0
 
     async def start(self) -> None:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -336,19 +343,46 @@ class SignerServer:
             except OSError:
                 pass
 
+    def report(self) -> Dict[str, Any]:
+        """What the socket has been asked to serve, including what it refused.
+
+        A client that cannot complete a handshake is a deployment fault -- a
+        version skew between two separately deployed units, or something else
+        entirely on the socket -- and it is invisible in a log nobody reads at
+        3am and obvious in a status endpoint.
+        """
+        return {
+            "schema": SIGNER_SCHEMA_VERSION,
+            "protocol_version": PROTOCOL_VERSION,
+            "held_connections": len(self._connections),
+            "bad_handshakes": self.bad_handshakes,
+            "version_mismatches": self.version_mismatches,
+            "service": self.service.report(),
+        }
+
     async def _handle(self, reader: asyncio.StreamReader,
                       writer: asyncio.StreamWriter) -> None:
         """Serve one connection, in whichever protocol it opens with.
 
-        Both protocols, chosen by looking at the first byte, and the
-        connection is HELD for the binary one -- that is the whole point of
-        it. A JSON caller still gets one request and a close, exactly as
-        before.
+        Both protocols, chosen by an EXPLICIT handshake rather than by
+        guessing from the first byte, and the connection is HELD for the
+        binary one -- that is the whole point of it. A JSON caller still gets
+        one request and a close, exactly as before.
+
+        The guess was wrong about one signature in 256. On a binary
+        connection the first byte is the low byte of a little-endian u32
+        length, and 0x7B is `{`: a frame whose body is 123, 379, 635 or 891
+        bytes long opened with `{` and was parsed as JSON. A Solana message
+        of 378 or 634 bytes is an ordinary transaction, so this was reachable
+        on the one path where being wrong means an unsigned transaction or a
+        stalled connection. `MCS` cannot begin a JSON object.
 
         Keeping JSON is not politeness. The signer and the desk are separate
         units that get deployed separately, and a protocol change that only
         works when both restart in the right order is a protocol change that
-        strands a running desk on the wrong afternoon.
+        strands a running desk on the wrong afternoon. The version byte is
+        what makes that survivable in the other direction too: a mismatch is
+        stated, not silently desynchronised.
         """
         current = asyncio.current_task()
         if current is not None:
@@ -358,8 +392,39 @@ class SignerServer:
             first = await reader.read(1)
             if not first:
                 return
+            if first == MAGIC[:1]:
+                rest = await reader.readexactly(HANDSHAKE_SIZE - 1)
+                try:
+                    version = parse_handshake(first + rest)
+                except ValueError as exc:
+                    writer.write(encode_response(
+                        STATUS_ERROR, str(exc).encode("utf-8")))
+                    await writer.drain()
+                    writer.close()
+                    return
+                if version != PROTOCOL_VERSION:
+                    # Stated, not tolerated. Two units that disagree about
+                    # the frame layout produce garbage that decodes as
+                    # something, and the something is a signing request.
+                    self.version_mismatches += 1
+                    writer.write(encode_response(
+                        STATUS_ERROR,
+                        f"protocol version {version} but this signer speaks "
+                        f"{PROTOCOL_VERSION}".encode("utf-8")))
+                    await writer.drain()
+                    writer.close()
+                    return
+                await self._serve_binary(reader, writer)
+                return
             if first != b"{":
-                await self._serve_binary(first, reader, writer)
+                # Neither protocol. Refused with a reason rather than
+                # silently dropped, because a client that has the socket
+                # path and the wrong idea should be told which it is.
+                self.bad_handshakes += 1
+                writer.write(encode_response(
+                    STATUS_ERROR, b"expected a JSON object or the binary handshake"))
+                await writer.drain()
+                writer.close()
                 return
             raw = first + await reader.readline()
             request = json.loads(raw)
@@ -383,7 +448,7 @@ class SignerServer:
         finally:
             writer.close()
 
-    async def _serve_binary(self, first: bytes, reader: asyncio.StreamReader,
+    async def _serve_binary(self, reader: asyncio.StreamReader,
                             writer: asyncio.StreamWriter) -> None:
         """Length-prefixed frames on a connection held until the peer leaves.
 
@@ -393,7 +458,7 @@ class SignerServer:
         and always has.
         """
         try:
-            header = first + await reader.readexactly(HEADER_SIZE - 1)
+            header = await reader.readexactly(HEADER_SIZE)
             while True:
                 length, op = decode_header(header)
                 payload = await reader.readexactly(length) if length else b""
@@ -465,6 +530,11 @@ class SignerClient:
         self._reader, self._writer = await asyncio.wait_for(
             asyncio.open_unix_connection(str(self.socket_path)),
             timeout=self.timeout_s)
+        # Declared, not inferred. Written before any frame so the server
+        # never has to guess from a length byte which protocol this is --
+        # and carried on the same write as the first frame by the kernel, so
+        # the handshake costs no round trip.
+        self._writer.write(HANDSHAKE)
         return self._reader, self._writer
 
     async def _frame(self, op: int, payload: bytes = b"") -> Tuple[int, bytes]:

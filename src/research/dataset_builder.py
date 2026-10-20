@@ -8,7 +8,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import (Any, Callable, Dict, List, Optional, Sequence,
+                    Set, Tuple)
 import numpy as np
 import aiohttp
 
@@ -53,6 +54,13 @@ class SnapshotTimepoint(Enum):
 
     PRELAUNCH = "prelaunch"
     T0 = "t0"
+    # Below the desk's own decode time, and there on purpose: they bound the
+    # value of latency work FROM BENEATH. If ten milliseconds already costs
+    # something measurable then the remaining microsecond effort has a
+    # ceiling, and knowing that ceiling before spending another month on it
+    # is worth two rows a launch.
+    T10MS = "t10ms"
+    T25MS = "t25ms"
     T50MS = "t50ms"
     T100MS = "t100ms"
     T250MS = "t250ms"
@@ -72,6 +80,8 @@ class SnapshotTimepoint(Enum):
 SNAPSHOT_OFFSETS_S.update({
     SnapshotTimepoint.PRELAUNCH: -1,
     SnapshotTimepoint.T0: 0,
+    SnapshotTimepoint.T10MS: 0.01,
+    SnapshotTimepoint.T25MS: 0.025,
     SnapshotTimepoint.T50MS: 0.05,
     SnapshotTimepoint.T100MS: 0.1,
     SnapshotTimepoint.T250MS: 0.25,
@@ -166,6 +176,17 @@ PUMP_INITIAL_VIRTUAL_SOL = 30_000_000_000
 PUMP_INITIAL_VIRTUAL_TOKEN = 1_073_000_000_000_000
 PUMP_CURVE_K = PUMP_INITIAL_VIRTUAL_SOL * PUMP_INITIAL_VIRTUAL_TOKEN
 
+#: Every pump.fun mint is created with one billion tokens at six decimals.
+#: A protocol constant of the same kind as the virtual reserves above -- a
+#: property of how the program initialises a curve, not a claim about any
+#: particular token -- and it matters because the fee tier table is indexed
+#: on MARKET CAP, which is supply times price. The CreateEvent carries no
+#: supply field, so without this the seeded curve reports a total supply of
+#: zero, market cap resolves to zero for every launch, and every trade is
+#: priced in the lowest tier regardless of where the coin actually is.
+#: Superseded the moment a real supply is observed.
+PUMP_TOKEN_TOTAL_SUPPLY = 1_000_000_000_000_000
+
 #: How far an observed curve may drift from the constant product before the
 #: invariant is treated as no longer describing this token. Fees and
 #: rounding move k slightly; a different curve shape moves it a lot.
@@ -198,6 +219,10 @@ class PointInTimeDatasetBuilder:
         champion_challenger: ChampionChallengerFramework,
         storage_path: str = "data/launch_episodes",
         actor_provider: Optional[Callable[[str, Optional[float]], Dict[str, Any]]] = None,
+        #: wallets -> (independent decisions, detail). The sniper-ring
+        #: detector has been learning which wallets arrive together across
+        #: every observed launch, and nothing ever asked it anything.
+        independence_provider: Optional[Callable[[Sequence[str]], Tuple[int, Dict[str, Any]]]] = None,
         memecoin_state_provider: Optional[Callable[[str, Optional[float]], Dict[str, Any]]] = None,
     ):
         self.chain_config = chain_config
@@ -210,11 +235,15 @@ class PointInTimeDatasetBuilder:
         self.rug_hazard = rug_hazard
         self.champion_challenger = champion_challenger
         self.actor_provider = actor_provider
+        self.independence_provider = independence_provider
         self.memecoin_state_provider = memecoin_state_provider
         self.storage_path = storage_path
         
         self.active_episodes: Dict[str, LaunchEpisode] = {}
         self.completed_episodes: Dict[str, LaunchEpisode] = {}
+        #: Set by wiring. Prices the delay ladder from the
+        #: snapshots this builder already takes.
+        self.latency_value: Optional[Any] = None
         self.outcome_index: Dict[str, Dict[str, Any]] = {}
         
         # The sweep runs at the fast cadence only while a sub-second target is
@@ -432,7 +461,11 @@ class PointInTimeDatasetBuilder:
         }
 
     async def _capture_wallet_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
-        smart_wallets = self.wallet_intel.get_top_wallets(limit=50)
+        # Measured followability, not the composite score. A wallet marked
+        # "smart" here becomes a training feature, so ranking it by a formula
+        # teaches the model the formula.
+        smart_wallets = self.wallet_intel.followable_wallets(
+            limit=50, include_unmeasured=False)
         
         initial_buyers = []
         smart_buyers = 0
@@ -445,8 +478,12 @@ class PointInTimeDatasetBuilder:
                 initial_buyers.append(buy)
                 total_sol_volume += buy["amount"] * buy["price"]
                 
-                ws = self.wallet_intel.get_wallet_score(buy["wallet"])
-                if ws and ws.overall_score > 0.7:
+                # Membership of the MEASURED followable set, not a composite
+                # score over a threshold. `overall_score > 0.7` was a formula
+                # compared against a number somebody picked, and this column
+                # is training data: a model trained on it learns the formula,
+                # including whatever the formula is wrong about.
+                if buy["wallet"] in smart_wallets:
                     smart_buyers += 1
                 # Insider status lives on the genealogy WalletProfile, not on
                 # WalletScore. Reading it off the score raised AttributeError
@@ -458,13 +495,41 @@ class PointInTimeDatasetBuilder:
                 if profile is not None and getattr(profile, "is_insider", False):
                     insider_buyers += 1
         
+        wallets = [buy["wallet"] for buy in initial_buyers if buy.get("wallet")]
+        independent, ring_detail = self._independent_buyers(wallets)
         return {
             "initial_buyer_count": len(initial_buyers),
             "smart_buyer_count": smart_buyers,
             "insider_buyer_count": insider_buyers,
             "total_sol_volume": total_sol_volume,
-            "buyer_diversity": len(set(b["wallet"] for b in initial_buyers)) / max(len(initial_buyers), 1)
+            "buyer_diversity": len(set(b["wallet"] for b in initial_buyers)) / max(len(initial_buyers), 1),
+            # Distinct wallets are not distinct DECIDERS. A ring that funds
+            # from one source and enters over several slots defeats both
+            # buyer_diversity and bundle_concentration, and is exactly what a
+            # competent bundler looks like.
+            "independent_buyer_count": independent,
+            "ring_compression": (independent / len(wallets)) if wallets and
+                                independent is not None else None,
+            "ring_detail": ring_detail,
         }
+
+    def _independent_buyers(self, wallets: Sequence[str]):
+        """How many independent decisions these wallets represent.
+
+        None when no ring detector is wired or it declines to answer, which
+        reads downstream as 1.0 -- full independence. That is the no-evidence
+        answer rather than the suspicious one: penalising a launch for a ring
+        nobody has detected would be inventing the ring.
+        """
+        provider = getattr(self, "independence_provider", None)
+        if not callable(provider) or not wallets:
+            return None, {"status": "DATA_BLOCKED", "reason": "no ring detector"}
+        try:
+            count, detail = provider(wallets)
+        except Exception as exc:  # pragma: no cover - measurement only
+            logger.debug("independence lookup failed: %s", exc)
+            return None, {"status": "DATA_BLOCKED", "error": str(exc)}
+        return int(count), dict(detail or {})
 
     async def _capture_flow_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
         observations = [
@@ -923,6 +988,20 @@ class PointInTimeDatasetBuilder:
             snapshot.feasible_exit_multiple = labels.get("feasible_exit_multiple")
             snapshot.realized_pnl = labels.get("realized_pnl")
         
+        # What being late would have cost on THIS launch, priced from the
+        # curve reserves already sitting in its own snapshot rows. Fed here
+        # because this is the one moment both halves exist: the sub-second
+        # prices and the outcome they would have been paid against.
+        ledger = getattr(self, "latency_value", None)
+        if ledger is not None and episode.final_outcome.get("status") == "OK":
+            try:
+                ledger.observe_snapshots(
+                    {SNAPSHOT_OFFSETS_S[timepoint]: snapshot.liquidity_features
+                     for timepoint, snapshot in episode.snapshots.items()
+                     if timepoint in SNAPSHOT_OFFSETS_S},
+                    episode.final_outcome.get("max_multiple"))
+            except Exception as exc:  # pragma: no cover - accounting only
+                logger.debug("latency value ledger for %s: %s", token, exc)
         self.completed_episodes[token] = episode
         self._active_checkpoint_path(token).unlink(missing_ok=True)
         if episode.final_outcome.get("status") == "OK":
