@@ -627,7 +627,10 @@ class ChampionChallengerFramework:
         temporary = Path(filename)
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(state, handle, sort_keys=True, allow_nan=False)
+                # dumps uses the one-shot C encoder; dump iterates Python
+                # fragments and made every growing research checkpoint stall
+                # the main loop. Keep exactly the same JSON/sync/replace rules.
+                handle.write(json.dumps(state, sort_keys=True, allow_nan=False))
                 handle.flush()
                 os.fsync(handle.fileno())
             for attempt in range(5):

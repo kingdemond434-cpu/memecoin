@@ -108,3 +108,11 @@ about decision-path latency or completed historical coverage.
 
 All of these conditions remain explicit blocks, without synthetic performance
 claims or bypassing the existing promotion and live-submission locks.
+
+Live profiling also found checkpoint serialization on the main event loop.
+The same observed 3.9 MB checkpoint took 0.217 seconds with streamed JSON
+encoding and 0.086 seconds with one-shot encoding in a single in-memory server
+sample. Both produced identical JSON bytes. Checkpoints now use one-shot
+encoding and one write, retaining rejection of nonfinite values, temporary
+file cleanup, flush/fsync and atomic replacement. This sample is not an
+end-to-end latency measurement or a production p99 claim.
