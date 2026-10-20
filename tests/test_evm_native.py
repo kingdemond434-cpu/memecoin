@@ -143,3 +143,50 @@ def test_same_native_block_route_size_does_not_manufacture_samples_after_restart
     for _ in range(3):
         restored.run_pass()
     assert restored.workflows.data.report()["variables"] == {"native_v2_buy_output": 1, "native_v2_sell_output": 1}
+
+
+def test_slow_native_backfill_cannot_hide_research_conversion_or_quote_probes(tmp_path):
+    async def scenario():
+        cancelled = []
+        conversions = []
+        class Slow:
+            async def run_once(self):
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.append("scout")
+            async def poll_once(self, sink):
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.append("observer")
+        async def convert():
+            conversions.append("conversion")
+            return {"processed": 0}
+        receipts = []
+        miner = GlobalResearchMiner(None, ledger_path=str(tmp_path/'leads'), chain_scout=Slow(),
+            evm_observers=[Slow()], native_event_sink=lambda event: "event-ref",
+            native_probes=[adapter(RPC())], native_probe_sink=lambda row: receipts.append(row) or "quote-ref",
+            unknown_engine=SimpleNamespace(run_async_pass=convert), observation_timeout_seconds=0.01)
+        result = await asyncio.wait_for(miner._run_observation_pass(), timeout=1)
+        assert cancelled == ["scout", "observer"] and len(conversions) == 3
+        assert result["evm"][0]["failure_type"] == "TimeoutError"
+        assert receipts[0]["status"] == "NATIVE_QUOTE_PARITY_VERIFIED"
+    asyncio.run(scenario())
+
+
+def test_cancelled_real_observer_releases_its_durable_lease(tmp_path):
+    from src.chains.evm_observation import EVMObservationAdapter, FactoryContract
+    class SlowRPC:
+        async def request(self, *args):
+            await asyncio.Event().wait()
+    observer = EVMObservationAdapter(SlowRPC(), chain_name="ethereum", chain_id=1,
+        factories=[FactoryContract("uniswap_v2", FACTORY)], start_block=1,
+        checkpoint_path=tmp_path/'frontier.sqlite')
+    async def scenario():
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(observer.poll_once(lambda event: "ref"), timeout=0.01)
+    asyncio.run(scenario())
+    with observer._db() as db:
+        row = db.execute('SELECT lease_token,lease_until FROM evm_observer_state').fetchone()
+    assert row['lease_token'] is None and row['lease_until'] is None
