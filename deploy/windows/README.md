@@ -7,6 +7,12 @@ deployment configuration. This permits bounded research/native observation
 declarations without editing the tracked default configuration on the server.
 It does not change the interactive task account or its authority.
 
+The task uses priority 5 (ordinary Normal process priority). Windows defaults
+scheduled tasks to priority 7, or Below Normal, which can starve collection and
+health/status on a saturated host. This setting changes CPU scheduling only;
+it does not change the task account, privileges, trading authority or logon
+requirements. See [Microsoft's priority mapping](https://learn.microsoft.com/en-us/windows/win32/taskschd/tasksettings-priority).
+
 `install-shadow-task.ps1` registers a new task for the current Windows user's interactive session and starts it. It resumes at that user's next logon, allows one instance and retries failures three times. It requires no password in a script. It refuses to overwrite an existing task. A signed-out user has no interactive session, so this is not an unattended boot service.
 
 ```powershell
