@@ -11,6 +11,8 @@ Use a dedicated checkout and virtual environment. The launcher clears the live a
   -LogRoot 'C:\path\to\logs'
 ```
 
+The launcher places itself and its descendants in a Windows job with kill-on-close, so stopping the task also ends its Python children. It refuses to launch if that containment cannot be established. [Windows job objects](https://learn.microsoft.com/windows/win32/procthread/job-objects) document this lifetime behavior.
+
 Inspect `http://127.0.0.1:18081/status` from the server, the named log directory and `Get-ScheduledTaskInfo MemecoinShadowCodex`. Close the bot gracefully when possible so ledgers and sockets flush. To stop automatic restarts and interrupt this deployment, disable and stop only its named task:
 
 ```powershell

@@ -54,36 +54,36 @@
         "producer_to_consumer": "Rights/PIT input admission and hard veto feed canonical evidence and execution refusal.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A03",
               "status": "PASS",
               "artifact": "A03-public_signal_to_pit_mechanism\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=e17a685822e51fd1d101483114ddd733fd404b1272e62019b418376fa580ed40"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=70862d07359a161b674fb0587f4eb8507211aecdb05bc024da068208c6cb6f42"
             },
             {
               "id": "A07",
               "status": "PASS",
               "artifact": "A07-planted_leakage_and_multiplicity_traps\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=e8e521e463a25da92145eeb60594c1932cf948d121c2d7a35152427ae153a6b8"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=0225cb952638497b265291b8fcc232db50f9bef6bbb149fed9bfd5e817a16ddf"
             },
             {
               "id": "A08",
               "status": "PASS",
               "artifact": "A08-known_safety_veto_overrides_high_alpha\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=8;sha256=5741a4444be47ca66f8f4f74866175a853e643d6a32456f48f79f5c218b66507"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=8;sha256=6513a5d1bb1eaad828b8caed664c9801db8a966dfa6d0218b9d2120f5c0c6028"
             },
             {
               "id": "A15",
               "status": "PASS",
               "artifact": "A15-operator_authority_required_for_live_transition\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=15;sha256=9d44f85b9cecf23661db43e55bbd918a1aadda7ff3102373d37d9c39c00cd7f3"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=15;sha256=d17818b7106bed03554add90dcaec99c350181cbbe183371f5f847b713e4b487"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Server source-rights inventory and every ingestion path require audit; prohibited actions never gain authority."
       }
@@ -131,18 +131,18 @@
         "producer_to_consumer": "Costed resource auction and explicit cash/incumbent/challenger ranking consume declared inputs.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A10",
               "status": "PASS",
               "artifact": "A10-strategy_competes_with_open_positions_and_cash\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=10;sha256=edef996f16dc92f03fc5b9ab71b23b06803365af0e2d4642b51d4efdc7cf5c20"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=10;sha256=5238d5f282ccdedcfc27bbb36d19f01497580a64fc283b1a6ece1ebbfbb87d19"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Incremental validated information, research monetary cost and portfolio log-growth are not measured."
       }
@@ -184,11 +184,11 @@
         "producer_to_consumer": "Initial source-audit baseline is preserved and supplemented with scoped implementation/evidence.",
         "evidence": {
           "status": "SOURCE_AUDIT_ONLY",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "No audited production runtime inventory establishes live capabilities."
       }
@@ -236,36 +236,36 @@
         "producer_to_consumer": "Existing miner drives durable evidence conversion and sealed proposal rounds.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A01",
               "status": "PASS",
               "artifact": "A01-dynamic_chain_or_protocol_discovery\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=1;sha256=c66c9ef826e109045cbf89a5167fa7ace81c07affcb536c84aadffe1cb273eaa"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=1;sha256=052368a0c1a1263eff8ea8e311e39bf341afbb7f3e46291342bf4ec387170b2d"
             },
             {
               "id": "A03",
               "status": "PASS",
               "artifact": "A03-public_signal_to_pit_mechanism\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=e17a685822e51fd1d101483114ddd733fd404b1272e62019b418376fa580ed40"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=70862d07359a161b674fb0587f4eb8507211aecdb05bc024da068208c6cb6f42"
             },
             {
               "id": "A11",
               "status": "PASS",
               "artifact": "A11-provider_failure_preserves_queued_work\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=5952f2f554258dc17616b34080229833be51a95895b2a23c8f445cff06c6e53f"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=fb9e0bde71aaf3c7da2631added073846d77a0cfd33f8dfaeae0c128c215374b"
             },
             {
               "id": "A13",
               "status": "PASS",
               "artifact": "A13-llm_outage_preserves_deterministic_operations\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=13;sha256=94302e325fcd823d482711f6ac34856da5dd17e33ba5e4ec622160ab8fffa899"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=13;sha256=aa7462a5daaf1db63716ed4e27f5d43b6d48d075f6ce7b553f2f122e1ed56e77"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Every request, forward outcome and integration job does not yet have a complete autonomous consumer."
       }
@@ -312,30 +312,30 @@
         "producer_to_consumer": "Evidence-backed coordinates feed persistent debt, leases, retries and hibernation.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A01",
               "status": "PASS",
               "artifact": "A01-dynamic_chain_or_protocol_discovery\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=1;sha256=c66c9ef826e109045cbf89a5167fa7ace81c07affcb536c84aadffe1cb273eaa"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=1;sha256=052368a0c1a1263eff8ea8e311e39bf341afbb7f3e46291342bf4ec387170b2d"
             },
             {
               "id": "A11",
               "status": "PASS",
               "artifact": "A11-provider_failure_preserves_queued_work\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=5952f2f554258dc17616b34080229833be51a95895b2a23c8f445cff06c6e53f"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=fb9e0bde71aaf3c7da2631added073846d77a0cfd33f8dfaeae0c128c215374b"
             },
             {
               "id": "A12",
               "status": "PASS",
               "artifact": "A12-restart_restores_debt_episodes_and_forward_evidence\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=24fa851cd33feeb908b041a8de64cc4eaff1b6d1f2e2595ea50568d4f92f0bbe"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=1c7bdb7a32dcc519e2afc4858bc017bfcbb74658bdf31a1be7e9e162490696f9"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Registration is not observed production coverage; economic coverage debt needs measured inputs."
       }
@@ -385,24 +385,24 @@
         "producer_to_consumer": "Public API scouting feeds discovered chains/protocols; native observers remain observation-only.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A01",
               "status": "PASS",
               "artifact": "A01-dynamic_chain_or_protocol_discovery\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=1;sha256=c66c9ef826e109045cbf89a5167fa7ace81c07affcb536c84aadffe1cb273eaa"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=1;sha256=052368a0c1a1263eff8ea8e311e39bf341afbb7f3e46291342bf4ec387170b2d"
             },
             {
               "id": "A02",
               "status": "PASS",
               "artifact": "A02-unknown_native_event_refusal\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=2;sha256=67f7f2593885126ff6e6aa364b9b4847f5ef69c5af64be35cf9f95e8d6a76a6f"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=2;sha256=68ec17850e772ef9b7cd3599af46206b257055d4a5b72d4403be16953c342990"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Provider-backed native data and exit/finality proof missing; other chain-family adapters remain incomplete."
       }
@@ -451,18 +451,18 @@
         "producer_to_consumer": "Versioned protocol contracts retain unknown layouts and verified fixture references.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A02",
               "status": "PASS",
               "artifact": "A02-unknown_native_event_refusal\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=2;sha256=67f7f2593885126ff6e6aa364b9b4847f5ef69c5af64be35cf9f95e8d6a76a6f"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=2;sha256=68ec17850e772ef9b7cd3599af46206b257055d4a5b72d4403be16953c342990"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Full live native decoder parity, verified ABI/IDL inventory and per-protocol buy/sell support unmeasured."
       }
@@ -516,18 +516,18 @@
         "producer_to_consumer": "Delayed after-cost followability rejects profitable-but-uncopyable wallet fixtures.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A04",
               "status": "PASS",
               "artifact": "A04-delayed_costly_wallet_not_followable\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=4;sha256=a2e7761177251c29799c3da15ae7e739c872d547441a2f1e5e8d4165f894974a"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=4;sha256=895e5f6f170aeb807be5a72ccab9598e7f4fb28ebb140c693cc9742dae1c647b"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Actor graph namespace/taxonomy expansion, cross-chain compression and all matched/shuffled controls incomplete."
       }
@@ -577,24 +577,24 @@
         "producer_to_consumer": "Existing public discovery surfaces can contribute canonical raw evidence and source requests.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A03",
               "status": "PASS",
               "artifact": "A03-public_signal_to_pit_mechanism\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=e17a685822e51fd1d101483114ddd733fd404b1272e62019b418376fa580ed40"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=70862d07359a161b674fb0587f4eb8507211aecdb05bc024da068208c6cb6f42"
             },
             {
               "id": "A11",
               "status": "PASS",
               "artifact": "A11-provider_failure_preserves_queued_work\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=5952f2f554258dc17616b34080229833be51a95895b2a23c8f445cff06c6e53f"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=fb9e0bde71aaf3c7da2631added073846d77a0cfd33f8dfaeae0c128c215374b"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Full multilingual native-language coverage and narrative/actor propagation expansion and metrics incomplete."
       }
@@ -642,24 +642,24 @@
         "producer_to_consumer": "Typed data/representation requests retain variable, mechanism, PIT, consumer and falsifier requirements.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A03",
               "status": "PASS",
               "artifact": "A03-public_signal_to_pit_mechanism\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=e17a685822e51fd1d101483114ddd733fd404b1272e62019b418376fa580ed40"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=70862d07359a161b674fb0587f4eb8507211aecdb05bc024da068208c6cb6f42"
             },
             {
               "id": "A11",
               "status": "PASS",
               "artifact": "A11-provider_failure_preserves_queued_work\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=5952f2f554258dc17616b34080229833be51a95895b2a23c8f445cff06c6e53f"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=fb9e0bde71aaf3c7da2631added073846d77a0cfd33f8dfaeae0c128c215374b"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Automatic lawful acquisition, representation implementation, validation and closure for every request not complete."
       }
@@ -707,24 +707,24 @@
         "producer_to_consumer": "Mechanism receipts and discriminating experiment requests enter persistent canonical queues.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A03",
               "status": "PASS",
               "artifact": "A03-public_signal_to_pit_mechanism\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=e17a685822e51fd1d101483114ddd733fd404b1272e62019b418376fa580ed40"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=70862d07359a161b674fb0587f4eb8507211aecdb05bc024da068208c6cb6f42"
             },
             {
               "id": "A13",
               "status": "PASS",
               "artifact": "A13-llm_outage_preserves_deterministic_operations\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=13;sha256=94302e325fcd823d482711f6ac34856da5dd17e33ba5e4ec622160ab8fffa899"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=13;sha256=aa7462a5daaf1db63716ed4e27f5d43b6d48d075f6ce7b553f2f122e1ed56e77"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "All mechanism labs, lab missions, decisive experiments and measured lab budgets are not implemented."
       }
@@ -771,18 +771,18 @@
         "producer_to_consumer": "Independent proposal inputs/outputs/failures seal before comparison and experiment conversion.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A13",
               "status": "PASS",
               "artifact": "A13-llm_outage_preserves_deterministic_operations\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=13;sha256=94302e325fcd823d482711f6ac34856da5dd17e33ba5e4ec622160ab8fffa899"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=13;sha256=aa7462a5daaf1db63716ed4e27f5d43b6d48d075f6ce7b553f2f122e1ed56e77"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Real external models, credentials, API access, usage costs and comparative discovery value remain unconfigured/unmeasured."
       }
@@ -829,18 +829,18 @@
         "producer_to_consumer": "Bounded executable rules and canonical program/parameter niches preserve independent breadth.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A06",
               "status": "PASS",
               "artifact": "A06-duplicates_and_parameter_neighbours_collapse\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=6;sha256=25fc8866308ea33562519ed02933f53575168159d15c3b2e9ab89b92f5a38c7d"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=6;sha256=977153f4482ccf67cc393a1a9ac6725562e90c07efdd5c133c362a02342386b8"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Broad symbolic regression, genetic programming, causal discovery and MAP-Elites search not implemented end to end."
       }
@@ -888,30 +888,30 @@
         "producer_to_consumer": "Raw evidence receives a typed disposition; valid exact programs freeze and route to canonical bounded replay.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A03",
               "status": "PASS",
               "artifact": "A03-public_signal_to_pit_mechanism\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=e17a685822e51fd1d101483114ddd733fd404b1272e62019b418376fa580ed40"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=70862d07359a161b674fb0587f4eb8507211aecdb05bc024da068208c6cb6f42"
             },
             {
               "id": "A05",
               "status": "PASS",
               "artifact": "A05-frozen_candidate_genealogy_and_execution\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=5;sha256=96a1ed56f678d7cbede5e7ce3299a3b396e26fb80ab1ae0e363380abf8fb94a8"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=5;sha256=1a3d3e4ff21d433446f1d687b1b67815ad78ae89936089e461c95e2d9fbef0b5"
             },
             {
               "id": "A07",
               "status": "PASS",
               "artifact": "A07-planted_leakage_and_multiplicity_traps\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=e8e521e463a25da92145eeb60594c1932cf948d121c2d7a35152427ae153a6b8"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=0225cb952638497b265291b8fcc232db50f9bef6bbb149fed9bfd5e817a16ddf"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Arbitrary useful prose is not automatically compiled; missing mappings/costs/observations stay blocked."
       }
@@ -958,30 +958,30 @@
         "producer_to_consumer": "Exact rules, PIT inputs, execution assumptions and genealogy bind immutable candidate/trial hashes.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A05",
               "status": "PASS",
               "artifact": "A05-frozen_candidate_genealogy_and_execution\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=5;sha256=96a1ed56f678d7cbede5e7ce3299a3b396e26fb80ab1ae0e363380abf8fb94a8"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=5;sha256=1a3d3e4ff21d433446f1d687b1b67815ad78ae89936089e461c95e2d9fbef0b5"
             },
             {
               "id": "A06",
               "status": "PASS",
               "artifact": "A06-duplicates_and_parameter_neighbours_collapse\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=6;sha256=25fc8866308ea33562519ed02933f53575168159d15c3b2e9ab89b92f5a38c7d"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=6;sha256=977153f4482ccf67cc393a1a9ac6725562e90c07efdd5c133c362a02342386b8"
             },
             {
               "id": "A07",
               "status": "PASS",
               "artifact": "A07-planted_leakage_and_multiplicity_traps\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=e8e521e463a25da92145eeb60594c1932cf948d121c2d7a35152427ae153a6b8"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=0225cb952638497b265291b8fcc232db50f9bef6bbb149fed9bfd5e817a16ddf"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Contract validity does not establish a mechanism, executable edge, untouched forward survival or authority."
       }
@@ -1029,24 +1029,24 @@
         "producer_to_consumer": "Sparse 21-axis frontier indexes chain/protocol/stage/route/risk/capital/portfolio coordinates.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A01",
               "status": "PASS",
               "artifact": "A01-dynamic_chain_or_protocol_discovery\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=1;sha256=c66c9ef826e109045cbf89a5167fa7ace81c07affcb536c84aadffe1cb273eaa"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=1;sha256=052368a0c1a1263eff8ea8e311e39bf341afbb7f3e46291342bf4ec387170b2d"
             },
             {
               "id": "A12",
               "status": "PASS",
               "artifact": "A12-restart_restores_debt_episodes_and_forward_evidence\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=24fa851cd33feeb908b041a8de64cc4eaff1b6d1f2e2595ea50568d4f92f0bbe"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=1c7bdb7a32dcc519e2afc4858bc017bfcbb74658bdf31a1be7e9e162490696f9"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Full segmented strategy lattice population, consumer coverage and observed coverage metrics incomplete."
       }
@@ -1096,30 +1096,30 @@
         "producer_to_consumer": "Bounded replay reuses canonical gauntlet, shared cohort/time CSCV, binding checks and durable trial ancestry.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A05",
               "status": "PASS",
               "artifact": "A05-frozen_candidate_genealogy_and_execution\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=5;sha256=96a1ed56f678d7cbede5e7ce3299a3b396e26fb80ab1ae0e363380abf8fb94a8"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=5;sha256=1a3d3e4ff21d433446f1d687b1b67815ad78ae89936089e461c95e2d9fbef0b5"
             },
             {
               "id": "A07",
               "status": "PASS",
               "artifact": "A07-planted_leakage_and_multiplicity_traps\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=e8e521e463a25da92145eeb60594c1932cf948d121c2d7a35152427ae153a6b8"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=0225cb952638497b265291b8fcc232db50f9bef6bbb149fed9bfd5e817a16ddf"
             },
             {
               "id": "A09",
               "status": "PASS",
               "artifact": "A09-route_aware_return_differs_from_marks\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=9;sha256=4a431a8160ef1d8f5d092b9135a429c9d691efea12dde7748174159b91e8acdb"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=9;sha256=3f25e6758089b195c916e905f62e5192bba96fffe51828160134a04a1bb2e213"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Full native-chain L4 replay and L5 untouched forward/L6 canary/L7 live attribution still require observed evidence."
       }
@@ -1166,24 +1166,24 @@
         "producer_to_consumer": "Declared resource envelopes, exploration floors, leases and named wake changes govern research work.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A11",
               "status": "PASS",
               "artifact": "A11-provider_failure_preserves_queued_work\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=5952f2f554258dc17616b34080229833be51a95895b2a23c8f445cff06c6e53f"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=fb9e0bde71aaf3c7da2631added073846d77a0cfd33f8dfaeae0c128c215374b"
             },
             {
               "id": "A12",
               "status": "PASS",
               "artifact": "A12-restart_restores_debt_episodes_and_forward_evidence\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=24fa851cd33feeb908b041a8de64cc4eaff1b6d1f2e2595ea50568d4f92f0bbe"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=1c7bdb7a32dcc519e2afc4858bc017bfcbb74658bdf31a1be7e9e162490696f9"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Expected information value, actual inference/data/engineering monetary costs and measured auction advantage unknown."
       }
@@ -1231,24 +1231,24 @@
         "producer_to_consumer": "Measured stage distributions and explicit unmeasured budget status feed readiness diagnostics.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A02",
               "status": "PASS",
               "artifact": "A02-unknown_native_event_refusal\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=2;sha256=67f7f2593885126ff6e6aa364b9b4847f5ef69c5af64be35cf9f95e8d6a76a6f"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=2;sha256=68ec17850e772ef9b7cd3599af46206b257055d4a5b72d4403be16953c342990"
             },
             {
               "id": "A15",
               "status": "PASS",
               "artifact": "A15-operator_authority_required_for_live_transition\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=15;sha256=9d44f85b9cecf23661db43e55bbd918a1aadda7ff3102373d37d9c39c00cd7f3"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=15;sha256=d17818b7106bed03554add90dcaec99c350181cbbe183371f5f847b713e4b487"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Complete build/sign/receipt/land/fill and chain/protocol/regime/route distributions require runtime tracing."
       }
@@ -1296,30 +1296,30 @@
         "producer_to_consumer": "Canonical proposals and successful simulated fills feed fixed lifetime/day/week/concentration budgets and persisted runner/harvest/shutdown state.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A10",
               "status": "PASS",
               "artifact": "A10-strategy_competes_with_open_positions_and_cash\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=10;sha256=edef996f16dc92f03fc5b9ab71b23b06803365af0e2d4642b51d4efdc7cf5c20"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=10;sha256=5238d5f282ccdedcfc27bbb36d19f01497580a64fc283b1a6ece1ebbfbb87d19"
             },
             {
               "id": "A12",
               "status": "PASS",
               "artifact": "A12-restart_restores_debt_episodes_and_forward_evidence\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=24fa851cd33feeb908b041a8de64cc4eaff1b6d1f2e2595ea50568d4f92f0bbe"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=1c7bdb7a32dcc519e2afc4858bc017bfcbb74658bdf31a1be7e9e162490696f9"
             },
             {
               "id": "A14",
               "status": "PASS",
               "artifact": "A14-no_monster_stress_respects_tail_budget\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=14;sha256=27e25564b74bfe9753dc38cfc368806f3e7c312d31449e3d77bc54a37e9260ff"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=14;sha256=be67cba96ec59ead6ab03c5755fee8d3289e85066580fa0f29608fb3b3bac0ab"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Real tail payoff, ruin probability, correlation, exit reliability, time between monsters and portfolio contribution unmeasured."
       }
@@ -1369,30 +1369,30 @@
         "producer_to_consumer": "Executable counterfactuals, retained negative knowledge and named wake conditions preserve research history.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A09",
               "status": "PASS",
               "artifact": "A09-route_aware_return_differs_from_marks\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=9;sha256=4a431a8160ef1d8f5d092b9135a429c9d691efea12dde7748174159b91e8acdb"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=9;sha256=3f25e6758089b195c916e905f62e5192bba96fffe51828160134a04a1bb2e213"
             },
             {
               "id": "A11",
               "status": "PASS",
               "artifact": "A11-provider_failure_preserves_queued_work\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=5952f2f554258dc17616b34080229833be51a95895b2a23c8f445cff06c6e53f"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=fb9e0bde71aaf3c7da2631added073846d77a0cfd33f8dfaeae0c128c215374b"
             },
             {
               "id": "A12",
               "status": "PASS",
               "artifact": "A12-restart_restores_debt_episodes_and_forward_evidence\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=24fa851cd33feeb908b041a8de64cc4eaff1b6d1f2e2595ea50568d4f92f0bbe"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=1c7bdb7a32dcc519e2afc4858bc017bfcbb74658bdf31a1be7e9e162490696f9"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Complete failure diagnosis taxonomy, survivor decomposition and enabling-change descendant admission incomplete."
       }
@@ -1440,30 +1440,30 @@
         "producer_to_consumer": "Proposal attribution/seals, content-bound trials and reversible persisted research state retain history.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A05",
               "status": "PASS",
               "artifact": "A05-frozen_candidate_genealogy_and_execution\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=5;sha256=96a1ed56f678d7cbede5e7ce3299a3b396e26fb80ab1ae0e363380abf8fb94a8"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=5;sha256=1a3d3e4ff21d433446f1d687b1b67815ad78ae89936089e461c95e2d9fbef0b5"
             },
             {
               "id": "A07",
               "status": "PASS",
               "artifact": "A07-planted_leakage_and_multiplicity_traps\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=e8e521e463a25da92145eeb60594c1932cf948d121c2d7a35152427ae153a6b8"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=0225cb952638497b265291b8fcc232db50f9bef6bbb149fed9bfd5e817a16ddf"
             },
             {
               "id": "A13",
               "status": "PASS",
               "artifact": "A13-llm_outage_preserves_deterministic_operations\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=13;sha256=94302e325fcd823d482711f6ac34856da5dd17e33ba5e4ec622160ab8fffa899"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=13;sha256=aa7462a5daaf1db63716ed4e27f5d43b6d48d075f6ce7b553f2f122e1ed56e77"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Measured agent value/cost, shadow comparison of every self-improvement and operational rollback drills missing."
       }
@@ -1512,24 +1512,24 @@
         "producer_to_consumer": "Durable raw references, typed work, leased retries and retained queue/debt metrics survive component restart.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A11",
               "status": "PASS",
               "artifact": "A11-provider_failure_preserves_queued_work\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=5952f2f554258dc17616b34080229833be51a95895b2a23c8f445cff06c6e53f"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=fb9e0bde71aaf3c7da2631added073846d77a0cfd33f8dfaeae0c128c215374b"
             },
             {
               "id": "A12",
               "status": "PASS",
               "artifact": "A12-restart_restores_debt_episodes_and_forward_evidence\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=24fa851cd33feeb908b041a8de64cc4eaff1b6d1f2e2595ea50568d4f92f0bbe"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=1c7bdb7a32dcc519e2afc4858bc017bfcbb74658bdf31a1be7e9e162490696f9"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Complete acquisition/repair/forward/integration worker coverage and production backpressure rates unmeasured."
       }
@@ -1579,30 +1579,30 @@
         "producer_to_consumer": "Frontier/tail/reporting preserve unknown metric values and expose scoped evidence counts.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A01",
               "status": "PASS",
               "artifact": "A01-dynamic_chain_or_protocol_discovery\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=1;sha256=c66c9ef826e109045cbf89a5167fa7ace81c07affcb536c84aadffe1cb273eaa"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=1;sha256=052368a0c1a1263eff8ea8e311e39bf341afbb7f3e46291342bf4ec387170b2d"
             },
             {
               "id": "A12",
               "status": "PASS",
               "artifact": "A12-restart_restores_debt_episodes_and_forward_evidence\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=24fa851cd33feeb908b041a8de64cc4eaff1b6d1f2e2595ea50568d4f92f0bbe"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=1c7bdb7a32dcc519e2afc4858bc017bfcbb74658bdf31a1be7e9e162490696f9"
             },
             {
               "id": "A14",
               "status": "PASS",
               "artifact": "A14-no_monster_stress_respects_tail_budget\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=14;sha256=27e25564b74bfe9753dc38cfc368806f3e7c312d31449e3d77bc54a37e9260ff"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=14;sha256=be67cba96ec59ead6ab03c5755fee8d3289e85066580fa0f29608fb3b3bac0ab"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Real log-loss/conformal, full stratification, cost/useful discovery, ruin/correlation/exit and portfolio metrics need measured samples."
       }
@@ -1650,102 +1650,102 @@
         "producer_to_consumer": "Fifteen isolated offline producer/consumer scenarios retain canonical evidence, input/result/file/source hashes and integration JUnit.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A01",
               "status": "PASS",
               "artifact": "A01-dynamic_chain_or_protocol_discovery\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=1;sha256=c66c9ef826e109045cbf89a5167fa7ace81c07affcb536c84aadffe1cb273eaa"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=1;sha256=052368a0c1a1263eff8ea8e311e39bf341afbb7f3e46291342bf4ec387170b2d"
             },
             {
               "id": "A02",
               "status": "PASS",
               "artifact": "A02-unknown_native_event_refusal\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=2;sha256=67f7f2593885126ff6e6aa364b9b4847f5ef69c5af64be35cf9f95e8d6a76a6f"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=2;sha256=68ec17850e772ef9b7cd3599af46206b257055d4a5b72d4403be16953c342990"
             },
             {
               "id": "A03",
               "status": "PASS",
               "artifact": "A03-public_signal_to_pit_mechanism\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=e17a685822e51fd1d101483114ddd733fd404b1272e62019b418376fa580ed40"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=70862d07359a161b674fb0587f4eb8507211aecdb05bc024da068208c6cb6f42"
             },
             {
               "id": "A04",
               "status": "PASS",
               "artifact": "A04-delayed_costly_wallet_not_followable\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=4;sha256=a2e7761177251c29799c3da15ae7e739c872d547441a2f1e5e8d4165f894974a"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=4;sha256=895e5f6f170aeb807be5a72ccab9598e7f4fb28ebb140c693cc9742dae1c647b"
             },
             {
               "id": "A05",
               "status": "PASS",
               "artifact": "A05-frozen_candidate_genealogy_and_execution\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=5;sha256=96a1ed56f678d7cbede5e7ce3299a3b396e26fb80ab1ae0e363380abf8fb94a8"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=5;sha256=1a3d3e4ff21d433446f1d687b1b67815ad78ae89936089e461c95e2d9fbef0b5"
             },
             {
               "id": "A06",
               "status": "PASS",
               "artifact": "A06-duplicates_and_parameter_neighbours_collapse\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=6;sha256=25fc8866308ea33562519ed02933f53575168159d15c3b2e9ab89b92f5a38c7d"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=6;sha256=977153f4482ccf67cc393a1a9ac6725562e90c07efdd5c133c362a02342386b8"
             },
             {
               "id": "A07",
               "status": "PASS",
               "artifact": "A07-planted_leakage_and_multiplicity_traps\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=e8e521e463a25da92145eeb60594c1932cf948d121c2d7a35152427ae153a6b8"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=0225cb952638497b265291b8fcc232db50f9bef6bbb149fed9bfd5e817a16ddf"
             },
             {
               "id": "A08",
               "status": "PASS",
               "artifact": "A08-known_safety_veto_overrides_high_alpha\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=8;sha256=5741a4444be47ca66f8f4f74866175a853e643d6a32456f48f79f5c218b66507"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=8;sha256=6513a5d1bb1eaad828b8caed664c9801db8a966dfa6d0218b9d2120f5c0c6028"
             },
             {
               "id": "A09",
               "status": "PASS",
               "artifact": "A09-route_aware_return_differs_from_marks\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=9;sha256=4a431a8160ef1d8f5d092b9135a429c9d691efea12dde7748174159b91e8acdb"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=9;sha256=3f25e6758089b195c916e905f62e5192bba96fffe51828160134a04a1bb2e213"
             },
             {
               "id": "A10",
               "status": "PASS",
               "artifact": "A10-strategy_competes_with_open_positions_and_cash\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=10;sha256=edef996f16dc92f03fc5b9ab71b23b06803365af0e2d4642b51d4efdc7cf5c20"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=10;sha256=5238d5f282ccdedcfc27bbb36d19f01497580a64fc283b1a6ece1ebbfbb87d19"
             },
             {
               "id": "A11",
               "status": "PASS",
               "artifact": "A11-provider_failure_preserves_queued_work\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=5952f2f554258dc17616b34080229833be51a95895b2a23c8f445cff06c6e53f"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=fb9e0bde71aaf3c7da2631added073846d77a0cfd33f8dfaeae0c128c215374b"
             },
             {
               "id": "A12",
               "status": "PASS",
               "artifact": "A12-restart_restores_debt_episodes_and_forward_evidence\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=24fa851cd33feeb908b041a8de64cc4eaff1b6d1f2e2595ea50568d4f92f0bbe"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=1c7bdb7a32dcc519e2afc4858bc017bfcbb74658bdf31a1be7e9e162490696f9"
             },
             {
               "id": "A13",
               "status": "PASS",
               "artifact": "A13-llm_outage_preserves_deterministic_operations\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=13;sha256=94302e325fcd823d482711f6ac34856da5dd17e33ba5e4ec622160ab8fffa899"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=13;sha256=aa7462a5daaf1db63716ed4e27f5d43b6d48d075f6ce7b553f2f122e1ed56e77"
             },
             {
               "id": "A14",
               "status": "PASS",
               "artifact": "A14-no_monster_stress_respects_tail_budget\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=14;sha256=27e25564b74bfe9753dc38cfc368806f3e7c312d31449e3d77bc54a37e9260ff"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=14;sha256=be67cba96ec59ead6ab03c5755fee8d3289e85066580fa0f29608fb3b3bac0ab"
             },
             {
               "id": "A15",
               "status": "PASS",
               "artifact": "A15-operator_authority_required_for_live_transition\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=15;sha256=9d44f85b9cecf23661db43e55bbd918a1aadda7ff3102373d37d9c39c00cd7f3"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=15;sha256=d17818b7106bed03554add90dcaec99c350181cbbe183371f5f847b713e4b487"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "All fifteen fixture scenarios pass; production/provider/untouched-forward/live capability remains UNMEASURED."
       }
@@ -1788,102 +1788,102 @@
         "producer_to_consumer": "Audit, scientific core, bounded discovery/conversion and shadow seams are implemented in the existing desk.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A01",
               "status": "PASS",
               "artifact": "A01-dynamic_chain_or_protocol_discovery\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=1;sha256=c66c9ef826e109045cbf89a5167fa7ace81c07affcb536c84aadffe1cb273eaa"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=1;sha256=052368a0c1a1263eff8ea8e311e39bf341afbb7f3e46291342bf4ec387170b2d"
             },
             {
               "id": "A02",
               "status": "PASS",
               "artifact": "A02-unknown_native_event_refusal\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=2;sha256=67f7f2593885126ff6e6aa364b9b4847f5ef69c5af64be35cf9f95e8d6a76a6f"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=2;sha256=68ec17850e772ef9b7cd3599af46206b257055d4a5b72d4403be16953c342990"
             },
             {
               "id": "A03",
               "status": "PASS",
               "artifact": "A03-public_signal_to_pit_mechanism\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=e17a685822e51fd1d101483114ddd733fd404b1272e62019b418376fa580ed40"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=70862d07359a161b674fb0587f4eb8507211aecdb05bc024da068208c6cb6f42"
             },
             {
               "id": "A04",
               "status": "PASS",
               "artifact": "A04-delayed_costly_wallet_not_followable\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=4;sha256=a2e7761177251c29799c3da15ae7e739c872d547441a2f1e5e8d4165f894974a"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=4;sha256=895e5f6f170aeb807be5a72ccab9598e7f4fb28ebb140c693cc9742dae1c647b"
             },
             {
               "id": "A05",
               "status": "PASS",
               "artifact": "A05-frozen_candidate_genealogy_and_execution\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=5;sha256=96a1ed56f678d7cbede5e7ce3299a3b396e26fb80ab1ae0e363380abf8fb94a8"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=5;sha256=1a3d3e4ff21d433446f1d687b1b67815ad78ae89936089e461c95e2d9fbef0b5"
             },
             {
               "id": "A06",
               "status": "PASS",
               "artifact": "A06-duplicates_and_parameter_neighbours_collapse\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=6;sha256=25fc8866308ea33562519ed02933f53575168159d15c3b2e9ab89b92f5a38c7d"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=6;sha256=977153f4482ccf67cc393a1a9ac6725562e90c07efdd5c133c362a02342386b8"
             },
             {
               "id": "A07",
               "status": "PASS",
               "artifact": "A07-planted_leakage_and_multiplicity_traps\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=e8e521e463a25da92145eeb60594c1932cf948d121c2d7a35152427ae153a6b8"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=0225cb952638497b265291b8fcc232db50f9bef6bbb149fed9bfd5e817a16ddf"
             },
             {
               "id": "A08",
               "status": "PASS",
               "artifact": "A08-known_safety_veto_overrides_high_alpha\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=8;sha256=5741a4444be47ca66f8f4f74866175a853e643d6a32456f48f79f5c218b66507"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=8;sha256=6513a5d1bb1eaad828b8caed664c9801db8a966dfa6d0218b9d2120f5c0c6028"
             },
             {
               "id": "A09",
               "status": "PASS",
               "artifact": "A09-route_aware_return_differs_from_marks\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=9;sha256=4a431a8160ef1d8f5d092b9135a429c9d691efea12dde7748174159b91e8acdb"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=9;sha256=3f25e6758089b195c916e905f62e5192bba96fffe51828160134a04a1bb2e213"
             },
             {
               "id": "A10",
               "status": "PASS",
               "artifact": "A10-strategy_competes_with_open_positions_and_cash\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=10;sha256=edef996f16dc92f03fc5b9ab71b23b06803365af0e2d4642b51d4efdc7cf5c20"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=10;sha256=5238d5f282ccdedcfc27bbb36d19f01497580a64fc283b1a6ece1ebbfbb87d19"
             },
             {
               "id": "A11",
               "status": "PASS",
               "artifact": "A11-provider_failure_preserves_queued_work\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=5952f2f554258dc17616b34080229833be51a95895b2a23c8f445cff06c6e53f"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=fb9e0bde71aaf3c7da2631added073846d77a0cfd33f8dfaeae0c128c215374b"
             },
             {
               "id": "A12",
               "status": "PASS",
               "artifact": "A12-restart_restores_debt_episodes_and_forward_evidence\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=24fa851cd33feeb908b041a8de64cc4eaff1b6d1f2e2595ea50568d4f92f0bbe"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=1c7bdb7a32dcc519e2afc4858bc017bfcbb74658bdf31a1be7e9e162490696f9"
             },
             {
               "id": "A13",
               "status": "PASS",
               "artifact": "A13-llm_outage_preserves_deterministic_operations\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=13;sha256=94302e325fcd823d482711f6ac34856da5dd17e33ba5e4ec622160ab8fffa899"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=13;sha256=aa7462a5daaf1db63716ed4e27f5d43b6d48d075f6ce7b553f2f122e1ed56e77"
             },
             {
               "id": "A14",
               "status": "PASS",
               "artifact": "A14-no_monster_stress_respects_tail_budget\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=14;sha256=27e25564b74bfe9753dc38cfc368806f3e7c312d31449e3d77bc54a37e9260ff"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=14;sha256=be67cba96ec59ead6ab03c5755fee8d3289e85066580fa0f29608fb3b3bac0ab"
             },
             {
               "id": "A15",
               "status": "PASS",
               "artifact": "A15-operator_authority_required_for_live_transition\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=15;sha256=9d44f85b9cecf23661db43e55bbd918a1aadda7ff3102373d37d9c39c00cd7f3"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=15;sha256=d17818b7106bed03554add90dcaec99c350181cbbe183371f5f847b713e4b487"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Complete ecosystem expansion, taxonomy/labs/search, measured APIs/native routes and forward cohorts remain outstanding."
       }
@@ -1938,60 +1938,60 @@
         "producer_to_consumer": "Hard safety, PIT/freeze/selection/queue invariants and separate operator gates remain enforced in fixture runtime.",
         "evidence": {
           "status": "OFFLINE_FIXTURE_RUNTIME",
-          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-05\\manifest.json",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-06\\manifest.json",
           "requirements": [
             {
               "id": "A04",
               "status": "PASS",
               "artifact": "A04-delayed_costly_wallet_not_followable\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=4;sha256=a2e7761177251c29799c3da15ae7e739c872d547441a2f1e5e8d4165f894974a"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=4;sha256=895e5f6f170aeb807be5a72ccab9598e7f4fb28ebb140c693cc9742dae1c647b"
             },
             {
               "id": "A05",
               "status": "PASS",
               "artifact": "A05-frozen_candidate_genealogy_and_execution\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=5;sha256=96a1ed56f678d7cbede5e7ce3299a3b396e26fb80ab1ae0e363380abf8fb94a8"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=5;sha256=1a3d3e4ff21d433446f1d687b1b67815ad78ae89936089e461c95e2d9fbef0b5"
             },
             {
               "id": "A07",
               "status": "PASS",
               "artifact": "A07-planted_leakage_and_multiplicity_traps\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=e8e521e463a25da92145eeb60594c1932cf948d121c2d7a35152427ae153a6b8"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=0225cb952638497b265291b8fcc232db50f9bef6bbb149fed9bfd5e817a16ddf"
             },
             {
               "id": "A08",
               "status": "PASS",
               "artifact": "A08-known_safety_veto_overrides_high_alpha\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=8;sha256=5741a4444be47ca66f8f4f74866175a853e643d6a32456f48f79f5c218b66507"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=8;sha256=6513a5d1bb1eaad828b8caed664c9801db8a966dfa6d0218b9d2120f5c0c6028"
             },
             {
               "id": "A11",
               "status": "PASS",
               "artifact": "A11-provider_failure_preserves_queued_work\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=5952f2f554258dc17616b34080229833be51a95895b2a23c8f445cff06c6e53f"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=fb9e0bde71aaf3c7da2631added073846d77a0cfd33f8dfaeae0c128c215374b"
             },
             {
               "id": "A12",
               "status": "PASS",
               "artifact": "A12-restart_restores_debt_episodes_and_forward_evidence\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=24fa851cd33feeb908b041a8de64cc4eaff1b6d1f2e2595ea50568d4f92f0bbe"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=1c7bdb7a32dcc519e2afc4858bc017bfcbb74658bdf31a1be7e9e162490696f9"
             },
             {
               "id": "A14",
               "status": "PASS",
               "artifact": "A14-no_monster_stress_respects_tail_budget\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=14;sha256=27e25564b74bfe9753dc38cfc368806f3e7c312d31449e3d77bc54a37e9260ff"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=14;sha256=be67cba96ec59ead6ab03c5755fee8d3289e85066580fa0f29608fb3b3bac0ab"
             },
             {
               "id": "A15",
               "status": "PASS",
               "artifact": "A15-operator_authority_required_for_live_transition\\result.json",
-              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=15;sha256=9d44f85b9cecf23661db43e55bbd918a1aadda7ff3102373d37d9c39c00cd7f3"
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=15;sha256=d17818b7106bed03554add90dcaec99c350181cbbe183371f5f847b713e4b487"
             }
           ],
           "production_status": "UNMEASURED",
           "live_capability": false,
-          "manifest_sha256": "5005662c4ca1af2ed2813868c78b033844a30d327156b72d7e77097348e1c4f1"
+          "manifest_sha256": "ba671ab9b50d64174a5363b361f3cbd02cdf090a9f009708920dd0a1c9a98a9c"
         },
         "remaining_gap": "Permanent production lawful access, reliable execution, measured edge and capital survival are not established by fixture assertions."
       }
@@ -2012,6 +2012,6 @@
     "source_drift_during_proof": [],
     "implementation_report": "docs/audits/UNKNOWN_ENGINE_IMPLEMENTATION_REPORT.md"
   },
-  "implementation_source_commit": "20d8fde3ff2d291fd7f734c371f99c8238760977",
+  "implementation_source_commit": "5f37343f8e83a49fe511b4cf7828b9b7feb87e5c",
   "baseline_notice": "Original classifications and runtime_evidence fields describe the pre-implementation audit. Supplemental implementation_update fields contain current scoped proof; neither establishes live edge."
 }

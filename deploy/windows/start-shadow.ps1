@@ -15,6 +15,8 @@ if (-not (Test-Path -LiteralPath $taskPython -PathType Leaf)) {
     throw 'Staging Python interpreter is missing'
 }
 New-Item -ItemType Directory -Path $taskLogs -Force | Out-Null
+Add-Type -Path (Join-Path $PSScriptRoot 'ShadowProcessJob.cs')
+[MemecoinShadowProcessJob]::AttachCurrentProcess()
 Set-Location -LiteralPath $taskRepo
 # This launcher only collects and simulates. It cannot inherit an armed
 # wallet or an isolated signer from the machine's environment.
