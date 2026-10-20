@@ -8549,7 +8549,8 @@ class TestSourceIntelligenceIsLiveWired(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(payload["declared"], 20)
         self.assertEqual(payload["ready"], 0)
         self.assertEqual(payload["by_state"].get("NO_FETCHER", 0)
-                         + payload["by_state"].get("UNCONFIGURED", 0),
+                         + payload["by_state"].get("UNCONFIGURED", 0)
+                         + payload["by_state"].get("UNAVAILABLE", 0),
                          payload["declared"])
 
 
@@ -13307,9 +13308,10 @@ class TestTheSourceUniverseIsActuallyWired(unittest.TestCase):
         self.assertEqual(transport_report.unsupported, [])
         self.assertEqual(report.by_state.get("UNKNOWN_KIND", 0), 0)
         # And every non-ready declaration is accounted for by name in exactly
-        # one of the two answerable buckets.
+        # one of the endpoint, credential or verified-unavailable buckets.
         named = {source for source, _ in transport_report.pending_endpoint}
         named |= {source for source, _ in transport_report.unconfigured}
+        named |= {source for source, _ in transport_report.unavailable}
         self.assertEqual(len(named), report.declared - report.ready)
 
     def test_the_registry_spans_regions_and_languages(self):
