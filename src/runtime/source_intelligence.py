@@ -9,6 +9,7 @@ surface with the trading code.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -51,6 +52,146 @@ class SourceIntelligence:
     write into state a decision reads later, which is the property that lets
     this live in its own file at all: a change to how a Telegram post is
     indexed cannot reach the code that sizes a position."""
+
+    def _enqueue_population_work(self, kind: str, payload: Dict[str, Any], *,
+                                 evidence_refs=(), now: Optional[float] = None) -> Optional[str]:
+        """Canonical intake on the existing research engine, with explicit debt.
+
+        Research persistence failures do not interrupt source indexing or
+        trading telemetry, but are visible as DATA_BLOCKED and logged. No
+        consumer, source operator, cost, exit fill or population is invented.
+        """
+        engine = getattr(self, "unknown_engine", None)
+        if engine is None or not callable(getattr(engine, "enqueue_work", None)):
+            return None
+        observed = now if now is not None else payload.get("observed_at")
+        previous = getattr(self, "population_research_intake", {})
+        try:
+            observed = float(observed)
+            job = engine.enqueue_work(kind, payload, axes={key: value for key, value in {
+                "chain": payload.get("chain_id"), "chain_family": payload.get("chain_family"),
+                "protocol": payload.get("protocol"), "data_source": payload.get("source_id"),
+                "narrative": payload.get("narrative_id"),
+                "region_language": f"{payload.get('region') or 'UNKNOWN'}:{payload.get('language') or 'UNKNOWN'}"
+                    if kind == "NARRATIVE_OBSERVATION" else None}.items() if value is not None},
+                evidence_refs=tuple(evidence_refs), now=observed)
+            if not job:
+                raise RuntimeError("canonical research intake returned no durable job reference")
+            self.population_research_intake = {"status": "OBSERVED", "kind": kind, "job_id": job, "observed_at": observed,
+                "failed_inputs": int(previous.get("failed_inputs", 0)),
+                "last_failure": previous.get("last_failure")}
+            return job
+        except Exception as exc:
+            self.population_research_intake = {"status": "DATA_BLOCKED", "kind": kind,
+                "reason": f"{type(exc).__name__}: {exc}", "observed_at": observed,
+                "failed_inputs": int(previous.get("failed_inputs", 0)) + 1,
+                "last_failure": {"kind": kind, "observed_at": observed, "reason": str(exc)}}
+            logger.error("population canonical intake DATA_BLOCKED (%s): %s", kind, exc)
+            return None
+
+    def _record_population_actor(self, token: str, event: Dict[str, Any], observation: Dict[str, Any]) -> Optional[str]:
+        # This callback is used by the decoded Solana trade handler. Preserve
+        # source event time separately from our actual observation clock.
+        frame = self._population_sampling_frame(token)
+        observed = time.time()
+        event_at = event.get("timestamp", observation.get("timestamp"))
+        payload = {"chain_id": event.get("chain_id") or "solana",
+            "chain_family": event.get("chain_family") or "SOLANA", "address": str(event["wallet"]),
+            "event_at": event_at, "observed_at": observed,
+            "source_id": event.get("source_id") or event.get("program") or "decoded-solana-trades",
+            "observation_id": event.get("signature"), "protocol": event.get("program") or event.get("launchpad"),
+            "relation": {"kind": "bought", "target": token, "target_type": "token"}}
+        # An explicitly declared sampling frame may accompany an observation.
+        # Merely arriving through this stream does not establish unbiasedness.
+        if observation.get("population_selection"):
+            payload["selection"] = observation["population_selection"]
+        elif frame is not None:
+            payload["selection"] = {"population": "UNBIASED", "selected_at": observed,
+                "rule_id": frame["rule_id"], "sampling_frame_ref": frame["reference"], "uses_outcomes": False}
+            if str(event["wallet"]) in frame.get("benchmark_wallet_ids", []):
+                payload["selection"].update(additional_populations=["FAMOUS_BENCHMARK"], benchmark_ref=frame["reference"])
+            native_key = [payload["chain_id"], str(event["wallet"]), token, event.get("signature")]
+            payload["control_plan"] = {"trial_id": "observed-stream:" + hashlib.sha256(json.dumps(native_key).encode()).hexdigest(),
+                "seed": hashlib.sha256(json.dumps([frame["rule_id"], native_key]).encode()).hexdigest(),
+                "delay_grid_seconds": frame["delay_grid_seconds"]}
+        if observation.get("population_control_plan"):
+            payload["control_plan"] = observation["population_control_plan"]
+        for field in ("lifecycle_stage", "regime", "capital_size", "entry_delay_seconds"):
+            if field in observation:
+                payload[field] = observation[field]
+        return self._enqueue_population_work("ACTOR_OBSERVATION", payload,
+            evidence_refs=event.get("evidence_refs") or (), now=observed)
+
+    def _population_sampling_frame(self, token: str) -> Optional[Dict[str, Any]]:
+        """Declare the observed-stream census design before recruiting a wallet.
+
+        Delay values are prospective experiment arms, never latency claims.
+        No launch outside the actually observed census is represented here.
+        """
+        engine = getattr(self, "unknown_engine", None)
+        records = getattr(getattr(self, "launch_census", None), "_records", {})
+        if engine is None or token not in records:
+            return None
+        try:
+            frame = engine.framework.get_research_component("population_sampling_frame_v1")
+            if frame:
+                return frame
+            declared = time.time()
+            benchmark_wallets = sorted((getattr(getattr(self, "benchmark_corpus", None), "wallets", {}) or {}).keys())
+            if len(benchmark_wallets) > 1000:
+                raise ValueError("benchmark sampling frame exceeds reviewed 1000-address bound")
+            contract = {"rule_id": "all-first-decoded-buys-in-observed-launch-census-v1",
+                "scope": "configured observed stream; first decoded buy per wallet per launch-census token",
+                "representativeness": "UNBIASED_WITHIN_DECLARED_OBSERVED_STREAM_ONLY",
+                "uses_outcomes": False, "declared_at": declared,
+                "benchmark_wallet_ids": benchmark_wallets,
+                "benchmark_semantics": "declared public-study roster membership; no verified skill or PNL claim",
+                "delay_grid_seconds": [1., 3., 10., 30.],
+                "delay_semantics": "predeclared randomized prospective measurement arms; not measured latency"}
+            reference = engine._record("population_sampling_frame_declared", contract, declared)
+            frame = {**contract, "reference": reference}
+            engine.framework.checkpoint_research_component("population_sampling_frame_v1", frame)
+            return frame
+        except Exception as exc:
+            self.population_research_intake = {"status": "DATA_BLOCKED", "kind": "SAMPLING_FRAME",
+                "reason": str(exc), "failed_inputs": int(getattr(self, "population_research_intake", {}).get("failed_inputs", 0)) + 1}
+            logger.error("population sampling frame DATA_BLOCKED: %s", exc)
+            return None
+
+    def _record_population_narrative(self, event: Any) -> Optional[str]:
+        metadata = dict(getattr(event, "metadata", None) or {})
+        transport = (getattr(self, "transports", {}) or {}).get(event.source_id)
+        tokens = list(getattr(event, "token_addresses", ()) or ())
+        # Token-linked public mentions share a namespace. Unlinked content is
+        # represented by its hash until an observed topic lineage is supplied.
+        narrative_id = metadata.get("narrative_id") or "content:" + event.content_hash
+        if len(tokens) == 1 and not metadata.get("narrative_id"):
+            native_chain = metadata.get("chain_id") or "UNKNOWN"
+            narrative_id = f"token:{native_chain}:{tokens[0]}"
+        payload = {"narrative_id": narrative_id, "source_id": event.source_id,
+            "platform": metadata.get("platform") or getattr(transport, "kind", None) or "UNKNOWN", "language": event.language or "UNKNOWN",
+            "region": metadata.get("region"), "event_at": event.source_at, "observed_at": event.observed_at,
+            "text": event.text, "stage": "MENTION", "chain_id": metadata.get("chain_id"),
+            "token_id": tokens[0] if len(tokens) == 1 else None,
+            "observation_id": hashlib.sha256(json.dumps([event.source_id, metadata.get("message_id") or metadata.get("link"),
+                event.content_hash, event.source_at], sort_keys=True).encode()).hexdigest()}
+        # Only explicit reviewed provenance can assert operator independence
+        # or original/clone/promotion labels. Author handles are not operators.
+        for key in ("operator_id", "operator_verified", "operator_evidence_refs", "label", "label_provenance"):
+            if key in metadata:
+                payload[key] = metadata[key]
+        return self._enqueue_population_work("NARRATIVE_OBSERVATION", payload,
+            evidence_refs=metadata.get("evidence_refs") or (), now=event.observed_at)
+
+    def _record_population_follow_outcome(self, payload: Dict[str, Any], *, evidence_refs=(),
+                                          now: Optional[float] = None) -> Optional[str]:
+        """Forward a resolved native paper/fill receipt without manufacturing it.
+
+        The population consumer validates every clock, actual fill, capacity,
+        fee/gas/tip/failure/crowding measurement and declared control trial.
+        A mark or benchmark screenshot is never converted to this envelope.
+        """
+        return self._enqueue_population_work("FOLLOW_OUTCOME", dict(payload), evidence_refs=evidence_refs, now=now)
 
     def _authenticity(self, token: str, candidate: Any) -> Dict[str, Any]:
         """Is this token the entity it claims to be, and how do we know.
@@ -255,6 +396,9 @@ class SourceIntelligence:
         for stale in [key for key in self._actor_entries
                       if key not in self.hot_state.active_tokens]:
             self._actor_entries.pop(stale, None)
+        population_recorder = getattr(self, "_record_population_actor", None)
+        if callable(population_recorder):
+            population_recorder(token, event, observation)
 
     async def _source_consumer_loop(self):
         """Index every source event the instant it arrives.
@@ -299,6 +443,9 @@ class SourceIntelligence:
 
     def _index_source_event(self, event: Any) -> None:
         """One event into the per-token index and the lead-lag graph."""
+        population_recorder = getattr(self, "_record_population_narrative", None)
+        if callable(population_recorder):
+            population_recorder(event)
         # A post from an account this launch NAMED in its own metadata is the
         # only verifiable social link available: the account controls what it
         # publishes and the desk observed the publication. It says the account
@@ -346,6 +493,9 @@ class SourceIntelligence:
             logger.warning("source mesh collection failed: %s", exc)
             return 0
         for event in events:
+            population_recorder = getattr(self, "_record_population_narrative", None)
+            if callable(population_recorder):
+                population_recorder(event)
             for token in event.token_addresses:
                 observations = self._source_events.setdefault(token, [])
                 observations.append(event)

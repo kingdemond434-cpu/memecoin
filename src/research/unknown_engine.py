@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import deque
 import hashlib
+import inspect
 import json
 import math
 import time
@@ -74,6 +75,57 @@ class UnknownOpportunityEngine:
         self.training_facts = deque(maxlen=16)
         self.last_proposal_round = {"status": "NOT_RUN", "authority": "none"}
         self.last_pass = {"status": "NOT_RUN", "authority": "none"}
+        self.workflows = None
+
+    def configure_workflows(self, workflows: Any) -> None:
+        self.workflows = workflows
+
+    def enqueue_work(self, kind: str, payload: dict, *, axes=None,
+                     evidence_refs=(), now: Optional[float] = None) -> str:
+        """Idempotently retain work before admitting it to the reference queue."""
+        now = time.time() if now is None else float(now)
+        if _contains_forbidden(payload):
+            raise ValueError("credentials or authority instructions cannot enter research work")
+        axes = dict(axes or {})
+        if kind == "EXACT_CANDIDATE":
+            created = payload["candidate"]["created_at"]
+            return self.ingest({"source_id": "canonical-research-compiler", "rights": "PUBLIC",
+                "event_at": created, "available_at": created, "observed_at": created,
+                "exact_candidate": payload["candidate"], "source_lineage": payload["candidate"]["source_lineage"]}, now=now)
+        identity = "work-" + _digest([kind, payload, axes])
+        if self.frontier.job(identity) is not None:
+            return identity
+        ref = self._record("research_typed_work", {"work_kind": kind, "point_payload": payload}, now)
+        auction = self.workflows.auction(kind) if self.workflows and kind in self.workflows.kinds else AuctionInputs()
+        return self.frontier.enqueue(kind, ref, axes=axes, job_id=identity,
+            evidence_refs=[ref, *evidence_refs], auction=auction,
+            exploration_tags=["unknown_mechanisms"], now=now)
+
+    def notify_evidence(self, changes, refs, now: float) -> None:
+        """Only the exact named new evidence can wake incomplete work."""
+        state = self.framework.get_research_component("research_evidence_wakes") or {"pending": {}}
+        for change in sorted(set(changes)):
+            if not isinstance(change, str) or not change:
+                raise ValueError("evidence changes must be named")
+            state["pending"][change] = {"refs": list(dict.fromkeys(refs)), "cursor": ""}
+        self.framework.checkpoint_research_component("research_evidence_wakes", state)
+        self._drain_evidence_wakes(now)
+
+    def _drain_evidence_wakes(self, now: float) -> None:
+        state = self.framework.get_research_component("research_evidence_wakes") or {"pending": {}}
+        for change, work in list(state["pending"].items())[:8]:
+            jobs = self.frontier.pending_work(states=("HIBERNATED",), limit=33, enabling_change=change,
+                                             after_job_id=work["cursor"])
+            for job in jobs[:32]:
+                if self.frontier.coordinate(job["axes"])["state"] == "HIBERNATED_LOW_VOI":
+                    continue
+                self.frontier.wake_job(job["job_id"], enabling_change=change, evidence_refs=work["refs"], now=now)
+            if len(jobs) < 33:
+                del state["pending"][change]
+            else:
+                work["cursor"] = jobs[31]["job_id"]
+        if state["pending"] or self.framework.get_research_component("research_evidence_wakes"):
+            self.framework.checkpoint_research_component("research_evidence_wakes", state)
 
     def wake_gauntlet_job(self, job_id: str, *, now: Optional[float] = None) -> bool:
         """A named enabling change costs existing work without resetting it."""
@@ -306,7 +358,14 @@ class UnknownOpportunityEngine:
             "gap": "exact entry/veto/size/exit/PIT/execution assumptions not supplied",
             "authority": "none"}
 
-    def _submit_exact(self, candidate: dict, now: float) -> str:
+    def _submit_exact(self, candidate: dict, now: float, *, allow_existing: bool = False) -> str:
+        previous = self.framework.hypotheses.get(candidate["candidate_id"])
+        if previous is not None and previous.exact_candidate == candidate:
+            if not allow_existing:
+                return "DUPLICATE"
+            if self.framework._exact_frozen_valid(previous):
+                return "EXACT_CANDIDATE"
+            return "BLOCKED"
         spec = HypothesisSpec(
             hypothesis_id=candidate["candidate_id"], mechanism=candidate["mechanism"],
             target="net_elogw", features=sorted(candidate["feature_program"]),
@@ -330,6 +389,8 @@ class UnknownOpportunityEngine:
         return "EXACT_CANDIDATE"
 
     def run_pass(self, *, limit: int = 8, now: Optional[float] = None) -> dict:
+        if self.workflows is not None:
+            return self._run_workflows_sync(limit=limit, now=now)
         now = time.time() if now is None else float(now)
         self._wake_checkpointed_gauntlet_work(limit, now)
         jobs = self.frontier.lease_jobs(self.worker, limit=limit, lease_seconds=120,
@@ -380,10 +441,138 @@ class UnknownOpportunityEngine:
                           "processed": len(results), "results": results, "authority": "none"}
         return self.last_pass
 
+    def _workflow_jobs(self, limit: int, now: float):
+        self._wake_checkpointed_gauntlet_work(limit, now)
+        self._drain_evidence_wakes(now)
+        self.workflows.prepare(now)
+        return self.frontier.lease_jobs(self.worker, limit=limit, lease_seconds=600,
+            resource_budget=self.research_pass_resource_units or float(limit),
+            kinds=sorted({"RAW_EVIDENCE"} | self.workflows.kinds), now=now)
+
+    def _dispatch_work(self, job: dict, payload: dict, now: float):
+        if job["kind"] != "RAW_EVIDENCE":
+            refs = list(dict.fromkeys([job["payload_ref"], *job["evidence_refs"]]))
+            return self.workflows.consume(job["kind"], payload, refs, job["axes"], now)
+        disposition, detail = self._compile(payload["raw"], now)
+        if disposition == "EXACT_CANDIDATE":
+            disposition = self._submit_exact(detail["candidate"], now,
+                allow_existing=payload["raw"].get("source_id") == "canonical-research-compiler")
+            detail["novelty"] = self.framework.candidate_niche(detail["candidate"]["candidate_id"])
+        children = []
+        if disposition in {"DATA_REQUEST", "REPRESENTATION_REQUEST", "SOURCE_REQUEST", "MECHANISM_HYPOTHESIS"}:
+            children.append({"kind": disposition, "payload": detail})
+        return {"disposition": disposition, "detail": detail, "children": children}
+
+    def _commit_work(self, job: dict, result: dict, now: float) -> dict:
+        from src.research.frontier import DISPOSITIONS
+        if not isinstance(result, dict) or not isinstance(result.get("detail"), dict):
+            raise ValueError("consumer must return a typed result")
+        children = result.get("children", [])
+        if not isinstance(children, list) or len(children) > 64:
+            raise ValueError("consumer exceeded bounded child work contract")
+        actual = str(result.get("disposition", "BLOCKED"))
+        blocked = actual in {"BLOCKED", "DATA_BLOCKED"}
+        disposition = "BLOCKED" if blocked else actual if actual in DISPOSITIONS else "DEEPENING_TASK"
+        detail = result["detail"]
+        receipts = self.framework.get_research_component("research_conversion_receipts") or {"refs": {}}
+        result_key = _digest([job["job_id"], result])
+        ref = receipts["refs"].get(result_key)
+        if ref is None:
+            ref = self._record("unknown_conversion_receipt", {"job_id": job["job_id"],
+                "input_ref": job["payload_ref"], "disposition": disposition,
+                "consumer_disposition": actual, "detail": detail, "authority": "none"}, now)
+            receipts["refs"][result_key] = ref
+            self.framework.checkpoint_research_component("research_conversion_receipts", receipts)
+        if job["kind"] == "GAUNTLET" and detail.get("status") in {"REJECTED", "HISTORICAL_SURVIVOR"}:
+            receipt = detail["receipt"]
+            hid, seal = receipt["candidate_id"], receipt["spec_hash"]
+            descendant = {"parent_id": hid, "parent_frozen_hash": seal}
+            if detail["status"] == "HISTORICAL_SURVIVOR":
+                descendant["survival_evidence"] = {"verdict": "SURVIVOR", "spec_hash": seal, "evidence_ref": ref}
+                next_kind = "SURVIVOR_DESCENDANT"
+            else:
+                # A rejected test is an attributed result, not proof of a
+                # specific causal failure. The diagnosis consumer requests
+                # discriminating evidence before permitting resurrection.
+                descendant["attribution"] = {"canonical_receipt_ref": ref,
+                    "observed_test_result": receipt.get("results", {}).get("test", {}).get(hid+"@"+seal, {})}
+                next_kind = "FAILURE_DESCENDANT"
+            self.enqueue_work(next_kind, descendant, axes=job["axes"], evidence_refs=[ref], now=now)
+        # Persist every downstream child before acknowledging the parent. A
+        # retry reuses semantic child identities, including after a crash.
+        for child in children:
+            self.enqueue_work(child["kind"], child["payload"], axes=child.get("axes", job["axes"]),
+                evidence_refs=[job["payload_ref"], ref], now=now)
+        if disposition == "EXACT_CANDIDATE":
+            self._queue_gauntlet(detail, job["axes"], [job["payload_ref"], ref], now)
+        changes = detail.get("changes", [])
+        if changes:
+            self.notify_evidence(changes, [job["payload_ref"], ref], now)
+        # Malformed raw input has a terminal validation receipt. Incomplete
+        # typed work retains its identity and exact named wake condition.
+        if blocked and job["kind"] != "RAW_EVIDENCE":
+            change = result.get("enabling_change") or detail.get("enabling_change")
+            if not change:
+                change = next((child.get("enabling_change") for child in children if child.get("enabling_change")), None)
+            change = change or "research-input:" + job["job_id"]
+            self.frontier.block_leased_job(job["job_id"], self.worker, job["lease_token"],
+                enabling_change=change, reason=str(detail.get("reason") or detail.get("status") or "observed input missing"),
+                evidence_refs=[ref], now=now)
+        else:
+            self.frontier.ack(job["job_id"], self.worker, job["lease_token"],
+                disposition=disposition, evidence_refs=[ref], now=now)
+        return {"job_id": job["job_id"], "disposition": disposition, "receipt": ref}
+
+    def _retry_work(self, job: dict, exc: Exception, now: float) -> dict:
+        self.frontier.retry(job["job_id"], self.worker, job["lease_token"],
+            reason=f"{type(exc).__name__}: {exc}", now=now)
+        return {"job_id": job["job_id"], "disposition": "BLOCKED", "reason": str(exc)}
+
+    def _pass_report(self, jobs: list, results: list) -> dict:
+        self.last_pass = {"status": "OK" if jobs else "NO_COSTED_WORK_DUE",
+                          "processed": len(results), "results": results, "authority": "none"}
+        return self.last_pass
+
+    def _run_workflows_sync(self, *, limit: int, now: Optional[float]) -> dict:
+        now = time.time() if now is None else float(now)
+        jobs = self._workflow_jobs(limit, now)
+        results = []
+        for job in jobs:
+            try:
+                payload = self._load_refs({job["payload_ref"]})[job["payload_ref"]]
+                result = self._dispatch_work(job, payload, now)
+                if inspect.isawaitable(result):
+                    result.close()
+                    raise RuntimeError("source acquisition requires the existing asynchronous research pass")
+                results.append(self._commit_work(job, result, now))
+            except Exception as exc:
+                results.append(self._retry_work(job, exc, now))
+        return self._pass_report(jobs, results)
+
+    async def run_async_pass(self, *, limit: int = 8, now: Optional[float] = None) -> dict:
+        if self.workflows is None:
+            return self.run_pass(limit=limit, now=now)
+        now = time.time() if now is None else float(now)
+        jobs = self._workflow_jobs(limit, now)
+        results = []
+        for job in jobs:
+            try:
+                payload = self._load_refs({job["payload_ref"]})[job["payload_ref"]]
+                result = self._dispatch_work(job, payload, now)
+                if inspect.isawaitable(result):
+                    result = await result
+                # Acquisition timestamps come from completion, not a pass's
+                # earlier start. Controlled tests can supply a fixed clock.
+                results.append(self._commit_work(job, result, now))
+            except Exception as exc:
+                results.append(self._retry_work(job, exc, now))
+        return self._pass_report(jobs, results)
+
     def report(self) -> dict:
         return {"status": "SHADOW_ONLY", "authority": "none", "frontier": self.frontier.report(),
                 "last_pass": self.last_pass, "canonical_evidence": self.evidence.report(),
                 "proposal_round": self.last_proposal_round,
+                "workflows": self.workflows.report() if self.workflows is not None else {"status": "NOT_CONFIGURED"},
                 "gauntlet_adapter": {"configured": self.gauntlet_handler is not None,
                     "configuration": getattr(self, "gauntlet_configuration", None),
                     "resource_costs": self.gauntlet_auction.to_dict(),

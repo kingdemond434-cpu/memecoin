@@ -2013,5 +2013,81 @@
     "implementation_report": "docs/audits/UNKNOWN_ENGINE_IMPLEMENTATION_REPORT.md"
   },
   "implementation_source_commit": "5f37343f8e83a49fe511b4cf7828b9b7feb87e5c",
-  "baseline_notice": "Original classifications and runtime_evidence fields describe the pre-implementation audit. Supplemental implementation_update fields contain current scoped proof; neither establishes live edge."
+  "baseline_notice": "Original classifications and runtime_evidence fields describe the pre-implementation audit. Supplemental implementation_update fields contain current scoped proof; neither establishes live edge.",
+  "architecture_followup": {
+    "as_of": "2026-10-20",
+    "baseline_preserved": true,
+    "state": "IMPLEMENTED_AND_OFFLINE_TESTED",
+    "live_capability": false,
+    "production_performance": "UNMEASURED",
+    "implemented_requirement_paths": [
+      3,
+      4,
+      7,
+      8,
+      9,
+      10,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      20,
+      21,
+      22,
+      24,
+      26
+    ],
+    "capabilities": [
+      "canonical typed queue consumers with named evidence wake and retry",
+      "chain-qualified actor graph and PIT matched/delayed populations",
+      "Unicode narrative provenance and source-outcome attribution",
+      "23 causal representations and registered paged source acquisition",
+      "17 mechanism recipes, 24 strategy families, 12 bounded training searches",
+      "18 attributed failure diagnoses and frozen survivor ablations",
+      "actual historical gauntlet and prospective native paper consumer",
+      "unsigned native simulation/message fee acquisition through actual executor",
+      "real native fills required for canary/champion forward credit"
+    ],
+    "proofs": [
+      {
+        "manifest": "C:\\Users\\dell\\memecoin-architecture-proof-20261020-02\\manifest.json",
+        "sha256": "8ed1475f4205e00cdb04511b59964b5d8f37b698652aba23e6ef4a8e3f444fa2",
+        "counts": {
+          "PASS": 122,
+          "FAIL": 0,
+          "SKIP": 0
+        },
+        "scope": "OFFLINE_SYNTHETIC_RUNTIME_ONLY",
+        "canonical_evidence_chain": {
+          "verified": true,
+          "detail": "OK",
+          "records": 122
+        }
+      },
+      {
+        "manifest": "C:\\Users\\dell\\memecoin-acceptance-architecture-20261020-07\\manifest.json",
+        "sha256": "abd62070a879f47db38cd8e3f93c2e5bf831578ab80f56e8a417189385817521",
+        "counts": {
+          "BLOCKED": 0,
+          "FAIL": 0,
+          "PASS": 15
+        },
+        "scope": "OFFLINE_FIXTURE_RUNTIME_ONLY",
+        "canonical_evidence_chain": {
+          "detail": "OK",
+          "records": 15,
+          "verified": true
+        }
+      }
+    ],
+    "remaining_dependencies": [
+      "actual provider access and independently verified source rights",
+      "measured typed native features, executable targets and explicit execution policies",
+      "actor-attributed delayed fills, crowding and complete costs",
+      "native adapters/fixtures for unsupported chains and protocols",
+      "untouched forward cohorts, real canary fills and measured production performance"
+    ]
+  }
 }

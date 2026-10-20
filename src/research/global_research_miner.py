@@ -109,6 +109,7 @@ class GlobalResearchMiner:
         self.observation_configuration = list(observation_configuration)
         self._evm_cursor = 0
         self.observation_status: Dict[str, Any] = {"status": "NOT_RUN", "observation_only": True}
+        self.conversion_status = {"passes": 0, "processed": 0, "recent_results": []}
 
     async def start(self):
         await self._load_ledger()
@@ -134,17 +135,36 @@ class GlobalResearchMiner:
             self._session = None
 
     async def _loop(self):
+        next_collection = 0.0
         while self._running:
             try:
-                await self.run_once()
+                if time.monotonic() >= next_collection:
+                    await self.run_once()
+                    next_collection = time.monotonic() + self.interval_seconds
+                else:
+                    await self._convert_pending()
             except Exception as exc:
                 logger.error("Global research miner failed: %s", exc)
-            await asyncio.sleep(self.interval_seconds)
+            await asyncio.sleep(min(10, self.interval_seconds))
+
+    async def _convert_pending(self):
+        if self.unknown_engine is not None:
+            run = getattr(self.unknown_engine, "run_async_pass", None)
+            if run is not None:
+                result = await run()
+            else:
+                result = self.unknown_engine.run_pass()
+            self.conversion_status["passes"] += 1
+            if isinstance(result, dict):
+                self.conversion_status["processed"] += result.get("processed", 0)
+                self.conversion_status["recent_results"] = (self.conversion_status["recent_results"] + result.get("results", []))[-64:]
+            return result
 
     async def run_once(self):
         # Deterministic public/native collection is independent of proposal
         # providers and uses this existing research pass, never a new task.
         await self._run_observation_pass()
+        await self._convert_pending()
         # Anonymous GitHub search permits only 10 requests/minute. Rotate eight
         # queries per hourly cycle so a bad/expired token never exhausts the
         # fallback budget while all languages are still covered over time.
@@ -153,11 +173,12 @@ class GlobalResearchMiner:
         self._query_cursor = (self._query_cursor + count) % len(self.QUERIES)
         for query, language in selected:
             await self._mine_github(query, language)
+            await self._convert_pending()
         await self._mine_arxiv()
         for url, language, source in self.RSS_FEEDS:
             await self._mine_rss(url, language, source)
+            await self._convert_pending()
         if self.unknown_engine is not None:
-            self.unknown_engine.run_pass()
             await self.unknown_engine.run_proposal_pass()
 
     async def _run_observation_pass(self):
@@ -361,6 +382,7 @@ class GlobalResearchMiner:
             "languages": sorted({lead.language for lead in self.leads}),
             "data_status": dict(self.data_status),
             "multi_chain_observation": dict(self.observation_status),
+            "conversion": dict(self.conversion_status),
             "license_blocked": sum(lead.status == "DATA_BLOCKED_LICENSE" for lead in self.leads),
             "unknown_opportunity_engine": (self.unknown_engine.report()
                                            if self.unknown_engine is not None

@@ -3178,7 +3178,7 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
         loop is intentionally budgeted and age-adaptive so thousands of active
         episodes cannot create an unbounded quote storm.
         """
-        if not self.jupiter or not self.jupiter._session or not self.dataset_builder.active_episodes:
+        if not self.dataset_builder or not self.dataset_builder.active_episodes:
             return
         self._refresh_market_observation_cohort()
         tokens = list(self._market_observation_cohort)
@@ -3231,6 +3231,12 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
             self._market_observation_cohort.add(episode.token)
 
     async def _observe_token_market(self, token: str, observed_at: float):
+        try:
+            await self._native_forward_tick(token, observed_at)
+        except (ValueError, TypeError, KeyError, OSError) as exc:
+            logger.warning("Native paper forward observation blocked for %s: %s", token, exc)
+        if not self.jupiter or not getattr(self.jupiter, "_session", True):
+            return
         probe_lamports = int(self.global_config.get("market_probe_lamports", 10_000_000))
         buy_quote = await self.jupiter.get_quote(WSOL_MINT, token, probe_lamports, slippage_bps=300)
         if not buy_quote or buy_quote.output_amount <= 0:

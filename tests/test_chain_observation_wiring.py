@@ -37,7 +37,7 @@ def desk_at(tmp_path, calls=None):
     return desk
 
 
-def test_production_loop_collects_before_conversion_and_provider_research(tmp_path):
+def test_production_loop_drains_after_discovery_and_between_public_collection(tmp_path):
     async def scenario():
         calls = []
         desk = desk_at(tmp_path, calls)
@@ -54,7 +54,9 @@ def test_production_loop_collects_before_conversion_and_provider_research(tmp_pa
         miner._mine_github = miner._mine_arxiv = miner._mine_rss = research
         await miner.run_once()
         assert calls[0] == "public-discovery"
-        assert calls.index("public-discovery") < calls.index("public-research") < calls.index("conversion") < calls.index("proposals")
+        assert calls.index("public-discovery") < calls.index("conversion") < calls.index("public-research") < calls.index("proposals")
+        assert calls.count("conversion") > 1
+        assert calls[-1] == "proposals"
         assert desk.research_frontier.chain("new-unlisted-chain")["family"] == "UNKNOWN"
         assert desk.research_frontier.report()["cost_blocked"] >= 1
         assert miner.get_stats()["multi_chain_observation"]["evm"][0]["status"] == "NOT_CONFIGURED"

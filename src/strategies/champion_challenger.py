@@ -9,6 +9,9 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import json
 import hashlib
+import math
+import tempfile
+import threading
 from pathlib import Path
 import numpy as np
 from src.research.research_contracts import canonical_candidate_identity, validate_exact_candidate
@@ -135,6 +138,7 @@ class ChampionChallengerFramework:
         self.decay_window = decay_window
         self.decay_threshold = decay_threshold
         self.state_path = Path(state_path) if state_path else None
+        self._state_write_lock = threading.RLock()
         
         # The registry and the trial ledger. Both classes existed, neither
         # was ever constructed, so every one of their methods was dead: no
@@ -378,7 +382,8 @@ class ChampionChallengerFramework:
                 self.mark_data_blocked(hyp_id, "frozen candidate content changed")
                 continue
             if now - shadow["started_at"] >= self.shadow_duration:
-                forward_results = list(shadow["forward_results"])
+                forward_results = [row for row in shadow["forward_results"]
+                                   if self._forward_credit(row, allow_paper=True)]
                 if len(forward_results) >= self.min_oos_samples:
                     avg_elogw = np.mean([r.get("elogw", 0) for r in forward_results])
                     win_rate = sum(1 for r in forward_results if r.get("pnl", 0) > 0) / len(forward_results)
@@ -405,9 +410,11 @@ class ChampionChallengerFramework:
                 self.mark_data_blocked(hyp_id, "frozen candidate content changed")
                 continue
             if now - canary["started_at"] >= self.canary_duration:
-                if canary["position_count"] >= 20:
-                    avg_pnl = canary["total_pnl"] / max(canary["position_count"], 1)
-                    win_rate = sum(1 for r in canary["forward_results"] if r.get("pnl", 0) > 0) / max(len(canary["forward_results"]), 1)
+                real_results = [row for row in canary["forward_results"]
+                                if self._forward_credit(row)]
+                if len(real_results) >= 20:
+                    avg_pnl = sum(row["pnl"] for row in real_results) / len(real_results)
+                    win_rate = sum(row["pnl"] > 0 for row in real_results) / len(real_results)
                     
                     if avg_pnl > 0 and win_rate > 0.3:
                         champion = ChampionModel(
@@ -438,8 +445,9 @@ class ChampionChallengerFramework:
 
     async def _monitor_champion_decay(self):
         for hyp_id, champion in list(self.champions.items()):
-            if len(champion.forward_performance) >= self.decay_window:
-                recent = list(champion.forward_performance)[-self.decay_window:]
+            measured = [row for row in champion.forward_performance if self._forward_credit(row)]
+            if len(measured) >= self.decay_window:
+                recent = measured[-self.decay_window:]
                 avg_elogw = np.mean([r.get("elogw", 0) for r in recent])
                 win_rate = sum(1 for r in recent if r.get("pnl", 0) > 0) / len(recent)
                 
@@ -454,22 +462,62 @@ class ChampionChallengerFramework:
                     champion.status = "HIBERNATED"
                     logger.warning(f"Champion {hyp_id} hibernated")
 
+    @staticmethod
+    def _forward_credit(result: Dict, *, allow_paper: bool = False) -> bool:
+        """Legacy/unmeasured marks never acquire actual native fill credit.
+
+        The validation consumer authenticates receipt rows. This final framework
+        check preserves their type at every stage, including restored state.
+        """
+        if not all(type(result.get(key)) in (int, float) and math.isfinite(result[key])
+                   for key in ("pnl", "elogw")):
+            return False
+        stamps = [result.get(key) for key in ("entry_at", "exit_at", "observed_at")]
+        if (not all(type(stamp) in (int, float) and math.isfinite(stamp) and stamp > 0 for stamp in stamps)
+                or not stamps[0] <= stamps[1] <= stamps[2] <= time.time()):
+            return False
+        execution = result.get("execution", {})
+        refs = result.get("evidence_refs", [])
+        if (not isinstance(execution, dict) or execution.get("native") is not True
+                or execution.get("filled") is not True
+                or execution.get("route") not in {"pump_curve", "pump_native", "pumpswap_native"}
+                or not isinstance(refs, list)
+                or sum(isinstance(ref, str) and ref.startswith("evidence:") for ref in refs) < 2):
+            return False
+        if (result.get("scope") == "observed_forward" and result.get("real_fill") is True
+                and execution.get("evidence_kind") == "observed_transaction"):
+            return all(isinstance(execution.get(key), str) and execution[key]
+                       for key in ("entry_signature", "exit_signature"))
+        return bool(allow_paper and result.get("scope") == "observed_forward_shadow"
+                    and result.get("real_fill") is False
+                    and execution.get("evidence_kind") == "native_simulation")
+
     def record_forward_result(self, hyp_id: str, result: Dict):
         hypothesis = self.hypotheses.get(hyp_id)
         if hypothesis is None or not self._exact_frozen_valid(hypothesis):
             return False
         if result.get("spec_hash") != hypothesis.frozen_hash:
             return False
+        if result.get("entry_at", 0) < hypothesis.frozen_at:
+            return False
         if hyp_id in self.champions:
+            if not self._forward_credit(result):
+                return False
             self.champions[hyp_id].forward_performance.append(result)
         elif hyp_id in self.shadow_models:
+            if not self._forward_credit(result, allow_paper=True):
+                return False
             self.shadow_models[hyp_id]["forward_results"].append(result)
         elif hyp_id in self.canary_models:
+            if not self._forward_credit(result):
+                return False
             canary = self.canary_models[hyp_id]
             canary["forward_results"].append(result)
             if "pnl" in result:
                 canary["position_count"] += 1
                 canary["total_pnl"] += result["pnl"]
+        else:
+            return False
         self._save_state()
         return True
 
@@ -529,6 +577,10 @@ class ChampionChallengerFramework:
         self._save_state()
 
     def _save_state(self):
+        with self._state_write_lock:
+            self._write_state()
+
+    def _write_state(self):
         if not self.state_path:
             return
         state = {
@@ -562,9 +614,27 @@ class ChampionChallengerFramework:
             },
         }
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
-        temporary.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
-        os.replace(temporary, self.state_path)
+        descriptor, filename = tempfile.mkstemp(prefix=self.state_path.name + ".", suffix=".tmp",
+                                               dir=str(self.state_path.parent))
+        temporary = Path(filename)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(state, handle, sort_keys=True, allow_nan=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            for attempt in range(5):
+                try:
+                    os.replace(temporary, self.state_path)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(.02 * 2 ** attempt)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("checkpoint temporary cleanup failed: %s", exc)
 
     def _load_state(self):
         if not self.state_path or not self.state_path.exists():
