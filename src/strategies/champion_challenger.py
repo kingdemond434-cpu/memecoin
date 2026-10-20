@@ -223,6 +223,13 @@ class ChampionChallengerFramework:
         if hypothesis_id not in self.hypotheses:
             return
         champion = self.champions.get(hypothesis_id)
+        existing = self.challengers.get(hypothesis_id, {})
+        if (self.hypotheses[hypothesis_id].status == ModelStatus.DATA_BLOCKED.value
+                and existing.get("status") == ModelStatus.DATA_BLOCKED.value
+                and existing.get("reason") == reason
+                and hypothesis_id not in self.shadow_models and hypothesis_id not in self.canary_models
+                and (champion is None or champion.status == "HIBERNATED")):
+            return  # unchanged evidence cannot require another full checkpoint
         if champion:
             champion.status = "HIBERNATED"
         self.shadow_models.pop(hypothesis_id, None)
@@ -345,6 +352,7 @@ class ChampionChallengerFramework:
 
     async def _evaluate_challengers(self):
         for hyp_id, challenger in list(self.challengers.items()):
+            await asyncio.sleep(0)
             if hyp_id not in self.hypotheses:
                 continue
             

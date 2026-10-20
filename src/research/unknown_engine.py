@@ -442,12 +442,28 @@ class UnknownOpportunityEngine:
         return self.last_pass
 
     def _workflow_jobs(self, limit: int, now: float):
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("research pass limit must be an integer between 1 and 1000")
         self._wake_checkpointed_gauntlet_work(limit, now)
         self._drain_evidence_wakes(now)
         self.workflows.prepare(now)
-        return self.frontier.lease_jobs(self.worker, limit=limit, lease_seconds=600,
-            resource_budget=self.research_pass_resource_units or float(limit),
-            kinds=sorted({"RAW_EVIDENCE"} | self.workflows.kinds), now=now)
+        kinds = sorted({"RAW_EVIDENCE"} | self.workflows.kinds)
+        budget = self.research_pass_resource_units or float(limit)
+        groups = self.frontier.due_kinds(kinds, resource_budget=budget, now=now)
+        jobs = []
+        if groups:
+            rotation = self.framework.get_research_component("research_consumer_rotation") or {"last_kind": ""}
+            selected = next((kind for kind in groups if kind > rotation["last_kind"]), groups[0])
+            # One bounded lease per active group rotation prevents an older
+            # RAW/tag backlog from indefinitely hiding a newly wired consumer.
+            jobs = self.frontier.lease_jobs(self.worker, limit=1, lease_seconds=600,
+                resource_budget=budget, kinds=[selected], now=now)
+            self.framework.checkpoint_research_component("research_consumer_rotation", {"last_kind": selected})
+        remaining = budget - sum(job["total_cost"] for job in jobs)
+        if len(jobs) < limit and remaining > 0:
+            jobs += self.frontier.lease_jobs(self.worker, limit=limit-len(jobs), lease_seconds=600,
+                resource_budget=remaining, kinds=kinds, now=now)
+        return jobs
 
     def _dispatch_work(self, job: dict, payload: dict, now: float):
         if job["kind"] != "RAW_EVIDENCE":

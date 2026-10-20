@@ -2052,10 +2052,10 @@
     ],
     "proofs": [
       {
-        "manifest": "C:\\Users\\dell\\memecoin-architecture-proof-20261020-04\\manifest.json",
-        "sha256": "d68bedfcfc241b78bc4833bfbab8af5d5efd965f0ad53137939be4e2944966fa",
+        "manifest": "C:\\Users\\dell\\memecoin-architecture-proof-20261020-06\\manifest.json",
+        "sha256": "eabc0f95ee65492c6330eca10119a762d9b1d737b1d6872204a30faeb8abb642",
         "counts": {
-          "PASS": 143,
+          "PASS": 146,
           "FAIL": 0,
           "SKIP": 0
         },
@@ -2063,12 +2063,12 @@
         "canonical_evidence_chain": {
           "verified": true,
           "detail": "OK",
-          "records": 143
+          "records": 146
         }
       },
       {
-        "manifest": "C:\\Users\\dell\\memecoin-acceptance-architecture-20261020-09\\manifest.json",
-        "sha256": "cccfa6d744bf78e1767ee792fa1f19fbd0c5fd7f7b0c2b312f145ad1f73b20ee",
+        "manifest": "C:\\Users\\dell\\memecoin-acceptance-architecture-20261020-11\\manifest.json",
+        "sha256": "d23184f1104f443b45649b321a610a09e17e4c99bc79857a75929a4c57658c57",
         "counts": {
           "BLOCKED": 0,
           "FAIL": 0,
@@ -2089,6 +2089,7 @@
       "native adapters/fixtures for unsupported chains and protocols",
       "untouched forward cohorts, real canary fills and measured production performance"
     ],
-    "ingestion_responsiveness": "Cooperative per-record source/research yields, eight-job legacy pricing page, FULL-durability WAL with explicitly closed idle anchor; active-reader/concurrent-writer and queue-fairness regressions passed."
+    "ingestion_responsiveness": "Cooperative per-record source/research yields, eight-job legacy pricing page, FULL-durability WAL with explicitly closed idle anchor; active-reader/concurrent-writer and queue-fairness regressions passed.",
+    "evaluation_and_consumer_fairness": "Unchanged DATA_BLOCKED evaluations do not rewrite state; changed/stale authority remains durably blocked. Cooperative candidate evaluation and one rotating costed consumer-group lease preserve the existing pass budget."
   }
 }

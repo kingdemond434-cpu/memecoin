@@ -703,6 +703,20 @@ class FrontierIndex:
                               " ORDER BY job_id LIMIT ?", (*params, int(limit))).fetchall()
         return [self.job(row[0]) for row in rows]
 
+    def due_kinds(self, kinds: Sequence[str], *, resource_budget: float, now: float) -> List[str]:
+        """Costed consumer groups due inside this pass's resource envelope."""
+        names = sorted(set(kinds))
+        if not names or len(names) > 64:
+            raise ValueError("bounded registered consumer kinds required")
+        budget = _number(resource_budget, "resource_budget", optional=False)
+        with self._db() as db:
+            rows = db.execute("SELECT DISTINCT j.kind FROM jobs j JOIN coordinates c USING(coordinate_id) "
+                "WHERE j.kind IN (" + ",".join("?" for _ in names) + ") "
+                "AND ((j.state IN ('READY','RETRY') AND j.available_at<=?) OR (j.state='LEASED' AND j.lease_until<=?)) "
+                "AND j.total_cost IS NOT NULL AND j.total_cost<=? AND j.cost_unit='resource_units' "
+                "AND c.state!='HIBERNATED_LOW_VOI' ORDER BY j.kind", (*names, now, now, budget)).fetchall()
+        return [row[0] for row in rows]
+
     def price_pending_job(self, job_id: str, *, auction: AuctionInputs,
                           evidence_refs: Sequence[str], reason: str,
                           now: Optional[float] = None) -> bool:
