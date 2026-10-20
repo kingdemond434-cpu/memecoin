@@ -99,5 +99,12 @@ block-hash state queries.
   an unattended account was rejected by automatic approval review and was
   not performed.
 
+Starting real public EVM backfills exposed long initial observation passes.
+Each scouting/backfill call now has a 20-second deadline, and the same loop
+drains research work between source calls and native probes. Partial native
+backfills retain their original checkpoint/evidence; cancellation releases the
+actual observer's durable lease. This is a network work bound, not a claim
+about decision-path latency or completed historical coverage.
+
 All of these conditions remain explicit blocks, without synthetic performance
 claims or bypassing the existing promotion and live-submission locks.

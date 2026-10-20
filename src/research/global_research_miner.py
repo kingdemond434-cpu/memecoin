@@ -91,7 +91,8 @@ class GlobalResearchMiner:
                  unknown_engine: Any = None, chain_scout: Any = None,
                  evm_observers: Any = (), native_event_sink: Any = None,
                  observation_configuration: Any = (), native_probes: Any = (),
-                 native_probe_sink: Any = None, native_probe_configuration: Any = ()):
+                 native_probe_sink: Any = None, native_probe_configuration: Any = (),
+                 observation_timeout_seconds: float = 20):
         self.framework = framework
         self.interval_seconds = interval_seconds
         self.leads: List[ResearchLead] = []
@@ -113,6 +114,9 @@ class GlobalResearchMiner:
         self.native_probe_sink = native_probe_sink
         self.native_probe_configuration = list(native_probe_configuration)
         self._native_probe_cursor = 0
+        if type(observation_timeout_seconds) not in (int, float) or not 0 < observation_timeout_seconds <= 60:
+            raise ValueError("bounded positive observation deadline required")
+        self.observation_timeout_seconds = float(observation_timeout_seconds)
         self.observation_status: Dict[str, Any] = {"status": "NOT_RUN", "observation_only": True}
         self.conversion_status = {"passes": 0, "processed": 0, "recent_results": []}
 
@@ -193,9 +197,11 @@ class GlobalResearchMiner:
             result["chain_scout"] = {"status": "DATA_BLOCKED", "reason": "offline or no shared HTTP client"}
         else:
             try:
-                result["chain_scout"] = await self.chain_scout.run_once()
+                result["chain_scout"] = await asyncio.wait_for(self.chain_scout.run_once(),
+                    timeout=self.observation_timeout_seconds)
             except Exception as exc:
                 result["chain_scout"] = {"status": "DATA_BLOCKED", "failure_type": type(exc).__name__}
+        await self._convert_pending()
         observations = []
         # More configured chains remain registered for later passes. A
         # bounded rotation changes coverage without creating a scheduler.
@@ -206,9 +212,11 @@ class GlobalResearchMiner:
                 observations.append({"status": "DATA_BLOCKED", "reason": "no canonical native-event sink"})
                 continue
             try:
-                observations.append(await adapter.poll_once(self.native_event_sink))
+                observations.append(await asyncio.wait_for(adapter.poll_once(self.native_event_sink),
+                    timeout=self.observation_timeout_seconds))
             except Exception as exc:
                 observations.append({"status": "DATA_BLOCKED", "failure_type": type(exc).__name__})
+            await self._convert_pending()
         if self.evm_observers:
             self._evm_cursor = (self._evm_cursor + count) % len(self.evm_observers)
         result["evm"] = observations or [{"status": "NOT_CONFIGURED", "observations": None}]
@@ -227,6 +235,7 @@ class GlobalResearchMiner:
                     "execution_eligible": False})
             except Exception as exc:
                 native.append({"chain": adapter.chain, "status": "DATA_BLOCKED", "failure_type": type(exc).__name__})
+            await self._convert_pending()
         if self.native_probes:
             self._native_probe_cursor = (self._native_probe_cursor + 2) % len(self.native_probes)
         result["native_quote_probes"] = native
