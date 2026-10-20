@@ -1,6 +1,7 @@
 """The research index preserves unknowns, work and authority across restarts."""
 
 from concurrent.futures import ThreadPoolExecutor
+import sqlite3
 
 import pytest
 
@@ -16,6 +17,30 @@ def priced(value=1.0, cost=1.0, **kwargs):
         coverage_debt=2, urgency=1,
         costs={"inference": cost, "data": 0, "engineering": 0,
                "conversion": 0, "gauntlet": 0}, **kwargs)
+
+
+def test_reference_index_uses_full_durability_wal_and_writer_can_commit_during_reader(tmp_path):
+    path = tmp_path / "concurrent.sqlite"
+    index = FrontierIndex(path)
+    with index._db() as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
+    reader = sqlite3.connect(path)
+    reader.execute("BEGIN")
+    reader.execute("SELECT * FROM jobs").fetchall()
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = pool.submit(index.enqueue, "RAW_EVIDENCE", "fixture:canonical-record", auction=priced())
+        job = future.result(timeout=3)
+        assert index.job(job)["state"] == "READY"
+    finally:
+        reader.rollback()
+        reader.close()
+        pool.shutdown(wait=True)
+    assert path.with_name(path.name+"-wal").exists()
+    index.close()
+    assert not path.with_name(path.name+"-wal").exists()
+    assert FrontierIndex(path).job(job)["payload_ref"] == "fixture:canonical-record"
 
 
 def test_sparse_identity_covers_every_axis_and_unseen_is_not_inserted(tmp_path):

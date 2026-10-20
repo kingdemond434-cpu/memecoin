@@ -741,6 +741,9 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
         if self.yellowstone:
             await self.yellowstone.close()
         self._flush_ledgers()
+        frontier = getattr(self, "research_frontier", None)
+        if frontier is not None:
+            frontier.close()
 
     def _flush_ledgers(self) -> None:
         """Persist the three ledgers a restart must not lose.

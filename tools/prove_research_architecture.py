@@ -22,7 +22,7 @@ from tools.prove_unknown_engine import SOURCE_FILES, isolated_runtime
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = ("tests/test_research_workflows.py", "tests/test_mechanism_labs.py",
     "tests/test_population_hunter.py", "tests/test_population_callbacks.py",
-    "tests/test_research_validation.py", "tests/test_native_forward.py")
+    "tests/test_research_validation.py", "tests/test_native_forward.py", "tests/test_frontier.py")
 
 
 def seal(path):

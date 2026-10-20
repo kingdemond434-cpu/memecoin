@@ -2052,10 +2052,10 @@
     ],
     "proofs": [
       {
-        "manifest": "C:\\Users\\dell\\memecoin-architecture-proof-20261020-02\\manifest.json",
-        "sha256": "8ed1475f4205e00cdb04511b59964b5d8f37b698652aba23e6ef4a8e3f444fa2",
+        "manifest": "C:\\Users\\dell\\memecoin-architecture-proof-20261020-04\\manifest.json",
+        "sha256": "d68bedfcfc241b78bc4833bfbab8af5d5efd965f0ad53137939be4e2944966fa",
         "counts": {
-          "PASS": 122,
+          "PASS": 143,
           "FAIL": 0,
           "SKIP": 0
         },
@@ -2063,12 +2063,12 @@
         "canonical_evidence_chain": {
           "verified": true,
           "detail": "OK",
-          "records": 122
+          "records": 143
         }
       },
       {
-        "manifest": "C:\\Users\\dell\\memecoin-acceptance-architecture-20261020-07\\manifest.json",
-        "sha256": "abd62070a879f47db38cd8e3f93c2e5bf831578ab80f56e8a417189385817521",
+        "manifest": "C:\\Users\\dell\\memecoin-acceptance-architecture-20261020-09\\manifest.json",
+        "sha256": "cccfa6d744bf78e1767ee792fa1f19fbd0c5fd7f7b0c2b312f145ad1f73b20ee",
         "counts": {
           "BLOCKED": 0,
           "FAIL": 0,
@@ -2088,6 +2088,7 @@
       "actor-attributed delayed fills, crowding and complete costs",
       "native adapters/fixtures for unsupported chains and protocols",
       "untouched forward cohorts, real canary fills and measured production performance"
-    ]
+    ],
+    "ingestion_responsiveness": "Cooperative per-record source/research yields, eight-job legacy pricing page, FULL-durability WAL with explicitly closed idle anchor; active-reader/concurrent-writer and queue-fairness regressions passed."
   }
 }
