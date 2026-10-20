@@ -212,6 +212,18 @@ def test_registered_capability_wakes_retained_source_request(desk):
     assert desk.frontier.job(job)["state"] == "ACKED"
 
 
+def test_active_consumer_rotation_serves_new_series_before_old_shared_tag_backlog(desk):
+    now = time.time()
+    old = [desk.enqueue_work("MECHANISM_HYPOTHESIS", {"mechanism": "curve_velocity", "finding_id": index}, now=now-100)
+           for index in range(40)]
+    series = desk.enqueue_work("OBSERVABLE_SERIES", {"points": [point(20, now-1)]}, now=now)
+    for _ in range(2):
+        desk.run_pass(now=now)
+    assert desk.frontier.job(series)["state"] == "ACKED"
+    assert any(desk.frontier.job(job)["state"] == "READY" for job in old)
+    assert desk.workflows.data.report()["variables"]["liquidity_usd"] == 1
+
+
 def test_miner_observation_timestamp_is_completion_not_request_start(monkeypatch):
     from src.research.data_miners import DataMinerPool, Enriches, MinerSpec
     clock = [100.]
