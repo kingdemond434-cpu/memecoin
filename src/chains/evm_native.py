@@ -99,12 +99,14 @@ class EVMV2NativeProbe:
         self.timeout_seconds = timeout_seconds
 
     async def probe(self) -> dict:
+        self._stage = "CHAIN_FINALITY"
         try:
             return await asyncio.wait_for(self._probe(), timeout=self.timeout_seconds)
         except Exception as exc:
             # Provider exception strings may contain credential-bearing URLs.
             return {"status": "DATA_BLOCKED", "chain": self.chain,
                     "failure_type": type(exc).__name__, "observed_at": time.time(),
+                    "stage": self._stage,
                     "observation_only": True, "execution_eligible": False, "authority": "none"}
 
     async def _probe(self) -> dict:
@@ -114,7 +116,7 @@ class EVMV2NativeProbe:
             raise ValueError("provider native chain mismatch or finality unavailable")
         block_hash = "0x" + hex_data(block["hash"], 32).hex()
         height, source_at = quantity(block["number"]), quantity(block["timestamp"])
-        if source_at > time.time() + 5:
+        if source_at <= 0 or source_at > time.time() + 5:
             raise ValueError("future native block time")
         pinned = {"blockHash": block_hash, "requireCanonical": True}
 
@@ -124,12 +126,14 @@ class EVMV2NativeProbe:
                 tx["from"] = sender
             return await self.rpc.request("eth_call", [tx, pinned])
 
+        self._stage = "NATIVE_ROUTE_IDENTITY"
         pair_raw, router_factory = await asyncio.gather(
             call(self.factory, "getPair(address,address)", address_word(self.token_in) + address_word(self.token_out)),
             call(self.router, "factory()"))
         pair = decode_address(pair_raw)
         if decode_address(router_factory) != self.factory:
             raise ValueError("router factory mismatch")
+        self._stage = "NATIVE_CODE_AND_RESERVES"
         codes = await asyncio.gather(*(self.rpc.request("eth_getCode", [contract, pinned])
                                       for contract in (self.factory, self.router, pair)))
         if any(not hex_data(code) for code in codes):
@@ -153,6 +157,7 @@ class EVMV2NativeProbe:
         def quote_args(amount, path):
             return word(amount) + word(64) + word(2) + "".join(address_word(token) for token in path)
 
+        self._stage = "NATIVE_QUOTE_PARITY"
         buy_raw, sell_raw = await asyncio.gather(
             call(self.router, "getAmountsOut(uint256,address[])", quote_args(self.amount_in, [self.token_in, self.token_out])),
             call(self.router, "getAmountsOut(uint256,address[])", quote_args(bought, [self.token_out, self.token_in])))
@@ -160,6 +165,7 @@ class EVMV2NativeProbe:
             raise ValueError("router quote disagrees with exact native reserve arithmetic")
         simulations = []
         if self.wallet:
+            self._stage = "INDEPENDENT_LEG_SIMULATION"
             for amount, path, output in ((self.amount_in, [self.token_in, self.token_out], bought),
                                          (bought, [self.token_out, self.token_in], sold)):
                 balance_raw, allowance_raw = await asyncio.gather(
@@ -182,6 +188,7 @@ class EVMV2NativeProbe:
                     raise ValueError("native gas estimate unavailable")
                 simulations.append({"input_amount": amount, "output_amount": output,
                     "estimated_gas_units": gas, "scope": "INDEPENDENT_LEG_ETH_CALL"})
+        self._stage = "CANONICAL_BLOCK_RECHECK"
         current = await self.rpc.request("eth_getBlockByNumber", [hex(height), False])
         if not isinstance(current, dict) or str(current.get("hash", "")).lower() != block_hash:
             raise ValueError("native block changed during probe")

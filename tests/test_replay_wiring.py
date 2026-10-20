@@ -48,3 +48,14 @@ def test_passed_statistical_model_report_is_not_silently_canonical_when_legacy()
     assert report["scientific_binding_status"] == "DATA_BLOCKED"
     assert framework.hypotheses[MODEL_HYPOTHESIS_ID].status == "data_blocked"
     assert not framework.shadow_models and not framework.is_live(MODEL_HYPOTHESIS_ID)
+
+
+def test_blocked_real_corpus_audit_is_exposed_without_constructing_replay(tmp_path):
+    manifest = tmp_path / "split.json"
+    manifest.write_text(json.dumps({"status": "DATA_BLOCKED", "blocked": [{"reasons": ["missing native costs"]}]}))
+    desk = SimpleNamespace(global_config={"research_replay": {"enabled": True,
+        "episode_path": str(tmp_path), "split_manifest_path": str(manifest)}},
+        champion_challenger=ChampionChallengerFramework())
+    assert SubsystemWiring._canonical_replay_options(desk) == {}
+    assert desk.research_replay_configuration["blocked_objects"] == 1
+    assert desk.research_replay_configuration["scope"] == "INPUT_AUDIT_ONLY"

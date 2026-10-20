@@ -1166,6 +1166,13 @@ class SubsystemWiring:
             if not episode_path.is_dir() or not manifest_path.is_file():
                 raise ValueError("observed corpus or frozen split manifest unavailable")
             split = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(split, dict) and split.get("status") == "DATA_BLOCKED":
+                blocked = split.get("blocked", [])
+                self.research_replay_configuration = {"status": "DATA_BLOCKED",
+                    "reason": "observed replay corpus admission blocked; retained input audit requires native evidence",
+                    "blocked_objects": len(blocked) if isinstance(blocked, list) else None,
+                    "scope": "INPUT_AUDIT_ONLY", "authority": "none"}
+                return {}
             if not isinstance(split, dict) or not split.get("corpus_hash"):
                 raise ValueError("content-bound chronological split manifest required")
             bounds = declaration["work_bound"]

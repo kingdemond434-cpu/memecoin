@@ -12,9 +12,17 @@ from src.strategies.opportunity_allocator import Opportunity
 class ResearchRuntime:
     def _retain_native_probe(self, result: dict) -> str:
         """Retain real native probe receipts and route successful typed facts."""
+        from src.research.data_requests import digest
         now = time.time()
-        ref = self.unknown_engine._record("research_native_evm_probe", result, now)
+        identity = None
         if result.get("status") == "NATIVE_QUOTE_PARITY_VERIFIED":
+            identity = "native-v2-probe-" + digest([result[key] for key in
+                ("chain_id", "block_hash", "factory", "router", "pair", "token_in", "token_out", "input_amount")])
+            previous = self.unknown_engine.frontier.job(identity)
+            if previous is not None:
+                return previous["payload_ref"]
+        ref = self.unknown_engine._record("research_native_evm_probe", result, now)
+        if identity is not None:
             points = [{"variable": name, "value": result[field], "unit": unit,
                 "chain": result["chain"], "entity_id": result["pair"],
                 "event_at": result["event_at"], "available_at": result["observed_at"],
@@ -25,8 +33,13 @@ class ResearchRuntime:
                 "native_probe_ref": ref, "point_in_time": True}
                 for name, field, unit in (("native_v2_buy_output", "quoted_buy_output", "token_raw"),
                     ("native_v2_sell_output", "quoted_sell_output", "token_raw"))]
-            self.unknown_engine.enqueue_work("DATA_OBSERVATION", {"points": points},
-                evidence_refs=[ref], axes={"chain": result["chain"], "protocol": "uniswap_v2"}, now=now)
+            payload_ref = self.unknown_engine._record("research_typed_work", {
+                "work_kind": "DATA_OBSERVATION", "point_payload": {"points": points}}, now)
+            self.unknown_engine.frontier.enqueue("DATA_OBSERVATION", payload_ref,
+                job_id=identity, evidence_refs=[payload_ref, ref],
+                axes={"chain": result["chain"], "protocol": "uniswap_v2"},
+                auction=self.unknown_engine.workflows.auction("DATA_OBSERVATION"),
+                exploration_tags=["new_source_classes"], now=now)
         return ref
 
     def _setup_research_consumers(self) -> None:

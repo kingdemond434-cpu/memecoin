@@ -127,3 +127,19 @@ def test_runtime_native_receipt_reaches_the_real_typed_data_consumer(tmp_path):
     assert data["variables"] == {"native_v2_buy_output": 1, "native_v2_sell_output": 1}
     assert engine.evidence.verify(engine.evidence.path)[0] and ref.startswith("evidence:")
     assert not engine.framework.canary_models and not engine.framework.champions
+
+
+def test_same_native_block_route_size_does_not_manufacture_samples_after_restart(tmp_path):
+    from src.runtime.research_runtime import ResearchRuntime
+    from test_research_workflows import create
+    engine = create(tmp_path)
+    receipt = asyncio.run(adapter(RPC()).probe())
+    ResearchRuntime._retain_native_probe(SimpleNamespace(unknown_engine=engine), receipt)
+    for _ in range(3):
+        engine.run_pass()
+    restored = create(tmp_path)
+    repeated = {**receipt, "observed_at": time.time()}
+    ResearchRuntime._retain_native_probe(SimpleNamespace(unknown_engine=restored), repeated)
+    for _ in range(3):
+        restored.run_pass()
+    assert restored.workflows.data.report()["variables"] == {"native_v2_buy_output": 1, "native_v2_sell_output": 1}

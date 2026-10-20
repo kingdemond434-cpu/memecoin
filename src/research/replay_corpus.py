@@ -175,6 +175,9 @@ def freeze_corpus(root: str | Path, output: str | Path, *, windows: dict,
             entries.append({"path": relative, "sha256": hashlib.sha256(raw).hexdigest()})
         report.update(corpus_hash=_digest(selected), files=entries, train_end=windows["train"][1],
                       validation_end=windows["validation"][1], test_end=windows["test"][1])
+    # Actual sealing finishes after capture/copy, never before a slow source
+    # scan. An injected clock is used only for deterministic offline tests.
+    report["frozen_at"] = time.time() if now is None else stamp
     (output / "split.json").write_text(json.dumps(report, indent=2, allow_nan=False)+"\n", encoding="utf-8")
     return report
 
