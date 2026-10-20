@@ -334,6 +334,10 @@ class SubsystemWiring:
             self.pump_monitor = PumpFunMonitor(self.rpc_program_stream, self._on_pump_event)
             self.pump_swap_monitor = PumpSwapMonitor(self.rpc_program_stream, self._on_pump_event)
             self.raydium_monitor = RaydiumMonitor(self.rpc_program_stream, self._on_raydium_event)
+            # initialize() creates this stream after research setup. Start
+            # it here, after its handlers exist, rather than in the earlier
+            # phase where rpc_program_stream was still None.
+            await self.rpc_program_stream.start()
 
     async def _start_secondary_feed(self) -> bool:
         """Bring up the RPC program stream BESIDE Yellowstone, tagged.
@@ -1352,7 +1356,3 @@ class SubsystemWiring:
                         started, len(self.miner_registration),
                         "offloaded thread" if self.miner_offload.report()["status"] != "OFF"
                         else "main loop")
-            # Event callbacks write to the PIT builder, hazard tracker, and
-            # research graphs. Start the stream only after all consumers exist.
-            if self.rpc_program_stream:
-                await self.rpc_program_stream.start()
