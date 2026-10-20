@@ -200,7 +200,10 @@ CAPACITY_REJECTIONS = frozenset({
 
 
 
-class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
+from src.runtime.research_runtime import ResearchRuntime
+
+
+class MemecoinQuantDesk(ResearchRuntime, ReportingSurface, RegimeAndEvidence,
                        ExecutionFeedback, DepthResolution, FollowableTrades,
                        CopyBookBudgets, PrelaunchFeed, TailLadder,
                        MinedRecordIngestion,
@@ -510,6 +513,14 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
         with open(self.config_path, encoding="utf-8") as handle:
             self.config = yaml.safe_load(handle)
         self.global_config = self.config.get("global", {})
+        self.risk_veto = RiskVeto(
+            require_complete_safety=bool(
+                self.global_config.get("require_complete_veto_inputs", True)),
+            max_exit_impact_pct=float(
+                self.global_config.get("max_veto_exit_impact_pct", 0.20)),
+            max_liquidity_fraction=float(
+                self.global_config.get("max_liquidity_fraction", 0.01)),
+        )
         # The governor is constructed before the config is read, so
         # memory_soft_fraction/memory_hard_fraction silently took defaults
         # and had never once applied. Rebound rather than reconstructed:
@@ -1050,6 +1061,17 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
                 token, item.get("to", ""), item.get("from", ""),
                 float(item.get("lamports", 0) or 0) / 1e9, candidate.timestamp,
             )
+        # Known safety facts are decided before alpha. The graded screens
+        # below may shrink uncertainty; they cannot overturn this authority.
+        hard_veto = self.risk_veto.evaluate(
+            risk, dev_state=self.dev_wallet_monitor.state(token),
+            connected_holder_pct=getattr(risk, "connected_cluster_pct", None))
+        if not hard_veto.clear:
+            reason = ("safety_veto:" + ",".join(hard_veto.reasons)
+                      if hard_veto.status == "VETO" else
+                      "DATA_BLOCKED_safety:" + ",".join(hard_veto.unmeasured))
+            self._record_blocked_decision(token, reason, hard_veto.to_dict())
+            return
         # Safety is graded, not binary. HONEYPOT, RUGGED and CRITICAL are
         # untradeable at any size and stay vetoes; HIGH is a worse token, not
         # an impossible one, and a hard reject on it discards the launches
@@ -1122,6 +1144,15 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
                 should_trade = True
         intelligence = self._entry_intelligence(
             token, candidate, risk, prediction, trade_info, liquidity)
+        # Recheck the canonical veto at the proposed notional as well. A
+        # token-level clearance does not authorise a size it cannot exit.
+        sized_veto = intelligence["risk_veto"]
+        if sized_veto["status"] != "CLEAR":
+            reason = ("safety_veto:" + ",".join(sized_veto["reasons"])
+                      if sized_veto["status"] == "VETO" else
+                      "DATA_BLOCKED_safety:" + ",".join(sized_veto["unmeasured"]))
+            self._record_blocked_decision(token, reason, sized_veto)
+            return
         coverage = self.entry_coverage.record(intelligence)
         decision = {"should_trade": should_trade, "trade_info": trade_info,
                     "authority": "shadow" if self.dry_run else "champion",
@@ -1195,7 +1226,21 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
         self._record_trade_evidence_packet(
             token, candidate, risk, liquidity, trade_info, intelligence,
             decision="ENTER" if should_trade else str(trade_info.get("reason", "IGNORE")),
-            veto=hard_veto.to_dict())
+            veto=sized_veto)
+        tail_hook = getattr(self, "_tail_shadow_candidate", None)
+        if should_trade and tail_hook is not None and getattr(self, "asymmetric_tail", None) is not None:
+            tail_opportunity = Opportunity(
+                token, float(trade_info.get("elogw", 0.0)),
+                float(trade_info.get("position_value_usd", 0.0)),
+                float(prediction.expected_hold_time) if prediction.expected_hold_time > 0 else None,
+                liquidity, sleeve="ASYMMETRIC_TAIL",
+                elogw_at=lambda usd: self.elogw_engine.log_growth_at_fraction(
+                    prediction, usd / max(self.wallet_equity_usd, 1e-9)))
+            try:
+                decision["asymmetric_tail_shadow"] = tail_hook(candidate, tail_opportunity, sized_veto)
+            except Exception as exc:
+                decision["asymmetric_tail_shadow"] = {
+                    "status": "DATA_BLOCKED", "failure_type": type(exc).__name__, "shadow_only": True}
         if not should_trade:
             # A launch we screened is a closed trace, not an abandoned one.
             # Screening is most of the funnel, and a ledger that only ever saw
@@ -1236,6 +1281,14 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
         # the result is inspected so a rejected submission is timed the same
         # as an accepted one: a failed entry is a slot spent.
         self.latency.mark(token, "sign_to_submit")
+        tail_fill = getattr(self, "_tail_shadow_fill", None)
+        if tail_fill is not None:
+            try:
+                tail_fill(token, success=bool(result.success), simulated=bool(result.simulated))
+            except Exception as exc:
+                logger.warning("tail shadow fill accounting blocked: %s", type(exc).__name__)
+                self.trade_evidence.record("asymmetric_tail_shadow_accounting_blocked", {
+                    "token": token, "failure_type": type(exc).__name__, "shadow_only": True})
         trace = self.latency.close(
             token, "entered" if result.success else "submit_failed")
         self._record_fee_outcome(int(priority_fee), bool(result.success), trace)
@@ -1742,7 +1795,10 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
                 prediction, min(usd / equity, self.elogw_engine.exposure_cap(liquidity))),
         )
         incumbents = await self._incumbent_opportunities()
-        slate = self.opportunity_allocator.rank(incumbents + [challenger])
+        cash = max(0.0, self.wallet_equity_usd - sum(
+            item.capital_usd * item.held_multiple for item in incumbents))
+        slate = self.opportunity_allocator.rank(incumbents + [challenger],
+            cash_available_usd=cash, cash_horizon_seconds=challenger.expected_hold_seconds)
         self.last_slate_report = slate.report()
         self._feed_opportunity_quality(slate)
 
@@ -3392,6 +3448,16 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
         native_delta_usd = int(result.native_balance_delta_lamports) / 1e9 * self.sol_price_usd
         allocated_cost = float(position["remaining_cost_usd"]) * actual_sold / max(current_tokens, 1)
         pnl = proceeds + native_delta_usd - allocated_cost
+        tail_exit = getattr(self, "_tail_shadow_exit", None)
+        if result.simulated and tail_exit is not None:
+            try:
+                tail_exit(token, fraction=actual_sold / max(current_tokens, 1),
+                          proceeds_usd=proceeds + native_delta_usd,
+                          allocated_cost_usd=allocated_cost)
+            except Exception as exc:
+                logger.warning("tail shadow exit accounting blocked: %s", type(exc).__name__)
+                self.trade_evidence.record("asymmetric_tail_shadow_accounting_blocked", {
+                    "token": token, "failure_type": type(exc).__name__, "shadow_only": True})
         self.total_pnl += pnl
         self.successful_exits += int(pnl > 0)
         self.elogw_engine.update_pnl(pnl)
@@ -3532,6 +3598,7 @@ class MemecoinQuantDesk(ReportingSurface, RegimeAndEvidence,
         self.elogw_engine.portfolio_value = self.mega_event_reserve.deployable_equity(
             self.wallet_equity_usd, reserve)
         self.equity_status = "OK"
+        self._ensure_asymmetric_tail()
 
     def _refresh_cohorts(self) -> None:
         """Follow the opening cohort of every token we still hold.

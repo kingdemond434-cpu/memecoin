@@ -2312,22 +2312,16 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
     async def test_promotion_evidence_survives_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = str(Path(directory) / "champion_state.json")
-            hypothesis = HypothesisSpec(
-                hypothesis_id="model-v1", mechanism="test", target="net_elogw",
-                features=["flow"], feature_hash="schema-1", model_type="test",
-                model_params={}, training_window="point-in-time", threshold=0.0,
-                sizing_rule={}, exit_rule={}, execution_policy={}, fakeability={},
-                cost_model={}, falsifier="negative oos", kill_thesis="decay",
-                source_provenance="fixture", trial_family="test", created_at=1.0,
-            )
+            hypothesis = self._hypothesis("model-v1")
             first = ChampionChallengerFramework(
                 min_oos_samples=1, min_portfolio_impact=0.0, state_path=state_path,
             )
             first.submit_hypothesis(hypothesis)
+            first.freeze_hypothesis("model-v1")
             first.record_trial_result(TrialResult(
                 hypothesis_id="model-v1", stage="CHRONOLOGICAL_OOS", samples=10,
                 metrics={}, oos_metrics={"elogw": 0.01}, portfolio_impact=0.01,
-                passed=True, timestamp=2.0,
+                passed=True, timestamp=time.time(), spec_hash=hypothesis.frozen_hash,
             ))
             await first._evaluate_challengers()
             await first.stop()
@@ -2339,6 +2333,9 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def _hypothesis(hypothesis_id: str) -> HypothesisSpec:
+        from test_scientific_core import exact_candidate
+        candidate = exact_candidate(hypothesis_id)
+        candidate["trial_family"] = "test"
         return HypothesisSpec(
             hypothesis_id=hypothesis_id, mechanism="test", target="net_elogw",
             features=["flow"], feature_hash="schema-1", model_type="test",
@@ -2346,6 +2343,7 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
             sizing_rule={}, exit_rule={}, execution_policy={}, fakeability={},
             cost_model={}, falsifier="negative oos", kill_thesis="decay",
             source_provenance="fixture", trial_family="test", created_at=1.0,
+            exact_candidate=candidate, agent_identity="fixture-agent",
         )
 
     async def test_full_promotion_pipeline_discovered_to_live_champion(self):
@@ -2354,12 +2352,13 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
             shadow_duration_hours=0, canary_duration_hours=0,
         )
         framework.submit_hypothesis(self._hypothesis("promo-1"))
+        framework.freeze_hypothesis("promo-1")
         self.assertEqual(framework.hypotheses["promo-1"].status, ModelStatus.DISCOVERED.value)
 
         framework.record_trial_result(TrialResult(
             hypothesis_id="promo-1", stage="CHRONOLOGICAL_OOS", samples=10,
             metrics={}, oos_metrics={"elogw": 0.02}, portfolio_impact=0.02,
-            passed=True, timestamp=2.0,
+            passed=True, timestamp=time.time(), spec_hash=framework.hypotheses["promo-1"].frozen_hash,
         ))
         await framework._evaluate_challengers()
         self.assertIn("promo-1", framework.shadow_models)
@@ -2367,14 +2366,16 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(framework.hypotheses["promo-1"].status, ModelStatus.FORWARD_SHADOW.value)
 
         for _ in range(5):
-            framework.record_forward_result("promo-1", {"elogw": 0.01, "pnl": 5.0})
+            framework.record_forward_result("promo-1", {"elogw": 0.01, "pnl": 5.0,
+                "spec_hash": framework.hypotheses["promo-1"].frozen_hash})
         await framework._evaluate_shadow_models()
         self.assertIn("promo-1", framework.canary_models)
         self.assertNotIn("promo-1", framework.shadow_models)
         self.assertEqual(framework.hypotheses["promo-1"].status, ModelStatus.CANARY.value)
 
         for _ in range(20):
-            framework.record_forward_result("promo-1", {"elogw": 0.01, "pnl": 5.0})
+            framework.record_forward_result("promo-1", {"elogw": 0.01, "pnl": 5.0,
+                "spec_hash": framework.hypotheses["promo-1"].frozen_hash})
         await framework._evaluate_canary_models()
         self.assertIn("promo-1", framework.champions)
         self.assertNotIn("promo-1", framework.canary_models)
@@ -2383,7 +2384,8 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(framework.get_stats()["live_champions"], 1)
 
         for _ in range(framework.decay_window):
-            framework.record_forward_result("promo-1", {"elogw": -0.01, "pnl": -5.0})
+            framework.record_forward_result("promo-1", {"elogw": -0.01, "pnl": -5.0,
+                "spec_hash": framework.hypotheses["promo-1"].frozen_hash})
         await framework._monitor_champion_decay()
         self.assertEqual(framework.champions["promo-1"].status, "HIBERNATED")
         self.assertEqual(framework.get_stats()["hibernated_champions"], 1)
@@ -2394,14 +2396,16 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
             shadow_duration_hours=0, canary_duration_hours=0,
         )
         shadow_framework.submit_hypothesis(self._hypothesis("shadow-fail"))
+        shadow_framework.freeze_hypothesis("shadow-fail")
         shadow_framework.record_trial_result(TrialResult(
             hypothesis_id="shadow-fail", stage="CHRONOLOGICAL_OOS", samples=10,
             metrics={}, oos_metrics={"elogw": 0.02}, portfolio_impact=0.02,
-            passed=True, timestamp=2.0,
+            passed=True, timestamp=time.time(), spec_hash=shadow_framework.hypotheses["shadow-fail"].frozen_hash,
         ))
         await shadow_framework._evaluate_challengers()
         for _ in range(5):
-            shadow_framework.record_forward_result("shadow-fail", {"elogw": -0.01, "pnl": -5.0})
+            shadow_framework.record_forward_result("shadow-fail", {"elogw": -0.01, "pnl": -5.0,
+                "spec_hash": shadow_framework.hypotheses["shadow-fail"].frozen_hash})
         await shadow_framework._evaluate_shadow_models()
         self.assertNotIn("shadow-fail", shadow_framework.shadow_models)
         self.assertNotIn("shadow-fail", shadow_framework.canary_models)
@@ -2413,19 +2417,22 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
             shadow_duration_hours=0, canary_duration_hours=0,
         )
         canary_framework.submit_hypothesis(self._hypothesis("canary-fail"))
+        canary_framework.freeze_hypothesis("canary-fail")
         canary_framework.record_trial_result(TrialResult(
             hypothesis_id="canary-fail", stage="CHRONOLOGICAL_OOS", samples=10,
             metrics={}, oos_metrics={"elogw": 0.02}, portfolio_impact=0.02,
-            passed=True, timestamp=2.0,
+            passed=True, timestamp=time.time(), spec_hash=canary_framework.hypotheses["canary-fail"].frozen_hash,
         ))
         await canary_framework._evaluate_challengers()
         for _ in range(5):
-            canary_framework.record_forward_result("canary-fail", {"elogw": 0.01, "pnl": 5.0})
+            canary_framework.record_forward_result("canary-fail", {"elogw": 0.01, "pnl": 5.0,
+                "spec_hash": canary_framework.hypotheses["canary-fail"].frozen_hash})
         await canary_framework._evaluate_shadow_models()
         self.assertIn("canary-fail", canary_framework.canary_models)
         # Fewer than 20 canary trades -> retired for insufficient evidence, not promoted.
         for _ in range(5):
-            canary_framework.record_forward_result("canary-fail", {"elogw": 0.01, "pnl": 5.0})
+            canary_framework.record_forward_result("canary-fail", {"elogw": 0.01, "pnl": 5.0,
+                "spec_hash": canary_framework.hypotheses["canary-fail"].frozen_hash})
         await canary_framework._evaluate_canary_models()
         self.assertNotIn("canary-fail", canary_framework.canary_models)
         self.assertNotIn("canary-fail", canary_framework.champions)
@@ -13730,7 +13737,8 @@ class TestEachSourceMinesOnItsOwnClock(unittest.IsolatedAsyncioTestCase):
         pool = DataMinerPool(on_records=explode)
         pool.register(self._spec(), self._fetch())
         result = (await pool.run_due(time.time() + 1_000))[0]
-        self.assertEqual(result.status, "OK")
+        self.assertEqual(result.status, "DATA_BLOCKED")
+        self.assertIn("consumer failed", result.detail)
         self.assertEqual(pool._health["m"].passes, 1)
 
     async def test_miners_are_staggered_rather_than_all_due_at_once(self):

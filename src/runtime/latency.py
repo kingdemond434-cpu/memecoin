@@ -324,20 +324,32 @@ class LatencyLedger:
         """
         rows = []
         breaching = []
+        unmeasured = []
         for stage, budget in sorted(budgets_us.items()):
             bucket = self._buckets.get(stage)
             row = bucket.to_dict() if bucket else {"data_status": "DATA_BLOCKED"}
             p99 = row.get("p99_us")
-            over = p99 is not None and p99 > budget
+            over = None if p99 is None else p99 > budget
+            if p99 is None:
+                unmeasured.append(stage)
             if over:
                 breaching.append(stage)
             rows.append({"stage": stage, "budget_us": budget,
                          "p99_us": p99, "over_budget": over,
                          "data_status": row.get("data_status")})
+        measured = len(rows) - len(unmeasured)
+        detail = []
+        if breaching:
+            detail.append("over budget at p99: " + ", ".join(breaching))
+        if unmeasured:
+            detail.append("unmeasured budget stages: " + ", ".join(unmeasured))
+        if not rows:
+            detail.append("no latency budgets declared")
         return {
-            "status": "DEGRADED" if breaching else "OK",
-            "detail": ("over budget at p99: " + ", ".join(breaching)
-                       if breaching else ""),
+            "status": ("DATA_BLOCKED" if not measured else
+                       "DEGRADED" if breaching or unmeasured else "OK"),
+            "detail": "; ".join(detail),
             "breaching": breaching,
+            "unmeasured_stages": unmeasured,
             "stages": rows,
         }

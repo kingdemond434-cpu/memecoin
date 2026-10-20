@@ -721,6 +721,14 @@ class ReportingSurface:
                                   else {"status": "DATA_BLOCKED",
                                         "detail": "channel book not built yet"}),
             "identity_watch": self.identity_report(),
+            "unknown_opportunity_engine": (
+                self.unknown_engine.report() if getattr(self, "unknown_engine", None) is not None
+                else {"status": "DATA_BLOCKED", "detail": "research engine not initialized"}),
+            "asymmetric_tail": (
+                self.asymmetric_tail.report(now=time.time())
+                if getattr(self, "asymmetric_tail", None) is not None
+                else {"status": "DATA_BLOCKED", "shadow_only": True,
+                      "detail": "positive observed equity and restored shadow budget required"}),
             "discovery": self.discovery_report(),
             "execution_conditions": self.execution_conditions_report(),
             "stream_events": self.stream_event_report(),

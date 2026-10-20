@@ -118,6 +118,7 @@ class Observation:
         default_factory=dict)
     cost_fraction: float = 0.0
     is_control: bool = False
+    chain: str = ""
 
     def net_return(self, latency_s: float, *, cost_multiplier: float = 1.0
                    ) -> Optional[float]:
@@ -218,8 +219,13 @@ def probability_of_backtest_overfitting(
         out_means = [statistics.fmean(row[i] for i in out_index)
                      for row in candidates]
         best = max(range(len(candidates)), key=lambda idx: in_means[idx])
-        rank = sorted(range(len(candidates)),
-                      key=lambda idx: out_means[idx]).index(best)
+        # Equal OOS scores have the same midrank. Arbitrarily putting the
+        # first-named identical variant at rank zero makes duplication alone
+        # produce PBO=1, even though no selection advantage existed.
+        selected = out_means[best]
+        lower = sum(value < selected for value in out_means)
+        tied = sum(value == selected for value in out_means)
+        rank = lower + (tied - 1) / 2.0
         # rank is 0 = worst. Below median means the in-sample winner is in the
         # bottom half of the out-of-sample ordering.
         if rank < (len(candidates) - 1) / 2.0:
@@ -502,7 +508,8 @@ class Gauntlet:
                 f"{len(result.regimes)} regimes")
         return result
 
-    def run(self, observations: Iterable[Observation]
+    def run(self, observations: Iterable[Observation], *,
+            expected_mechanisms: Optional[Sequence[str]] = None
             ) -> Dict[str, GauntletResult]:
         """Every mechanism, with PBO computed across them jointly.
 
@@ -514,24 +521,43 @@ class Gauntlet:
         for item in observations:
             grouped.setdefault(item.mechanism, []).append(item)
         pbo = self._joint_pbo(grouped)
-        return {name: self.evaluate(name, rows, pbo=pbo)
-                for name, rows in sorted(grouped.items())}
+        expected = set(expected_mechanisms or ())
+        observed = {name for name, rows in grouped.items()
+                    if not any(row.is_control for row in rows)}
+        missing = expected - observed
+        results = {name: self.evaluate(name, rows, pbo=pbo)
+                   for name, rows in sorted(grouped.items())}
+        if (len(expected | observed) > 1 and pbo is None) or missing:
+            for result in results.values():
+                if result.verdict is not Verdict.CONTROL:
+                    result.verdict = Verdict.DATA_BLOCKED
+                    result.reasons.append("selection evidence incomplete: shared cohort/time PBO required"
+                                          + (f"; missing variants {sorted(missing)}" if missing else ""))
+        return results
 
     def _joint_pbo(self, grouped: Dict[str, List[Observation]]
                    ) -> Optional[float]:
         """Align every non-control mechanism on a common time grid for CSCV."""
-        series: List[List[float]] = []
+        aligned: List[Dict[Tuple[str, str, float], float]] = []
         for name, rows in sorted(grouped.items()):
             if any(item.is_control for item in rows):
                 continue
-            ordered = sorted(rows, key=lambda item: item.timestamp)
-            values = [item.log_growth(self.reference_latency_s)
-                      for item in ordered]
-            values = [value for value in values if value is not None]
-            if values:
-                series.append(values)
-        if len(series) < 2:
+            values = {}
+            for item in rows:
+                value = item.log_growth(self.reference_latency_s)
+                if value is None:
+                    continue
+                key = (item.chain, item.cohort, item.timestamp)
+                if key in values:
+                    # Repeated outcomes cannot create independent samples.
+                    return None
+                values[key] = value
+            aligned.append(values)
+        if len(aligned) < 2:
             return None
+        common = set(aligned[0]).intersection(*(set(row) for row in aligned[1:]))
+        keys = sorted(common, key=lambda key: (key[2], key[0], key[1]))
+        series = [[row[key] for key in keys] for row in aligned]
         return probability_of_backtest_overfitting(series)
 
 

@@ -104,9 +104,8 @@ class MinerSpec:
     endpoint: str = ""
     requires_env: Tuple[str, ...] = ()
     detail: str = ""
-    # Records per pass beyond which the result is truncated. A source that
-    # suddenly returns fifty thousand rows is backfilling or broken, and
-    # handing all of them downstream is worse than dropping the tail.
+    # Bound immediate downstream work; a configured retention sink persists
+    # the full batch before the remainder becomes explicit deferred work.
     max_records: int = 500
 
     def missing_credentials(self) -> List[str]:
@@ -178,9 +177,13 @@ class DataMinerPool:
     """
 
     def __init__(self, *, concurrency: int = 6,
-                 on_records: Optional[Callable[[str, List[Dict[str, Any]]], None]] = None):
+                 on_records: Optional[Callable[[str, List[Dict[str, Any]]], None]] = None,
+                 retain_batch: Optional[Callable] = None,
+                 retain_disposition: Optional[Callable] = None):
         self.concurrency = max(1, int(concurrency))
         self.on_records = on_records
+        self.retain_batch = retain_batch
+        self.retain_disposition = retain_disposition
         self._specs: Dict[str, MinerSpec] = {}
         self._callables: Dict[str, Callable[[], Awaitable[List[Dict[str, Any]]]]] = {}
         self._health: Dict[str, MinerHealth] = {}
@@ -290,8 +293,22 @@ class DataMinerPool:
                 return MinerResult(miner_id=miner_id, status="DATA_BLOCKED",
                                    fetched_at=now, detail=health.last_error)
 
-        kept = list(records or ())[:spec.max_records]
-        stamped = [self._stamp(spec, record, now) for record in kept]
+        all_stamped = [self._stamp(spec, record, now) for record in (records or ())]
+        batch_ref = None
+        if all_stamped and self.retain_batch is not None:
+            try:
+                batch_ref = self.retain_batch(miner_id, all_stamped, now)
+                if not batch_ref:
+                    raise RuntimeError("retention sink returned no evidence reference")
+            except Exception as exc:
+                health.failures += 1
+                health.last_error = f"retention failed: {type(exc).__name__}"
+                return MinerResult(miner_id=miner_id, status="DATA_BLOCKED",
+                                   fetched_at=now, detail=health.last_error)
+        stamped = all_stamped[:spec.max_records]
+        deferred = len(all_stamped) - len(stamped)
+        delivery_status = "DEFERRED" if deferred else "DELIVERED"
+        delivery_detail = f"delivered={len(stamped)}; deferred={deferred}"
         health.passes += 1
         health.records += len(stamped)
         health.last_ok_at = now
@@ -305,11 +322,22 @@ class DataMinerPool:
             try:
                 self.on_records(miner_id, stamped)
             except Exception as exc:
+                delivery_status = "RETRY_REQUIRED"
+                delivery_detail = f"consumer failed: {type(exc).__name__}; batch retained={bool(batch_ref)}"
+                health.failures += 1
+                health.last_error = delivery_detail
                 logger.warning("miner %s consumer raised: %s", miner_id, exc)
+        if batch_ref and self.retain_disposition is not None:
+            try:
+                self.retain_disposition(batch_ref, delivery_status, delivery_detail, now)
+            except Exception as exc:
+                delivery_status = "RETRY_REQUIRED"
+                health.failures += 1
+                health.last_error = f"disposition failed: {type(exc).__name__}; batch={batch_ref}"
         return MinerResult(
-            miner_id=miner_id, status="OK", records=stamped, fetched_at=now,
+            miner_id=miner_id, status=("DATA_BLOCKED" if delivery_status == "RETRY_REQUIRED" else "OK"), records=stamped, fetched_at=now,
             latency_ms=int((time.time() - started) * 1000),
-            detail=f"{len(stamped)} record(s)")
+            detail=delivery_detail + (f"; evidence={batch_ref}" if batch_ref else ""))
 
     @staticmethod
     def _stamp(spec: MinerSpec, record: Dict[str, Any], now: float) -> Dict[str, Any]:

@@ -10,6 +10,15 @@ from src.chains.launchpads import (
     anchor_discriminator, default_specs)
 
 
+def reviewed_test_spec(**kwargs):
+    """Local test schema attestation, never represented as mainnet evidence."""
+    return LaunchpadSpec(
+        protocol_version="local-test-v1", source_ref="fixture:source",
+        idl_ref="fixture:idl", verification_provenance="fixture:review",
+        fixture_refs=("fixture:decoder-parity",), layout_verified=True,
+        decoder_parity=True, **kwargs)
+
+
 class DiscriminatorsAreDerivedNotTranscribed(unittest.TestCase):
 
     def test_it_is_anchor_s_own_rule(self):
@@ -52,7 +61,7 @@ class ProgramIdsAreHypothesesUntilObserved(unittest.TestCase):
 class DecodingProducesOneShapeForEveryVenue(unittest.TestCase):
 
     def setUp(self):
-        self.spec = LaunchpadSpec(
+        self.spec = reviewed_test_spec(
             name="testpad", program_id="PROG", create_instructions=("create",),
             mint_account_index=0, creator_account_index=1)
         self.registry = LaunchpadRegistry([self.spec])
@@ -86,7 +95,7 @@ class DecodingProducesOneShapeForEveryVenue(unittest.TestCase):
 
     def test_a_launch_with_no_identifiable_mint_is_refused(self):
         # Emitting it would put a blank key into the census.
-        spec = LaunchpadSpec(name="p", program_id="P",
+        spec = reviewed_test_spec(name="p", program_id="P",
                              create_instructions=("create",),
                              mint_account_index=None)
         registry = LaunchpadRegistry([spec])
@@ -94,9 +103,10 @@ class DecodingProducesOneShapeForEveryVenue(unittest.TestCase):
         self.assertIsNone(registry.decode("P", data, ["A"], [0], "sig", 1))
 
     def test_the_fee_payer_stands_in_for_an_unmapped_creator(self):
-        spec = LaunchpadSpec(name="p", program_id="P",
+        spec = reviewed_test_spec(name="p", program_id="P",
                              create_instructions=("create",),
-                             mint_account_index=0, creator_account_index=None)
+                             mint_account_index=0, creator_account_index=None,
+                             fee_payer_is_creator=True)
         registry = LaunchpadRegistry([spec])
         data = anchor_discriminator("create") + b"\x00" * 16
         event = registry.decode("P", data, ["MINT"], [0], "sig", 1,
@@ -107,7 +117,7 @@ class DecodingProducesOneShapeForEveryVenue(unittest.TestCase):
 class VerificationIsEarnedByObservation(unittest.TestCase):
 
     def setUp(self):
-        self.registry = LaunchpadRegistry([LaunchpadSpec(
+        self.registry = LaunchpadRegistry([reviewed_test_spec(
             name="testpad", program_id="PROG", create_instructions=("create",),
             mint_account_index=0)])
 
@@ -142,6 +152,47 @@ class VerificationIsEarnedByObservation(unittest.TestCase):
     def test_the_first_signature_is_kept_for_audit(self):
         self._observe(0)
         self.assertEqual("sig0", self.registry.specs["PROG"].first_seen_signature)
+
+
+class UnknownLayoutsCannotEarnTrust(unittest.TestCase):
+
+    def test_unconfirmed_account_indexes_are_not_decoded(self):
+        spec = LaunchpadSpec("hypothesis", "P", ("create",), mint_account_index=0)
+        registry = LaunchpadRegistry([spec])
+        self.assertIsNone(registry.decode("P", anchor_discriminator("create"), ["not-known-to-be-mint"], [0], "s", 1))
+        self.assertEqual(1.0, registry.report()["unknown_event_rate"])
+
+    def test_three_distinct_events_without_source_idl_parity_do_not_verify(self):
+        from src.chains.launchpads import CanonicalLaunchEvent
+        spec = LaunchpadSpec("hypothesis", "P", ("create",), mint_account_index=0)
+        registry = LaunchpadRegistry([spec])
+        for index in range(OBSERVATIONS_TO_VERIFY + 5):
+            event = CanonicalLaunchEvent("hypothesis", "P", "mint", None, f"sig-{index}", index, 100,
+                                         instruction="create", provisional=True)
+            self.assertFalse(registry.observe(event))
+        self.assertFalse(spec.trusted)
+
+    def test_a_status_flag_without_source_contract_cannot_claim_verified_coverage(self):
+        spec = LaunchpadSpec("hypothesis", "P", ("create",), mint_account_index=0, status="VERIFIED")
+        registry = LaunchpadRegistry([spec])
+        self.assertFalse(spec.trusted)
+        self.assertEqual(0, registry.report()["verified"])
+        self.assertEqual("DATA_BLOCKED_PROTOCOL_CONTRACT", registry.report()["venues"]["hypothesis"]["status"])
+
+    def test_default_pump_positions_come_from_the_official_vendored_idl(self):
+        from src.chains.idl import load_idl
+        spec = next(item for item in default_specs() if item.name == "pump.fun")
+        idl = load_idl("pump")
+        create = next(item for item in idl["instructions"] if item["name"] == "create")
+        self.assertEqual("mint", create["accounts"][spec.mint_account_index]["name"])
+        self.assertEqual(idl["address"], spec.program_id)
+        self.assertTrue(spec.verification_ready)
+        self.assertIsNone(spec.creator_account_index)
+
+    def test_fee_payer_is_not_assumed_to_be_creator(self):
+        spec = reviewed_test_spec(name="p", program_id="P", create_instructions=("create",), mint_account_index=0)
+        event = LaunchpadRegistry([spec]).decode("P", anchor_discriminator("create"), ["mint"], [0], "s", 1, fee_payer="payer")
+        self.assertIsNone(event.creator)
 
 
 if __name__ == "__main__":

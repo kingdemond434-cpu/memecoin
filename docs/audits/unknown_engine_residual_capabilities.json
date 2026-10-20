@@ -1,0 +1,1988 @@
+{
+  "schema_version": "1",
+  "as_of": "2026-10-20",
+  "repository": "kingdemond434-cpu/memecoin",
+  "source_commit": "11f53bde0cce612b0b51eb9a3ee8761d093d7b46",
+  "runtime_evidence_policy": "Source inspection and synthetic tests do not establish EXISTS_AND_LIVE. No server runtime proof has been collected.",
+  "requirements": [
+    {
+      "requirement": 0,
+      "title": "Lawful public intelligence and authority boundaries",
+      "existing_implementation": [
+        "src/research/provider_terms.py",
+        "src/execution/signer.py",
+        "src/strategies/risk_veto.py"
+      ],
+      "producer": "provider access policy and isolated signer",
+      "state": "PARTIAL",
+      "stored_state": "source policy and live operator acknowledgement",
+      "consumer": "collection admission and hard rejection",
+      "decision_consequence": "Authority remains separate; unknown data never grants live permission",
+      "test": [
+        {
+          "path": "tests/test_provider_terms.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        },
+        {
+          "path": "tests/test_promotion_ladder.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "No audited server access/source-rights inventory",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Retain operator locks; classify source rights per evidence object",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "PARTIAL",
+        "implementation_paths": [
+          "src/research/unknown_engine.py",
+          "src/research/proposal_rounds.py",
+          "src/main.py"
+        ],
+        "producer_to_consumer": "Rights/PIT input admission and hard veto feed canonical evidence and execution refusal.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A03",
+              "status": "PASS",
+              "artifact": "A03-public_signal_to_pit_mechanism\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=45db0b5bc7a3afd0c22c0a783a66eb6114dcba615bfc49da780424d3b9011682"
+            },
+            {
+              "id": "A07",
+              "status": "PASS",
+              "artifact": "A07-planted_leakage_and_multiplicity_traps\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=5f0a56c9b920941b1cab2ffb0a658def1e2a0c4588e8ff3adaf0e0c94d4ee210"
+            },
+            {
+              "id": "A08",
+              "status": "PASS",
+              "artifact": "A08-known_safety_veto_overrides_high_alpha\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=8;sha256=b97febc18eea7c729868e6f13eb6f5997d69620afec2974ff0bd523442451667"
+            },
+            {
+              "id": "A15",
+              "status": "PASS",
+              "artifact": "A15-operator_authority_required_for_live_transition\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=15;sha256=c1be74fc60c3010ec45fc46fe50939a4d5b038c58c71c89d33c6a5f7757c3fdc"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Server source-rights inventory and every ingestion path require audit; prohibited actions never gain authority."
+      }
+    },
+    {
+      "requirement": 1,
+      "title": "After-cost geometric growth and research value",
+      "existing_implementation": [
+        "src/strategies/elogw_engine.py",
+        "src/strategies/opportunity_allocator.py"
+      ],
+      "producer": "prediction and execution outcomes",
+      "state": "PARTIAL",
+      "stored_state": "expected log-growth estimates",
+      "consumer": "candidate versus position/cash competition",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_core.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "No research-resource auction; runtime economics unverified",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Add explicit research cost/value auction with unknowns preserved",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "PARTIAL",
+        "implementation_paths": [
+          "src/research/frontier.py",
+          "src/strategies/opportunity_allocator.py"
+        ],
+        "producer_to_consumer": "Costed resource auction and explicit cash/incumbent/challenger ranking consume declared inputs.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A10",
+              "status": "PASS",
+              "artifact": "A10-strategy_competes_with_open_positions_and_cash\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=10;sha256=9194925f8f48f69dae226e7e84a2d1d64fa771c0c2a62a489b991f0950c24f30"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Incremental validated information, research monetary cost and portfolio log-growth are not measured."
+      }
+    },
+    {
+      "requirement": 2,
+      "title": "Diff-first residual capability ledger",
+      "existing_implementation": [
+        "docs/audits/unknown_engine_residual_capabilities.json"
+      ],
+      "producer": "independent source audits",
+      "state": "RUNTIME_UNMEASURED",
+      "stored_state": "this ledger",
+      "consumer": "implementation priority",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "No server runtime evidence yet",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Reconcile this ledger after each tested integration",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "RUNTIME_UNMEASURED",
+        "implementation_paths": [
+          "docs/audits/unknown_engine_residual_capabilities.json",
+          "docs/audits/UNKNOWN_ENGINE_IMPLEMENTATION_REPORT.md"
+        ],
+        "producer_to_consumer": "Initial source-audit baseline is preserved and supplemented with scoped implementation/evidence.",
+        "evidence": {
+          "status": "SOURCE_AUDIT_ONLY",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "No audited production runtime inventory establishes live capabilities."
+      }
+    },
+    {
+      "requirement": 3,
+      "title": "Permanent unknown-opportunity loop",
+      "existing_implementation": [
+        "src/research/global_research_miner.py",
+        "src/runtime/training.py"
+      ],
+      "producer": "public research leads and outcomes",
+      "state": "PARTIAL",
+      "stored_state": "lead ledger and champion state",
+      "consumer": "hypothesis registration/training",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_core.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "No durable raw-to-candidate queue or frontier consumer",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Extend existing runtime loop with durable research work",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "PARTIAL",
+        "implementation_paths": [
+          "src/research/unknown_engine.py",
+          "src/research/global_research_miner.py"
+        ],
+        "producer_to_consumer": "Existing miner drives durable evidence conversion and sealed proposal rounds.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A01",
+              "status": "PASS",
+              "artifact": "A01-dynamic_chain_or_protocol_discovery\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=1;sha256=fad2cadace63160f73e8138660c5e7d384de2ff1508e5bd4094dcdc47313fb82"
+            },
+            {
+              "id": "A03",
+              "status": "PASS",
+              "artifact": "A03-public_signal_to_pit_mechanism\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=45db0b5bc7a3afd0c22c0a783a66eb6114dcba615bfc49da780424d3b9011682"
+            },
+            {
+              "id": "A11",
+              "status": "PASS",
+              "artifact": "A11-provider_failure_preserves_queued_work\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=d59cf5023de740510724cc14f67330803d907bc20ddcd67c45fe50fecc8b43ed"
+            },
+            {
+              "id": "A13",
+              "status": "PASS",
+              "artifact": "A13-llm_outage_preserves_deterministic_operations\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=13;sha256=1e48a26ac7de3046b86519f95baa5cb4fe8d988ed2657ef40e1d7e0ac6b23248"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Every request, forward outcome and integration job does not yet have a complete autonomous consumer."
+      }
+    },
+    {
+      "requirement": 4,
+      "title": "Persistent frontier tensor",
+      "existing_implementation": [
+        "src/research/source_substitution.py",
+        "src/chains/launchpad_discovery.py"
+      ],
+      "producer": "source/program observations",
+      "state": "MISSING",
+      "stored_state": "memory-only discovery maps",
+      "consumer": "coverage reports",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_launchpad_discovery.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "No coordinate identity, debt, hibernation or restoration",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Implement sparse durable frontier in canonical research storage",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "SHADOW_ONLY",
+        "implementation_paths": [
+          "src/research/frontier.py"
+        ],
+        "producer_to_consumer": "Evidence-backed coordinates feed persistent debt, leases, retries and hibernation.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A01",
+              "status": "PASS",
+              "artifact": "A01-dynamic_chain_or_protocol_discovery\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=1;sha256=fad2cadace63160f73e8138660c5e7d384de2ff1508e5bd4094dcdc47313fb82"
+            },
+            {
+              "id": "A11",
+              "status": "PASS",
+              "artifact": "A11-provider_failure_preserves_queued_work\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=d59cf5023de740510724cc14f67330803d907bc20ddcd67c45fe50fecc8b43ed"
+            },
+            {
+              "id": "A12",
+              "status": "PASS",
+              "artifact": "A12-restart_restores_debt_episodes_and_forward_evidence\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=9403e159df5188c9a99ade81d55b39cdd8eb5323e6671946d93384d480175933"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Registration is not observed production coverage; economic coverage debt needs measured inputs."
+      }
+    },
+    {
+      "requirement": 5,
+      "title": "Dynamic chain discovery and native observation",
+      "existing_implementation": [
+        "src/chains/rpc_manager.py",
+        "src/detection/token_detector.py",
+        "config/chains.yaml"
+      ],
+      "producer": "native Solana stream; static EVM configuration",
+      "state": "SOLANA_ONLY",
+      "stored_state": "Solana episodes",
+      "consumer": "Solana desk decisions",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_core.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "EVM observers unwired; PairCreated decoding incorrect; no dynamic chain stages",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Correct verified EVM event parsing and add observation-only registry/backfill",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "PARTIAL",
+        "implementation_paths": [
+          "src/research/chain_opportunity.py",
+          "src/chains/evm_observation.py",
+          "src/chains/evm_events.py"
+        ],
+        "producer_to_consumer": "Public API scouting feeds discovered chains/protocols; native observers remain observation-only.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A01",
+              "status": "PASS",
+              "artifact": "A01-dynamic_chain_or_protocol_discovery\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=1;sha256=fad2cadace63160f73e8138660c5e7d384de2ff1508e5bd4094dcdc47313fb82"
+            },
+            {
+              "id": "A02",
+              "status": "PASS",
+              "artifact": "A02-unknown_native_event_refusal\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=2;sha256=95458bc0474c41a9d69bae51c6677add6eb98f077f94ef37f582acc9cc285d65"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Provider-backed native data and exit/finality proof missing; other chain-family adapters remain incomplete."
+      }
+    },
+    {
+      "requirement": 6,
+      "title": "Verified protocol discovery",
+      "existing_implementation": [
+        "src/chains/launchpads.py",
+        "src/chains/launchpad_discovery.py"
+      ],
+      "producer": "native instructions and unknown program census",
+      "state": "PARTIAL",
+      "stored_state": "provisional launchpad observations",
+      "consumer": "launch candidates",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_launchpads.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "Unconfirmed fixed layouts can auto-verify after three observations",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Require source/version/fixtures/parity proof and persist unknown events",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "PARTIAL",
+        "implementation_paths": [
+          "src/research/frontier.py",
+          "src/chains/evm_events.py",
+          "src/chains/yellowstone_grpc.py"
+        ],
+        "producer_to_consumer": "Versioned protocol contracts retain unknown layouts and verified fixture references.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A02",
+              "status": "PASS",
+              "artifact": "A02-unknown_native_event_refusal\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=2;sha256=95458bc0474c41a9d69bae51c6677add6eb98f077f94ef37f582acc9cc285d65"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Full live native decoder parity, verified ABI/IDL inventory and per-protocol buy/sell support unmeasured."
+      }
+    },
+    {
+      "requirement": 7,
+      "title": "Public actor/wallet discovery",
+      "existing_implementation": [
+        "src/research/actor_store.py",
+        "src/strategies/wallet_intelligence.py",
+        "src/research/copyability.py"
+      ],
+      "producer": "public launch/funding/trade evidence",
+      "state": "PARTIAL",
+      "stored_state": "temporal actor edges and wallet corpora",
+      "consumer": "independence and measured followability",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_actor_store.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        },
+        {
+          "path": "tests/test_copyability.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "Incomplete chain namespaces, graph kinds and matched/shuffled controls",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Extend existing temporal graph and delayed executable controls",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "PARTIAL",
+        "implementation_paths": [
+          "src/research/benchmark_wallets.py",
+          "src/strategies/wallet_value.py",
+          "src/research/actor_store.py"
+        ],
+        "producer_to_consumer": "Delayed after-cost followability rejects profitable-but-uncopyable wallet fixtures.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A04",
+              "status": "PASS",
+              "artifact": "A04-delayed_costly_wallet_not_followable\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=4;sha256=1c03a1dda32b3cfe45cffb22e0d678b78343d620dbf61cef086c06cd21079b93"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Actor graph namespace/taxonomy expansion, cross-chain compression and all matched/shuffled controls incomplete."
+      }
+    },
+    {
+      "requirement": 8,
+      "title": "Sources, narratives and regional discovery",
+      "existing_implementation": [
+        "src/research/world_crawler.py",
+        "src/runtime/source_intelligence.py",
+        "src/strategies/source_genealogy.py"
+      ],
+      "producer": "public search and source transports",
+      "state": "PARTIAL",
+      "stored_state": "source events and genealogy",
+      "consumer": "PIT source features",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_world_crawler.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "Crawler frontier not durable; Latin-only keyword extraction; incomplete propagation metrics",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Persist discovery dispositions and add native-language representations",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "PARTIAL",
+        "implementation_paths": [
+          "src/research/world_crawler.py",
+          "src/research/source_catalogue.py",
+          "src/research/chain_opportunity.py"
+        ],
+        "producer_to_consumer": "Existing public discovery surfaces can contribute canonical raw evidence and source requests.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A03",
+              "status": "PASS",
+              "artifact": "A03-public_signal_to_pit_mechanism\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=45db0b5bc7a3afd0c22c0a783a66eb6114dcba615bfc49da780424d3b9011682"
+            },
+            {
+              "id": "A11",
+              "status": "PASS",
+              "artifact": "A11-provider_failure_preserves_queued_work\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=d59cf5023de740510724cc14f67330803d907bc20ddcd67c45fe50fecc8b43ed"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Full multilingual native-language coverage and narrative/actor propagation expansion and metrics incomplete."
+      }
+    },
+    {
+      "requirement": 9,
+      "title": "Data-axis and representation requests",
+      "existing_implementation": [
+        "src/research/data_miners.py",
+        "src/research/feature_engine.py"
+      ],
+      "producer": "miner records",
+      "state": "MISSING",
+      "stored_state": "versioned fixed features",
+      "consumer": "training/serving feature builder",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_core.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "No canonical request lifecycle with consumer/mechanism/falsifier",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Add typed request objects and explicit acquisition/validation lifecycle",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "PARTIAL",
+        "implementation_paths": [
+          "src/research/unknown_engine.py",
+          "src/research/frontier.py"
+        ],
+        "producer_to_consumer": "Typed data/representation requests retain variable, mechanism, PIT, consumer and falsifier requirements.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A03",
+              "status": "PASS",
+              "artifact": "A03-public_signal_to_pit_mechanism\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=45db0b5bc7a3afd0c22c0a783a66eb6114dcba615bfc49da780424d3b9011682"
+            },
+            {
+              "id": "A11",
+              "status": "PASS",
+              "artifact": "A11-provider_failure_preserves_queued_work\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=d59cf5023de740510724cc14f67330803d907bc20ddcd67c45fe50fecc8b43ed"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Automatic lawful acquisition, representation implementation, validation and closure for every request not complete."
+      }
+    },
+    {
+      "requirement": 10,
+      "title": "Mechanism labs",
+      "existing_implementation": [
+        "src/research/global_research_miner.py",
+        "src/research/descendant_generator.py"
+      ],
+      "producer": "public leads and attribution leaks",
+      "state": "PARTIAL",
+      "stored_state": "fixed mechanism hypotheses",
+      "consumer": "champion/challenger registry",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_hypothesis_ledger.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "No persistent lab mission/experiment/budget contract",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Register mechanism labs on shared schema and work queue",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "PARTIAL",
+        "implementation_paths": [
+          "src/research/unknown_engine.py",
+          "src/research/proposal_rounds.py"
+        ],
+        "producer_to_consumer": "Mechanism receipts and discriminating experiment requests enter persistent canonical queues.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A03",
+              "status": "PASS",
+              "artifact": "A03-public_signal_to_pit_mechanism\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=45db0b5bc7a3afd0c22c0a783a66eb6114dcba615bfc49da780424d3b9011682"
+            },
+            {
+              "id": "A13",
+              "status": "PASS",
+              "artifact": "A13-llm_outage_preserves_deterministic_operations\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=13;sha256=1e48a26ac7de3046b86519f95baa5cb4fe8d988ed2657ef40e1d7e0ac6b23248"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "All mechanism labs, lab missions, decisive experiments and measured lab budgets are not implemented."
+      }
+    },
+    {
+      "requirement": 11,
+      "title": "Independent research agents",
+      "existing_implementation": [
+        "src/strategies/champion_challenger.py"
+      ],
+      "producer": "operator research proposals",
+      "state": "MISSING",
+      "stored_state": "hypotheses",
+      "consumer": "canonical evaluation",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_hypothesis_ledger.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "No sealed first-pass round, external Claude/DeepSeek runtime provider access unmeasured",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Implement proposal-only sealed rounds; require configured authorized providers",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "SHADOW_ONLY",
+        "implementation_paths": [
+          "src/research/proposal_rounds.py",
+          "src/research/unknown_engine.py"
+        ],
+        "producer_to_consumer": "Independent proposal inputs/outputs/failures seal before comparison and experiment conversion.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A13",
+              "status": "PASS",
+              "artifact": "A13-llm_outage_preserves_deterministic_operations\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=13;sha256=1e48a26ac7de3046b86519f95baa5cb4fe8d988ed2657ef40e1d7e0ac6b23248"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Real external models, credentials, API access, usage costs and comparative discovery value remain unconfigured/unmeasured."
+      }
+    },
+    {
+      "requirement": 12,
+      "title": "Machine search and quality diversity",
+      "existing_implementation": [
+        "src/research/descendant_generator.py"
+      ],
+      "producer": "named failure attribution",
+      "state": "PARTIAL",
+      "stored_state": "descendant proposals",
+      "consumer": "hypothesis consumer",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_core.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "No mechanism-constrained program grammar or niche archive",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Add deterministic mechanism grammar, genealogy and quality-diversity niches",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "PARTIAL",
+        "implementation_paths": [
+          "src/research/research_contracts.py",
+          "src/strategies/champion_challenger.py"
+        ],
+        "producer_to_consumer": "Bounded executable rules and canonical program/parameter niches preserve independent breadth.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A06",
+              "status": "PASS",
+              "artifact": "A06-duplicates_and_parameter_neighbours_collapse\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=6;sha256=00d703b956e40678db54d3f4207113fa1a780221606fc2038f582fe2285ee928"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Broad symbolic regression, genetic programming, causal discovery and MAP-Elites search not implemented end to end."
+      }
+    },
+    {
+      "requirement": 13,
+      "title": "Raw-to-testable strategy compiler",
+      "existing_implementation": [
+        "src/research/global_research_miner.py",
+        "src/strategies/champion_challenger.py"
+      ],
+      "producer": "ResearchLead",
+      "state": "MISSING",
+      "stored_state": "keyword mechanism and HypothesisSpec",
+      "consumer": "challenger registration",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_hypothesis_ledger.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "Useful findings can remain blocked prose without exact strategy disposition",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Add typed compiler dispositions routed to existing canonical gauntlet",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "PARTIAL",
+        "implementation_paths": [
+          "src/research/unknown_engine.py",
+          "src/research/candidate_replay.py"
+        ],
+        "producer_to_consumer": "Raw evidence receives a typed disposition; valid exact programs freeze and route to canonical bounded replay.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A03",
+              "status": "PASS",
+              "artifact": "A03-public_signal_to_pit_mechanism\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=45db0b5bc7a3afd0c22c0a783a66eb6114dcba615bfc49da780424d3b9011682"
+            },
+            {
+              "id": "A05",
+              "status": "PASS",
+              "artifact": "A05-frozen_candidate_genealogy_and_execution\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=5;sha256=9745331f8ba8f071e2cff05dc3e2fa8740e4e3f9ea7cfd4aaebe786ea2d83773"
+            },
+            {
+              "id": "A07",
+              "status": "PASS",
+              "artifact": "A07-planted_leakage_and_multiplicity_traps\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=5f0a56c9b920941b1cab2ffb0a658def1e2a0c4588e8ff3adaf0e0c94d4ee210"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Arbitrary useful prose is not automatically compiled; missing mappings/costs/observations stay blocked."
+      }
+    },
+    {
+      "requirement": 14,
+      "title": "Frozen exact candidate contract",
+      "existing_implementation": [
+        "src/strategies/champion_challenger.py"
+      ],
+      "producer": "HypothesisSpec",
+      "state": "PARTIAL",
+      "stored_state": "mutable frozen_at field",
+      "consumer": "trial/evaluation methods",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_hypothesis_ledger.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "Incomplete exact rules/PIT/execution contract; no immutable content hash enforcement",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Extend canonical spec, content-hash freeze and enforce at evaluation",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "SHADOW_ONLY",
+        "implementation_paths": [
+          "src/research/research_contracts.py",
+          "src/strategies/champion_challenger.py"
+        ],
+        "producer_to_consumer": "Exact rules, PIT inputs, execution assumptions and genealogy bind immutable candidate/trial hashes.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A05",
+              "status": "PASS",
+              "artifact": "A05-frozen_candidate_genealogy_and_execution\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=5;sha256=9745331f8ba8f071e2cff05dc3e2fa8740e4e3f9ea7cfd4aaebe786ea2d83773"
+            },
+            {
+              "id": "A06",
+              "status": "PASS",
+              "artifact": "A06-duplicates_and_parameter_neighbours_collapse\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=6;sha256=00d703b956e40678db54d3f4207113fa1a780221606fc2038f582fe2285ee928"
+            },
+            {
+              "id": "A07",
+              "status": "PASS",
+              "artifact": "A07-planted_leakage_and_multiplicity_traps\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=5f0a56c9b920941b1cab2ffb0a658def1e2a0c4588e8ff3adaf0e0c94d4ee210"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Contract validity does not establish a mechanism, executable edge, untouched forward survival or authority."
+      }
+    },
+    {
+      "requirement": 15,
+      "title": "Segmented strategy lattice",
+      "existing_implementation": [
+        "src/runtime/intelligence_manifest.py",
+        "src/strategies/opportunity_allocator.py"
+      ],
+      "producer": "existing strategy modules",
+      "state": "PARTIAL",
+      "stored_state": "disconnected family metadata",
+      "consumer": "entry/exit intelligence",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_no_orphan_modules.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "No persistent chain/protocol/stage/regime/latency/capital/exit coverage",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Register reusable strategy families as frontier coordinates",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "PARTIAL",
+        "implementation_paths": [
+          "src/research/frontier.py",
+          "src/research/research_contracts.py"
+        ],
+        "producer_to_consumer": "Sparse 21-axis frontier indexes chain/protocol/stage/route/risk/capital/portfolio coordinates.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A01",
+              "status": "PASS",
+              "artifact": "A01-dynamic_chain_or_protocol_discovery\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=1;sha256=fad2cadace63160f73e8138660c5e7d384de2ff1508e5bd4094dcdc47313fb82"
+            },
+            {
+              "id": "A12",
+              "status": "PASS",
+              "artifact": "A12-restart_restores_debt_episodes_and_forward_evidence\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=9403e159df5188c9a99ade81d55b39cdd8eb5323e6671946d93384d480175933"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Full segmented strategy lattice population, consumer coverage and observed coverage metrics incomplete."
+      }
+    },
+    {
+      "requirement": 16,
+      "title": "Canonical multi-fidelity gauntlet",
+      "existing_implementation": [
+        "src/research/gauntlet.py",
+        "src/research/promotion_gate.py"
+      ],
+      "producer": "observed cohorts and trial results",
+      "state": "PARTIAL",
+      "stored_state": "gauntlet verdicts and promotion evidence",
+      "consumer": "existing promotion gate",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_gauntlet.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "PBO aligns different cohorts by list index; missing PBO can pass; trial ledger omitted on restart",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Repair alignment and persist multiplicity; add PIT/freeze admission before canonical evaluator",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "PARTIAL",
+        "implementation_paths": [
+          "src/research/candidate_replay.py",
+          "src/research/gauntlet.py",
+          "src/research/gauntlet_feed.py",
+          "src/strategies/champion_challenger.py"
+        ],
+        "producer_to_consumer": "Bounded replay reuses canonical gauntlet, shared cohort/time CSCV, binding checks and durable trial ancestry.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A05",
+              "status": "PASS",
+              "artifact": "A05-frozen_candidate_genealogy_and_execution\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=5;sha256=9745331f8ba8f071e2cff05dc3e2fa8740e4e3f9ea7cfd4aaebe786ea2d83773"
+            },
+            {
+              "id": "A07",
+              "status": "PASS",
+              "artifact": "A07-planted_leakage_and_multiplicity_traps\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=5f0a56c9b920941b1cab2ffb0a658def1e2a0c4588e8ff3adaf0e0c94d4ee210"
+            },
+            {
+              "id": "A09",
+              "status": "PASS",
+              "artifact": "A09-route_aware_return_differs_from_marks\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=9;sha256=9c8e106d7c545958e4f60ca10a82500af127213ba5a54e4c47c48d53457f56b6"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Full native-chain L4 replay and L5 untouched forward/L6 canary/L7 live attribution still require observed evidence."
+      }
+    },
+    {
+      "requirement": 17,
+      "title": "Research-capital auction",
+      "existing_implementation": [
+        "src/research/data_miners.py"
+      ],
+      "producer": "research requests",
+      "state": "MISSING",
+      "stored_state": "independent miner cadence",
+      "consumer": "scheduled collection",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_core.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "No costed research auction/exploration floors/hibernation",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Rank persistent jobs by declared VOI and budget with exploration floors",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "SHADOW_ONLY",
+        "implementation_paths": [
+          "src/research/frontier.py",
+          "src/research/unknown_engine.py"
+        ],
+        "producer_to_consumer": "Declared resource envelopes, exploration floors, leases and named wake changes govern research work.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A11",
+              "status": "PASS",
+              "artifact": "A11-provider_failure_preserves_queued_work\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=d59cf5023de740510724cc14f67330803d907bc20ddcd67c45fe50fecc8b43ed"
+            },
+            {
+              "id": "A12",
+              "status": "PASS",
+              "artifact": "A12-restart_restores_debt_episodes_and_forward_evidence\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=9403e159df5188c9a99ade81d55b39cdd8eb5323e6671946d93384d480175933"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Expected information value, actual inference/data/engineering monetary costs and measured auction advantage unknown."
+      }
+    },
+    {
+      "requirement": 18,
+      "title": "Measured latency and exit readiness",
+      "existing_implementation": [
+        "src/runtime/latency.py",
+        "src/execution/exit_readiness.py"
+      ],
+      "producer": "native callbacks and execution results",
+      "state": "PARTIAL",
+      "stored_state": "aggregate stage reservoirs",
+      "consumer": "diagnostics and delay value",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_latency_value.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "Actual build/sign/land/fill boundaries and chain/protocol stratification incomplete",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Carry one trace ID through actual execution boundaries",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "PARTIAL",
+        "implementation_paths": [
+          "src/runtime/latency.py",
+          "src/runtime/execution_readiness.py"
+        ],
+        "producer_to_consumer": "Measured stage distributions and explicit unmeasured budget status feed readiness diagnostics.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A02",
+              "status": "PASS",
+              "artifact": "A02-unknown_native_event_refusal\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=2;sha256=95458bc0474c41a9d69bae51c6677add6eb98f077f94ef37f582acc9cc285d65"
+            },
+            {
+              "id": "A15",
+              "status": "PASS",
+              "artifact": "A15-operator_authority_required_for_live_transition\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=15;sha256=c1be74fc60c3010ec45fc46fe50939a4d5b038c58c71c89d33c6a5f7757c3fdc"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Complete build/sign/receipt/land/fill and chain/protocol/regime/route distributions require runtime tracing."
+      }
+    },
+    {
+      "requirement": 19,
+      "title": "Budgeted asymmetric-tail sleeve",
+      "existing_implementation": [
+        "src/strategies/monster.py",
+        "src/execution/executable_tail.py"
+      ],
+      "producer": "calibrated continuation and executable marks",
+      "state": "MISSING",
+      "stored_state": "position-level monster state",
+      "consumer": "existing exit policy",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_executable_tail.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "No separate shadow sleeve budget, concentration/loss caps or no-monster stress proof",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Implement shadow-only sleeve policy using existing veto and allocator",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "SHADOW_ONLY",
+        "implementation_paths": [
+          "src/strategies/asymmetric_tail.py",
+          "src/runtime/research_runtime.py"
+        ],
+        "producer_to_consumer": "Canonical proposals and successful simulated fills feed fixed lifetime/day/week/concentration budgets and persisted runner/harvest/shutdown state.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A10",
+              "status": "PASS",
+              "artifact": "A10-strategy_competes_with_open_positions_and_cash\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=10;sha256=9194925f8f48f69dae226e7e84a2d1d64fa771c0c2a62a489b991f0950c24f30"
+            },
+            {
+              "id": "A12",
+              "status": "PASS",
+              "artifact": "A12-restart_restores_debt_episodes_and_forward_evidence\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=9403e159df5188c9a99ade81d55b39cdd8eb5323e6671946d93384d480175933"
+            },
+            {
+              "id": "A14",
+              "status": "PASS",
+              "artifact": "A14-no_monster_stress_respects_tail_budget\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=14;sha256=bad111cd92fd23eb67027698345bd0e0999aff99f5b374e0ad2ab321cefe25c2"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Real tail payoff, ruin probability, correlation, exit reliability, time between monsters and portfolio contribution unmeasured."
+      }
+    },
+    {
+      "requirement": 20,
+      "title": "Failure/survivor/counterfactual feedback",
+      "existing_implementation": [
+        "src/research/attribution.py",
+        "src/research/descendant_generator.py",
+        "src/research/counterfactual_corpus.py"
+      ],
+      "producer": "decisions, executable outcomes and attribution",
+      "state": "PARTIAL",
+      "stored_state": "counterfactual corpus",
+      "consumer": "descendant suggestions",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_core.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "No complete diagnosis taxonomy/enabling-change admission/restart-safe descendant queue",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Require named enabling change and preserve canonical genealogy/trial identity",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "PARTIAL",
+        "implementation_paths": [
+          "src/research/counterfactual_corpus.py",
+          "src/research/descendant_generator.py",
+          "src/research/frontier.py"
+        ],
+        "producer_to_consumer": "Executable counterfactuals, retained negative knowledge and named wake conditions preserve research history.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A09",
+              "status": "PASS",
+              "artifact": "A09-route_aware_return_differs_from_marks\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=9;sha256=9c8e106d7c545958e4f60ca10a82500af127213ba5a54e4c47c48d53457f56b6"
+            },
+            {
+              "id": "A11",
+              "status": "PASS",
+              "artifact": "A11-provider_failure_preserves_queued_work\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=d59cf5023de740510724cc14f67330803d907bc20ddcd67c45fe50fecc8b43ed"
+            },
+            {
+              "id": "A12",
+              "status": "PASS",
+              "artifact": "A12-restart_restores_debt_episodes_and_forward_evidence\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=9403e159df5188c9a99ade81d55b39cdd8eb5323e6671946d93384d480175933"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Complete failure diagnosis taxonomy, survivor decomposition and enabling-change descendant admission incomplete."
+      }
+    },
+    {
+      "requirement": 21,
+      "title": "Versioned reversible research self-improvement",
+      "existing_implementation": [
+        "src/strategies/champion_challenger.py",
+        "src/research/promotion_gate.py"
+      ],
+      "producer": "challenger proposals",
+      "state": "PARTIAL",
+      "stored_state": "hypotheses and gate hash",
+      "consumer": "shadow/canary evaluation",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_promotion_ladder.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "Research proposals lack immutable attribution and provider-cost/outcome metrics",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Keep proposals outside authority; persist immutable versions and outcomes",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "PARTIAL",
+        "implementation_paths": [
+          "src/research/proposal_rounds.py",
+          "src/strategies/champion_challenger.py"
+        ],
+        "producer_to_consumer": "Proposal attribution/seals, content-bound trials and reversible persisted research state retain history.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A05",
+              "status": "PASS",
+              "artifact": "A05-frozen_candidate_genealogy_and_execution\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=5;sha256=9745331f8ba8f071e2cff05dc3e2fa8740e4e3f9ea7cfd4aaebe786ea2d83773"
+            },
+            {
+              "id": "A07",
+              "status": "PASS",
+              "artifact": "A07-planted_leakage_and_multiplicity_traps\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=5f0a56c9b920941b1cab2ffb0a658def1e2a0c4588e8ff3adaf0e0c94d4ee210"
+            },
+            {
+              "id": "A13",
+              "status": "PASS",
+              "artifact": "A13-llm_outage_preserves_deterministic_operations\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=13;sha256=1e48a26ac7de3046b86519f95baa5cb4fe8d988ed2657ef40e1d7e0ac6b23248"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Measured agent value/cost, shadow comparison of every self-improvement and operational rollback drills missing."
+      }
+    },
+    {
+      "requirement": 22,
+      "title": "Persistent queues and backpressure",
+      "existing_implementation": [
+        "src/research/object_store.py",
+        "src/runtime/evidence.py"
+      ],
+      "producer": "raw research leads and requests",
+      "state": "MISSING",
+      "stored_state": "append-only evidence and object storage",
+      "consumer": "current ad hoc consumers",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_object_store.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "No leased restart-safe queue spanning raw/conversion/gauntlet/forward/integration",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Reuse canonical evidence store; add durable job IDs, retry leases and delay metrics",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "PARTIAL",
+        "implementation_paths": [
+          "src/research/frontier.py",
+          "src/research/unknown_engine.py",
+          "src/runtime/research_runtime.py"
+        ],
+        "producer_to_consumer": "Durable raw references, typed work, leased retries and retained queue/debt metrics survive component restart.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A11",
+              "status": "PASS",
+              "artifact": "A11-provider_failure_preserves_queued_work\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=d59cf5023de740510724cc14f67330803d907bc20ddcd67c45fe50fecc8b43ed"
+            },
+            {
+              "id": "A12",
+              "status": "PASS",
+              "artifact": "A12-restart_restores_debt_episodes_and_forward_evidence\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=9403e159df5188c9a99ade81d55b39cdd8eb5323e6671946d93384d480175933"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Complete acquisition/repair/forward/integration worker coverage and production backpressure rates unmeasured."
+      }
+    },
+    {
+      "requirement": 23,
+      "title": "Truthful required metrics",
+      "existing_implementation": [
+        "src/runtime/reporting.py",
+        "src/runtime/intelligence_manifest.py"
+      ],
+      "producer": "subsystem reports",
+      "state": "PARTIAL",
+      "stored_state": "readiness JSON",
+      "consumer": "operator status",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_readiness.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "No complete frontier/research/tail report; no runtime artifact inventory",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Expose explicit UNMEASURED with evidence references and queue/frontier counters",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "PARTIAL",
+        "implementation_paths": [
+          "src/runtime/latency.py",
+          "src/runtime/reporting.py",
+          "src/strategies/asymmetric_tail.py",
+          "src/research/frontier.py"
+        ],
+        "producer_to_consumer": "Frontier/tail/reporting preserve unknown metric values and expose scoped evidence counts.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A01",
+              "status": "PASS",
+              "artifact": "A01-dynamic_chain_or_protocol_discovery\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=1;sha256=fad2cadace63160f73e8138660c5e7d384de2ff1508e5bd4094dcdc47313fb82"
+            },
+            {
+              "id": "A12",
+              "status": "PASS",
+              "artifact": "A12-restart_restores_debt_episodes_and_forward_evidence\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=9403e159df5188c9a99ade81d55b39cdd8eb5323e6671946d93384d480175933"
+            },
+            {
+              "id": "A14",
+              "status": "PASS",
+              "artifact": "A14-no_monster_stress_respects_tail_budget\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=14;sha256=bad111cd92fd23eb67027698345bd0e0999aff99f5b374e0ad2ab321cefe25c2"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Real log-loss/conformal, full stratification, cost/useful discovery, ruin/correlation/exit and portfolio metrics need measured samples."
+      }
+    },
+    {
+      "requirement": 24,
+      "title": "End-to-end acceptance artifacts",
+      "existing_implementation": [
+        "tests",
+        "tools/run_gauntlet.py"
+      ],
+      "producer": "unit and integration fixtures",
+      "state": "RUNTIME_UNMEASURED",
+      "stored_state": "test results",
+      "consumer": "CI",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [
+        {
+          "path": "tests/test_core.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "No consolidated artifact-backed proof for all 15 requirements",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Add deterministic offline acceptance harness; separate fixtures from real server proof",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "SHADOW_ONLY",
+        "implementation_paths": [
+          "tools/prove_unknown_engine.py",
+          "tests/test_unknown_engine_proof.py"
+        ],
+        "producer_to_consumer": "Fifteen isolated offline producer/consumer scenarios retain canonical evidence, input/result/file/source hashes and integration JUnit.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A01",
+              "status": "PASS",
+              "artifact": "A01-dynamic_chain_or_protocol_discovery\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=1;sha256=fad2cadace63160f73e8138660c5e7d384de2ff1508e5bd4094dcdc47313fb82"
+            },
+            {
+              "id": "A02",
+              "status": "PASS",
+              "artifact": "A02-unknown_native_event_refusal\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=2;sha256=95458bc0474c41a9d69bae51c6677add6eb98f077f94ef37f582acc9cc285d65"
+            },
+            {
+              "id": "A03",
+              "status": "PASS",
+              "artifact": "A03-public_signal_to_pit_mechanism\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=45db0b5bc7a3afd0c22c0a783a66eb6114dcba615bfc49da780424d3b9011682"
+            },
+            {
+              "id": "A04",
+              "status": "PASS",
+              "artifact": "A04-delayed_costly_wallet_not_followable\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=4;sha256=1c03a1dda32b3cfe45cffb22e0d678b78343d620dbf61cef086c06cd21079b93"
+            },
+            {
+              "id": "A05",
+              "status": "PASS",
+              "artifact": "A05-frozen_candidate_genealogy_and_execution\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=5;sha256=9745331f8ba8f071e2cff05dc3e2fa8740e4e3f9ea7cfd4aaebe786ea2d83773"
+            },
+            {
+              "id": "A06",
+              "status": "PASS",
+              "artifact": "A06-duplicates_and_parameter_neighbours_collapse\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=6;sha256=00d703b956e40678db54d3f4207113fa1a780221606fc2038f582fe2285ee928"
+            },
+            {
+              "id": "A07",
+              "status": "PASS",
+              "artifact": "A07-planted_leakage_and_multiplicity_traps\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=5f0a56c9b920941b1cab2ffb0a658def1e2a0c4588e8ff3adaf0e0c94d4ee210"
+            },
+            {
+              "id": "A08",
+              "status": "PASS",
+              "artifact": "A08-known_safety_veto_overrides_high_alpha\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=8;sha256=b97febc18eea7c729868e6f13eb6f5997d69620afec2974ff0bd523442451667"
+            },
+            {
+              "id": "A09",
+              "status": "PASS",
+              "artifact": "A09-route_aware_return_differs_from_marks\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=9;sha256=9c8e106d7c545958e4f60ca10a82500af127213ba5a54e4c47c48d53457f56b6"
+            },
+            {
+              "id": "A10",
+              "status": "PASS",
+              "artifact": "A10-strategy_competes_with_open_positions_and_cash\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=10;sha256=9194925f8f48f69dae226e7e84a2d1d64fa771c0c2a62a489b991f0950c24f30"
+            },
+            {
+              "id": "A11",
+              "status": "PASS",
+              "artifact": "A11-provider_failure_preserves_queued_work\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=d59cf5023de740510724cc14f67330803d907bc20ddcd67c45fe50fecc8b43ed"
+            },
+            {
+              "id": "A12",
+              "status": "PASS",
+              "artifact": "A12-restart_restores_debt_episodes_and_forward_evidence\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=9403e159df5188c9a99ade81d55b39cdd8eb5323e6671946d93384d480175933"
+            },
+            {
+              "id": "A13",
+              "status": "PASS",
+              "artifact": "A13-llm_outage_preserves_deterministic_operations\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=13;sha256=1e48a26ac7de3046b86519f95baa5cb4fe8d988ed2657ef40e1d7e0ac6b23248"
+            },
+            {
+              "id": "A14",
+              "status": "PASS",
+              "artifact": "A14-no_monster_stress_respects_tail_budget\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=14;sha256=bad111cd92fd23eb67027698345bd0e0999aff99f5b374e0ad2ab321cefe25c2"
+            },
+            {
+              "id": "A15",
+              "status": "PASS",
+              "artifact": "A15-operator_authority_required_for_live_transition\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=15;sha256=c1be74fc60c3010ec45fc46fe50939a4d5b038c58c71c89d33c6a5f7757c3fdc"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "All fifteen fixture scenarios pass; production/provider/untouched-forward/live capability remains UNMEASURED."
+      }
+    },
+    {
+      "requirement": 25,
+      "title": "Ordered implementation A-G",
+      "existing_implementation": [
+        "docs/blueprints/GLOBAL_MEMECOIN_MAXIMUM_EDGE_BLUEPRINT.md",
+        "docs/blueprints/MEMECOIN_UNKNOWN_OPPORTUNITY_ENGINE_ADDENDUM.md"
+      ],
+      "producer": "operator blueprint",
+      "state": "PARTIAL",
+      "stored_state": "governing directives",
+      "consumer": "implementation work",
+      "decision_consequence": "Research evidence only until separately validated",
+      "test": [],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "Forward cohorts/external providers/native adapters require measured time/access",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Complete code stages in order; keep unmeasured stages explicitly blocked",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "PARTIAL",
+        "implementation_paths": [
+          "docs/audits/UNKNOWN_ENGINE_IMPLEMENTATION_REPORT.md",
+          "src/research/unknown_engine.py"
+        ],
+        "producer_to_consumer": "Audit, scientific core, bounded discovery/conversion and shadow seams are implemented in the existing desk.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A01",
+              "status": "PASS",
+              "artifact": "A01-dynamic_chain_or_protocol_discovery\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=1;sha256=fad2cadace63160f73e8138660c5e7d384de2ff1508e5bd4094dcdc47313fb82"
+            },
+            {
+              "id": "A02",
+              "status": "PASS",
+              "artifact": "A02-unknown_native_event_refusal\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=2;sha256=95458bc0474c41a9d69bae51c6677add6eb98f077f94ef37f582acc9cc285d65"
+            },
+            {
+              "id": "A03",
+              "status": "PASS",
+              "artifact": "A03-public_signal_to_pit_mechanism\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=3;sha256=45db0b5bc7a3afd0c22c0a783a66eb6114dcba615bfc49da780424d3b9011682"
+            },
+            {
+              "id": "A04",
+              "status": "PASS",
+              "artifact": "A04-delayed_costly_wallet_not_followable\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=4;sha256=1c03a1dda32b3cfe45cffb22e0d678b78343d620dbf61cef086c06cd21079b93"
+            },
+            {
+              "id": "A05",
+              "status": "PASS",
+              "artifact": "A05-frozen_candidate_genealogy_and_execution\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=5;sha256=9745331f8ba8f071e2cff05dc3e2fa8740e4e3f9ea7cfd4aaebe786ea2d83773"
+            },
+            {
+              "id": "A06",
+              "status": "PASS",
+              "artifact": "A06-duplicates_and_parameter_neighbours_collapse\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=6;sha256=00d703b956e40678db54d3f4207113fa1a780221606fc2038f582fe2285ee928"
+            },
+            {
+              "id": "A07",
+              "status": "PASS",
+              "artifact": "A07-planted_leakage_and_multiplicity_traps\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=5f0a56c9b920941b1cab2ffb0a658def1e2a0c4588e8ff3adaf0e0c94d4ee210"
+            },
+            {
+              "id": "A08",
+              "status": "PASS",
+              "artifact": "A08-known_safety_veto_overrides_high_alpha\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=8;sha256=b97febc18eea7c729868e6f13eb6f5997d69620afec2974ff0bd523442451667"
+            },
+            {
+              "id": "A09",
+              "status": "PASS",
+              "artifact": "A09-route_aware_return_differs_from_marks\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=9;sha256=9c8e106d7c545958e4f60ca10a82500af127213ba5a54e4c47c48d53457f56b6"
+            },
+            {
+              "id": "A10",
+              "status": "PASS",
+              "artifact": "A10-strategy_competes_with_open_positions_and_cash\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=10;sha256=9194925f8f48f69dae226e7e84a2d1d64fa771c0c2a62a489b991f0950c24f30"
+            },
+            {
+              "id": "A11",
+              "status": "PASS",
+              "artifact": "A11-provider_failure_preserves_queued_work\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=d59cf5023de740510724cc14f67330803d907bc20ddcd67c45fe50fecc8b43ed"
+            },
+            {
+              "id": "A12",
+              "status": "PASS",
+              "artifact": "A12-restart_restores_debt_episodes_and_forward_evidence\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=9403e159df5188c9a99ade81d55b39cdd8eb5323e6671946d93384d480175933"
+            },
+            {
+              "id": "A13",
+              "status": "PASS",
+              "artifact": "A13-llm_outage_preserves_deterministic_operations\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=13;sha256=1e48a26ac7de3046b86519f95baa5cb4fe8d988ed2657ef40e1d7e0ac6b23248"
+            },
+            {
+              "id": "A14",
+              "status": "PASS",
+              "artifact": "A14-no_monster_stress_respects_tail_budget\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=14;sha256=bad111cd92fd23eb67027698345bd0e0999aff99f5b374e0ad2ab321cefe25c2"
+            },
+            {
+              "id": "A15",
+              "status": "PASS",
+              "artifact": "A15-operator_authority_required_for_live_transition\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=15;sha256=c1be74fc60c3010ec45fc46fe50939a4d5b038c58c71c89d33c6a5f7757c3fdc"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Complete ecosystem expansion, taxonomy/labs/search, measured APIs/native routes and forward cohorts remain outstanding."
+      }
+    },
+    {
+      "requirement": 26,
+      "title": "Permanent safety/scientific laws",
+      "existing_implementation": [
+        "src/strategies/risk_veto.py",
+        "src/execution/signer.py",
+        "src/research/promotion_gate.py"
+      ],
+      "producer": "known safety facts and operator acknowledgement",
+      "state": "PARTIAL",
+      "stored_state": "separate locks and gate evidence",
+      "consumer": "execution authorization",
+      "decision_consequence": "Authority remains separate; unknown data never grants live permission",
+      "test": [
+        {
+          "path": "tests/test_promotion_ladder.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        },
+        {
+          "path": "tests/test_core.py",
+          "status": "INSPECTED_NOT_EXECUTED_BY_AUDIT"
+        }
+      ],
+      "runtime_evidence": {
+        "status": "UNMEASURED",
+        "artifacts": []
+      },
+      "gap": "Research additions need enforceable immutable/PIT/trial/queue invariants",
+      "expected_value": {
+        "status": "HYPOTHESIS",
+        "value": null,
+        "rationale": "Improve judgeable breadth, scientific validity or operational safety; not a measured return claim"
+      },
+      "implementation_cost": {
+        "status": "UNESTIMATED",
+        "value": null
+      },
+      "action": "Add adversarial acceptance tests without changing live locks",
+      "implementation_update": {
+        "reviewed_at": "2026-10-20",
+        "state": "PARTIAL",
+        "implementation_paths": [
+          "src/main.py",
+          "src/research/proposal_rounds.py",
+          "src/research/promotion_gate.py",
+          "src/execution/signer.py"
+        ],
+        "producer_to_consumer": "Hard safety, PIT/freeze/selection/queue invariants and separate operator gates remain enforced in fixture runtime.",
+        "evidence": {
+          "status": "OFFLINE_FIXTURE_RUNTIME",
+          "manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+          "requirements": [
+            {
+              "id": "A04",
+              "status": "PASS",
+              "artifact": "A04-delayed_costly_wallet_not_followable\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=4;sha256=1c03a1dda32b3cfe45cffb22e0d678b78343d620dbf61cef086c06cd21079b93"
+            },
+            {
+              "id": "A05",
+              "status": "PASS",
+              "artifact": "A05-frozen_candidate_genealogy_and_execution\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=5;sha256=9745331f8ba8f071e2cff05dc3e2fa8740e4e3f9ea7cfd4aaebe786ea2d83773"
+            },
+            {
+              "id": "A07",
+              "status": "PASS",
+              "artifact": "A07-planted_leakage_and_multiplicity_traps\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=7;sha256=5f0a56c9b920941b1cab2ffb0a658def1e2a0c4588e8ff3adaf0e0c94d4ee210"
+            },
+            {
+              "id": "A08",
+              "status": "PASS",
+              "artifact": "A08-known_safety_veto_overrides_high_alpha\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=8;sha256=b97febc18eea7c729868e6f13eb6f5997d69620afec2974ff0bd523442451667"
+            },
+            {
+              "id": "A11",
+              "status": "PASS",
+              "artifact": "A11-provider_failure_preserves_queued_work\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=11;sha256=d59cf5023de740510724cc14f67330803d907bc20ddcd67c45fe50fecc8b43ed"
+            },
+            {
+              "id": "A12",
+              "status": "PASS",
+              "artifact": "A12-restart_restores_debt_episodes_and_forward_evidence\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=12;sha256=9403e159df5188c9a99ade81d55b39cdd8eb5323e6671946d93384d480175933"
+            },
+            {
+              "id": "A14",
+              "status": "PASS",
+              "artifact": "A14-no_monster_stress_respects_tail_budget\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=14;sha256=bad111cd92fd23eb67027698345bd0e0999aff99f5b374e0ad2ab321cefe25c2"
+            },
+            {
+              "id": "A15",
+              "status": "PASS",
+              "artifact": "A15-operator_authority_required_for_live_transition\\result.json",
+              "canonical_evidence_ref": "acceptance-evidence.jsonl#sequence=15;sha256=c1be74fc60c3010ec45fc46fe50939a4d5b038c58c71c89d33c6a5f7757c3fdc"
+            }
+          ],
+          "production_status": "UNMEASURED",
+          "live_capability": false
+        },
+        "remaining_gap": "Permanent production lawful access, reliable execution, measured edge and capital survival are not established by fixture assertions."
+      }
+    }
+  ],
+  "implementation_review": {
+    "as_of": "2026-10-20",
+    "baseline_preserved": true,
+    "interpretation": "Original row fields are the independent Phase-A baseline. Supplemental implementation_update fields describe later code and scoped evidence; neither source nor fixture existence establishes live capability.",
+    "proof_manifest": "C:\\Users\\dell\\memecoin-acceptance-runtime-20261020-02\\manifest.json",
+    "proof_status": "PASS",
+    "proof_counts": {
+      "BLOCKED": 0,
+      "FAIL": 0,
+      "PASS": 15
+    },
+    "production_status": "UNMEASURED",
+    "source_drift_during_proof": [],
+    "implementation_report": "docs/audits/UNKNOWN_ENGINE_IMPLEMENTATION_REPORT.md"
+  }
+}

@@ -74,7 +74,7 @@ class VerificationCountsDistinctTransactions(unittest.TestCase):
                        if not spec.trusted)
         return program, CanonicalLaunchEvent(
             venue=registry.specs[program].name, program_id=program,
-            instruction="create", mint="Mint1", creator="Creator1",
+            instruction=registry.specs[program].create_instructions[0], mint="Mint1", creator="Creator1",
             signature=signature, slot=1, observed_at=0.0)
 
     def test_the_same_transaction_three_times_verifies_nothing(self):
@@ -94,6 +94,17 @@ class VerificationCountsDistinctTransactions(unittest.TestCase):
 
         registry = self._registry()
         program, _ = self._event(registry, "x")
+        # Observation count supplements reviewed source/IDL/fixture parity;
+        # three plausible account-order guesses can never establish a layout.
+        spec = registry.specs[program]
+        spec.protocol_version = "local-test-v1"
+        spec.source_ref = "fixture:source"
+        spec.idl_ref = "fixture:idl"
+        spec.verification_provenance = "fixture:review"
+        spec.fixture_refs = ("fixture:decoder-parity",)
+        spec.layout_verified = True
+        spec.decoder_parity = True
+        spec.mint_account_index = 0
         verified = False
         for index in range(OBSERVATIONS_TO_VERIFY):
             _, event = self._event(registry, f"Signature{index}")

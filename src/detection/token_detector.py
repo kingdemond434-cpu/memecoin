@@ -12,6 +12,7 @@ from web3 import AsyncWeb3
 from web3.types import LogReceipt, TxData
 
 from src.chains.rpc_manager import ChainConfig, ChainRegistry, RPCManager
+from src.chains.evm_events import PAIR_CREATED_TOPIC, decode_pair_created, select_quote_pair
 
 logger = logging.getLogger(__name__)
 
@@ -170,19 +171,25 @@ class MempoolDetector(BaseDetector):
                 return
 
             for log in receipt.get("logs", []):
-                topics = log.get("topics", [])
-                if len(topics) >= 3 and topics[0].lower() == "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cdadefa3b5c4c54fae".lower():
-                    token_addr = "0x" + topics[2][-40:]
-                    pair_addr = "0x" + topics[1][-40:]
+                if str(log.get("address", "")).lower() != factory_addr.lower():
+                    continue
+                decoded = decode_pair_created(log)
+                selected = select_quote_pair(decoded, self.chain_config.base_tokens) if decoded else None
+                if selected:
+                    token_addr, base_token = selected
                     await self.callback(TokenCandidate(
                         address=token_addr,
                         chain=self.chain_name,
                         source=DetectionSource.FACTORY,
                         block_number=int(receipt["blockNumber"], 16),
                         tx_hash=tx["hash"],
-                        deployer=tx["from"],
+                        deployer=None,
                         factory=factory_addr,
-                        pair=pair_addr,
+                        pair=decoded.pair,
+                        base_token=base_token,
+                        metadata={"observation_only": True, "execution_eligible": False,
+                                  "transaction_sender": tx.get("from"),
+                                  "native_event": "PairCreated", "pair_count": decoded.pair_count},
                     ))
                     return
         except Exception as e:
@@ -195,22 +202,12 @@ class MempoolDetector(BaseDetector):
                 return
 
             for log in receipt.get("logs", []):
-                topics = log.get("topics", [])
-                if len(topics) >= 3 and topics[0].lower() == "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118".lower():
-                    token_a = "0x" + topics[1][-40:]
-                    token_b = "0x" + topics[2][-40:]
-                    pair_addr = log["address"]
-                    
-                    new_token = None
-                    base_token = None
-                    for bt in self.chain_config.base_tokens:
-                        if token_a.lower() == bt.lower():
-                            new_token, base_token = token_b, token_a
-                            break
-                        if token_b.lower() == bt.lower():
-                            new_token, base_token = token_a, token_b
-                            break
-                    
+                decoded = decode_pair_created(log)
+                selected = select_quote_pair(decoded, self.chain_config.base_tokens) if decoded else None
+                known_factory = next((address for address in self.chain_config.factories.values()
+                                      if address.lower() == str(log.get("address", "")).lower()), None)
+                if selected and known_factory:
+                    new_token, base_token = selected
                     if new_token:
                         await self.callback(TokenCandidate(
                             address=new_token,
@@ -218,9 +215,13 @@ class MempoolDetector(BaseDetector):
                             source=DetectionSource.MEMPOOL,
                             block_number=int(receipt["blockNumber"], 16),
                             tx_hash=tx["hash"],
-                            deployer=tx["from"],
-                            pair=pair_addr,
+                            deployer=None,
+                            factory=known_factory,
+                            pair=decoded.pair,
                             base_token=base_token,
+                            metadata={"observation_only": True, "execution_eligible": False,
+                                      "transaction_sender": tx.get("from"),
+                                      "native_event": "PairCreated", "pair_count": decoded.pair_count},
                         ))
                         return
         except Exception as e:
@@ -233,7 +234,7 @@ class FactoryPoller(BaseDetector):
         super().__init__(chain_name, chain_config, rpc, callback)
         self.poll_interval = poll_interval
         self._last_blocks: Dict[str, int] = {}
-        self._pair_created_topic = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cdadefa3b5c4c54fae"
+        self._pair_created_topic = PAIR_CREATED_TOPIC
 
     async def start(self):
         self.running = True
@@ -267,7 +268,7 @@ class FactoryPoller(BaseDetector):
             return
 
         logs = await self.rpc.request("eth_getLogs", [{
-            "fromBlock": hex(from_block),
+            "fromBlock": hex(from_block + 1),
             "toBlock": hex(to_block),
             "address": factory_addr,
             "topics": [self._pair_created_topic]
@@ -275,14 +276,16 @@ class FactoryPoller(BaseDetector):
 
         if logs:
             for log in logs:
-                topics = log.get("topics", [])
-                if len(topics) >= 3:
-                    token_addr = "0x" + topics[2][-40:]
-                    pair_addr = "0x" + topics[1][-40:]
+                if str(log.get("address", "")).lower() != factory_addr.lower():
+                    continue
+                decoded = decode_pair_created(log)
+                selected = select_quote_pair(decoded, self.chain_config.base_tokens) if decoded else None
+                if selected:
+                    token_addr, base_token = selected
                     tx_hash = log.get("transactionHash")
                     
                     tx = await self.rpc.request("eth_getTransactionByHash", [tx_hash]) if tx_hash else None
-                    deployer = tx["from"] if tx else None
+                    transaction_sender = tx.get("from") if tx else None
                     
                     await self.callback(TokenCandidate(
                         address=token_addr,
@@ -290,9 +293,13 @@ class FactoryPoller(BaseDetector):
                         source=DetectionSource.FACTORY,
                         block_number=int(log["blockNumber"], 16),
                         tx_hash=tx_hash,
-                        deployer=deployer,
+                        deployer=None,
                         factory=factory_addr,
-                        pair=pair_addr,
+                        pair=decoded.pair,
+                        base_token=base_token,
+                        metadata={"observation_only": True, "execution_eligible": False,
+                                  "transaction_sender": transaction_sender,
+                                  "native_event": "PairCreated", "pair_count": decoded.pair_count},
                     ))
 
         self._last_blocks[factory_name] = to_block

@@ -1,0 +1,18 @@
+{
+  "fixture_kind": "OFFICIAL_ABI_SCHEMA",
+  "source": "https://github.com/Uniswap/v2-core/blob/master/contracts/interfaces/IUniswapV2Factory.sol",
+  "retrieved_on": "2026-10-20",
+  "mainnet_transaction_evidence": false,
+  "event": {
+    "anonymous": false,
+    "type": "event",
+    "name": "PairCreated",
+    "inputs": [
+      {"indexed": true, "name": "token0", "type": "address"},
+      {"indexed": true, "name": "token1", "type": "address"},
+      {"indexed": false, "name": "pair", "type": "address"},
+      {"indexed": false, "name": "", "type": "uint256"}
+    ]
+  },
+  "validation": "Tests ABI-encode invented local addresses against this published interface. The encoded logs are synthetic controls and are not represented as observed chain transactions."
+}

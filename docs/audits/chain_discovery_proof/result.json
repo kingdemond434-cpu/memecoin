@@ -1,0 +1,104 @@
+{
+  "status": "OBSERVED_WITH_PERSISTED_DEBT",
+  "observed_at": 1792456550.9672627,
+  "chains": [
+    "ethereum",
+    "robinhood",
+    "solana"
+  ],
+  "protocols": [
+    {
+      "chain_id": "solana",
+      "protocol_id": "meteora"
+    },
+    {
+      "chain_id": "solana",
+      "protocol_id": "pumpfun"
+    },
+    {
+      "chain_id": "solana",
+      "protocol_id": "pumpswap"
+    },
+    {
+      "chain_id": "solana",
+      "protocol_id": "raydium"
+    }
+  ],
+  "http_requests": 5,
+  "source_response_refs": [
+    "evidence:c4ff6c451e332262b9663d1d43a6a3c18aeb1f30574371bd150aac5ffab8066b:1",
+    "evidence:77bae2eca9f0d34923f0a330ef1f757b1799038f66975b19ce027c028ace2aac:2",
+    "evidence:ce9ca000bcb937566272c1aff6e8a8a2fbc636489584013ed1f4324a89c27e60:3",
+    "evidence:6ba2931af0f74b748b2924937e6a0528aa118739c47f415bc4aab5baf40c5dca:4",
+    "evidence:cdfa8b320c9d2fae16922fc623254e5bd4bbdb0a65f21c0248feda2d64852c6d:5"
+  ],
+  "blocked": [],
+  "deferred": [
+    {
+      "evidence_ref": "evidence:c4ff6c451e332262b9663d1d43a6a3c18aeb1f30574371bd150aac5ffab8066b:1",
+      "reason": "NOT_THIS_PASS_PAIR_REQUEST_BUDGET",
+      "remaining_targets": 26
+    }
+  ],
+  "invalid_rows": 0,
+  "observation_only": true,
+  "execution_eligible": false,
+  "api_documentation": "https://docs.dexscreener.com/api/reference",
+  "proof_scope": "ONE_LOCAL_PUBLIC_SOURCE_DISCOVERY_PASS_NO_TRADING_OR_FORWARD_PERFORMANCE_CLAIM",
+  "completed_at_utc": "2026-10-20T01:35:52.178159+01:00",
+  "canonical_evidence_path": "C:\\Users\\dell\\memecoin-chain-discovery-proof\\canonical_evidence.jsonl",
+  "frontier_path": "C:\\Users\\dell\\memecoin-chain-discovery-proof\\frontier.sqlite",
+  "evidence_integrity": {
+    "intact": true,
+    "detail": "OK",
+    "records": 5
+  },
+  "newly_registered_chain_ids": [
+    "ethereum",
+    "robinhood",
+    "solana"
+  ],
+  "restart_restored_all_chains": true,
+  "unknown_metrics_preserved": true,
+  "registry_report": {
+    "schema_version": 1,
+    "status": "INDEX_ONLY_RUNTIME_UNMEASURED",
+    "path": "C:\\Users\\dell\\memecoin-chain-discovery-proof\\frontier.sqlite",
+    "coordinates": 7,
+    "coordinate_states": {
+      "DISCOVERED": 7
+    },
+    "unregistered_coordinate_state": "UNSEEN",
+    "coverage_debt": null,
+    "coverage_debt_measured_coordinates": 0,
+    "coverage_debt_unmeasured_coordinates": 7,
+    "chains": 3,
+    "protocol_versions": 4,
+    "queue_states": {},
+    "pending": 0,
+    "cost_blocked": 0,
+    "arrivals": 0,
+    "drained": 0,
+    "window_seconds": 3600.0,
+    "growth_per_second": 0.0,
+    "drain_per_second": 0.0,
+    "oldest_pending_age_seconds": null,
+    "oldest_high_value_job": null,
+    "oldest_high_value_age_seconds": null,
+    "cost_of_delay": null,
+    "cost_of_delay_measured_jobs": 0,
+    "cost_of_delay_unmeasured_jobs": 0,
+    "by_kind": [],
+    "exploration_floors": {
+      "unknown_chains": 0.1,
+      "unknown_protocols": 0.1,
+      "unknown_actors": 0.1,
+      "unknown_mechanisms": 0.1,
+      "new_source_classes": 0.1,
+      "strange_falsifiable": 0.1,
+      "new_models_tools": 0.1
+    },
+    "authority": "RESEARCH_INDEX_ONLY_NO_CAPITAL_AUTHORITY"
+  },
+  "evidence_reference_format": "Captured first-pass refs use evidence:<hash>:<ledger_sequence>; raw records are verified by hash and sequence. Production record_reference uses byte offsets."
+}

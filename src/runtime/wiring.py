@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import time
 from dataclasses import asdict, is_dataclass, replace as dataclasses_replace
@@ -37,6 +38,12 @@ from src.execution.jupiter_jito import (
 from src.research.trade_evidence import TradeEvidenceLedger
 from src.research.dataset_builder import PointInTimeDatasetBuilder
 from src.research.global_research_miner import GlobalResearchMiner
+from src.research.frontier import AuctionInputs, FrontierIndex
+from src.research.candidate_replay import CandidateReplayHandler
+from src.research.chain_opportunity import ChainOpportunityScout
+from src.chains.evm_observation import EVMObservationAdapter, FactoryContract
+from src.research.unknown_engine import UnknownOpportunityEngine
+from src.research.proposal_rounds import ProposalRoundRunner, build_providers
 from src.research.chain_miners import register_chain_miners
 from src.execution.signer import signer_from_env
 from src.runtime.offload import OffloadedPool, install_fast_event_loop
@@ -873,13 +880,20 @@ class SubsystemWiring:
         if not report or report.get("status") != "PASSED":
             return
         net_elogw = float(report.get("net_elogw_proxy", 0) or 0)
-        self.champion_challenger.record_trial_result(TrialResult(
+        accepted = self.champion_challenger.record_trial_result(TrialResult(
             hypothesis_id=MODEL_HYPOTHESIS_ID, stage="CHRONOLOGICAL_OOS",
             samples=int(report.get("oos_samples", 0) or 0), metrics={"brier_skill": float(report.get("mean_brier_skill", 0) or 0)},
             oos_metrics={"elogw": net_elogw}, portfolio_impact=net_elogw,
             passed=net_elogw > 0, timestamp=float(report.get("created_at", time.time()) or time.time()),
             notes="route-feasible OOS proxy; forward shadow remains mandatory",
+            spec_hash=str(report.get("spec_hash") or ""),
         ))
+        report["scientific_binding_status"] = "BOUND" if accepted else "DATA_BLOCKED"
+        if not accepted:
+            self.champion_challenger.mark_data_blocked(MODEL_HYPOTHESIS_ID,
+                "statistical model report lacks an exact pre-evaluation frozen strategy binding")
+            logger.warning("Model statistical validation is not canonical promotion evidence: unbound or nonexact strategy")
+        return accepted
 
     @staticmethod
     def _latest_model_mtime() -> float:
@@ -986,6 +1000,167 @@ class SubsystemWiring:
             risk_level_enum=RiskLevel)
         self.detection_engine = TokenDetectionEngine(self.chain_registry)
 
+    def _retain_opportunity_evidence(self, event_type: str, payload: Dict[str, Any], timestamp: float) -> str:
+        """Append to the desk's existing ledger before changing an index."""
+        ledger = self.trade_evidence
+        reference = ledger.record_reference(event_type, payload, timestamp=timestamp)
+        if reference is None:
+            raise RuntimeError("canonical opportunity evidence write failed")
+        return reference
+
+    def _retain_chain_scout_record(self, record: Dict[str, Any]) -> str:
+        kind = record.get("kind")
+        if kind == "source_response":
+            ref = self._retain_opportunity_evidence("unknown_public_source_response", record, record["observed_at"])
+            self.research_frontier.enqueue("DISCOVERY_RESPONSE", ref, evidence_refs=[ref],
+                                          exploration_tags=["new_source_classes"])
+            return ref
+        if kind not in ("chain", "protocol"):
+            raise ValueError("unsupported scout record")
+        ref = str(record["source_response_ref"])
+        axes = {"chain": record["chain_id"], "data_source": "dexscreener:public-api"}
+        self.research_frontier.observe_discovery(kind, str(record["identity"]), axes=axes,
+            family=str(record.get("chain_family") or "UNKNOWN"),
+            version=str(record.get("version") or "1"), metrics=record.get("metrics"),
+            contract=record.get("contract"), evidence_refs=[ref], now=record["observed_at"])
+        if kind == "protocol":
+            axes["protocol"] = record["identity"]
+        self.research_frontier.enqueue(f"{kind.upper()}_INTEGRATION", ref, axes=axes,
+            evidence_refs=[ref], exploration_tags=["unknown_chains" if kind == "chain" else "unknown_protocols"])
+        return ref
+
+    def _retain_native_observation(self, native: Any) -> str:
+        identity = f"native-observation-{native.event_id}"
+        previous = self.research_frontier.job(identity)
+        if previous is not None:
+            return previous["payload_ref"]
+        event = native.to_event()
+        ref = self._retain_opportunity_evidence("unknown_native_chain_observation", event.to_dict(), native.observed_at)
+        # The shared collector Event envelope is compatible; a two-token EVM
+        # factory observation is not a Solana launch episode. No trading or
+        # Solana dataset callback is invoked here.
+        axes = {"chain": native.chain_id, "chain_family": native.chain_family,
+                "protocol": native.protocol, "event_type": native.event_type,
+                "data_source": event.source_id}
+        self.research_frontier.register_chain(native.chain_id, native.chain_family, evidence_refs=[ref])
+        chain = self.research_frontier.chain(native.chain_id)
+        if chain["stage"] == "DISCOVERED":
+            self.research_frontier.advance_chain(native.chain_id, "OBSERVATION_ONLY", evidence_refs=[ref])
+        if native.protocol is not None:
+            contract = {"status": "OBSERVED", "observed_native_events": [native.event_type],
+                        "execution_support": None}
+            if native.decoder_ref is not None:
+                contract["abi_ref"] = native.decoder_ref
+            self.research_frontier.register_protocol(native.protocol, native.chain_id,
+                native.protocol_version or "UNKNOWN", contract=contract, evidence_refs=[ref])
+        self.research_frontier.observe_coordinate(axes,
+            state="DATA_BLOCKED" if native.event_type == "UNKNOWN" else "OBSERVED", evidence_refs=[ref])
+        self.research_frontier.enqueue("NATIVE_OBSERVATION", ref, axes=axes, job_id=identity,
+            evidence_refs=[ref], exploration_tags=["unknown_protocols"])
+        return ref
+
+    async def _setup_opportunity_observation(self, research_path: Path) -> None:
+        """Optional EVM observers reuse registry clients and this research loop.
+
+        global.evm_observation is a list of explicit chain/start_block/finality
+        declarations. Optional factories are FactoryContract dictionaries;
+        absent ABI/source provenance leaves native decoder support UNKNOWN.
+        This configuration never enables a detection-engine chain or signer.
+        """
+        self.chain_opportunity_scout = None
+        self.evm_observers = []
+        self.evm_observation_configuration = []
+        if self.offline:
+            self.evm_observation_configuration = [{"status": "DATA_BLOCKED", "reason": "offline"}]
+            return
+        if getattr(self, "http_client", None) is not None:
+            self.chain_opportunity_scout = ChainOpportunityScout(
+                self.http_client, self._retain_chain_scout_record,
+                max_rows=int(self.global_config.get("chain_scout_max_rows", 256)),
+                max_pair_requests=int(self.global_config.get("chain_scout_pair_budget", 4)))
+        declarations = self.global_config.get("evm_observation", [])
+        if not isinstance(declarations, list):
+            self.evm_observation_configuration = [{"status": "DATA_BLOCKED", "reason": "evm_observation must be a list"}]
+            return
+        for declaration in declarations:
+            name = str(declaration.get("chain", "")) if isinstance(declaration, dict) else ""
+            try:
+                if not isinstance(declaration, dict) or not name or "start_block" not in declaration:
+                    raise ValueError("native chain and historical start_block are required")
+                config = self.chain_registry.get_chain(name)
+                if config is None or getattr(config.chain_type, "value", None) != "evm":
+                    raise ValueError("configured native EVM chain is unavailable")
+                contracts = declaration.get("factories")
+                if contracts is not None:
+                    contracts = [FactoryContract(**values) for values in contracts]
+                rpc = self.chain_registry.get_rpc(name)
+                if rpc is None:
+                    # Existing registry manager owns endpoint health, retries
+                    # and shutdown. No second transport or observer task.
+                    rpc = RPCManager(config)
+                    self.chain_registry.rpc_managers[name] = rpc
+                    await rpc.start()
+                adapter = EVMObservationAdapter.from_registry(
+                    self.chain_registry, name, start_block=declaration["start_block"],
+                    factory_contracts=contracts, checkpoint_path=research_path / "frontier.sqlite",
+                    finality_tag=str(declaration.get("finality_tag", "finalized")),
+                    max_blocks_per_pass=int(declaration.get("max_blocks_per_pass", 8)))
+                self.evm_observers.append(adapter)
+                self.evm_observation_configuration.append({"chain": name, "status": "CONFIGURED_NOT_OBSERVED",
+                                                            "observation_only": True, "execution_eligible": False})
+            except Exception as exc:
+                # Configuration/transport exceptions may include provider URL
+                # secrets; expose type and chain, never exception text.
+                self.evm_observation_configuration.append({"chain": name, "status": "DATA_BLOCKED",
+                                                            "failure_type": type(exc).__name__})
+
+    def _canonical_replay_options(self) -> Dict[str, Any]:
+        """Configure existing replay only from an explicit corpus/split/budget."""
+        declaration = self.global_config.get("research_replay")
+        self.research_replay_configuration = {"status": "DATA_BLOCKED", "reason": "explicit replay configuration absent"}
+        if declaration is None:
+            return {}
+        try:
+            if not isinstance(declaration, dict):
+                raise ValueError("research_replay must be an object")
+            if declaration.get("enabled") is not True:
+                self.research_replay_configuration = {"status": "DISABLED", "reason": "replay not explicitly enabled"}
+                return {}
+            episode_path = Path(declaration["episode_path"])
+            manifest_path = Path(declaration["split_manifest_path"])
+            if not episode_path.is_dir() or not manifest_path.is_file():
+                raise ValueError("observed corpus or frozen split manifest unavailable")
+            split = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(split, dict) or not split.get("corpus_hash"):
+                raise ValueError("content-bound chronological split manifest required")
+            bounds = declaration["work_bound"]
+            keys = {"max_episodes", "max_family_variants", "max_bootstrap_draws"}
+            if (not isinstance(bounds, dict) or set(bounds) != keys
+                    or any(type(value) is not int or value <= 0 for value in bounds.values())):
+                raise ValueError("explicit positive integer replay work bounds required")
+            costs = declaration["resource_costs"]
+            auction = AuctionInputs(costs=costs)
+            if auction.total_cost is None or auction.total_cost <= 0:
+                raise ValueError("all replay resource costs must be explicitly declared")
+            pass_units = declaration["pass_resource_units"]
+            if (type(pass_units) not in (int, float) or not math.isfinite(pass_units)
+                    or pass_units < auction.total_cost):
+                raise ValueError("pass resource envelope must accommodate the declared replay")
+            handler = CandidateReplayHandler(self.champion_challenger, episode_path,
+                                             chronological_split=split, **bounds)
+            self.research_replay_configuration = {"status": "CONFIGURED_NOT_EVALUATED",
+                "scope": "L0-L4_ONLY", "resource_costs": auction.to_dict(), "work_bound": bounds,
+                "monetary_cost": None}
+            return {"gauntlet_handler": handler, "gauntlet_costs": costs,
+                    "gauntlet_work_bound": bounds, "research_pass_resource_units": pass_units}
+        except (ValueError, TypeError, KeyError, OSError) as exc:
+            # Deterministic research remains available when a replay corpus,
+            # manifest or resource declaration is not ready.
+            self.research_replay_configuration = {"status": "DATA_BLOCKED",
+                "reason": "explicit replay manifest/corpus/resource configuration invalid or unavailable",
+                "failure_type": type(exc).__name__}
+            return {}
+
     async def _setup_research(self):
         self.dataset_builder = PointInTimeDatasetBuilder(
             self.solana_config, self.solana_rpc, self.genealogy, self.wallet_intel, self.social_intel,
@@ -1021,7 +1196,19 @@ class SubsystemWiring:
         self.info_graph.set_outcome_provider(self.dataset_builder.get_outcome)
         if hasattr(self.genealogy, "set_outcome_provider"):
             self.genealogy.set_outcome_provider(self.dataset_builder.get_outcome)
-        self.global_research = GlobalResearchMiner(self.champion_challenger)
+        research_path = Path(self.global_config.get("research_state_dir", "data/research"))
+        self.research_frontier = FrontierIndex(research_path / "frontier.sqlite")
+        self.unknown_engine = UnknownOpportunityEngine(
+            self.champion_challenger, self.research_frontier, self.trade_evidence,
+            proposal_runner=ProposalRoundRunner(self.trade_evidence, build_providers(
+                self.global_config.get("research_providers", []))), **self._canonical_replay_options())
+        self.unknown_engine.gauntlet_configuration = self.research_replay_configuration
+        await self._setup_opportunity_observation(research_path)
+        self.global_research = GlobalResearchMiner(
+            self.champion_challenger, ledger_path=str(research_path / "public_leads.jsonl"),
+            unknown_engine=self.unknown_engine, chain_scout=self.chain_opportunity_scout,
+            evm_observers=self.evm_observers, native_event_sink=self._retain_native_observation,
+            observation_configuration=self.evm_observation_configuration)
         # World discovery: the hourly crawler, its keyless search fan-out, the
         # canonical event ledger and the provider-terms watcher. Constructed
         # here so the loop started in main() has something to drive; an
@@ -1034,7 +1221,9 @@ class SubsystemWiring:
         # than only record it.
         self.data_miners = DataMinerPool(
             concurrency=int(self.global_config.get("data_miner_concurrency", 6)),
-            on_records=self._ingest_mined_records)
+            on_records=self._ingest_mined_records,
+            retain_batch=self._retain_mined_batch,
+            retain_disposition=self._retain_mined_disposition)
         self.miner_registration = dict(register_solana_miners(
             self.data_miners, rpc=self.solana_rpc, http=self.http_client,
             watched_tokens=self._mineable_tokens))
