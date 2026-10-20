@@ -108,7 +108,11 @@ sources:
     kind: mastodon
     tier: 3
     region: global
-    options: {instance: "https://mastodon.social"}
+    options:
+      instance: "https://mastodon.social"
+      availability: UNAVAILABLE
+      unavailable_reason: "2026-10-20 public probes return HTTP 422 requiring an authenticated user, including limit=20&local=true; anonymous preview unavailable"
+      verification_source: "https://docs.joinmastodon.org/methods/timelines/#view-public-timeline"
 
   # ---- live video and audio: spoken before written ------------------------
   - id: youtube:websub-watchlist
@@ -132,7 +136,11 @@ sources:
     language: en
     region: global
     poll_interval_seconds: 20
-    options: {instance: "https://mastodon.online"}
+    options:
+      instance: "https://mastodon.online"
+      availability: UNAVAILABLE
+      unavailable_reason: "2026-10-20 desk probe returned HTTP 422; independent public probe could not connect; no verified anonymous timeline access"
+      verification_source: "https://docs.joinmastodon.org/methods/timelines/#view-public-timeline"
   - id: mastodon:mstdn-jp
     kind: mastodon
     tier: 3
@@ -489,7 +497,9 @@ sources:
     poll_interval_seconds: 120
     degraded_after_seconds: 7200
     dead_after_seconds: 172800
-    options: {url: "https://www.odaily.news/feed", language: zh}
+    # Same publisher, verified 2026-10-20: HTTP 200, RSS XML, 10 newsflash
+    # items. The former www.odaily.news/feed returns HTTP 404.
+    options: {url: "https://rss.odaily.news/rss/newsflash", language: zh}
   - id: rss:cn-panews
     kind: rss
     tier: 1
@@ -507,7 +517,12 @@ sources:
     poll_interval_seconds: 300
     degraded_after_seconds: 21600
     dead_after_seconds: 259200
-    options: {url: "https://www.techflowpost.com/rss.xml", language: zh}
+    options:
+      url: "https://www.techflowpost.com/rss.xml"
+      language: zh
+      availability: UNAVAILABLE
+      unavailable_reason: "2026-10-20 configured RSS path returns HTTP 404; publisher homepage exposes no RSS alternate link; replacement remains unverified"
+      verification_source: "https://www.techflowpost.com/"
   - id: rss:cn-chaincatcher
     kind: rss
     # Verified from this node 2026-08-30: HTTP 200, 50 items. Verified

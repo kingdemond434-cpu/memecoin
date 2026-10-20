@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import inspect
 import queue
 import threading
 import time
@@ -64,10 +65,11 @@ class OffloadedPool:
     def __init__(self, pool: Any, *, sink: Callable[[str, List[Dict[str, Any]]], None],
                  queue_depth: int = DEFAULT_QUEUE_DEPTH,
                  drain_interval_s: float = 0.05,
-                 name: str = "miners"):
+                 name: str = "miners", on_loop_stop: Optional[Callable] = None):
         self.pool = pool
         self.sink = sink
         self.name = name
+        self.on_loop_stop = on_loop_stop
         self.drain_interval_s = float(drain_interval_s)
         self._queue: "queue.Queue[Tuple[str, List[Dict[str, Any]]]]" = queue.Queue(
             maxsize=int(queue_depth))
@@ -117,6 +119,13 @@ class OffloadedPool:
                 loop.run_until_complete(self.pool.stop())
             except Exception:
                 pass
+            if self.on_loop_stop is not None:
+                try:
+                    cleanup = self.on_loop_stop()
+                    if inspect.isawaitable(cleanup):
+                        loop.run_until_complete(cleanup)
+                except Exception as exc:
+                    logger.warning("offload resource shutdown: %s", type(exc).__name__)
             try:
                 loop.close()
             except Exception:

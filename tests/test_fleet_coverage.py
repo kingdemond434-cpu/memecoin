@@ -9,6 +9,7 @@ coverage that makes that unnecessary next time.
 
 import unittest
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -545,8 +546,23 @@ class TheDefaultBranchIsGuardedLocally(unittest.TestCase):
 
     HOOK = Path("deploy/hooks/pre-push")
 
+    def _hook_command(self, hook=None):
+        hook = (hook or self.HOOK).resolve()
+        if os.name != "nt":
+            return [str(hook)]
+        # Windows cannot execute the extensionless shebang file directly.
+        # Use Git's own Bash, avoiding an unrelated WSL launcher on PATH.
+        git = shutil.which("git")
+        if git:
+            for base in list(Path(git).resolve().parents)[:3]:
+                for relative in ("bin/bash.exe", "usr/bin/bash.exe"):
+                    bash = base / relative
+                    if bash.is_file():
+                        return [str(bash), hook.as_posix()]
+        self.skipTest("Git for Windows Bash is required to execute the pre-push hook")
+
     def _run(self, ref_line):
-        return subprocess.run([str(self.HOOK)], input=ref_line, text=True,
+        return subprocess.run(self._hook_command(), input=ref_line, text=True,
                               capture_output=True)
 
     def test_the_hook_exists_and_is_executable(self):

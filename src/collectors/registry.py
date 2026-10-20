@@ -134,6 +134,7 @@ class DeclarationState(Enum):
     UNCONFIGURED = "UNCONFIGURED"
     UNKNOWN_KIND = "UNKNOWN_KIND"
     NO_FETCHER = "NO_FETCHER"
+    UNAVAILABLE = "UNAVAILABLE"
 
 
 @dataclass
@@ -424,6 +425,10 @@ def build_sources(
             elif state is not DeclarationState.READY:
                 report.problems.append((declaration.source_id, reason))
 
+        if str((declaration.options or {}).get("availability", "")).upper() == "UNAVAILABLE":
+            mark(DeclarationState.UNAVAILABLE,
+                 str(declaration.options.get("unavailable_reason") or "no verified public endpoint"))
+            continue
         factory = ADAPTER_KINDS.get(declaration.kind)
         if factory is None:
             mark(DeclarationState.UNKNOWN_KIND, f"no adapter for kind {declaration.kind}")

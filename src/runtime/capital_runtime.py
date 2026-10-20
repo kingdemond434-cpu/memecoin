@@ -111,4 +111,3 @@ class CapitalRuntime:
                 held_multiple=multiple,
             ))
         return opportunities
-

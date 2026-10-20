@@ -201,6 +201,12 @@ class RPCManager:
         self._health_check_task = asyncio.create_task(self._health_check_loop())
         await self._initial_health_check()
 
+    async def close_current_loop(self):
+        """Release this worker's session without stopping the main RPC loop."""
+        session = self._sessions.pop(asyncio.get_running_loop(), None)
+        if session is not None and not session.closed:
+            await session.close()
+
     async def stop(self):
         if self._health_check_task:
             self._health_check_task.cancel()

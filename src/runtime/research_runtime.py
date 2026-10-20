@@ -10,6 +10,10 @@ from src.strategies.opportunity_allocator import Opportunity
 
 
 class ResearchRuntime:
+    async def _close_research_worker_resources(self) -> None:
+        await self.http_client.close_current_loop()
+        await self.solana_rpc.close_current_loop()
+
     def _retain_mined_batch(self, miner_id: str, records: list[dict], now: float) -> str:
         return self.unknown_engine._record("mined_batch", {
             "miner_id": miner_id, "records": records,

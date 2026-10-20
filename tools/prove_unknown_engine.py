@@ -34,13 +34,16 @@ SOURCE_FILES = ("tools/prove_unknown_engine.py", "src/research/unknown_engine.py
     "src/research/frontier.py", "src/research/research_contracts.py",
     "src/research/trade_evidence.py", "src/research/gauntlet.py", "src/research/gauntlet_feed.py",
     "src/research/dataset_builder.py", "src/research/forward_evidence.py",
-    "src/research/counterfactual_corpus.py", "src/research/lifecycle_replay.py",
+    "src/research/counterfactual_corpus.py", "src/research/lifecycle_replay.py", "src/research/candidate_replay.py",
     "src/research/benchmark_wallets.py", "src/research/promotion_gate.py",
     "src/chains/yellowstone_grpc.py", "src/strategies/champion_challenger.py",
     "src/strategies/risk_veto.py", "src/strategies/opportunity_allocator.py",
     "src/strategies/asymmetric_tail.py", "src/execution/jupiter_jito.py", "src/main.py",
     "src/research/proposal_rounds.py", "src/research/global_research_miner.py",
-    "src/runtime/research_runtime.py")
+    "src/runtime/research_runtime.py", "src/runtime/capital_runtime.py",
+    "src/runtime/wiring.py", "src/runtime/offload.py", "src/chains/rpc_manager.py",
+    "src/collectors/transports.py", "src/collectors/registry.py",
+    "src/chains/evm_events.py", "src/chains/evm_observation.py", "src/research/chain_opportunity.py")
 
 REQUIREMENTS = (
     ("A01", "dynamic_chain_or_protocol_discovery"),

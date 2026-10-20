@@ -11065,20 +11065,42 @@ class TestSourceTransports(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(shared.handlers, [])
 
     async def test_transport_startup_is_concurrent_and_bounded(self):
-        class Slow:
-            def __init__(self, delay):
-                self.delay = delay
+        entered = active = peak = 0
+        two_started, release = asyncio.Event(), asyncio.Event()
 
+        class Held:
             async def start(self):
-                await asyncio.sleep(self.delay)
+                nonlocal entered, active, peak
+                entered += 1
+                active += 1
+                peak = max(peak, active)
+                if entered == 2:
+                    two_started.set()
+                try:
+                    await release.wait()
+                finally:
+                    active -= 1
 
-        started = time.perf_counter()
-        failures = await start_transports(
-            {"one": Slow(0.05), "two": Slow(0.05)},
-            timeout_s=0.2, concurrency=2)
-        elapsed = time.perf_counter() - started
-        self.assertEqual(failures, {})
-        self.assertLess(elapsed, 0.09)
+        startup = asyncio.create_task(start_transports(
+            {"one": Held(), "two": Held(), "three": Held()},
+            timeout_s=5, concurrency=2))
+        try:
+            # Both must enter while neither can finish. Serial startup cannot
+            # reach this barrier; an unbounded startup would enter all three.
+            await asyncio.wait_for(two_started.wait(), timeout=5)
+            self.assertEqual(entered, 2)
+            self.assertEqual(peak, 2)
+            self.assertFalse(startup.done())
+            release.set()
+            failures = await asyncio.wait_for(startup, timeout=5)
+            self.assertEqual(failures, {})
+            self.assertEqual(entered, 3)
+            self.assertEqual(peak, 2)
+        finally:
+            release.set()
+            if not startup.done():
+                startup.cancel()
+            await asyncio.gather(startup, return_exceptions=True)
 
     async def test_one_hung_transport_does_not_stall_startup(self):
         class Slow:
@@ -13481,8 +13503,8 @@ class TestTelegramNeverPromptsUnderSystemd(unittest.TestCase):
         Compared as values rather than matched as source text: a string check
         passes while the two drift, which is the failure it exists to catch.
         """
-        self.assertEqual(str(telegram_authorize.SESSION_PATH),
-                         TelegramChannelTransport.SESSION_PATH)
+        self.assertEqual(Path(telegram_authorize.SESSION_PATH),
+                         Path(TelegramChannelTransport.SESSION_PATH))
         self.assertEqual(TelegramChannelTransport.SESSION_PATH,
                          "data/telegram/collector")
 
@@ -13564,8 +13586,8 @@ class TestTelegramNeverPromptsUnderSystemd(unittest.TestCase):
         self.assertIn("EnvironmentFile=", message)
 
     def test_the_tool_and_the_transport_agree_on_the_session_path(self):
-        self.assertEqual(str(telegram_authorize.SESSION_PATH),
-                         TelegramChannelTransport.SESSION_PATH)
+        self.assertEqual(Path(telegram_authorize.SESSION_PATH),
+                         Path(TelegramChannelTransport.SESSION_PATH))
 
     def test_the_source_never_calls_the_prompting_entry_point(self):
         """Telethon's start() is the one that prompts; connect() is not."""
@@ -16479,16 +16501,19 @@ class TestTheHazardModelIsMemoryBounded(unittest.TestCase):
 
     def test_a_failed_spill_is_counted_not_silent(self):
         """An invisible hole is what makes a research corpus quietly wrong."""
-        model = ContinuousRugHazardModel(
-            SimpleNamespace(name="solana"), None, None, None, None,
-            spill_path=Path("/proc/nonexistent-dir/hazard.jsonl"))
-        model.max_tracked_tokens = 1
-        model.record_observation("stale", {"type": "trade"})
-        model.record_observation("fresh", {"type": "trade"})
-        model._last_touched["stale"] = 0.0
-        model.prune()
-        self.assertEqual(model.spill_failures, 1)
-        self.assertEqual(model.tokens_spilled, 0)
+        with tempfile.TemporaryDirectory() as directory:
+            blocker = Path(directory) / "not-a-directory"
+            blocker.write_text("fixture prevents creating a child directory")
+            model = ContinuousRugHazardModel(
+                SimpleNamespace(name="solana"), None, None, None, None,
+                spill_path=blocker / "hazard.jsonl")
+            model.max_tracked_tokens = 1
+            model.record_observation("stale", {"type": "trade"})
+            model.record_observation("fresh", {"type": "trade"})
+            model._last_touched["stale"] = 0.0
+            model.prune()
+            self.assertEqual(model.spill_failures, 1)
+            self.assertEqual(model.tokens_spilled, 0)
 
 
 class TestTheCensusKnowsWhichLaunchesStillNeedADeathVerdict(unittest.TestCase):
@@ -17496,13 +17521,20 @@ class TestTheDeskShedsContextBeforeTheKernelShedsIt(unittest.TestCase):
         against 4 GB while its real cap was 900 MB, reported band CALM at
         11% of a ceiling it is killed long before reaching, and had never
         fired a single trim or shed."""
-        paths = _own_cgroup_paths()
+        # Supply the Linux proc record explicitly. The path derivation must
+        # remain testable on Windows and on CI without systemd/cgroups.
+        membership = "0::/user.slice/user-1000.slice/user@1000.service/memecoin-shadow.service\n"
+        with mock.patch("src.runtime.memory_governor.Path.read_text", return_value=membership):
+            paths = _own_cgroup_paths()
         self.assertTrue(paths, "no cgroup paths derived from /proc/self/cgroup")
+        base = Path("/sys/fs/cgroup")
+        self.assertEqual(Path(paths[0]), base / "user.slice" / "user-1000.slice"
+                         / "user@1000.service" / "memecoin-shadow.service" / "memory.max")
         # Most specific first, so a unit's own cap wins over its slice's.
         self.assertTrue(paths[0].endswith(("memory.max", "memory.limit_in_bytes")))
-        self.assertNotEqual(paths[0], "/sys/fs/cgroup/memory.max")
+        self.assertNotEqual(Path(paths[0]), base / "memory.max")
         for candidate in paths:
-            self.assertTrue(candidate.startswith("/sys/fs/cgroup"))
+            self.assertTrue(Path(candidate).is_relative_to(base))
         # Walks upward: later entries are ancestors of earlier ones.
         self.assertGreater(len(paths[0]), len(paths[-1]))
 
@@ -17745,6 +17777,9 @@ class TestTheIsolatedSignerWorksEndToEnd(unittest.IsolatedAsyncioTestCase):
     real trade."""
 
     async def _serve(self, tmp, **policy):
+        import socket
+        if not hasattr(socket, "AF_UNIX"):
+            self.skipTest("AF_UNIX is unavailable on this Python/OS")
         from solders.keypair import Keypair as KP
         from src.execution.signer import SignerServer, SignerService, SignerPolicy
         policy.setdefault("require_live_ack", False)

@@ -1289,7 +1289,7 @@ class SubsystemWiring:
         self.miner_offload = OffloadedPool(
             self.data_miners, sink=self._ingest_mined_records,
             queue_depth=int(self.global_config.get("miner_queue_depth", 4096)),
-            name="miners")
+            name="miners", on_loop_stop=self._close_research_worker_resources)
         # The chain receive path in Rust: socket, HTTP/2, prost decode,
         # program filter and signature dedupe, with only what survives
         # crossing into Python. Runs in SHADOW beside the grpc.aio client,
