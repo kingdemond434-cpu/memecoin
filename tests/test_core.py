@@ -8997,6 +8997,10 @@ class TestOrphanIntelligence(unittest.IsolatedAsyncioTestCase):
         # answers DATA_BLOCKED, no expected value can be computed net of
         # cost, and the desk cannot justify an entry -- which is not a
         # missing field in a report, it is the reason nothing gets entered.
+        # The real desk shares the process default. Synthetic tiers belong to
+        # this fixture; adopting them globally makes later fee tests depend on
+        # test order and leaves other desks pricing against invented tiers.
+        desk.fee_schedule = PumpFeeSchedule()
         desk.fee_schedule.adopt_chain_config(
             parse_fee_config(TestOnChainFeeConfig._account()),
             source="chain:test")
