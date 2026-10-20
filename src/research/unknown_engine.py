@@ -590,6 +590,9 @@ class UnknownOpportunityEngine:
         return {"status": "SHADOW_ONLY", "authority": "none", "frontier": self.frontier.report(),
                 "last_pass": self.last_pass, "canonical_evidence": self.evidence.report(),
                 "proposal_round": self.last_proposal_round,
+                "provider_configuration": (self.proposal_runner.configuration_report()
+                    if callable(getattr(self.proposal_runner, "configuration_report", None))
+                    else {"status": "NOT_CONFIGURED", "authority": "none"}),
                 "workflows": self.workflows.report() if self.workflows is not None else {"status": "NOT_CONFIGURED"},
                 "gauntlet_adapter": {"configured": self.gauntlet_handler is not None,
                     "configuration": getattr(self, "gauntlet_configuration", None),

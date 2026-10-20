@@ -1,0 +1,29 @@
+# Merge these explicit declarations into global in a dedicated deployment
+# configuration. No wallet keys or API values belong here. Enabling replay
+# requires a sealed, observed corpus; DATA_BLOCKED audit output is not a split.
+global:
+  research_replay:
+    enabled: false
+    episode_path: data/research/sealed-corpus
+    split_manifest_path: data/research/sealed-corpus/split.json
+    work_bound:
+      max_episodes: 2000
+      max_family_variants: 32
+      max_bootstrap_draws: 20000000
+    resource_costs: {inference: 0, data: 0, engineering: 0, conversion: 0, gauntlet: 8}
+    pass_resource_units: 8
+  research_providers:
+    - {name: claude, api_kind: anthropic, model_env: MEMECOIN_CLAUDE_MODEL, credential_env: ANTHROPIC_API_KEY, enabled: false, max_input_bytes: 32768, max_output_tokens: 2048, timeout_seconds: 30}
+    - {name: codex, api_kind: openai, model_env: MEMECOIN_CODEX_MODEL, credential_env: OPENAI_API_KEY, enabled: false, max_input_bytes: 32768, max_output_tokens: 2048, timeout_seconds: 30}
+    - {name: deepseek, api_kind: deepseek, model_env: MEMECOIN_DEEPSEEK_MODEL, credential_env: DEEPSEEK_API_KEY, enabled: false, max_input_bytes: 32768, max_output_tokens: 2048, timeout_seconds: 30}
+  # Native probes require explicit reviewed addresses, raw token sizes and
+  # source provenance. They never sign, submit or enable another trading chain.
+  # evm_native_probes:
+  #   - chain: ethereum
+  #     factory: <reviewed Uniswap V2 factory address>
+  #     router: <reviewed Uniswap V2 router address>
+  #     token_in: <input ERC20 address>
+  #     token_out: <output ERC20 address>
+  #     amount_in: <positive raw integer>
+  #     source_ref: <official deployment provenance>
+  #     finality_tag: finalized

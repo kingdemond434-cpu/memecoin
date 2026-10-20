@@ -283,6 +283,12 @@ class CandidateReplayHandler:
         return [(spec.hypothesis_id + "@" + seal, spec) for seal, spec in sorted(selected.items())]
 
     def _episodes(self) -> list[dict]:
+        if isinstance(self.split, Mapping) and "files" in self.split:
+            from src.research.replay_corpus import load_sealed_corpus
+            rows = load_sealed_corpus(self.episode_path, self.split, max_episodes=self.max_episodes)
+            if any(row.get("final_outcome", {}).get("status") != "OK" for row in rows):
+                raise ReplayBlocked("sealed corpus contains unresolved launches")
+            return rows
         paths = sorted(self.episode_path.glob("*/*.json.gz"))
         if not paths or len(paths) > self.max_episodes:
             raise ReplayBlocked("episode corpus absent or exceeds explicit work budget")

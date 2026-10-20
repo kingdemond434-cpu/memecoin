@@ -22,7 +22,8 @@ chains:
       uniswap_v3: "0xE592427A0AEce92De3Edee1F18E0157C05861564"
     base_tokens:
       - "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"  # WETH
-      - "0xA0b86a33E6441e8C3D8a4b4B4C4C4C4C4C4C4C4C4"  # USDC
+      # Circle's native USDC deployment: developers.circle.com/stablecoins/usdc-contract-addresses
+      - "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"  # USDC
       - "0xdAC17F958D2ee523a2206206994597C13D831ec7"  # USDT
     min_liquidity_usd: 10000
     max_tax: 15
@@ -70,10 +71,11 @@ chains:
     decimals: 18
     block_time: 0.25
     factories:
-      uniswap_v2: "0xFAf8c5E3C71d29E0993aD52a4a3F173f3d579Dd2"
+      # Official V2 deployment: developers.uniswap.org/docs/protocols/v2/deployments
+      uniswap_v2: "0xf1D7CC64Fb4452F05c498126312eBE29f30Fbcf9"
       uniswap_v3: "0x1F98431c8aD98523631AE4a59f267346ea31F984"
     routers:
-      uniswap_v2: "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+      uniswap_v2: "0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24"
       uniswap_v3: "0xE592427A0AEce92De3Edee1F18E0157C05861564"
     base_tokens:
       - "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"  # WETH

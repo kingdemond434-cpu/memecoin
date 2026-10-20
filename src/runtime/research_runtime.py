@@ -10,6 +10,25 @@ from src.strategies.opportunity_allocator import Opportunity
 
 
 class ResearchRuntime:
+    def _retain_native_probe(self, result: dict) -> str:
+        """Retain real native probe receipts and route successful typed facts."""
+        now = time.time()
+        ref = self.unknown_engine._record("research_native_evm_probe", result, now)
+        if result.get("status") == "NATIVE_QUOTE_PARITY_VERIFIED":
+            points = [{"variable": name, "value": result[field], "unit": unit,
+                "chain": result["chain"], "entity_id": result["pair"],
+                "event_at": result["event_at"], "available_at": result["observed_at"],
+                "observed_at": result["observed_at"], "source_id": "native:uniswap_v2",
+                "source_class": "canonical_native_observation", "rights": "PUBLIC", "partition": "forward",
+                "row_id": ":".join((result["block_hash"], result["pair"], result["token_in"],
+                    result["token_out"], str(result["input_amount"]))),
+                "native_probe_ref": ref, "point_in_time": True}
+                for name, field, unit in (("native_v2_buy_output", "quoted_buy_output", "token_raw"),
+                    ("native_v2_sell_output", "quoted_sell_output", "token_raw"))]
+            self.unknown_engine.enqueue_work("DATA_OBSERVATION", {"points": points},
+                evidence_refs=[ref], axes={"chain": result["chain"], "protocol": "uniswap_v2"}, now=now)
+        return ref
+
     def _setup_research_consumers(self) -> None:
         from src.research.population_hunter import PopulationHunter
         from src.research.mechanism_labs import MechanismLaboratory

@@ -1079,6 +1079,8 @@ class SubsystemWiring:
         self.chain_opportunity_scout = None
         self.evm_observers = []
         self.evm_observation_configuration = []
+        self.evm_native_probes = []
+        self.evm_native_configuration = []
         if self.offline:
             self.evm_observation_configuration = [{"status": "DATA_BLOCKED", "reason": "offline"}]
             return
@@ -1122,6 +1124,30 @@ class SubsystemWiring:
                 # secrets; expose type and chain, never exception text.
                 self.evm_observation_configuration.append({"chain": name, "status": "DATA_BLOCKED",
                                                             "failure_type": type(exc).__name__})
+        from src.chains.evm_native import EVMV2NativeProbe
+        probes = self.global_config.get("evm_native_probes", [])
+        if not isinstance(probes, list) or len(probes) > 4:
+            self.evm_native_configuration = [{"status": "DATA_BLOCKED", "reason": "at most four explicit native probes required"}]
+            return
+        for declaration in probes:
+            name = declaration.get("chain", "") if isinstance(declaration, dict) else ""
+            try:
+                config = self.chain_registry.get_chain(name)
+                if config is None or getattr(config.chain_type, "value", None) != "evm":
+                    raise ValueError("native EVM registry chain required")
+                rpc = self.chain_registry.get_rpc(name)
+                if rpc is None:
+                    rpc = RPCManager(config)
+                    self.chain_registry.rpc_managers[name] = rpc
+                    await rpc.start()
+                probe = EVMV2NativeProbe(rpc, chain=name, chain_id=config.chain_id,
+                    **{key: value for key, value in declaration.items() if key != "chain"})
+                self.evm_native_probes.append(probe)
+                self.evm_native_configuration.append({"chain": name, "status": "CONFIGURED_NOT_OBSERVED",
+                    "observation_only": True, "execution_eligible": False})
+            except Exception as exc:
+                self.evm_native_configuration.append({"chain": name, "status": "DATA_BLOCKED",
+                    "failure_type": type(exc).__name__})
 
     def _canonical_replay_options(self) -> Dict[str, Any]:
         """Configure existing replay only from an explicit corpus/split/budget."""
@@ -1217,7 +1243,9 @@ class SubsystemWiring:
             self.champion_challenger, ledger_path=str(research_path / "public_leads.jsonl"),
             unknown_engine=self.unknown_engine, chain_scout=self.chain_opportunity_scout,
             evm_observers=self.evm_observers, native_event_sink=self._retain_native_observation,
-            observation_configuration=self.evm_observation_configuration)
+            observation_configuration=self.evm_observation_configuration,
+            native_probes=self.evm_native_probes, native_probe_sink=self._retain_native_probe,
+            native_probe_configuration=self.evm_native_configuration)
         # World discovery: the hourly crawler, its keyless search fan-out, the
         # canonical event ledger and the provider-terms watcher. Constructed
         # here so the loop started in main() has something to drive; an

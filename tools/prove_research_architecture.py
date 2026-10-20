@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TESTS = ("tests/test_research_workflows.py", "tests/test_mechanism_labs.py",
     "tests/test_population_hunter.py", "tests/test_population_callbacks.py",
     "tests/test_research_validation.py", "tests/test_native_forward.py", "tests/test_frontier.py",
-    "tests/test_research_evaluation.py")
+    "tests/test_research_evaluation.py", "tests/test_evm_native.py", "tests/test_replay_corpus.py")
 
 
 def seal(path):
@@ -44,7 +44,9 @@ def run(output):
     output.mkdir(parents=True, exist_ok=False)
     paths = tuple(dict.fromkeys((*SOURCE_FILES, *TESTS, "src/research/actor_store.py",
         "src/research/descendant_generator.py", "tests/test_candidate_replay.py",
-        "tests/test_scientific_core.py", "tools/prove_research_architecture.py")))
+        "tests/test_scientific_core.py", "tools/prove_research_architecture.py",
+        "src/chains/evm_native.py", "src/research/replay_corpus.py",
+        "tools/prepare_research_corpus.py", "tools/probe_native_routes.py")))
     before = {name: seal(ROOT / name) for name in paths}
     command = [sys.executable, "-B", "-m", "tools.prove_research_architecture", "--child-output", str(output)]
     allowed = {"path", "systemroot", "windir", "comspec", "temp", "tmp", "userprofile", "home",
