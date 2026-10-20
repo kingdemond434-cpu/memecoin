@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory=$true)][string]$PythonExe,
     [Parameter(Mandatory=$true)][string]$LogRoot,
     [string]$TaskName = 'MemecoinShadowCodex',
-    [ValidateRange(1024,65535)][int]$HealthPort = 18081
+    [ValidateRange(1024,65535)][int]$HealthPort = 18081,
+    [string]$ConfigPath = ''
 )
 $ErrorActionPreference = 'Stop'
 $taskRepo = [IO.Path]::GetFullPath($RepoRoot)
@@ -19,6 +20,11 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 }
 $taskUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $taskArguments = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy RemoteSigned -File "{0}" -RepoRoot "{1}" -PythonExe "{2}" -LogRoot "{3}" -HealthPort {4}' -f $taskLauncher,$taskRepo,$taskPython,$taskLogs,$HealthPort
+if ($ConfigPath) {
+    $taskConfig = [IO.Path]::GetFullPath($ConfigPath)
+    if (-not (Test-Path -LiteralPath $taskConfig -PathType Leaf)) { throw 'Explicit deployment configuration is missing' }
+    $taskArguments += ' -ConfigPath "{0}"' -f $taskConfig
+}
 $taskAction = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -Argument $taskArguments -WorkingDirectory $taskRepo
 $taskTrigger = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
 $taskPrincipal = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Limited

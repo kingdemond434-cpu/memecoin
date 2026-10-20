@@ -268,6 +268,44 @@ class ProposalRoundRunner:
         if len({provider.name for provider in providers}) != len(providers):
             raise ValueError("independent providers require distinct identities")
 
+    def configuration_report(self) -> dict:
+        """Configuration presence only; never call a provider or expose a key."""
+        configured = {provider.name: provider for provider in self.providers}
+        rows = []
+        for name in sorted(set(self.required_providers) | set(configured)):
+            provider = configured.get(name)
+            if provider is None:
+                rows.append({"provider": name, "status": "DATA_BLOCKED", "reason": "provider not configured"})
+                continue
+            if not isinstance(provider, HTTPProposalProvider):
+                rows.append({"provider": name, "status": "CUSTOM_ADAPTER_UNVERIFIED"})
+                continue
+            config, environment = provider.config, provider.environ
+            missing = [key for key in (config.model_env, config.credential_env)
+                       if not str(environment.get(key, "")).strip()]
+            valid = (config.api_kind in HTTPProposalProvider.ENDPOINTS
+                and type(config.max_input_bytes) is int and config.max_input_bytes > 0
+                and type(config.max_output_tokens) is int and config.max_output_tokens > 0
+                and type(config.timeout_seconds) in (int, float)
+                and math.isfinite(config.timeout_seconds) and config.timeout_seconds > 0)
+            rates = (config.input_usd_per_million, config.output_usd_per_million)
+            if any(rate is not None and (type(rate) not in (int, float)
+                    or not math.isfinite(rate) or rate < 0) for rate in rates):
+                valid = False
+            if config.max_cost_usd is not None and (type(config.max_cost_usd) not in (int, float)
+                    or not math.isfinite(config.max_cost_usd) or config.max_cost_usd <= 0
+                    or any(rate is None for rate in rates)):
+                valid = False
+            rows.append({"provider": name,
+                "status": "CONFIGURED_NOT_AUTHENTICATED" if config.enabled and valid and not missing else "DATA_BLOCKED",
+                "enabled": config.enabled, "missing_environment_names": missing,
+                "model_environment_name": config.model_env, "credential_environment_name": config.credential_env,
+                "valid_resource_bounds": valid, "max_input_bytes": config.max_input_bytes,
+                "max_output_tokens": config.max_output_tokens, "authentication": "UNMEASURED"})
+        return {"status": "CONFIGURED_NOT_AUTHENTICATED" if rows and all(
+                    row["status"] == "CONFIGURED_NOT_AUTHENTICATED" for row in rows) else "DATA_BLOCKED",
+                "providers": rows, "network_requests": 0, "authority": "none"}
+
     def _previous(self, round_id: str) -> list[dict]:
         if not self.ledger.path.exists():
             return []

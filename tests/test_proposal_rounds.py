@@ -6,6 +6,23 @@ import json
 import pytest
 
 from src.research.proposal_rounds import HTTPProposalProvider, ProposalRoundRunner, ProviderConfig
+
+
+def test_configuration_report_names_missing_inputs_without_network_or_secrets(tmp_path):
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("configuration report attempted an API request")
+    config = ProviderConfig("codex", "openai", "MODEL_NAME", "KEY_NAME", 1000, 100, 2, enabled=True)
+    provider = HTTPProposalProvider(config, post_json=forbidden, environ={"KEY_NAME": "private-value"})
+    runner = ProposalRoundRunner(TradeEvidenceLedger(tmp_path / "evidence.jsonl"), [provider])
+    result = runner.configuration_report()
+    assert result["status"] == "DATA_BLOCKED" and result["network_requests"] == 0
+    row = next(item for item in result["providers"] if item["provider"] == "codex")
+    assert row["missing_environment_names"] == ["MODEL_NAME"]
+    assert "private-value" not in str(result)
+    provider.environ = {"MODEL_NAME": "explicit-model", "KEY_NAME": "private-value"}
+    assert runner.configuration_report()["status"] == "DATA_BLOCKED"  # other required brains absent
+    single = ProposalRoundRunner(runner.ledger, [provider], required_providers=["codex"])
+    assert single.configuration_report()["status"] == "CONFIGURED_NOT_AUTHENTICATED"
 from src.research.trade_evidence import TradeEvidenceLedger
 
 

@@ -90,7 +90,8 @@ class GlobalResearchMiner:
                  ledger_path: str = "data/research/public_leads.jsonl", *,
                  unknown_engine: Any = None, chain_scout: Any = None,
                  evm_observers: Any = (), native_event_sink: Any = None,
-                 observation_configuration: Any = ()):
+                 observation_configuration: Any = (), native_probes: Any = (),
+                 native_probe_sink: Any = None, native_probe_configuration: Any = ()):
         self.framework = framework
         self.interval_seconds = interval_seconds
         self.leads: List[ResearchLead] = []
@@ -108,6 +109,10 @@ class GlobalResearchMiner:
         self.native_event_sink = native_event_sink
         self.observation_configuration = list(observation_configuration)
         self._evm_cursor = 0
+        self.native_probes = list(native_probes)
+        self.native_probe_sink = native_probe_sink
+        self.native_probe_configuration = list(native_probe_configuration)
+        self._native_probe_cursor = 0
         self.observation_status: Dict[str, Any] = {"status": "NOT_RUN", "observation_only": True}
         self.conversion_status = {"passes": 0, "processed": 0, "recent_results": []}
 
@@ -208,6 +213,24 @@ class GlobalResearchMiner:
             self._evm_cursor = (self._evm_cursor + count) % len(self.evm_observers)
         result["evm"] = observations or [{"status": "NOT_CONFIGURED", "observations": None}]
         result["evm_deferred_this_pass"] = max(0, len(self.evm_observers) - count)
+        native = []
+        for offset in range(min(2, len(self.native_probes))):
+            adapter = self.native_probes[(self._native_probe_cursor + offset) % len(self.native_probes)]
+            try:
+                receipt = await adapter.probe()
+                if self.native_probe_sink is None:
+                    raise ValueError("canonical native probe sink unavailable")
+                reference = self.native_probe_sink(receipt)
+                if not reference:
+                    raise ValueError("canonical native probe receipt not retained")
+                native.append({"chain": adapter.chain, "status": receipt["status"], "evidence_ref": reference,
+                    "execution_eligible": False})
+            except Exception as exc:
+                native.append({"chain": adapter.chain, "status": "DATA_BLOCKED", "failure_type": type(exc).__name__})
+        if self.native_probes:
+            self._native_probe_cursor = (self._native_probe_cursor + 2) % len(self.native_probes)
+        result["native_quote_probes"] = native
+        result["native_quote_configuration"] = self.native_probe_configuration
         self.observation_status = result
         return result
 
