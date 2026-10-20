@@ -42,7 +42,7 @@ class _Fixture(unittest.IsolatedAsyncioTestCase):
             suffix = ".json.gz" if gz else ".json"
             (directory / f"tok{index}{suffix}").write_text("{}")
 
-    def _supervisor(self, jobs=(), **kwargs):
+    def _supervisor(self, jobs=None, **kwargs):
         return TrainingSupervisor(self.storage, self.models, jobs=jobs, **kwargs)
 
 

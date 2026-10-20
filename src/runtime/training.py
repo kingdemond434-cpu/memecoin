@@ -194,7 +194,7 @@ class TrainingSupervisor:
     def __init__(self, storage: Path, model_dir: Path, *,
                  new_episodes_required: int = DEFAULT_NEW_EPISODES,
                  timeout_s: float = DEFAULT_TIMEOUT_S,
-                 jobs: Sequence[TrainingJob] = ()):
+                 jobs: Optional[Sequence[TrainingJob]] = None):
         self.storage = Path(storage)
         self.model_dir = Path(model_dir)
         self.new_episodes_required = int(new_episodes_required)
@@ -211,7 +211,8 @@ class TrainingSupervisor:
         # carried automatically, and a new counter has to be added to
         # _FRESH deliberately.
         self.jobs: List[TrainingJob] = [
-            replace(job, **_FRESH) for job in (jobs or DEFAULT_JOBS)]
+            replace(job, **_FRESH)
+            for job in (DEFAULT_JOBS if jobs is None else jobs)]
         self.running = ""
         self.rounds = 0
         self.episodes_at_last_round = -1
@@ -330,8 +331,8 @@ class TrainingSupervisor:
                 *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(Path(__file__).resolve().parents[2]),
-                preexec_fn=_lower_priority if os.name == "posix" else None)
+                cwd=str(Path(__file__).resolve().parents[2]))
+            _lower_priority(process.pid)
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(), timeout=min(300.0, self.timeout_s))
         except Exception as exc:
@@ -366,8 +367,8 @@ class TrainingSupervisor:
                 *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(Path(__file__).resolve().parents[2]),
-                preexec_fn=_lower_priority if os.name == "posix" else None)
+                cwd=str(Path(__file__).resolve().parents[2]))
+            _lower_priority(process.pid)
         except Exception as exc:
             return self._failed(job, f"could not start: {exc}", started)
         try:
@@ -461,10 +462,16 @@ class TrainingSupervisor:
         }
 
 
-def _lower_priority() -> None:  # pragma: no cover - child process only
-    """Run the fit below the desk. Background work yields, never the reverse."""
+def _lower_priority(pid: int) -> None:
+    """Lower only the spawned worker, from the parent process.
+
+    Python preexec_fn callbacks can deadlock after fork when gRPC/native
+    threads are running. They also execute before create_subprocess_exec
+    returns, outside the trainer timeout. Set priority after spawning so
+    worker startup stays bounded by the normal subprocess machinery.
+    """
     try:
-        os.nice(TRAINER_NICE)
+        os.setpriority(os.PRIO_PROCESS, pid, TRAINER_NICE)
     except (OSError, AttributeError):
         pass
 

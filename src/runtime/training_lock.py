@@ -39,6 +39,11 @@ try:  # pragma: no cover - platform shape
 except ImportError:  # pragma: no cover - Windows
     fcntl = None  # type: ignore
 
+try:  # pragma: no cover - platform shape
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None  # type: ignore
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_LOCK_NAME = "training.lock"
@@ -57,25 +62,20 @@ def training_lock(root: Path, *, owner: str = "",
                   ) -> Iterator[Optional[int]]:
     """Hold the exclusive training lock, or raise TrainingBusy immediately.
 
-    Yields the file descriptor so a caller can inspect it in a test. On a
-    platform without `fcntl` the lock degrades to a no-op with a warning
-    rather than refusing to train: single-trainer boxes exist, and failing
-    closed here would stop training everywhere for a problem that only occurs
-    where two paths overlap.
+    Yields the file descriptor. POSIX uses flock; Windows uses a nonblocking
+    byte-range lock. Both are released by the kernel after a crash. An
+    unsupported platform refuses to train rather than silently overlapping.
     """
     directory = Path(root)
     directory.mkdir(parents=True, exist_ok=True)
     path = lock_path(directory)
 
-    if fcntl is None:  # pragma: no cover - platform shape
-        logger.warning("no fcntl on this platform; training is unguarded")
-        yield None
-        return
-
     handle = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    acquired = False
     try:
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _acquire(handle)
+            acquired = True
         except OSError as exc:
             if exc.errno not in (errno.EACCES, errno.EAGAIN):
                 raise
@@ -86,15 +86,17 @@ def training_lock(root: Path, *, owner: str = "",
                 "corpus") from exc
         # Stamp who holds it. Advisory only -- the flock is the mechanism, and
         # this text exists so a human reading the file learns something.
-        os.ftruncate(handle, 0)
+        offset = 0 if fcntl is not None else 1
+        os.ftruncate(handle, offset)
+        os.lseek(handle, offset, os.SEEK_SET)
         os.write(handle, f"{owner or 'training'} pid={os.getpid()} "
                          f"at={time.time():.0f}\n".encode())
         os.fsync(handle)
         yield handle
     finally:
         try:
-            if fcntl is not None:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+            if acquired:
+                _release(handle)
         except OSError:
             pass
         os.close(handle)
@@ -102,7 +104,7 @@ def training_lock(root: Path, *, owner: str = "",
 
 def _read_holder(handle: int) -> str:
     try:
-        os.lseek(handle, 0, os.SEEK_SET)
+        os.lseek(handle, 0 if fcntl is not None else 1, os.SEEK_SET)
         return os.read(handle, 256).decode("utf-8", "replace").strip()
     except OSError:
         return ""
@@ -114,8 +116,6 @@ def holder(root: Path) -> Tuple[bool, str]:
     Probes by trying to take the lock and releasing it immediately, so the
     answer reflects the kernel's view rather than a stale PID in a file.
     """
-    if fcntl is None:  # pragma: no cover - platform shape
-        return False, "unguarded: no fcntl on this platform"
     path = lock_path(Path(root))
     if not path.exists():
         return False, ""
@@ -125,10 +125,32 @@ def holder(root: Path) -> Tuple[bool, str]:
         return False, f"lock unreadable: {exc}"
     try:
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _acquire(handle)
         except OSError:
             return True, _read_holder(handle)
-        fcntl.flock(handle, fcntl.LOCK_UN)
+        _release(handle)
         return False, ""
     finally:
         os.close(handle)
+
+
+def _acquire(handle: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    elif msvcrt is not None:
+        # Reserve one byte; holder text starts after it so another process can
+        # still read diagnostics while the mandatory Windows lock is held.
+        if os.fstat(handle).st_size == 0:
+            os.write(handle, b"\0")
+        os.lseek(handle, 0, os.SEEK_SET)
+        msvcrt.locking(handle, msvcrt.LK_NBLCK, 1)
+    else:  # pragma: no cover - unsupported operating system
+        raise RuntimeError("no supported cross-process training lock")
+
+
+def _release(handle: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    elif msvcrt is not None:
+        os.lseek(handle, 0, os.SEEK_SET)
+        msvcrt.locking(handle, msvcrt.LK_UNLCK, 1)
