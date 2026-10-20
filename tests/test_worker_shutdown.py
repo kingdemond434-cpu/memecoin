@@ -43,3 +43,29 @@ async def test_worker_closes_its_http_and_rpc_sessions_before_loop_dies():
         await worker.stop()
         await http.close()
         await rpc.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_during_startup_cannot_leave_a_daemon_loop_running():
+    entered = threading.Event()
+    release = threading.Event()
+    cleaned = threading.Event()
+    class Pool:
+        async def start(self):
+            entered.set()
+            while not release.is_set():
+                await asyncio.sleep(0.001)
+        async def stop(self):
+            pass
+    async def cleanup():
+        cleaned.set()
+    worker = OffloadedPool(Pool(), sink=lambda *args: None, on_loop_stop=cleanup)
+    await worker.start()
+    assert await asyncio.to_thread(entered.wait, 5)
+    stop = asyncio.create_task(worker.stop())
+    await asyncio.sleep(0.01)
+    release.set()
+    await asyncio.wait_for(stop, timeout=6)
+    assert cleaned.is_set()
+    assert worker._loop.is_closed()
+    assert worker._thread is None

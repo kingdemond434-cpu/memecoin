@@ -77,6 +77,7 @@ class OffloadedPool:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._drainer: Optional[asyncio.Task] = None
         self._running = False
+        self._worker_started = threading.Event()
         self.enqueued = 0
         self.delivered = 0
         self.dropped = 0
@@ -110,7 +111,9 @@ class OffloadedPool:
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(self.pool.start())
-            loop.run_forever()
+            self._worker_started.set()
+            if self._running:
+                loop.run_forever()
         except Exception as exc:  # pragma: no cover - thread teardown
             self.thread_error = f"{type(exc).__name__}: {exc}"
             logger.error("offloaded pool %s died: %s", self.name, exc)
@@ -137,6 +140,7 @@ class OffloadedPool:
         if self._running:
             return
         self._running = True
+        self._worker_started.clear()
         self.started_at = time.time()
         # Rebound here rather than at construction so a caller that builds the
         # pool normally and offloads it later cannot leave the original
@@ -157,11 +161,17 @@ class OffloadedPool:
                 pass
             self._drainer = None
         loop = self._loop
-        if loop is not None and loop.is_running():
+        # run_until_complete(start()) briefly stops the loop before
+        # run_forever(). Queueing stop across that gap avoids a lost stop.
+        if loop is not None and not loop.is_closed() and self._worker_started.is_set():
             loop.call_soon_threadsafe(loop.stop)
         if self._thread is not None:
-            self._thread.join(timeout=5.0)
-            self._thread = None
+            await asyncio.to_thread(self._thread.join, 5.0)
+            if self._thread.is_alive():
+                self.thread_error = "worker did not finish its resource shutdown"
+                logger.warning("offload %s shutdown is incomplete", self.name)
+            else:
+                self._thread = None
 
     # --- the main-loop side ----------------------------------------------
 
