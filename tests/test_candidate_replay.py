@@ -245,11 +245,17 @@ def test_new_explicit_budget_wakes_persisted_unknown_cost_work_without_dropping_
     engine.ingest(raw(exact_candidate=candidate))
     engine.run_pass()
     assert engine.frontier.report()["cost_blocked"] == 1
+    pointer = next(iter(engine.framework.get_research_component("gauntlet_work")["jobs"].values()))
+    job = engine.frontier.job(pointer["job_id"])
+    engine.frontier.observe_coordinate(job["axes"], state="HIBERNATED_LOW_VOI",
+        enabling_change="canonical-replay-cost-and-work-envelope-configured",
+        hibernation_reason="replay resource cost was not yet declared", evidence_refs=[job["payload_ref"]])
     configured = UnknownOpportunityEngine(engine.framework, engine.frontier, engine.evidence,
         gauntlet_handler=handler, gauntlet_costs=costs, gauntlet_work_bound=bounds,
         research_pass_resource_units=4)
     assert configured.run_pass()["results"][0]["disposition"] == "DEEPENING_TASK"
     assert configured.frontier.report()["cost_blocked"] == 0
+    assert configured.frontier.coordinate(job["axes"])["state"] == "DISCOVERED"
 
 
 def test_parameter_neighbours_share_pending_family_sweep_and_duplicates_keep_ancestry(tmp_path):

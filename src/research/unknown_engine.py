@@ -86,6 +86,10 @@ class UnknownOpportunityEngine:
         change = "canonical-replay-cost-and-work-envelope-configured"
         if job["total_cost"] is not None:
             return False
+        coordinate = self.frontier.coordinate(job["axes"])
+        if (coordinate["state"] == "HIBERNATED_LOW_VOI"
+                and coordinate.get("enabling_change") != change):
+            return False
         ref = self._record("unknown_gauntlet_budget_declared", {
             "job_id": job_id, "resource_costs": self.gauntlet_auction.to_dict(),
             "work_bound": self.gauntlet_work_bound, "monetary_cost": None}, now)
@@ -94,6 +98,10 @@ class UnknownOpportunityEngine:
                 reason="previously unknown replay cost now has an explicit resource envelope", now=now)
         elif job.get("enabling_change") != change:
             return False
+        if (coordinate["state"] == "HIBERNATED_LOW_VOI"
+                and coordinate.get("enabling_change") == change):
+            self.frontier.wake_coordinate(job["axes"], enabling_change=change,
+                                           evidence_refs=[ref], now=now)
         self.frontier.wake_job(job_id, enabling_change=change, evidence_refs=[ref],
                                auction=self.gauntlet_auction, now=now)
         return True

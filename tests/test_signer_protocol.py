@@ -12,6 +12,7 @@ buys transport cost, not standing permission. These assert both halves.
 from __future__ import annotations
 
 import asyncio
+import socket
 import struct
 import unittest
 
@@ -63,6 +64,8 @@ class BothProtocolsWorkAgainstARealSocket(unittest.TestCase):
     """A signer and a desk are deployed separately; both must be servable."""
 
     def setUp(self):
+        if not hasattr(socket, "AF_UNIX"):
+            self.skipTest("AF_UNIX is unavailable on this Python/OS")
         import tempfile
         from pathlib import Path
 

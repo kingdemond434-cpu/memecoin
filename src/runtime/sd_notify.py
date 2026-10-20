@@ -75,17 +75,26 @@ class SystemdNotifier:
         return self._socket is not None and not self._failed
 
     def _connect(self) -> None:
+        family = getattr(socket, "AF_UNIX", None)
+        if family is None:
+            # Windows builds without Unix-domain sockets cannot speak the
+            # systemd notify protocol. This is the documented no-op mode.
+            self._failed = True
+            return
         address = self.address
         # A leading '@' is systemd's spelling of the abstract namespace, which
         # Python spells with a leading NUL.
         if address.startswith("@"):
             address = "\0" + address[1:]
+        handle = None
         try:
-            handle = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC)
+            handle = socket.socket(family, socket.SOCK_DGRAM | getattr(socket, "SOCK_CLOEXEC", 0))
             # Never block the event loop on the service manager.
             handle.setblocking(False)
             handle.connect(address)
         except OSError as exc:
+            if handle is not None:
+                handle.close()
             logger.debug("systemd notify socket unavailable: %s", exc)
             self._failed = True
             return

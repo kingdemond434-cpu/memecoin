@@ -168,9 +168,9 @@ class LocalDirectoryStore:
     def list(self, prefix: str = "") -> List[str]:
         base = self.root
         return sorted(
-            str(item.relative_to(base)) for item in base.rglob("*")
+            item.relative_to(base).as_posix() for item in base.rglob("*")
             if item.is_file() and not item.name.endswith(".partial")
-            and str(item.relative_to(base)).startswith(prefix))
+            and item.relative_to(base).as_posix().startswith(prefix))
 
     def delete(self, key: str) -> None:
         try:
@@ -342,8 +342,7 @@ class ArchiveVault:
 
     def _relative(self, path: Path) -> str:
         try:
-            return str(Path(path).resolve().relative_to(
-                self.local_root.resolve()))
+            return Path(path).resolve().relative_to(self.local_root.resolve()).as_posix()
         except ValueError:
             return Path(path).name
 
