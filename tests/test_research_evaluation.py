@@ -1,9 +1,29 @@
 """Restored blocked research must not monopolize the running event loop."""
 import asyncio
+import json
 from types import SimpleNamespace
+
+import pytest
 
 from src.strategies.champion_challenger import ChampionChallengerFramework
 from test_scientific_core import spec
+
+
+def test_large_checkpoint_roundtrips_and_failed_encoding_preserves_durable_state(tmp_path):
+    path = tmp_path / "framework.json"
+    framework = ChampionChallengerFramework(state_path=str(path))
+    state = {"observations": [{"id": index, "refs": ["canonical:fixture"],
+        "clock": 1000. + index, "value": None} for index in range(2000)]}
+    framework.checkpoint_research_component("observed", state)
+    before = path.read_bytes()
+    assert json.loads(before)["research_components"]["observed"] == state
+    framework.frozen_specs["invalid_legacy_value"] = float("nan")
+    with pytest.raises(ValueError):
+        framework._save_state()
+    assert path.read_bytes() == before and not list(tmp_path.glob("*.tmp"))
+    restored = ChampionChallengerFramework(state_path=str(path))
+    assert restored.get_research_component("observed") == state
+    assert not restored.champions and not restored.canary_models
 
 
 def test_unchanged_block_is_noop_but_new_reason_or_stale_authority_persists(monkeypatch):
