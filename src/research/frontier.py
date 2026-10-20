@@ -19,6 +19,7 @@ import sqlite3
 import time
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence
 import uuid
+import weakref
 
 
 SCHEMA_VERSION = 1
@@ -197,6 +198,12 @@ class FrontierIndex:
         if sum(self.exploration_floors.values()) > 1 + 1e-9:
             raise ValueError("exploration floors must sum to <= 1")
         with self._db() as db:
+            # The miner worker and main-loop intake share this reference
+            # index. WAL permits readers during a durable writer commit;
+            # rollback-journal flush/delete cycles stall Windows intake.
+            mode = db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            if str(mode).lower() != "wal":
+                raise RuntimeError("frontier requires WAL for concurrent research intake")
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS coordinates(
@@ -238,12 +245,26 @@ class FrontierIndex:
             db.execute("INSERT OR IGNORE INTO metadata VALUES('schema_version', ?)",
                        (str(SCHEMA_VERSION),))
             db.execute("INSERT OR IGNORE INTO metadata VALUES('exploration_cursor', '0')")
+            # Keep WAL open across short transactions. Closing the last
+            # connection after every event would checkpoint/delete it again,
+            # turning each source record back into repeated database flushes.
+            keeper = sqlite3.connect(str(self.path), timeout=15, check_same_thread=False)
+            keeper.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+            self._close_keeper = weakref.finalize(self, keeper.close)
+
+    def close(self) -> None:
+        """Release the idle WAL anchor after all research producers stop."""
+        self._close_keeper()
 
     @contextmanager
     def _db(self) -> Iterator[sqlite3.Connection]:
+        finalizer = getattr(self, "_close_keeper", None)
+        if finalizer is not None and not finalizer.alive:
+            raise RuntimeError("research frontier is closed")
         db = sqlite3.connect(str(self.path), timeout=15)
         db.row_factory = sqlite3.Row
         try:
+            db.execute("PRAGMA synchronous=FULL")
             with db:
                 yield db
         finally:

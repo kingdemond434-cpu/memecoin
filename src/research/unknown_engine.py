@@ -550,6 +550,7 @@ class UnknownOpportunityEngine:
         return self._pass_report(jobs, results)
 
     async def run_async_pass(self, *, limit: int = 8, now: Optional[float] = None) -> dict:
+        import asyncio
         if self.workflows is None:
             return self.run_pass(limit=limit, now=now)
         now = time.time() if now is None else float(now)
@@ -566,6 +567,7 @@ class UnknownOpportunityEngine:
                 results.append(self._commit_work(job, result, now))
             except Exception as exc:
                 results.append(self._retry_work(job, exc, now))
+            await asyncio.sleep(0)
         return self._pass_report(jobs, results)
 
     def report(self) -> dict:

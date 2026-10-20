@@ -47,7 +47,7 @@ class ResearchWorkflows:
         return AuctionInputs(costs={"inference": 0, "data": 3 if kind == "SOURCE_ACQUISITION" else 0,
                                     "engineering": 0, "conversion": 1, "gauntlet": 0})
 
-    def prepare(self, now: float, limit: int = 64) -> None:
+    def prepare(self, now: float, limit: int = 8) -> None:
         if self.seed_labs:
             from src.research.mechanism_labs import STRATEGY_FAMILIES
             state = self.engine.framework.get_research_component("research_family_intake") or {"seeded": {}}

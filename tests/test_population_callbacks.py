@@ -1,5 +1,7 @@
 """Production source hooks retain actual facts through the canonical queue."""
 from types import SimpleNamespace
+import asyncio
+from collections import deque
 
 from src.collectors.event_source import Event, SourceClass
 from src.research.frontier import FrontierIndex
@@ -11,6 +13,33 @@ from src.strategies.champion_challenger import ChampionChallengerFramework
 
 class Desk(SourceIntelligence):
     pass
+
+
+def test_nonempty_source_queue_yields_between_durable_records(monkeypatch):
+    async def scenario():
+        value = Desk()
+        value._running = True
+        value.transports = {}
+        value.social_intel = SimpleNamespace()
+        pending = deque(range(20))
+        indexed, heartbeat = [], []
+        async def start(*args, **kwargs): return {}
+        async def mesh_start(): return 1
+        async def next_event(): return pending.popleft()
+        value.source_mesh = SimpleNamespace(start=mesh_start, next_event=next_event)
+        def index(event):
+            indexed.append(event)
+            if not pending:
+                value._running = False
+        value._index_source_event = index
+        monkeypatch.setattr("src.runtime.source_intelligence.start_transports", start)
+        async def health():
+            await asyncio.sleep(0)
+            heartbeat.append(len(indexed))
+        await asyncio.gather(value._source_consumer_loop(), health())
+        assert indexed == list(range(20))
+        assert 0 < heartbeat[0] < len(indexed)
+    asyncio.run(scenario())
 
 
 def desk(tmp_path):

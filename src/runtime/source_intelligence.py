@@ -440,6 +440,10 @@ class SourceIntelligence:
                 self._index_source_event(event)
             except Exception as exc:
                 logger.warning("source event indexing failed: %s", exc)
+            # Queue.get() completes synchronously while producers keep the
+            # queue nonempty. Yield between durable records so a replay/feed
+            # burst cannot monopolize health, market and shutdown callbacks.
+            await asyncio.sleep(0)
 
     def _index_source_event(self, event: Any) -> None:
         """One event into the per-token index and the lead-lag graph."""
