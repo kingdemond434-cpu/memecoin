@@ -2309,6 +2309,15 @@ class TestGenealogyClustering(unittest.IsolatedAsyncioTestCase):
 
 
 class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _native_fill_fixture():
+        """Explicit signed native fixture evidence, never an inferred fill."""
+        return {"real_fill": True, "scope": "observed_forward",
+                "entry_at": time.time(), "exit_at": time.time(), "observed_at": time.time(),
+                "evidence_refs": ["evidence:fixture-entry:0", "evidence:fixture-exit:1"],
+                "execution": {"native": True, "filled": True, "route": "pump_curve",
+                              "evidence_kind": "observed_transaction",
+                              "entry_signature": "fixture-entry", "exit_signature": "fixture-exit"}}
     async def test_promotion_evidence_survives_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = str(Path(directory) / "champion_state.json")
@@ -2366,7 +2375,7 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(framework.hypotheses["promo-1"].status, ModelStatus.FORWARD_SHADOW.value)
 
         for _ in range(5):
-            framework.record_forward_result("promo-1", {"elogw": 0.01, "pnl": 5.0,
+            framework.record_forward_result("promo-1", {**self._native_fill_fixture(), "elogw": 0.01, "pnl": 5.0,
                 "spec_hash": framework.hypotheses["promo-1"].frozen_hash})
         await framework._evaluate_shadow_models()
         self.assertIn("promo-1", framework.canary_models)
@@ -2374,7 +2383,7 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(framework.hypotheses["promo-1"].status, ModelStatus.CANARY.value)
 
         for _ in range(20):
-            framework.record_forward_result("promo-1", {"elogw": 0.01, "pnl": 5.0,
+            framework.record_forward_result("promo-1", {**self._native_fill_fixture(), "elogw": 0.01, "pnl": 5.0,
                 "spec_hash": framework.hypotheses["promo-1"].frozen_hash})
         await framework._evaluate_canary_models()
         self.assertIn("promo-1", framework.champions)
@@ -2384,7 +2393,7 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(framework.get_stats()["live_champions"], 1)
 
         for _ in range(framework.decay_window):
-            framework.record_forward_result("promo-1", {"elogw": -0.01, "pnl": -5.0,
+            framework.record_forward_result("promo-1", {**self._native_fill_fixture(), "elogw": -0.01, "pnl": -5.0,
                 "spec_hash": framework.hypotheses["promo-1"].frozen_hash})
         await framework._monitor_champion_decay()
         self.assertEqual(framework.champions["promo-1"].status, "HIBERNATED")
@@ -2404,7 +2413,7 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
         ))
         await shadow_framework._evaluate_challengers()
         for _ in range(5):
-            shadow_framework.record_forward_result("shadow-fail", {"elogw": -0.01, "pnl": -5.0,
+            shadow_framework.record_forward_result("shadow-fail", {**self._native_fill_fixture(), "elogw": -0.01, "pnl": -5.0,
                 "spec_hash": shadow_framework.hypotheses["shadow-fail"].frozen_hash})
         await shadow_framework._evaluate_shadow_models()
         self.assertNotIn("shadow-fail", shadow_framework.shadow_models)
@@ -2425,13 +2434,13 @@ class TestResearchLedger(unittest.IsolatedAsyncioTestCase):
         ))
         await canary_framework._evaluate_challengers()
         for _ in range(5):
-            canary_framework.record_forward_result("canary-fail", {"elogw": 0.01, "pnl": 5.0,
+            canary_framework.record_forward_result("canary-fail", {**self._native_fill_fixture(), "elogw": 0.01, "pnl": 5.0,
                 "spec_hash": canary_framework.hypotheses["canary-fail"].frozen_hash})
         await canary_framework._evaluate_shadow_models()
         self.assertIn("canary-fail", canary_framework.canary_models)
         # Fewer than 20 canary trades -> retired for insufficient evidence, not promoted.
         for _ in range(5):
-            canary_framework.record_forward_result("canary-fail", {"elogw": 0.01, "pnl": 5.0,
+            canary_framework.record_forward_result("canary-fail", {**self._native_fill_fixture(), "elogw": 0.01, "pnl": 5.0,
                 "spec_hash": canary_framework.hypotheses["canary-fail"].frozen_hash})
         await canary_framework._evaluate_canary_models()
         self.assertNotIn("canary-fail", canary_framework.canary_models)

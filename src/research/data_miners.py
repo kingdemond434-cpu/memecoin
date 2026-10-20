@@ -293,11 +293,13 @@ class DataMinerPool:
                 return MinerResult(miner_id=miner_id, status="DATA_BLOCKED",
                                    fetched_at=now, detail=health.last_error)
 
-        all_stamped = [self._stamp(spec, record, now) for record in (records or ())]
+        received_at = time.time()
+        all_stamped = [{**self._stamp(spec, record, received_at),
+                        "_request_started_at": started, "_scheduled_at": now} for record in (records or ())]
         batch_ref = None
         if all_stamped and self.retain_batch is not None:
             try:
-                batch_ref = self.retain_batch(miner_id, all_stamped, now)
+                batch_ref = self.retain_batch(miner_id, all_stamped, received_at)
                 if not batch_ref:
                     raise RuntimeError("retention sink returned no evidence reference")
             except Exception as exc:
@@ -311,7 +313,7 @@ class DataMinerPool:
         delivery_detail = f"delivered={len(stamped)}; deferred={deferred}"
         health.passes += 1
         health.records += len(stamped)
-        health.last_ok_at = now
+        health.last_ok_at = received_at
         health.last_error = ""
         # A pass that worked clears the penalty. Keeping it would punish a
         # source for a limit it has already recovered from.
@@ -329,13 +331,13 @@ class DataMinerPool:
                 logger.warning("miner %s consumer raised: %s", miner_id, exc)
         if batch_ref and self.retain_disposition is not None:
             try:
-                self.retain_disposition(batch_ref, delivery_status, delivery_detail, now)
+                self.retain_disposition(batch_ref, delivery_status, delivery_detail, received_at)
             except Exception as exc:
                 delivery_status = "RETRY_REQUIRED"
                 health.failures += 1
                 health.last_error = f"disposition failed: {type(exc).__name__}; batch={batch_ref}"
         return MinerResult(
-            miner_id=miner_id, status=("DATA_BLOCKED" if delivery_status == "RETRY_REQUIRED" else "OK"), records=stamped, fetched_at=now,
+            miner_id=miner_id, status=("DATA_BLOCKED" if delivery_status == "RETRY_REQUIRED" else "OK"), records=stamped, fetched_at=received_at,
             latency_ms=int((time.time() - started) * 1000),
             detail=delivery_detail + (f"; evidence={batch_ref}" if batch_ref else ""))
 

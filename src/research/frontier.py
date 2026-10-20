@@ -575,7 +575,8 @@ class FrontierIndex:
 
     def lease_jobs(self, worker: str, *, limit: int = 8, lease_seconds: float = 60,
                    resource_budget: Optional[float] = None, cost_unit: str = "resource_units",
-                   scan_limit: int = 256, now: Optional[float] = None) -> List[Dict[str, Any]]:
+                   scan_limit: int = 256, kinds: Optional[Sequence[str]] = None,
+                   now: Optional[float] = None) -> List[Dict[str, Any]]:
         """One bounded resource auction inside the caller's existing pass.
 
         Exploration floors rotate durably when a pass is smaller than the
@@ -604,6 +605,14 @@ class FrontierIndex:
             eligible = due + " AND j.total_cost IS NOT NULL AND j.cost_unit=? AND EXISTS " \
                 "(SELECT 1 FROM coordinates c WHERE c.coordinate_id=j.coordinate_id AND c.state!='HIBERNATED_LOW_VOI')"
             params = (moment, moment, cost_unit)
+            if kinds is not None:
+                names = sorted(set(kinds))
+                if not names:
+                    return []
+                if len(names) > 64 or any(not isinstance(name, str) or not name for name in names):
+                    raise ValueError("bounded named consumer kinds required")
+                eligible += " AND j.kind IN (" + ",".join("?" for _ in names) + ")"
+                params += tuple(names)
             tags = [tag for tag, fraction in self.exploration_floors.items() if fraction > 0]
             cursor = int(db.execute("SELECT value FROM metadata WHERE key='exploration_cursor'").fetchone()[0])
             ordered_tags = tags[cursor % len(tags):] + tags[:cursor % len(tags)] if tags else []
@@ -654,6 +663,63 @@ class FrontierIndex:
                     "SELECT axes FROM coordinates WHERE coordinate_id=?", (row["coordinate_id"],)).fetchone()[0])
                 result.append(leased)
         return result
+
+    def pending_work(self, *, kinds: Sequence[str] = (), states: Sequence[str] = ("READY", "RETRY"),
+                     limit: int = 64, after_job_id: str = "", enabling_change: Optional[str] = None) -> List[Dict[str, Any]]:
+        """A bounded cursor scan for consumer migration and evidence wakes."""
+        if not 1 <= int(limit) <= _MAX_BATCH or not states or len(states) > 8 or len(kinds) > 64:
+            raise ValueError("invalid bounded pending-work query")
+        where = ["state IN (" + ",".join("?" for _ in states) + ")", "job_id>?"]
+        params: list = [*states, after_job_id]
+        if kinds:
+            where.append("kind IN (" + ",".join("?" for _ in kinds) + ")")
+            params.extend(kinds)
+        if enabling_change is not None:
+            where.append("enabling_change=?")
+            params.append(enabling_change)
+        with self._db() as db:
+            rows = db.execute("SELECT job_id FROM jobs WHERE " + " AND ".join(where) +
+                              " ORDER BY job_id LIMIT ?", (*params, int(limit))).fetchall()
+        return [self.job(row[0]) for row in rows]
+
+    def price_pending_job(self, job_id: str, *, auction: AuctionInputs,
+                          evidence_refs: Sequence[str], reason: str,
+                          now: Optional[float] = None) -> bool:
+        """Declare a consumer's resource envelope without resetting work."""
+        if auction.total_cost is None or auction.total_cost <= 0 or not reason:
+            raise ValueError("explicit bounded positive resource cost and reason required")
+        refs = _refs(evidence_refs)
+        moment = time.time() if now is None else float(now)
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if not row or row["state"] not in {"READY", "RETRY"} or row["total_cost"] is not None:
+                return False
+            coordinate = db.execute("SELECT state FROM coordinates WHERE coordinate_id=?", (row["coordinate_id"],)).fetchone()
+            if coordinate[0] == "HIBERNATED_LOW_VOI":
+                return False
+            merged = sorted(set(refs + json.loads(row["evidence_refs"])))
+            values = auction.to_dict()
+            db.execute("UPDATE jobs SET auction=?,priority=?,total_cost=?,cost_unit=?,evidence_refs=?,updated_at=? WHERE job_id=?",
+                (_json(values), auction.priority, auction.total_cost, values["cost_unit"], _json(merged), moment, job_id))
+            self._event(db, job_id, "resource_envelope_declared", row["state"], row["state"], reason, refs, moment)
+        return True
+
+    def block_leased_job(self, job_id: str, worker: str, lease_token: str, *, enabling_change: str,
+                         reason: str, evidence_refs: Sequence[str], now: Optional[float] = None) -> None:
+        """Keep incomplete work resumable; a blocked receipt is not an ACK."""
+        if not enabling_change or not reason:
+            raise ValueError("named enabling change and measured blocking reason required")
+        refs = _refs(evidence_refs)
+        moment = time.time() if now is None else float(now)
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = self._leased(db, job_id, worker, lease_token, moment)
+            merged = sorted(set(refs + json.loads(row["evidence_refs"])))
+            db.execute("UPDATE jobs SET state='HIBERNATED',disposition='BLOCKED',enabling_change=?,hibernation_reason=?,"
+                       "last_error=?,evidence_refs=?,updated_at=?,lease_owner=NULL,lease_token=NULL,lease_until=NULL WHERE job_id=?",
+                       (enabling_change, reason, reason, _json(merged), moment, job_id))
+            self._event(db, job_id, "input_blocked", "LEASED", "HIBERNATED", reason, refs, moment)
 
     @staticmethod
     def _leased(db: sqlite3.Connection, job_id: str, worker: str, token: str,

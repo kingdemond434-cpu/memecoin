@@ -1061,6 +1061,11 @@ class SubsystemWiring:
             state="DATA_BLOCKED" if native.event_type == "UNKNOWN" else "OBSERVED", evidence_refs=[ref])
         self.research_frontier.enqueue("NATIVE_OBSERVATION", ref, axes=axes, job_id=identity,
             evidence_refs=[ref], exploration_tags=["unknown_protocols"])
+        engine = getattr(self, "unknown_engine", None)
+        if engine is not None and getattr(engine, "workflows", None) is not None:
+            engine.notify_evidence(["research_validation:chain_integration_inputs",
+                "research_validation:protocol_integration_inputs", "research_validation:integration_inputs"],
+                [ref], native.observed_at)
         return ref
 
     async def _setup_opportunity_observation(self, research_path: Path) -> None:
@@ -1342,6 +1347,7 @@ class SubsystemWiring:
                     affinity=tuple(self.global_config.get(
                         "context_miner_cpus", ()) or ()),
                     name="context"))
+        self._setup_research_consumers()
         if not self.offline:
             await self.dataset_builder.start()
             await self.global_research.start()

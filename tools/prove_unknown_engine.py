@@ -43,7 +43,10 @@ SOURCE_FILES = ("tools/prove_unknown_engine.py", "src/research/unknown_engine.py
     "src/runtime/research_runtime.py", "src/runtime/capital_runtime.py",
     "src/runtime/wiring.py", "src/runtime/offload.py", "src/chains/rpc_manager.py",
     "src/collectors/transports.py", "src/collectors/registry.py",
-    "src/chains/evm_events.py", "src/chains/evm_observation.py", "src/research/chain_opportunity.py")
+    "src/chains/evm_events.py", "src/chains/evm_observation.py", "src/research/chain_opportunity.py",
+    "src/research/data_requests.py", "src/research/research_workflows.py", "src/research/mechanism_labs.py",
+    "src/research/machine_search.py", "src/research/population_hunter.py", "src/research/research_validation.py",
+    "src/research/native_forward.py", "src/runtime/source_intelligence.py", "src/research/data_miners.py")
 
 REQUIREMENTS = (
     ("A01", "dynamic_chain_or_protocol_discovery"),
@@ -469,7 +472,7 @@ def scenario_llm(path: Path) -> dict:
     report = engine.last_proposal_round
     assert report["status"] == "DATA_BLOCKED"
     assert all(row["status"] == "DATA_BLOCKED" for row in report["providers"])
-    collected = engine.last_pass
+    collected = miner.get_stats()["conversion"]
     risk = RiskVeto().evaluate(safety_report(can_mint=True))
     validation = Gauntlet(bootstrap=20).run(observations(count=200))
     assert collected["processed"] == 1 and risk.status == "VETO" and validation

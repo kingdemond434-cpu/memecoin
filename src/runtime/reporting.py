@@ -586,6 +586,7 @@ class ReportingSurface:
             # never returned a record reads differently from one that is
             # failing, and the two need different fixes.
             "data_miners": self.data_miners.report(),
+            "population_research_intake": getattr(self, "population_research_intake", {"status": "NOT_OBSERVED"}),
             # Which operator is answering each question right now, and what
             # is dark. A domain running on its third rung is fine and is
             # reported as such; a domain with no rung left is a question the

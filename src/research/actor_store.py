@@ -39,8 +39,10 @@ last line rather than the run.
 from __future__ import annotations
 
 import bisect
+import hashlib
 import json
 import logging
+import math
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -76,6 +78,26 @@ class EdgeKind(Enum):
     SOLD = "sold"
     #: mint -> launchpad.
     LAUNCHED_ON = "launched_on"
+    RELATED = "related"
+    CREATED = "created"
+    ROUTED = "routed"
+    BRIDGED = "bridged"
+    REFERENCED = "referenced"
+
+
+def native_node(chain_id: str, entity_type: str, identifier: str,
+                chain_family: str = "UNKNOWN") -> str:
+    """Native identifiers are observations, never assertions of shared identity.
+
+    Only explicitly EVM hexadecimal identifiers are case insensitive. In
+    particular, base58/Solana identifiers retain their original case.
+    """
+    chain, entity, value = str(chain_id).strip().lower(), str(entity_type).strip().lower(), str(identifier).strip()
+    if not chain or not entity or not value:
+        raise ValueError("native node requires chain, entity type and identifier")
+    if str(chain_family).upper() == "EVM" and value.lower().startswith("0x"):
+        value = value.lower()
+    return "native:" + json.dumps([chain, entity, value], separators=(",", ":"), ensure_ascii=False)
 
 
 @dataclass(frozen=True)
@@ -91,6 +113,9 @@ class Edge:
     #: recoverable from an unordered edge set.
     rank: Optional[int] = None
     amount: Optional[float] = None
+    observation_id: Optional[str] = None
+    event_at: Optional[float] = None
+    evidence_refs: Tuple[str, ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
         return {**asdict(self), "kind": self.kind.value}
@@ -100,7 +125,9 @@ class Edge:
         return cls(source=str(row["source"]), target=str(row["target"]),
                    kind=EdgeKind(row["kind"]),
                    observed_at=float(row["observed_at"]),
-                   rank=row.get("rank"), amount=row.get("amount"))
+                   rank=row.get("rank"), amount=row.get("amount"),
+                   observation_id=row.get("observation_id"), event_at=row.get("event_at"),
+                   evidence_refs=tuple(row.get("evidence_refs") or ()))
 
 
 @dataclass
@@ -137,10 +164,15 @@ class ActorStore:
         self._in: Dict[Tuple[str, EdgeKind], List[Tuple[float, int]]] = (
             defaultdict(list))
         self._appended = 0
+        self._native_ids: Set[str] = set()
 
     # -- building --------------------------------------------------------
 
     def add(self, edge: Edge) -> None:
+        if edge.observation_id and edge.observation_id in self._native_ids:
+            return
+        if edge.observation_id:
+            self._native_ids.add(edge.observation_id)
         index = len(self.edges)
         self.edges.append(edge)
         for store, key in ((self._out, (edge.source, edge.kind)),
@@ -152,6 +184,37 @@ class ActorStore:
             # and an unsorted bucket makes every as-of cut wrong rather than
             # slow.
             bisect.insort(bucket, item)
+
+    def observe_native(self, *, chain_id: str, chain_family: str, source: str,
+                       target: str, kind: EdgeKind, event_at: float, observed_at: float,
+                       evidence_refs: Sequence[str], observation_id: str,
+                       source_type: str = "wallet", target_type: str = "wallet",
+                       target_chain_id: Optional[str] = None,
+                       target_chain_family: Optional[str] = None) -> Edge:
+        """Idempotent reference-only graph materialization for canonical facts.
+
+        The durable graph append precedes the in-memory index update. A caller
+        retry after a checkpoint failure therefore cannot duplicate an edge.
+        """
+        if (not evidence_refs or not observation_id or not math.isfinite(event_at)
+                or not math.isfinite(observed_at) or event_at > observed_at):
+            raise ValueError("native relation requires PIT times and canonical references")
+        identity = hashlib.sha256(json.dumps([str(chain_id).strip().lower(), observation_id], separators=(",", ":")).encode()).hexdigest()
+        edge = Edge(native_node(chain_id, source_type, source, chain_family),
+                    native_node(target_chain_id or chain_id, target_type, target,
+                                target_chain_family or chain_family), kind,
+                    float(observed_at), observation_id=identity, event_at=float(event_at),
+                    evidence_refs=tuple(sorted(set(evidence_refs))))
+        if identity in self._native_ids:
+            existing = next(item for item in self.edges if item.observation_id == identity)
+            if (existing.source, existing.target, existing.kind, existing.event_at, existing.observed_at) != (
+                    edge.source, edge.target, edge.kind, edge.event_at, edge.observed_at):
+                raise ValueError("native observation identity has conflicting facts; explicit correction required")
+            return existing
+        if identity not in self._native_ids:
+            self.append_to_log([edge])
+            self.add(edge)
+        return edge
 
     def extend(self, edges: Iterable[Edge]) -> int:
         count = 0
@@ -200,7 +263,7 @@ class ActorStore:
     @staticmethod
     def _cut(bucket: Sequence[Tuple[float, int]], as_of: float) -> int:
         """How many entries were observed at or before `as_of`."""
-        return bisect.bisect_right(bucket, (float(as_of), len(bucket) + 1))
+        return bisect.bisect_right(bucket, (float(as_of), math.inf))
 
     def out_edges(self, node: str, kind: EdgeKind, as_of: float
                   ) -> List[Edge]:

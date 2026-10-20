@@ -104,8 +104,16 @@ def test_exact_frozen_trial_enters_shadow_and_forward_results_require_its_seal()
     asyncio.run(framework._evaluate_challengers())
     assert "c1" in framework.shadow_models
     assert not framework.record_forward_result("c1", {"elogw": 0.1, "pnl": 1})
-    assert framework.record_forward_result("c1", {"elogw": 0.1, "pnl": 1,
-        "spec_hash": framework.hypotheses["c1"].frozen_hash})
+    assert not framework.record_forward_result("c1", {"elogw": 0.1, "pnl": 1,
+        "spec_hash": framework.hypotheses["c1"].frozen_hash})  # untyped mark stays unmeasured
+    observed = {"elogw": 0.1, "pnl": 1, "real_fill": True, "scope": "observed_forward",
+        "entry_at": time.time(), "exit_at": time.time(), "observed_at": time.time(),
+        "evidence_refs": ["evidence:offline-entry:0", "evidence:offline-exit:1"],
+        "execution": {"native": True, "filled": True, "route": "pump_curve",
+                      "evidence_kind": "observed_transaction", "entry_signature": "offline-entry",
+                      "exit_signature": "offline-exit"},
+        "spec_hash": framework.hypotheses["c1"].frozen_hash}
+    assert framework.record_forward_result("c1", observed)
     assert len(framework.shadow_models["c1"]["forward_results"]) == 1
 
 
