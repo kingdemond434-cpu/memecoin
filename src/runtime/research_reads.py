@@ -193,7 +193,19 @@ def research_report(desk: Any) -> Dict[str, Any]:
         "sources": source_intelligence_report(desk),
         "wallets": wallet_intelligence_report(desk),
         "evidence_quality": evidence_quality_report(desk),
+        "onion_research": onion_research_report(desk),
     }
+
+
+def onion_research_report(desk: Any) -> Dict[str, Any]:
+    rows = [transport.report() for transport in getattr(desk, "transports", {}).values()
+            if getattr(transport, "kind", None) == "onion"]
+    observed = [row for row in rows if row.get("last_observed_at") is not None]
+    return {"status": "OBSERVED" if observed else "DATA_BLOCKED", "authority": "none",
+            "scope": "DECLARED_PUBLIC_ONION_SOURCES_ONLY", "all_onion_coverage": False,
+            "sources": rows, "observed_sources": len(observed),
+            "unverified_claims_only": True,
+            "detail": "" if observed else "no declared onion source has produced a successful observation"}
 
 
 def fallback_confidence(desk: Any, facts: Sequence[str],

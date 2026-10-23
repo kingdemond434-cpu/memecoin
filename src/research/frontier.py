@@ -233,6 +233,12 @@ class FrontierIndex:
                     job_id TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(job_id, tag));
                 CREATE INDEX IF NOT EXISTS jobs_due ON jobs(state, available_at, priority DESC, created_at);
                 CREATE INDEX IF NOT EXISTS tag_jobs ON job_tags(tag, job_id);
+                CREATE INDEX IF NOT EXISTS jobs_active_created ON jobs(cost_unit,created_at,job_id)
+                    WHERE total_cost IS NOT NULL AND state IN ('READY','RETRY','LEASED');
+                CREATE INDEX IF NOT EXISTS jobs_active_kind_created ON jobs(cost_unit,kind,created_at,job_id)
+                    WHERE total_cost IS NOT NULL AND state IN ('READY','RETRY','LEASED');
+                CREATE INDEX IF NOT EXISTS jobs_active_priority ON jobs(cost_unit,priority DESC,created_at,job_id)
+                    WHERE total_cost IS NOT NULL AND state IN ('READY','RETRY','LEASED');
                 CREATE TABLE IF NOT EXISTS transitions(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, subject TEXT NOT NULL,
                     action TEXT NOT NULL, previous_state TEXT, next_state TEXT,
@@ -623,7 +629,7 @@ class FrontierIndex:
             # Expired leases are selectable without rewriting every expired
             # row: one bounded pass never scans/mutates an unbounded backlog.
             due = "((j.state IN ('READY','RETRY') AND j.available_at<=?) OR (j.state='LEASED' AND j.lease_until<=?))"
-            eligible = due + " AND j.total_cost IS NOT NULL AND j.cost_unit=? AND EXISTS " \
+            eligible = due + " AND j.state IN ('READY','RETRY','LEASED') AND j.total_cost IS NOT NULL AND j.cost_unit=? AND EXISTS " \
                 "(SELECT 1 FROM coordinates c WHERE c.coordinate_id=j.coordinate_id AND c.state!='HIBERNATED_LOW_VOI')"
             params = (moment, moment, cost_unit)
             if kinds is not None:
@@ -658,18 +664,27 @@ class FrontierIndex:
                     break
                 visited += 1
                 count = max(1, int(math.floor(limit * self.exploration_floors[tag])))
-                rows = db.execute("SELECT j.* FROM jobs j JOIN job_tags t ON t.job_id=j.job_id "
-                                  f"WHERE {eligible} AND t.tag=? "
+                # Driving this from tag_jobs visits every historical tagged
+                # job before sorting. Production profiling found that scan
+                # monopolizing the event loop after days of retained work.
+                # Scan only active costed jobs, preserving the same FIFO and
+                # exploration-floor semantics and retaining all old evidence.
+                fifo_index = ("jobs_active_kind_created" if kinds is not None and len(names) == 1
+                              else "jobs_active_created")
+                rows = db.execute(f"SELECT j.* FROM jobs j INDEXED BY {fifo_index} "
+                                  f"WHERE {eligible} AND EXISTS (SELECT 1 FROM job_tags t "
+                                  "WHERE t.job_id=j.job_id AND t.tag=?) "
                                   "ORDER BY j.created_at,j.job_id LIMIT ?",
                                   (*params, tag, int(scan_limit))).fetchall()
                 take(rows, count)
             if tags:
                 db.execute("UPDATE metadata SET value=? WHERE key='exploration_cursor'",
                            (str((cursor + max(1, visited)) % len(tags)),))
-            rows = db.execute(f"SELECT j.* FROM jobs j WHERE {eligible} "
-                              "ORDER BY j.priority DESC,j.created_at,j.job_id LIMIT ?",
-                              (*params, int(scan_limit))).fetchall()
-            take(rows, limit - len(selected))
+            if len(selected) < limit:
+                rows = db.execute(f"SELECT j.* FROM jobs j INDEXED BY jobs_active_priority WHERE {eligible} "
+                                  "ORDER BY j.priority DESC,j.created_at,j.job_id LIMIT ?",
+                                  (*params, int(scan_limit))).fetchall()
+                take(rows, limit - len(selected))
             result = []
             for row in selected:
                 token = uuid.uuid4().hex
@@ -710,12 +725,19 @@ class FrontierIndex:
             raise ValueError("bounded registered consumer kinds required")
         budget = _number(resource_budget, "resource_budget", optional=False)
         with self._db() as db:
-            rows = db.execute("SELECT DISTINCT j.kind FROM jobs j JOIN coordinates c USING(coordinate_id) "
-                "WHERE j.kind IN (" + ",".join("?" for _ in names) + ") "
+            # Ask whether one eligible row exists per bounded consumer kind.
+            # DISTINCT over every retained row bought no additional evidence.
+            found = []
+            for name in names:
+                row = db.execute("SELECT j.kind FROM jobs j INDEXED BY jobs_active_kind_created "
+                "JOIN coordinates c USING(coordinate_id) WHERE j.kind=? "
+                "AND j.state IN ('READY','RETRY','LEASED') "
                 "AND ((j.state IN ('READY','RETRY') AND j.available_at<=?) OR (j.state='LEASED' AND j.lease_until<=?)) "
                 "AND j.total_cost IS NOT NULL AND j.total_cost<=? AND j.cost_unit='resource_units' "
-                "AND c.state!='HIBERNATED_LOW_VOI' ORDER BY j.kind", (*names, now, now, budget)).fetchall()
-        return [row[0] for row in rows]
+                "AND c.state!='HIBERNATED_LOW_VOI' LIMIT 1", (name, now, now, budget)).fetchone()
+                if row:
+                    found.append(row[0])
+        return found
 
     def price_pending_job(self, job_id: str, *, auction: AuctionInputs,
                           evidence_refs: Sequence[str], reason: str,

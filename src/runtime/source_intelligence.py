@@ -180,8 +180,19 @@ class SourceIntelligence:
         for key in ("operator_id", "operator_verified", "operator_evidence_refs", "label", "label_provenance"):
             if key in metadata:
                 payload[key] = metadata[key]
-        return self._enqueue_population_work("NARRATIVE_OBSERVATION", payload,
+        if getattr(transport, "kind", None) == "onion":
+            payload["public_source_evidence"] = {key: metadata.get(key) for key in (
+                "url", "source_ref", "content_hash", "publication_time_known", "published_at",
+                "observation_kind", "claim_status", "claim_topics", "evm_address_mentions",
+                "address_role_status", "text_truncated", "onion_observation_id")}
+        job_id = self._enqueue_population_work("NARRATIVE_OBSERVATION", payload,
             evidence_refs=metadata.get("evidence_refs") or (), now=event.observed_at)
+        if job_id and getattr(transport, "kind", None) == "onion":
+            try:
+                transport.acknowledge(metadata.get("onion_observation_id"), job_id)
+            except Exception as exc:
+                logger.warning("onion canonical acknowledgement deferred: %s", type(exc).__name__)
+        return job_id
 
     def _record_population_follow_outcome(self, payload: Dict[str, Any], *, evidence_refs=(),
                                           now: Optional[float] = None) -> Optional[str]:

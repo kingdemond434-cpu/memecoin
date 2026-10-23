@@ -59,6 +59,7 @@ REGISTRY_SCHEMA_VERSION = "v1"
 #: not produced in seconds IS unhealthy, and waiting longer on it delays
 #: noticing. Only the poll-and-parse kinds get room.
 DEFAULT_POLL_TIMEOUTS: Dict[str, float] = {
+    "onion": 45.0,
     "rss": 20.0,
     "official_site": 20.0,
     "code_repo": 20.0,
@@ -69,6 +70,7 @@ DEFAULT_POLL_TIMEOUTS: Dict[str, float] = {
 }
 
 DEFAULT_POLL_INTERVALS: Dict[str, float] = {
+    "onion": 120.0,
     "telegram": 0.10,
     "bluesky": 0.05,
     "nostr": 0.05,
@@ -86,6 +88,7 @@ DEFAULT_POLL_INTERVALS: Dict[str, float] = {
 #: Declaration kind -> adapter factory. Every factory takes (source_id, fetch)
 #: plus its own keywords, so a new kind is one entry here.
 ADAPTER_KINDS: Dict[str, Callable[..., EventSource]] = {
+    "onion": adapters.onion_source,
     "telegram": adapters.telegram_source,
     "bluesky": adapters.bluesky_source,
     "nostr": adapters.nostr_source,
@@ -282,6 +285,7 @@ def _cadence_bucket(seconds: float) -> str:
 #: naming the same endpoint are the same source however they are spelled, so
 #: this is what lets the overlay merge below be id-spelling independent.
 ENDPOINT_OPTIONS: Dict[str, Tuple[str, ...]] = {
+    "onion": ("url",),
     "rss": ("url",),
     "official_site": ("url",),
     "mastodon": ("instance",),

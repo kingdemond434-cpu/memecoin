@@ -249,6 +249,35 @@ def official_site_source(source_id: str, fetch, domain: str) -> CallableSource:
     return CallableSource(source_id, SourceClass.OFFICIAL, fetch, to_event)
 
 
+def onion_source(source_id: str, fetch) -> CallableSource:
+    """Public onion claims, never official-domain authenticity evidence."""
+    def to_event(record: Dict[str, Any], now: float) -> Optional[Event]:
+        text = record.get("text") or ""
+        if not text:
+            return None
+        observed = float(record["observed_at"])
+        return normalise(source_id, SourceClass.WEB, text,
+            source_at=observed, observed_at=observed,
+            metadata={"url": record["url"], "source_ref": record["source_ref"],
+                "content_hash": record["content_hash"],
+                "onion_observation_id": record.get("observation_id"),
+                "text_truncated": record.get("text_truncated", False),
+                "publication_time_known": False, "published_at": None,
+                "observation_kind": record["observation_kind"],
+                "transport": "tor_socks5_remote_dns", "claim_status": "UNVERIFIED",
+                "claim_topics": [topic for topic, pattern in (
+                    ("launch", r"\b(?:launch|presale|fairlaunch|mint)\b"),
+                    ("wallet", r"\b(?:wallet|whale|deployer|funder)\b"),
+                    ("claimed_insider", r"\b(?:insider|dev|developer|alpha|early)\b"),
+                    ("claimed_coordination", r"\b(?:pump|coordinated|group|signal)\b"))
+                    if re.search(pattern, text, re.IGNORECASE)],
+                "evm_address_mentions": sorted(set(re.findall(r"\b0x[0-9a-fA-F]{40}\b", text))),
+                "address_role_status": "UNVERIFIED_MENTIONS_NOT_WALLET_OR_MINT_CLASSIFICATIONS",
+                "execution_authority": False,
+                "discovered_onion_links": record.get("discovered_onion_links", [])})
+    return CallableSource(source_id, SourceClass.WEB, fetch, to_event)
+
+
 def code_repository_source(source_id: str, fetch) -> CallableSource:
     """Public repository activity, which occasionally names a mint before marketing."""
     def to_event(record: Dict[str, Any], now: float) -> Optional[Event]:

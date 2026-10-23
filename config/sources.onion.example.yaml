@@ -1,0 +1,17 @@
+# Append this file to global.source_registry in the active deployment config.
+# Each selected source needs a verified public URL and provenance; names alone
+# are coverage targets. No invented addresses or automatic mirror trust.
+sources:
+  - id: onion:dread-public-discussions
+    kind: onion
+    region: global
+    tier: 3
+    poll_interval_seconds: 120
+    poll_timeout_seconds: 45
+    options:
+      availability: UNAVAILABLE
+      unavailable_reason: Verified current public Dread endpoint and provenance have not been supplied
+      source_ref: operator-selected-public-forum
+      max_pages: 128
+      max_depth: 6
+      pages_per_poll: 1

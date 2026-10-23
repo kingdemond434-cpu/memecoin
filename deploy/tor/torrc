@@ -1,0 +1,6 @@
+ClientOnly 1
+SocksPort 0.0.0.0:9050
+SafeSocks 1
+TestSocks 1
+DataDirectory /tmp/tor
+Log notice stdout

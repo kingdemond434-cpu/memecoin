@@ -40,7 +40,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urljoin
 
 logger = logging.getLogger(__name__)
 
@@ -156,17 +156,27 @@ class HttpClient:
             return existing
         import aiohttp
 
+        trace = aiohttp.TraceConfig()
+
+        async def refuse_onion_redirect(_session, _context, params):
+            target = urljoin(str(params.url), params.response.headers.get("Location", ""))
+            if (urlparse(target).hostname or "").lower().rstrip(".").endswith(".onion"):
+                raise TransportError("onion redirects require the dedicated Tor transport")
+
+        trace.on_request_redirect.append(refuse_onion_redirect)
         created = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=self.timeout_s),
             connector=aiohttp.TCPConnector(limit=self.limit,
                                            limit_per_host=self.limit_per_host),
-            headers={"User-Agent": USER_AGENT})
+            headers={"User-Agent": USER_AGENT}, trace_configs=[trace])
         self._sessions[loop] = created
         return created
 
     async def get(self, url: str, *, headers: Optional[Dict[str, str]] = None
                   ) -> Tuple[int, str, Dict[str, str]]:
         """Status, body and response headers. Raises only on transport failure."""
+        if (urlparse(url).hostname or "").lower().rstrip(".").endswith(".onion"):
+            raise TransportError("onion destinations require the dedicated Tor transport")
         session = await self.session()
         try:
             async with session.get(url, headers=headers or {}) as response:
@@ -971,6 +981,7 @@ class TransportReport:
 #: built for it. Stated as data so a missing option is reported by name rather
 #: than discovered as a TypeError at construction.
 REQUIRED_OPTIONS: Dict[str, Tuple[str, ...]] = {
+    "onion": ("url", "source_ref"),
     "rss": ("url",),
     "official_site": ("url",),
     "mastodon": ("instance",),
@@ -1002,6 +1013,15 @@ def build_transport(declaration: Any, client: HttpClient) -> Any:
     if missing:
         raise TransportError(f"declaration is missing options: {', '.join(missing)}")
     source_id = declaration.source_id
+
+    if kind == "onion":
+        from src.collectors.onion import OnionResearchTransport
+        return OnionResearchTransport(source_id, str(options["url"]),
+            source_ref=options["source_ref"], max_pages=options.get("max_pages", 32),
+            pages_per_poll=options.get("pages_per_poll", 1),
+            max_depth=options.get("max_depth", 3),
+            state_path=options.get("state_path") or
+                "data/research/onion/" + hashlib.sha256(source_id.encode()).hexdigest() + ".json")
 
     if kind == "rss":
         return RssTransport(source_id, str(options["url"]), client,
