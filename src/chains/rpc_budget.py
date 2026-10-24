@@ -21,10 +21,11 @@ class RPCBudgetExhausted(RuntimeError):
 
 
 class RPCBudget:
-    def __init__(self, path, credential, *, rps=5, daily=25000, monthly=750000):
-        if not credential or not math.isfinite(rps) or not 0 < rps <= 1000 or not 0 < daily <= monthly:
-            raise ValueError("bounded explicit RPC allocation required")
-        self.rps, self.daily, self.monthly = float(rps), int(daily), int(monthly)
+    def __init__(self, path, credential, *, rps=10, daily=None, monthly=None):
+        if not credential or not math.isfinite(rps) or rps <= 0 or any(v is not None and (type(v) is not int or v <= 0) for v in (daily, monthly)):
+            raise ValueError("valid RPC rate and optional operator allocations required")
+        if daily is not None and monthly is not None and daily > monthly: raise ValueError('daily allocation exceeds monthly allocation')
+        self.rps, self.daily, self.monthly = float(rps), daily, monthly
         self.identity = hashlib.sha256(credential.encode()).hexdigest()
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path, timeout=3, check_same_thread=False)
@@ -54,10 +55,10 @@ class RPCBudget:
             used_month = row[3] if row and row[1] == month else 0
             cost = sum(self.cost(m) for m in methods)
             midnight = clock.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-            if used_month + cost > self.monthly:
+            if self.monthly is not None and used_month + cost > self.monthly:
                 reset = (clock.replace(day=28, hour=0, minute=0, second=0, microsecond=0) + timedelta(days=4)).replace(day=1)
                 raise RPCBudgetExhausted(reset.timestamp())
-            if used_day + cost > self.daily: raise RPCBudgetExhausted(midnight.timestamp())
+            if self.daily is not None and used_day + cost > self.daily: raise RPCBudgetExhausted(midnight.timestamp())
             delay = max(0, (row[4] if row else 0) - now,
                         (row[5] if row and "sendTransaction" in methods else 0) - now)
             if delay > 0: return delay

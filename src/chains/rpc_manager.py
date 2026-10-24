@@ -125,8 +125,9 @@ class RPCManager:
         self._helius_budget = None
         if os.getenv("HELIUS_API_KEY") and any(self._is_helius(e) for e in self.endpoints):
             self._helius_budget = RPCBudget(os.getenv("MEMECOIN_RPC_BUDGET_DB", "data/state/rpc_budget.sqlite"),
-                os.environ["HELIUS_API_KEY"], rps=float(os.getenv("MEMECOIN_RPC_RPS", "5")),
-                daily=int(os.getenv("MEMECOIN_RPC_DAILY_UNITS", "25000")), monthly=int(os.getenv("MEMECOIN_RPC_MONTHLY_UNITS", "750000")))
+                os.environ["HELIUS_API_KEY"], rps=float(os.getenv("MEMECOIN_RPC_RPS", "10")),
+                daily=int(os.environ["MEMECOIN_RPC_DAILY_UNITS"]) if os.getenv("MEMECOIN_RPC_DAILY_UNITS") else None,
+                monthly=int(os.environ["MEMECOIN_RPC_MONTHLY_UNITS"]) if os.getenv("MEMECOIN_RPC_MONTHLY_UNITS") else None)
 
     @staticmethod
     def _is_helius(ep):
