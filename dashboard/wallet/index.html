@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Memecoin · wallet and paper research</title><link rel="stylesheet" href="/wallet/wallet.css">
+<script defer src="/wallet/wallet.js"></script></head>
+<body><main><p class="eyebrow">MEMECOIN / RESEARCH DESK</p>
+<h1>Wallet &amp; paper research</h1><p id="mode">Connecting to the research service…</p>
+<section><h2>Phantom wallet</h2><p>Connect your wallet and prove ownership with a message signature. Connecting grants no trading authority. Every transaction requires your approval in Phantom.</p>
+<div class="actions"><button id="connect">Connect Phantom</button><button id="disconnect">Disconnect</button></div>
+<p id="wallet">No wallet connected.</p><p id="notice" role="status"></p></section>
+<section><h2>Transaction approvals</h2><p>Only requests from the configured execution signer appear here. Review the full transaction in Phantom before approving.</p><div id="requests">No pending requests.</div></section>
+<section><h2>Prediction market paper experiment</h2><p>Polymarket and Kalshi · simulated cash · displayed order-book depth · fees included</p>
+<p id="experiment"></p><div class="scroll"><table><thead><tr><th>Account / strategy</th><th>Paper cash</th><th>Realized paper P&amp;L</th><th>Open positions</th></tr></thead><tbody id="accounts"></tbody></table></div>
+<p id="counts"></p><p>YES and NO controls measure the simulation baseline. A complete-set candidate is experimental. Paper fills are not real fills and do not prove a trading edge.</p><details><summary>Source availability</summary><pre id="errors"></pre></details></section>
+<footer>Use this page through localhost or an SSH tunnel. No seed phrase or private key is requested.</footer>
+</main></body></html>

@@ -28,6 +28,7 @@ Set-Location -LiteralPath $taskRepo
 $env:ALLOW_LIVE_TRADING = ''
 $env:SOLANA_PRIVATE_KEY = ''
 $env:MEMECOIN_SIGNER_SOCKET = ''
+$env:MEMECOIN_WALLET_MODE = ''
 $env:HEALTH_HOST = '127.0.0.1'
 $env:HEALTH_PORT = [string]$HealthPort
 $env:PYTHONUNBUFFERED = '1'

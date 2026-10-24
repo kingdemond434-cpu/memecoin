@@ -221,6 +221,11 @@ class SubsystemWiring:
         refusal the moment the desk has earned the right to trade and has
         nothing to sign with.
         """
+        if os.getenv("MEMECOIN_WALLET_MODE", "").strip() == "phantom":
+            from src.execution.phantom import PublicWallet
+            self.keypair = PublicWallet(os.environ["SOLANA_WALLET_ADDRESS"])
+            logger.info("Phantom public wallet configured; no signing key loaded")
+            return
         encoded = os.getenv("SOLANA_PRIVATE_KEY", "").strip()
         if not encoded:
             authorised = False

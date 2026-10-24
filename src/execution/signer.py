@@ -689,6 +689,11 @@ def signer_from_env(keypair: Any, socket_path: Optional[Path] = None
     desk to holding its own key, which is precisely the state isolation
     exists to leave.
     """
+    if os.getenv("MEMECOIN_WALLET_MODE", "").strip() == "phantom":
+        from src.execution.phantom import PhantomSignerClient
+        return PhantomSignerClient(
+            str(keypair.pubkey()), os.getenv("MEMECOIN_PHANTOM_URL", "http://127.0.0.1:18082"),
+            Path(os.environ["MEMECOIN_PHANTOM_TOKEN_FILE"]))
     configured = socket_path or os.getenv("MEMECOIN_SIGNER_SOCKET", "").strip()
     if configured:
         return SignerClient(Path(configured))
