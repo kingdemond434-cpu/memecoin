@@ -64,7 +64,7 @@ class OnionFrontierTransport(Transport):
         with self.lock, self.db:
             self._enqueue(urls, source_ref, observed_at)
 
-    def migrate(self, state):
+    def migrate(self, state, legacy_directory=None):
         """Retain legacy pending/admitted URLs, once, without rewriting its archive."""
         with self.lock, self.db:
             if self.db.execute("SELECT 1 FROM meta WHERE name='legacy_migrated'").fetchone():
@@ -72,6 +72,20 @@ class OnionFrontierTransport(Transport):
             for bucket in ("admitted", "pending"):
                 for entry in state.get(bucket, {}).values():
                     self._enqueue([entry["url"]], entry["source_ref"], entry["discovered_at"])
+                    if legacy_directory and entry.get('source_id'):
+                        saved_path = Path(legacy_directory) / (hashlib.sha256(entry['source_id'].encode()).hexdigest() + '.json')
+                        if saved_path.exists():
+                            from src.collectors.onion import OnionResearchTransport
+                            # Use the original strict loader, with no network
+                            # client, to retain old crawl pages and unacked
+                            # observations instead of abandoning their outbox.
+                            legacy = OnionResearchTransport(entry['source_id'], entry['url'], source_ref=entry['source_ref'],
+                                client=object(), max_pages=256, max_depth=8, state_path=saved_path)
+                            self._enqueue(legacy.pages, entry['source_ref'], entry['discovered_at'])
+                            for observation in legacy.pending:
+                                record = {**observation, 'crawl_depth': legacy.pages[observation['url']]}
+                                self.db.execute('INSERT OR IGNORE INTO outbox VALUES(?,?)',
+                                                (record['observation_id'], json.dumps(record, allow_nan=False)))
             self.db.execute("INSERT INTO meta VALUES('legacy_migrated',?)", (str(state.get("capacity_debt", 0)),))
 
     def acknowledge(self, observation_id, canonical_job_id):

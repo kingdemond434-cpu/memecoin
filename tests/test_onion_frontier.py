@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 
 import pytest
 
@@ -94,5 +95,27 @@ def test_access_challenge_is_deferred_without_claim_observation(tmp_path):
         assert frontier.report()['pages'] == 1
         assert frontier.report()['observed_pages'] == 0
         assert frontier.report()['deferred_pages'] == 1
+    finally:
+        run(frontier.stop())
+
+
+def test_unacknowledged_legacy_observation_is_imported_before_new_fetch(tmp_path):
+    from src.collectors.onion import OnionResearchTransport
+    source_id = 'onion:legacy'
+    state_path = tmp_path / (hashlib.sha256(source_id.encode()).hexdigest() + '.json')
+    old = OnionResearchTransport(source_id, URL, source_ref='frontier_job:legacy',
+        client=Pages(['<p>claimed launch</p><a href="/next">next</a>']), state_path=state_path)
+    pending = run(old.fetch())
+    frontier = OnionFrontierTransport(tmp_path / 'frontier.sqlite', client_factory=lambda _: pytest.fail('legacy outbox was skipped'))
+    try:
+        frontier.migrate({'admitted': {'old': {'source_id': source_id, 'url': URL,
+            'source_ref': 'frontier_job:legacy', 'discovered_at': 1}}}, tmp_path)
+        imported = run(frontier.fetch())[0]
+        assert imported['observation_id'] == pending[0]['observation_id']
+        assert imported['observed_at'] == pending[0]['observed_at']
+        assert frontier.report()['pages'] == 2
+        frontier.acknowledge(imported['observation_id'], 'canonical:recovered')
+        assert frontier.report()['pending_canonical_delivery'] == 0
+        assert state_path.exists()
     finally:
         run(frontier.stop())
