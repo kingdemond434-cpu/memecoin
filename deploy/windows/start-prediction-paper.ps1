@@ -11,6 +11,8 @@ $taskPython = [IO.Path]::GetFullPath($PythonExe)
 if (-not (Test-Path -LiteralPath (Join-Path $taskRepo 'src\runtime\market_gateway.py'))) { throw 'Paper release missing' }
 if (-not (Test-Path -LiteralPath $taskPython -PathType Leaf)) { throw 'Python runtime missing' }
 New-Item -ItemType Directory -Path $taskState -Force | Out-Null
+Add-Type -Path (Join-Path $PSScriptRoot 'ShadowProcessJob.cs')
+[MemecoinShadowProcessJob]::AttachCurrentProcess()
 Set-Location -LiteralPath $taskRepo
 $env:ALLOW_LIVE_TRADING = ''
 $env:SOLANA_PRIVATE_KEY = ''
