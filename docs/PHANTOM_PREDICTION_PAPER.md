@@ -109,10 +109,13 @@ adverse-execution analysis. These are separate from a claim of profitable MEV
 or universal Solana coverage. Phantom does not supply launch data or private
 order flow. Unsupported venues require their own adapters and validation.
 
-Run the sidecar with `deploy/windows/start-prediction-paper.ps1`. Keep code
-read-only to its task account and its private state writable. Restart policies
-and login dependencies must be verified on the VPS; an Interactive task cannot
-promise collection across Windows logout. Do not reuse production directories
+Run the sidecar with `deploy/windows/start-prediction-paper.ps1`. Its dedicated
+installer uses Windows LocalService, with no password, an AtStartup trigger,
+unlimited execution time and restart-on-failure. Code/runtime are read-only to
+that account and only its paper state is writable. This does not change the
+main desk's existing Interactive task. Restart policies and login dependencies
+must be verified on the VPS; an Interactive task cannot promise collection
+across Windows logout. Do not reuse production directories
 for software tests. Run the full suite with `tools/validate_checkout.py` in a
 new isolated checkout, with credentials removed.
 
