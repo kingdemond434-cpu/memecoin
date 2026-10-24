@@ -1,0 +1,34 @@
+schema_version: 1
+# Targets, not a claim that these domains are observed or executable.
+domains:
+  - launch_census
+  - prelaunch_footprints
+  - pool_migrations
+  - token_permissions
+  - liquidity_and_exit_capacity
+  - developer_and_funder_lineage
+  - wallet_cohorts
+  - exchange_listing_changes
+  - regional_market_activity
+  - influencer_attention
+  - public_political_statements
+  - macro_and_geopolitics
+  - culture_sports_and_weather
+  - community_growth
+  - public_insider_claims
+  - public_onion_claims
+  - execution_competition_and_mev
+  - prediction_market_rules_and_oracles
+  - source_authenticity_and_coordination
+  - independent_missed_opportunity_audits
+actor_classes: [developer, funder, wallet, influencer, public_figure, politician, exchange, community, anonymous_claimant]
+regions: [global, us, gb, eu, cn, kr, jp, cis, tr, mena, in, sea, africa, latam, br, vn, id]
+languages: [en, zh, ko, ja, ru, tr, ar, hi, id, vi, th, tl, es, pt, fr, de, it, pl, nl, sv]
+chains: [solana, ethereum, base, bsc, arbitrum, polygon, optimism, avalanche, sui, ton, tron]
+policy:
+  explore_slots_per_round: 2
+  total_proposals_per_round: 8
+  snapshot_fresh_seconds: 180
+  learned_changes_require: chronological_after_cost_validation_and_untouched_forward_evidence
+  missing_data_is_coverage_debt: true
+  live_authority: false

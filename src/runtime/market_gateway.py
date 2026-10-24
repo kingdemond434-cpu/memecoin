@@ -22,10 +22,12 @@ from src.research.prediction_markets import PaperBroker, PredictionPaperRunner
 from src.research.local_decisions import LocalDecisions
 from src.research.behavioral_forensics import PublicWalletResearch
 from src.research.market_robustness import cpcv_splits, reality_check
+from src.research.intelligence_coverage import IntelligenceCoverage
 
 ASSETS = Path(__file__).resolve().parents[2] / "dashboard" / "wallet"
 PAPER_TASK = web.AppKey("paper_task", asyncio.Task)
 FORENSICS_TASK = web.AppKey("forensics_task", asyncio.Task)
+COVERAGE_TASK = web.AppKey("coverage_task", asyncio.Task)
 
 
 def token_at(path: Path):
@@ -43,6 +45,7 @@ def token_at(path: Path):
 def make_app(broker, *, token, port=18082, bridge=None, start_runner=True):
     runner = PredictionPaperRunner(broker)
     forensics = PublicWalletResearch(broker)
+    coverage = IntelligenceCoverage(broker)
     runner.condition_hints = lambda: [row[0] for row in broker.db.execute(
         "SELECT json_extract(payload,'$.market') FROM public_trades WHERE at>? ORDER BY at DESC LIMIT 8", (time.time() - 300,))]
     bridge = bridge or PhantomBridge()
@@ -85,16 +88,19 @@ def make_app(broker, *, token, port=18082, bridge=None, start_runner=True):
     app = web.Application(middlewares=[boundary], client_max_size=16 * 1024)
 
     async def health(request):
-        task = app.get(PAPER_TASK)
-        healthy = not start_runner or task is not None and not task.done()
+        components = {name: not start_runner or app.get(key) is not None and not app[key].done()
+                      for name, key in (("paper", PAPER_TASK), ("wallet_research", FORENSICS_TASK), ("coverage", COVERAGE_TASK))}
+        healthy = all(components.values())
         return web.json_response({"status": "healthy" if healthy else "failed", "mode": "PAPER",
+                                  "components": components,
                                   "live_submission_locked": True, "uptime_seconds": time.time() - started_at},
                                  status=200 if healthy else 503)
 
     async def status(request):
         return web.json_response({"prediction_markets": runner.report(), "phantom": bridge.report(),
                                   "local_decisions": local_decisions.report(),
-                                  "public_wallet_research": forensics.report()})
+                                  "public_wallet_research": forensics.report(),
+                                  "global_coverage": coverage.report()})
 
     async def evaluate(request):
         data = await request.json()
@@ -172,10 +178,11 @@ def make_app(broker, *, token, port=18082, bridge=None, start_runner=True):
         if start_runner:
             app[PAPER_TASK] = asyncio.create_task(runner.run(), name="prediction-paper")
             app[FORENSICS_TASK] = asyncio.create_task(forensics.run(), name="public-wallet-forensics")
+            app[COVERAGE_TASK] = asyncio.create_task(coverage.run(), name="intelligence-coverage")
 
     async def cleanup(app):
         bridge.disconnect()
-        tasks = [app[key] for key in (PAPER_TASK, FORENSICS_TASK) if key in app]
+        tasks = [app[key] for key in (PAPER_TASK, FORENSICS_TASK, COVERAGE_TASK) if key in app]
         for task in tasks: task.cancel()
         if tasks: await asyncio.gather(*tasks, return_exceptions=True)
         broker.close()
