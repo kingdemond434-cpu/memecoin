@@ -76,6 +76,13 @@ class UnknownOpportunityEngine:
         self.last_proposal_round = {"status": "NOT_RUN", "authority": "none"}
         self.last_pass = {"status": "NOT_RUN", "authority": "none"}
         self.workflows = None
+        # One-time migration before work resumes. Import commits before the
+        # legacy map is retired, so interruption cannot lose retry identities.
+        legacy = self.framework.get_research_component('research_conversion_receipts')
+        if legacy and legacy.get('refs'):
+            self.frontier.retain_conversion_receipts(legacy['refs'])
+            self.framework.checkpoint_research_component('research_conversion_receipts',
+                {'storage': 'frontier.sqlite/conversion_receipts', 'migrated_refs': len(legacy['refs'])})
 
     def configure_workflows(self, workflows: Any) -> None:
         self.workflows = workflows
@@ -490,15 +497,13 @@ class UnknownOpportunityEngine:
         blocked = actual in {"BLOCKED", "DATA_BLOCKED"}
         disposition = "BLOCKED" if blocked else actual if actual in DISPOSITIONS else "DEEPENING_TASK"
         detail = result["detail"]
-        receipts = self.framework.get_research_component("research_conversion_receipts") or {"refs": {}}
         result_key = _digest([job["job_id"], result])
-        ref = receipts["refs"].get(result_key)
+        ref = self.frontier.conversion_receipt(result_key)
         if ref is None:
             ref = self._record("unknown_conversion_receipt", {"job_id": job["job_id"],
                 "input_ref": job["payload_ref"], "disposition": disposition,
                 "consumer_disposition": actual, "detail": detail, "authority": "none"}, now)
-            receipts["refs"][result_key] = ref
-            self.framework.checkpoint_research_component("research_conversion_receipts", receipts)
+            self.frontier.retain_conversion_receipts({result_key: ref})
         if job["kind"] == "GAUNTLET" and detail.get("status") in {"REJECTED", "HISTORICAL_SURVIVOR"}:
             receipt = detail["receipt"]
             hid, seal = receipt["candidate_id"], receipt["spec_hash"]
