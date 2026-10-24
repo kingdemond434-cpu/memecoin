@@ -40,6 +40,12 @@ and emitted text at 16,000 characters with an explicit truncation flag.
 Publication time is unknown unless separately established; an initial snapshot
 does not establish when its claims were first published.
 
+Both EVM and validated 32-byte Solana address mentions are retained in the
+canonical claim metadata. Solana mentions are not automatically assigned token
+roles: a public key can identify a wallet, mint, pool or program. Topic matching
+includes English, Chinese, Russian and Spanish phrases; these are labels over
+unverified text, not verified identities or independent signals.
+
 The adapter emits `SourceClass.WEB`, not `OFFICIAL`. The ordinary source-mesh
 consumer writes the original claim provenance to the canonical narrative work
 item. It does not grant actor independence, authenticity, a profitable strategy

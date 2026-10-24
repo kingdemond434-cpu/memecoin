@@ -41,3 +41,10 @@ single SQLite transaction, retaining the complete legacy data and leaving a
 small framework descriptor. See `docs/POPULATION_STATE.md` for migration,
 backup and rollback requirements. Availability must still be measured after
 deployment; this change does not establish trading performance.
+
+VPS validation on release `83bd3e2` passed 3,388 tests, with 106 skips and 14
+subtests passed, in a separate checkout. Linux CI additionally exercised the
+native extension: 3,485 tests passed, nine skipped and 14 subtests passed.
+These counts describe software checks, not earned shadow time or actual fills.
+See `docs/VPS_VALIDATION.md` for isolation and the retained recovery audit from
+the earlier interrupted shared-checkout run.
