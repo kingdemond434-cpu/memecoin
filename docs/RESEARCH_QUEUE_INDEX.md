@@ -22,3 +22,10 @@ Regressions bound SQLite VM work with 12,000 archived tagged jobs and with
 12,000 unrelated active jobs. Migration, pricing, hibernation, wake, lease,
 acknowledgement and transaction rollback are checked against retained work.
 This is a scheduling and availability fix, not an alpha-performance claim.
+
+Queue reporting uses a compact covering index for counts, time-window arrivals
+and drains, and unknown-cost work. One aggregation replaces repeated scans of
+the large payload table. Sparse indexes retain measured delay values and the
+oldest positive-priority work. Zero delay remains a measured zero; missing
+delay remains unknown, including for hibernated work. Completed work remains
+in the history and arrival/drain windows keep their closed boundaries.

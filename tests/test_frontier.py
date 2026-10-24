@@ -377,6 +377,30 @@ def test_measured_delay_value_is_reported_without_filling_other_values(tmp_path)
     assert report["oldest_high_value_age_seconds"] == 100
 
 
+def test_reporting_preserves_closed_windows_archives_future_and_hibernated_unknowns(tmp_path):
+    index = FrontierIndex(tmp_path / "report.sqlite")
+    archived = index.enqueue("lab", "lake:archived", auction=priced(delay_value_per_second=.1), now=100)
+    lease = index.lease_jobs("worker", lease_seconds=200, limit=1, now=101)[0]
+    index.ack(archived, "worker", lease["lease_token"], disposition="NEGATIVE_KNOWLEDGE", evidence_refs=["lake:receipt"], now=175)
+    index.enqueue("request", "lake:unknown-cost", now=150)
+    index.enqueue("lab", "lake:measured-zero", auction=priced(delay_value_per_second=0), now=200)
+    index.enqueue("lab", "lake:future", auction=priced(delay_value_per_second=.002), now=201)
+    hibernated = index.enqueue("lab", "lake:hibernated", auction=priced(delay_value_per_second=.003), now=160)
+    index.hibernate_job(hibernated, enabling_change="new-data", reason="test", now=190)
+    index.enqueue("lab", "lake:old-uncalibrated-delay", auction=priced(), now=149)
+    report = index.report(now=200, window_seconds=50)
+    assert report["arrivals"] == 3 and report["drained"] == 1
+    assert report["pending"] == 5 and report["cost_blocked"] == 1
+    assert report["queue_states"] == {"ACKED": 1, "HIBERNATED": 1, "READY": 4}
+    assert report["oldest_pending_age_seconds"] == 51
+    assert report["oldest_high_value_age_seconds"] == 51
+    assert report["cost_of_delay"] == pytest.approx(.12)
+    assert report["cost_of_delay_measured_jobs"] == 3
+    assert report["cost_of_delay_unmeasured_jobs"] == 2
+    assert sum(row["count"] for row in report["by_kind"]) == 6
+    index.close()
+
+
 def test_stable_id_collision_rolls_back_without_orphan_coordinate(tmp_path):
     index = FrontierIndex(tmp_path / "index.sqlite")
     index.enqueue("lab", "lake:one", job_id="fixed", axes={"chain": "x"})
