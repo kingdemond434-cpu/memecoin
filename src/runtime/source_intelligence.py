@@ -187,7 +187,7 @@ class SourceIntelligence:
         if getattr(transport, "kind", None) in {"onion", "onion_directory"}:
             payload["public_source_evidence"] = {key: metadata.get(key) for key in (
                 "url", "source_ref", "content_hash", "publication_time_known", "published_at",
-                "observation_kind", "claim_status", "claim_topics", "evm_address_mentions",
+                "observation_kind", "claim_status", "claim_topics", "evm_address_mentions", "solana_address_mentions",
                 "address_role_status", "text_truncated", "onion_observation_id")}
         job_id = self._enqueue_population_work("NARRATIVE_OBSERVATION", payload,
             evidence_refs=metadata.get("evidence_refs") or (), now=event.observed_at)

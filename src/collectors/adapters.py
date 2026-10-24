@@ -18,6 +18,7 @@ resolver requires it: a candidate mint is one step from a purchase, and any
 """
 
 import logging
+from dataclasses import replace
 import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence
@@ -256,7 +257,7 @@ def onion_source(source_id: str, fetch) -> CallableSource:
         if not text:
             return None
         observed = float(record["observed_at"])
-        return normalise(source_id, SourceClass.WEB, text,
+        event = normalise(source_id, SourceClass.WEB, text,
             source_at=observed, observed_at=observed,
             metadata={"url": record["url"], "source_ref": record["source_ref"],
                 "content_hash": record["content_hash"],
@@ -266,15 +267,19 @@ def onion_source(source_id: str, fetch) -> CallableSource:
                 "observation_kind": record["observation_kind"],
                 "transport": "tor_socks5_remote_dns", "claim_status": "UNVERIFIED",
                 "claim_topics": [topic for topic, pattern in (
-                    ("launch", r"\b(?:launch|presale|fairlaunch|mint)\b"),
-                    ("wallet", r"\b(?:wallet|whale|deployer|funder)\b"),
-                    ("claimed_insider", r"\b(?:insider|dev|developer|alpha|early)\b"),
-                    ("claimed_coordination", r"\b(?:pump|coordinated|group|signal)\b"))
+                    ("launch", r"\b(?:launch|presale|fairlaunch|mint|preventa|lanzamiento|запуск|пресейл)\b|预售|發行|发行"),
+                    ("wallet", r"\b(?:wallet|whale|deployer|funder|billetera|ballena|кошел[её]к|кит)\b|钱包|錢包|巨鲸|巨鯨"),
+                    ("claimed_insider", r"\b(?:insider|dev|developer|alpha|early|инсайд\w*)\b|内幕|內幕|内部消息|內部消息"),
+                    ("claimed_coordination", r"\b(?:pump|coordinated|group|signal|памп|сигнал)\b|拉盘|拉盤|喊单|喊單"))
                     if re.search(pattern, text, re.IGNORECASE)],
                 "evm_address_mentions": sorted(set(re.findall(r"\b0x[0-9a-fA-F]{40}\b", text))),
+                "solana_address_mentions": sorted(set(extract_mints(text))),
                 "address_role_status": "UNVERIFIED_MENTIONS_NOT_WALLET_OR_MINT_CLASSIFICATIONS",
                 "execution_authority": False,
                 "discovered_onion_links": record.get("discovered_onion_links", [])})
+        # A valid public key may name a wallet, mint, program or pool. Preserve
+        # the mention without asserting a token identity from source prose.
+        return replace(event, token_addresses=())
     return CallableSource(source_id, SourceClass.WEB, fetch, to_event)
 
 

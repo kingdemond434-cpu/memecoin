@@ -162,6 +162,27 @@ def test_adapter_preserves_unverified_claims_without_official_authenticity():
     assert event.metadata["execution_authority"] is False
 
 
+def test_multilingual_claims_preserve_wallet_mentions_without_claiming_token_roles():
+    from types import SimpleNamespace
+    from src.runtime.source_intelligence import SourceIntelligence
+    address = "So11111111111111111111111111111111111111112"
+    body = f"<p>内幕 预售 钱包 拉盘 {address} and 0x{'a' * 40}</p>"
+    transport = OnionResearchTransport("onion:forum", URL, source_ref="public-origin", client=Pages([body]))
+    event = asyncio.run(onion_source("onion:forum", transport).collect())[0]
+    assert event.metadata["claim_topics"] == ["launch", "wallet", "claimed_insider", "claimed_coordination"]
+    assert event.metadata["solana_address_mentions"] == [address]
+    assert event.token_addresses == ()
+    captured = []
+    def enqueue(kind, payload, **kwargs):
+        captured.append(payload)
+        return "retained-job"
+    desk = SimpleNamespace(transports={event.source_id: transport}, _enqueue_population_work=enqueue)
+    SourceIntelligence._record_population_narrative(desk, event)
+    assert captured[0]["token_id"] is None
+    assert captured[0]["public_source_evidence"]["solana_address_mentions"] == [address]
+    assert captured[0]["public_source_evidence"]["evm_address_mentions"] == ["0x" + "a" * 40]
+
+
 def test_registry_reports_missing_proxy_and_dread_endpoint_honestly(monkeypatch):
     monkeypatch.delenv("MEMECOIN_TOR_PROXY_URL", raising=False)
     declaration = SourceDeclaration("onion:test", "onion", options={"url": URL, "source_ref": "public-origin"})
