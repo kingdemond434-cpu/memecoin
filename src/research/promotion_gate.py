@@ -412,7 +412,17 @@ class PromotionLedger:
         self._stage_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self._stage_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(payload), encoding="utf-8")
-        temporary.replace(self._stage_path)
+        # Windows scanners/readers can briefly deny rename access after a
+        # closed read. Keep the old authoritative file intact while retrying
+        # the same atomic replacement; persistent denial still fails closed.
+        for attempt in range(5):
+            try:
+                temporary.replace(self._stage_path)
+                return
+            except PermissionError as exc:
+                if getattr(exc, "winerror", None) not in {5, 32, 33} or attempt == 4:
+                    raise
+                time.sleep(.01 * 2 ** attempt)
 
     def submit(self, evidence: Evidence,
                criteria: Optional[PromotionCriteria] = None) -> Verdict:

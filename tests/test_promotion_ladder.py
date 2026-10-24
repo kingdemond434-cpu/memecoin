@@ -12,6 +12,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from src.research.promotion_gate import (
     DEFAULT_CRITERIA, STAGE_ORDER, Evidence, PromotionLedger, Stage)
@@ -107,6 +108,38 @@ class ItStartsUnauthorisedAndStaysThatWay(_Fixture):
 
 
 class ItAdvancesExactlyOneStagePerPass(_Fixture):
+
+    def test_transient_windows_replace_denial_retries_the_same_atomic_write(self):
+        original = Path.replace
+        denied = PermissionError("temporary Windows sharing violation")
+        denied.winerror = 32
+        attempts = []
+        def replace(path, target):
+            attempts.append((path, target))
+            if len(attempts) < 3: raise denied
+            return original(path, target)
+        with patch.object(Path, "replace", replace), patch("src.research.promotion_gate.time.sleep") as pause:
+            self.ledger.submit(self._passing(Stage.HISTORICAL))
+        self.assertEqual(3, len(attempts))
+        self.assertEqual(1, len(set(attempts)))
+        self.assertEqual(2, pause.call_count)
+        self.assertIs(Stage.CHRONOLOGICAL_OOS, self.ledger.current_stage())
+
+    def test_persistent_windows_replace_denial_keeps_original_authority(self):
+        self.ledger._write_stage(Stage.HISTORICAL, "fixture")
+        before = self.ledger._stage_path.read_bytes()
+        denied = PermissionError("persistent denial")
+        denied.winerror = 5
+        with patch.object(Path, "replace", side_effect=denied) as replace, patch("src.research.promotion_gate.time.sleep"):
+            with self.assertRaises(PermissionError): self.ledger.submit(self._passing(Stage.HISTORICAL))
+        self.assertEqual(5, replace.call_count)
+        self.assertEqual(before, self.ledger._stage_path.read_bytes())
+        self.assertFalse(self.ledger.authorises_live_capital()[0])
+
+    def test_unrelated_permission_error_is_not_retried(self):
+        with patch.object(Path, "replace", side_effect=PermissionError("denied")) as replace:
+            with self.assertRaises(PermissionError): self.ledger.submit(self._passing(Stage.HISTORICAL))
+        self.assertEqual(1, replace.call_count)
 
     def test_a_pass_advances_one_stage(self):
         start = self.ledger.current_stage()

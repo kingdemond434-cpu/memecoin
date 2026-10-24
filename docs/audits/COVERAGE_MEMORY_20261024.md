@@ -31,6 +31,10 @@ no signer, live authority, executable strategy scheduler or promotion path.
   unmeasured. Missing labels are never recorded as economic failures.
 - The paired operator page displays coverage freshness, proposals and memory
   measurements. Health fails if paper, wallet-research or coverage workers die.
+- A Windows suite exposed a transient access-denied error during atomic
+  promotion-state replacement. The same write retries up to five times only
+  for Windows sharing/access error codes. Persistent denial raises and leaves
+  the previous authoritative file intact. Promotion criteria are unchanged.
 
 ## Requirements that software alone cannot complete
 
