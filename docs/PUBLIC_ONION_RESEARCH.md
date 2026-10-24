@@ -60,7 +60,7 @@ market execution.
 
 HTTP failures, unsupported documents, access challenges, missing proxy and
 invalid checkpoints are explicit failures. A name in a configuration file does
-not count as an observed source. `/status` includes `research.onion_research`
+not count as an observed source. `/status` includes `wallet_follow.research.onion_research`
 and per-transport coverage, candidate links and pending delivery counts.
 
 ## Configuration
