@@ -14628,12 +14628,24 @@ class TestSourceMeshStreams(unittest.IsolatedAsyncioTestCase):
 
     async def test_each_source_keeps_its_own_cadence(self):
         """A chat channel and a daily regulatory feed do not share a clock."""
-        brisk = self._Fake("brisk", [], interval=0.01)
+        third_poll = asyncio.Event()
+        class Observed(self._Fake):
+            async def poll(self):
+                result = await super().poll()
+                if self.polls >= 3:
+                    third_poll.set()
+                return result
+        brisk = Observed("brisk", [], interval=0.01)
         languid = self._Fake("languid", [], interval=5.0)
         mesh = SourceMesh([brisk, languid])
         await mesh.start()
-        await asyncio.sleep(0.1)
-        await mesh.stop()
+        try:
+            # Test independent scheduling, not the busy host's ability to
+            # deliver three timer wakeups inside a 100 ms observation window.
+            # The deadline is still shorter than the slow source's cadence.
+            await asyncio.wait_for(third_poll.wait(), timeout=2.0)
+        finally:
+            await mesh.stop()
         self.assertGreater(brisk.polls, 2)
         self.assertLessEqual(languid.polls, 1)
 
