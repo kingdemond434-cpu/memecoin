@@ -45,7 +45,7 @@ SOURCE_FILES = ("tools/prove_unknown_engine.py", "src/research/unknown_engine.py
     "src/collectors/transports.py", "src/collectors/registry.py",
     "src/chains/evm_events.py", "src/chains/evm_observation.py", "src/research/chain_opportunity.py",
     "src/research/data_requests.py", "src/research/research_workflows.py", "src/research/mechanism_labs.py",
-    "src/research/machine_search.py", "src/research/population_hunter.py", "src/research/research_validation.py",
+    "src/research/machine_search.py", "src/research/population_hunter.py", "src/research/population_index.py", "src/research/research_validation.py",
     "src/research/native_forward.py", "src/runtime/source_intelligence.py", "src/research/data_miners.py")
 
 REQUIREMENTS = (

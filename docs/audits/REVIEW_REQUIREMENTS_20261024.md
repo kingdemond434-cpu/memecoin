@@ -33,3 +33,11 @@ job lease query. This change drives auctions from indexed active costed jobs,
 keeps archived work/evidence intact, skips an unnecessary priority scan when a
 floor already fills the pass, and bounds due-kind existence checks. A regression
 test imposes a SQLite work budget with 12,000 retained tagged jobs.
+
+The VPS subsequently showed another main-loop stall in framework state writes.
+The population component had grown to roughly 75 MB of the 80 MB checkpoint.
+Population observations and replay receipts now commit incrementally in a
+single SQLite transaction, retaining the complete legacy data and leaving a
+small framework descriptor. See `docs/POPULATION_STATE.md` for migration,
+backup and rollback requirements. Availability must still be measured after
+deployment; this change does not establish trading performance.
