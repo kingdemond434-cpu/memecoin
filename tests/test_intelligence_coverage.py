@@ -196,7 +196,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
              patch("src.runtime.market_gateway.PublicWalletResearch.run", worker), \
              patch("src.runtime.market_gateway.IntelligenceCoverage.run", worker):
             broker = PaperBroker(Path(temp) / "paper.sqlite")
-            app = make_app(broker, token="a" * 32)
+            app = make_app(broker, token="a" * 32, prediction_scope='legacy-paper')
             async with TestClient(TestServer(app)) as client:
                 app[COVERAGE_TASK].cancel()
                 await asyncio.gather(app[COVERAGE_TASK], return_exceptions=True)

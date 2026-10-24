@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional, Set
 from urllib.parse import urlsplit
+from src.chains.rpc_budget import RPCBudget, RPCBudgetExhausted
 
 import aiohttp
 import yaml
@@ -22,7 +23,7 @@ def _host_of(url: str) -> str:
     """The host, for logs. Provider URLs carry the API key in the path or the
     query string, so the whole URL must never reach a log line."""
     try:
-        return urlsplit(url).netloc or "unknown-host"
+        return urlsplit(url).hostname or "unknown-host"
     except ValueError:
         return "unknown-host"
 
@@ -121,6 +122,19 @@ class RPCManager:
         self._health_check_task: Optional[asyncio.Task] = None
         self._request_semaphore = loop_local_semaphore(
             max_concurrent_total, "rpc_manager.requests")
+        self._helius_budget = None
+        if os.getenv("HELIUS_API_KEY") and any(self._is_helius(e) for e in self.endpoints):
+            self._helius_budget = RPCBudget(os.getenv("MEMECOIN_RPC_BUDGET_DB", "data/state/rpc_budget.sqlite"),
+                os.environ["HELIUS_API_KEY"], rps=float(os.getenv("MEMECOIN_RPC_RPS", "5")),
+                daily=int(os.getenv("MEMECOIN_RPC_DAILY_UNITS", "25000")), monthly=int(os.getenv("MEMECOIN_RPC_MONTHLY_UNITS", "750000")))
+
+    @staticmethod
+    def _is_helius(ep):
+        return urlsplit(ep.endpoint.url).hostname in {"mainnet.helius-rpc.com", "devnet.helius-rpc.com"}
+
+    async def _allocate(self, ep, methods):
+        if self._helius_budget is not None and self._is_helius(ep):
+            await self._helius_budget.acquire(methods)
 
     def _session_for_loop(self):
         """This loop's aiohttp session, created on first use by that loop.
@@ -226,6 +240,9 @@ class RPCManager:
         self._loopless_session = None
         if self._session and not self._session.closed:
             await self._session.close()
+        if self._helius_budget is not None:
+            self._helius_budget.close()
+            self._helius_budget = None
 
     async def _initial_health_check(self):
         await asyncio.gather(*[self._check_endpoint(e) for e in self.endpoints])
@@ -236,9 +253,11 @@ class RPCManager:
             await asyncio.gather(*[self._check_endpoint(e) for e in self.endpoints])
 
     async def _check_endpoint(self, ep: EndpointHealth):
+        if ep.cooldown_until > time.time(): return
         start = time.time()
         method, params = self._health_probe()
         try:
+            await self._allocate(ep, [method])
             async with self.session.post(
                 ep.endpoint.url,
                 json={"jsonrpc": "2.0", "method": method, "params": params, "id": 1},
@@ -272,6 +291,9 @@ class RPCManager:
                                _host_of(ep.endpoint.url), resp.status)
                 ep.last_check = time.time()
                 return
+        except RPCBudgetExhausted as exc:
+            ep.cooldown_until = exc.retry_at
+            return
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
             logger.debug("RPC health probe failed for %s", _host_of(ep.endpoint.url))
         self._penalise(ep, 0)
@@ -329,19 +351,9 @@ class RPCManager:
                       if e.health != RPCHealth.DOWN and e.cooldown_until <= now
                       and not (method and method in e.blocked_methods)]
         if not candidates:
-            # Everything is either down or cooling. Prefer the endpoint whose
-            # cooldown expires soonest over failing the call outright: a stale
-            # answer beats no answer for enrichment, and the caller still sees
-            # the refusal if that endpoint is still rate limited.
-            waiting = [e for e in self.endpoints
-                       if e.health != RPCHealth.DOWN
-                       and not (method and method in e.blocked_methods)]
-            if not waiting:
-                # Every endpoint that could serve this method is down or has
-                # carved it out. Returning one that answers 403 forever would
-                # dress a permanent refusal as a transient failure.
-                return None
-            candidates = [min(waiting, key=lambda e: e.cooldown_until)]
+            # Retry-After is an actual refusal window, including when every
+            # provider is cooling. Never turn it into another immediate call.
+            return None
         if prefer_ws:
             candidates = [e for e in candidates if e.endpoint.ws_url]
         if not candidates:
@@ -361,8 +373,9 @@ class RPCManager:
                 ep = self._select_endpoint(method=method)
                 if not ep:
                     raise RuntimeError(
-                        f"No healthy RPC endpoint serves {method}")
+                        f"No healthy RPC endpoint serves {method}" + (f"; last: {last_refusal}" if last_refusal else ""))
                 try:
+                    await self._allocate(ep, [method])
                     async with self.session.post(
                         ep.endpoint.url,
                         json={"jsonrpc": "2.0", "method": method, "params": params, "id": 1},
@@ -416,11 +429,15 @@ class RPCManager:
                         continue
                 except RPCError:
                     raise
+                except RPCBudgetExhausted as exc:
+                    ep.cooldown_until = exc.retry_at
+                    last_refusal = "configured RPC allocation exhausted"
+                    continue
                 except Exception as e:
                     self._penalise(ep, 0)
-                    last_refusal = f"{_host_of(ep.endpoint.url)} {type(e).__name__}: {e}"
+                    last_refusal = f"{_host_of(ep.endpoint.url)} {type(e).__name__}"
                     if attempt == 2:
-                        raise
+                        raise RPCError(last_refusal) from None
                     await asyncio.sleep(0.1 * (attempt + 1))
             raise RuntimeError(
                 f"All RPC endpoints failed for {method}"
@@ -438,10 +455,18 @@ class RPCManager:
         Missing ids come back as None so the caller sees a hole instead of a
         shifted list.
         """
+        if self._helius_budget is not None:
+            chunk = 1 if any(r.get('method') == 'sendTransaction' for r in requests) else max(1, int(self._helius_budget.rps))
+            if len(requests) > chunk:
+                results = []
+                for offset in range(0, len(requests), chunk):
+                    results.extend(await self.batch_request(requests[offset:offset+chunk]))
+                return results
         async with self._request_semaphore:
             ep = self._select_endpoint()
             if not ep:
                 raise RuntimeError("No healthy RPC endpoints")
+            await self._allocate(ep, [r["method"] for r in requests])
             async with self.session.post(
                 ep.endpoint.url,
                 json=requests,
@@ -474,6 +499,8 @@ class RPCManager:
             raise RuntimeError("No usable RPC endpoints")
 
         async def submit(item: EndpointHealth):
+            if item.cooldown_until > time.time(): return None
+            await self._allocate(item, [method])
             async with self.session.post(
                 item.endpoint.url,
                 json={"jsonrpc": "2.0", "method": method, "params": params, "id": 1},
@@ -515,6 +542,7 @@ class RPCManager:
     def get_stats(self) -> Dict[str, Any]:
         return {
             "chain": self.chain_config.name,
+            "provider_budget": self._helius_budget.report() if self._helius_budget is not None else None,
             "endpoints": [
                 {
                     # Provider keys commonly live in the query string or final
@@ -523,6 +551,8 @@ class RPCManager:
                     # path/query/fragment data.
                     "url": self._safe_endpoint_origin(e.endpoint.url),
                     "health": e.health.value,
+                    "available": e.health != RPCHealth.DOWN and e.cooldown_until <= time.time(),
+                    "cooldown_until": e.cooldown_until,
                     "latency_ms": round(e.latency_ms, 2),
                     "success": e.success_count,
                     "errors": e.error_count,

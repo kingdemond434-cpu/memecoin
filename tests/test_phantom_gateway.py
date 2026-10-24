@@ -113,7 +113,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.token = token_at(Path(self.temp.name) / "gateway.token")
         broker = PaperBroker(Path(self.temp.name) / "paper.sqlite")
-        self.client = TestClient(TestServer(make_app(broker, token=self.token, start_runner=False)))
+        self.client = TestClient(TestServer(make_app(broker, token=self.token, start_runner=False, prediction_scope='legacy-paper')))
         await self.client.start_server()
         self.headers = {"Host": "127.0.0.1:18082"}
 
