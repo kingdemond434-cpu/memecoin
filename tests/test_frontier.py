@@ -1,6 +1,7 @@
 """The research index preserves unknowns, work and authority across restarts."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import sqlite3
 
 import pytest
@@ -17,6 +18,39 @@ def priced(value=1.0, cost=1.0, **kwargs):
         coverage_debt=2, urgency=1,
         costs={"inference": cost, "data": 0, "engineering": 0,
                "conversion": 0, "gauntlet": 0}, **kwargs)
+
+
+def test_exploration_lease_does_not_scan_retained_tag_history(tmp_path, monkeypatch):
+    index = FrontierIndex(tmp_path / "retained.sqlite", exploration_floors={"history": .5})
+    active = index.enqueue("DATA_REQUEST", "lake:active", auction=priced(),
+                           exploration_tags=["history"], now=100)
+    with index._db() as db:
+        template = dict(db.execute("SELECT * FROM jobs WHERE job_id=?", (active,)).fetchone())
+        columns = list(template)
+        rows = []
+        for number in range(12000):
+            row = {**template, "job_id": "retained:" + str(number), "state": "ACKED"}
+            rows.append(tuple(row[column] for column in columns))
+        db.executemany("INSERT INTO jobs (" + ",".join(columns) + ") VALUES (" +
+                       ",".join("?" for _ in columns) + ")", rows)
+        db.executemany("INSERT INTO job_tags VALUES (?,?)", ((row[0], "history") for row in rows))
+    real_db = index._db
+    operations = [0]
+
+    @contextmanager
+    def bounded_db():
+        with real_db() as db:
+            def progress():
+                operations[0] += 100
+                return int(operations[0] > 15000)
+            db.set_progress_handler(progress, 100)
+            yield db
+
+    monkeypatch.setattr(index, "_db", bounded_db)
+    leased = index.lease_jobs("worker", kinds=["DATA_REQUEST"], limit=1, now=101)
+    assert [row["job_id"] for row in leased] == [active]
+    assert operations[0] < 15000
+    index.close()
 
 
 def test_reference_index_uses_full_durability_wal_and_writer_can_commit_during_reader(tmp_path):

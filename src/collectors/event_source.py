@@ -286,9 +286,18 @@ class SourceMesh:
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=self.max_queue)
         self._producers: List[asyncio.Task] = []
         self._running = False
+        self._owner_loop = None
 
     def add(self, source: EventSource) -> None:
+        if any(existing.source_id == source.source_id for existing in self.sources):
+            return
         self.sources.append(source)
+        if self._running and self._owner_loop is not None:
+            def start_added_source():
+                name = "source:" + source.source_id
+                if self._running and not any(task.get_name() == name for task in self._producers):
+                    self._producers.append(asyncio.create_task(self._producer(source), name=name))
+            self._owner_loop.call_soon_threadsafe(start_added_source)
 
     def _expire(self, now: float) -> None:
         stale = [key for key, (first_at, _) in self._seen.items()
@@ -324,6 +333,12 @@ class SourceMesh:
         source is appended to the original's list and only the event itself
         is suppressed.
         """
+        metadata = getattr(event, "metadata", None) or {}
+        if metadata.get("onion_observation_id") or metadata.get("onion_directory_observation_id"):
+            # This source has a durable outbox and a canonical queue ACK.
+            # Suppressing redelivery here could strand a snapshot that the
+            # research engine never accepted. Its stable ID is deduped there.
+            return True
         key = event.content_hash
         if key in self._seen:
             self._seen[key][1].append(event.source_id)
@@ -372,8 +387,9 @@ class SourceMesh:
         """Spawn one persistent producer per source. Returns how many started."""
         if self._running:
             return len(self._producers)
+        self._owner_loop = asyncio.get_running_loop()
         self._running = True
-        self._producers = [asyncio.create_task(self._producer(source))
+        self._producers = [asyncio.create_task(self._producer(source), name="source:" + source.source_id)
                            for source in self.sources]
         return len(self._producers)
 

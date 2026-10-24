@@ -1,0 +1,26 @@
+# Explicit overlay: docker compose -f docker-compose.yml -f docker-compose.tor.yml up -d --build
+# The SOCKS listener is reachable only inside this deployment; no host port.
+services:
+  tor:
+    build: ./deploy/tor
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    logging:
+      driver: json-file
+      options: {max-size: 5m, max-file: "2"}
+  desk:
+    depends_on:
+      tor:
+        condition: service_started
+    environment:
+      MEMECOIN_TOR_PROXY_URL: socks5://tor:9050

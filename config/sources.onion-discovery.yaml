@@ -1,0 +1,18 @@
+sources:
+  - id: onion-directory:dread-public-announcements
+    kind: onion_directory
+    region: global
+    tier: 3
+    poll_interval_seconds: 3600
+    poll_timeout_seconds: 20
+    options:
+      url: https://www.reddit.com/r/DreadAlert/
+  - id: onion-directory:dread-public-archive-claims
+    kind: onion_directory
+    region: global
+    tier: 3
+    poll_interval_seconds: 21600
+    poll_timeout_seconds: 20
+    options:
+      # Historical public link claims, not a current operator identity proof.
+      url: https://www.reddit.com/r/DreadAlert/comments/11k6y39/march_6th_dread_we_are_back/

@@ -67,6 +67,27 @@ DEFAULT_MIN_BIN_SAMPLES = 10
 DEFAULT_ECE_THRESHOLD = 0.05
 
 
+def binomial_interval(successes: int, samples: int) -> Optional[List[float]]:
+    """95% Wilson interval under independent Bernoulli observations.
+
+    Zero observed winners is not a proven zero probability. Dependence and
+    distribution shift require separate cohort/forward validation; this
+    descriptive interval grants no promotion authority.
+    """
+    if (type(samples) is not int or type(successes) is not int
+            or not 0 <= successes <= samples):
+        raise ValueError("valid integer event and observation counts required")
+    if not samples:
+        return None
+    z2 = 1.959963984540054 ** 2
+    probability = successes / samples
+    denominator = 1 + z2 / samples
+    center = (probability + z2 / (2 * samples)) / denominator
+    radius = math.sqrt(z2 * (probability * (1 - probability) / samples +
+                             z2 / (4 * samples * samples))) / denominator
+    return [max(0., center - radius), min(1., center + radius)]
+
+
 class Provenance(Enum):
     """Where a prediction/outcome pair came from.
 
@@ -134,6 +155,7 @@ class Bin:
             "gap": (round(self.gap, 4) if self.gap is not None else None),
             # A bin this thin is shown but must not be reasoned from.
             "thin": self.count < min_bin_samples,
+            "observed_rate_interval_95": binomial_interval(int(self.observed_sum), self.count),
         }
 
 
@@ -274,6 +296,10 @@ class ModelCalibration:
                 self.by_provenance.get(Provenance.FORWARD_REAL.value, 0)),
             "min_samples": self.min_samples,
             "brier": (round(self.brier, 5) if self.brier is not None else None),
+            "positive_events": int(sum(bucket.observed_sum for bucket in self.bins)),
+            "observed_rate_interval_95": binomial_interval(
+                int(sum(bucket.observed_sum for bucket in self.bins)), self.count),
+            "interval_assumption": "INDEPENDENT_BERNOULLI_DESCRIPTIVE_ONLY",
             "expected_calibration_error": (round(ece, 5) if ece is not None else None),
             "ece_threshold": self.ece_threshold,
             "understates_risk_by": (round(direction["understated"], 5)
