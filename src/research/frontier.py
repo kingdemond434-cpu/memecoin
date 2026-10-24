@@ -295,10 +295,20 @@ class FrontierIndex:
                 # Derived queue only: old jobs/tags remain the source of truth.
                 # Backfill and its completion marker commit in one transaction;
                 # triggers keep every later transition in that same transaction.
-                db.execute("DELETE FROM active_job_tags")
-                db.execute("INSERT INTO active_job_tags SELECT t.tag,j.job_id,j.cost_unit,j.kind,j.created_at "
-                           "FROM jobs j JOIN job_tags t ON t.job_id=j.job_id "
-                           "WHERE j.total_cost IS NOT NULL AND j.state IN ('READY','RETRY','LEASED')")
+                cache_size = db.execute("PRAGMA cache_size").fetchone()[0]
+                try:
+                    # Read the large legacy job table sequentially. Following
+                    # its state index caused random reads across an 800 MB VPS
+                    # file. A fixed 128 MiB cache holds tag/index working pages
+                    # for this one migration, then returns to the prior bound.
+                    db.execute("PRAGMA cache_size=-131072")
+                    db.execute("DELETE FROM active_job_tags")
+                    db.execute("INSERT INTO active_job_tags SELECT t.tag,j.job_id,j.cost_unit,j.kind,j.created_at "
+                               "FROM jobs j NOT INDEXED CROSS JOIN job_tags t "
+                               "WHERE t.job_id=j.job_id AND j.total_cost IS NOT NULL "
+                               "AND j.state IN ('READY','RETRY','LEASED')")
+                finally:
+                    db.execute(f"PRAGMA cache_size={int(cache_size)}")
                 db.execute("INSERT OR REPLACE INTO metadata VALUES('active_job_tags_v1','1')")
             # Keep WAL open across short transactions. Closing the last
             # connection after every event would checkpoint/delete it again,
