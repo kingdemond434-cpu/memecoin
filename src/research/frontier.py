@@ -240,6 +240,12 @@ class FrontierIndex:
                     WHERE total_cost IS NOT NULL AND state IN ('READY','RETRY','LEASED');
                 CREATE INDEX IF NOT EXISTS jobs_active_priority ON jobs(cost_unit,priority DESC,created_at,job_id)
                     WHERE total_cost IS NOT NULL AND state IN ('READY','RETRY','LEASED');
+                CREATE INDEX IF NOT EXISTS jobs_reporting ON jobs(state,kind,created_at,completed_at,priority,total_cost);
+                CREATE INDEX IF NOT EXISTS jobs_high_value_created ON jobs(created_at,job_id)
+                    WHERE state!='ACKED' AND priority>0;
+                CREATE INDEX IF NOT EXISTS jobs_measured_delay
+                    ON jobs(state,created_at,json_extract(auction,'$.delay_value_per_second'))
+                    WHERE json_extract(auction,'$.delay_value_per_second') IS NOT NULL;
                 CREATE TABLE IF NOT EXISTS active_job_tags(
                     tag TEXT NOT NULL, job_id TEXT NOT NULL, cost_unit TEXT NOT NULL,
                     kind TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY(tag,job_id));
@@ -922,26 +928,35 @@ class FrontierIndex:
         if window <= 0:
             raise ValueError("window_seconds must be positive")
         with self._db() as db:
-            counts = {r[0]: r[1] for r in db.execute("SELECT state,COUNT(*) FROM jobs GROUP BY state")}
+            # One pass over a compact covering index, rather than repeated
+            # scans of the growing job table and its large evidence/JSON rows.
+            groups = [dict(row) for row in db.execute(
+                "SELECT kind,state,COUNT(*) AS count,MIN(created_at) AS oldest_at,"
+                "SUM(created_at>=? AND created_at<=?) AS arrivals,"
+                "SUM(completed_at>=? AND completed_at<=?) AS drains,"
+                "SUM(total_cost IS NULL) AS uncosted "
+                "FROM jobs INDEXED BY jobs_reporting GROUP BY state,kind ORDER BY kind,state",
+                (moment-window, moment, moment-window, moment))]
+            counts = {}
+            for row in groups:
+                counts[row["state"]] = counts.get(row["state"], 0) + row["count"]
             states = {r[0]: r[1] for r in db.execute("SELECT state,COUNT(*) FROM coordinates GROUP BY state")}
-            arrivals = db.execute("SELECT COUNT(*) FROM jobs WHERE created_at>=? AND created_at<=?",
-                                  (moment - window, moment)).fetchone()[0]
-            drains = db.execute("SELECT COUNT(*) FROM jobs WHERE completed_at>=? AND completed_at<=?",
-                                (moment - window, moment)).fetchone()[0]
+            arrivals = sum(row["arrivals"] or 0 for row in groups)
+            drains = sum(row["drains"] or 0 for row in groups)
             pending = "state!='ACKED'"
-            oldest = db.execute(f"SELECT MIN(created_at) FROM jobs WHERE {pending}").fetchone()[0]
-            valuable = db.execute(f"SELECT job_id,created_at FROM jobs WHERE {pending} AND priority>0 "
+            oldest = min((row["oldest_at"] for row in groups if row["state"] != "ACKED"), default=None)
+            valuable = db.execute(f"SELECT job_id,created_at FROM jobs INDEXED BY jobs_high_value_created WHERE {pending} AND priority>0 "
                                   "ORDER BY created_at LIMIT 1").fetchone()
-            blocked = db.execute(f"SELECT COUNT(*) FROM jobs WHERE {pending} AND total_cost IS NULL").fetchone()[0]
+            blocked = sum(row["uncosted"] for row in groups if row["state"] != "ACKED")
             debt = db.execute("SELECT SUM(coverage_debt),COUNT(coverage_debt),COUNT(*) FROM coordinates").fetchone()
             chain_count = db.execute("SELECT COUNT(DISTINCT chain_id) FROM chains").fetchone()[0]
             protocol_count = db.execute("SELECT COUNT(*) FROM protocols").fetchone()[0]
             # SQL aggregation avoids loading the growing index into RAM.
-            delay = db.execute(f"SELECT SUM(json_extract(auction,'$.delay_value_per_second') * "
-                               f"MAX(0,? - created_at)), COUNT(json_extract(auction,'$.delay_value_per_second')),"
-                               f"COUNT(*) FROM jobs WHERE {pending}", (moment,)).fetchone()
-            by_kind = [dict(row) for row in db.execute(
-                "SELECT kind,state,COUNT(*) AS count,MIN(created_at) AS oldest_at FROM jobs GROUP BY kind,state")]
+            delay = db.execute("SELECT SUM(json_extract(auction,'$.delay_value_per_second') * "
+                               "MAX(0,? - created_at)), COUNT(*) FROM jobs INDEXED BY jobs_measured_delay "
+                               f"WHERE {pending} AND json_extract(auction,'$.delay_value_per_second') IS NOT NULL",
+                               (moment,)).fetchone()
+            by_kind = [{key: row[key] for key in ("kind", "state", "count", "oldest_at")} for row in groups]
         pending_count = sum(n for state, n in counts.items() if state != "ACKED")
         return {
             "schema_version": SCHEMA_VERSION, "status": "INDEX_ONLY_RUNTIME_UNMEASURED",
@@ -957,7 +972,7 @@ class FrontierIndex:
             "oldest_high_value_job": valuable["job_id"] if valuable else None,
             "oldest_high_value_age_seconds": max(0.0, moment - valuable["created_at"]) if valuable else None,
             "cost_of_delay": delay[0], "cost_of_delay_measured_jobs": delay[1],
-            "cost_of_delay_unmeasured_jobs": delay[2] - delay[1],
+            "cost_of_delay_unmeasured_jobs": pending_count - delay[1],
             "by_kind": by_kind, "exploration_floors": dict(self.exploration_floors),
             "authority": "RESEARCH_INDEX_ONLY_NO_CAPITAL_AUTHORITY",
         }
