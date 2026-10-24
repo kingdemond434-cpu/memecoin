@@ -81,12 +81,12 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(1, self.coverage.report()["debt_records"])
         self.coverage.ingest(self.snapshot())
         self.assertEqual(1, len(self.coverage.report()["dynamic_source_rows"]))
-        jobs = self.coverage.plan()
+        jobs = self.coverage.propose_round()
         self.assertFalse(any(j["kind"] == "SOURCE_HEALTH" for j in jobs))
         self.assertGreaterEqual(self.coverage.report()["debt_records"], 1)
 
     def test_plans_rotate_exploration_and_survive_restart_without_authority(self):
-        plans = [self.coverage.plan() for _ in range(10)]
+        plans = [self.coverage.propose_round() for _ in range(10)]
         domains = {j["subject"] for plan in plans for j in plan if j["kind"] == "BLIND_SPOT_EXPLORATION"}
         self.assertEqual(set(self.coverage.scope["domains"]), domains)
         for plan in plans:
@@ -129,7 +129,9 @@ class OpportunityTests(unittest.TestCase):
         census.resolve("entered", peak_multiple=5)
         census.enter("entered")
         census.resolve("loss", peak_multiple=.9)
+        before = census.state()
         report = census.positive_opportunity_review()
+        self.assertEqual(before, census.state())
         self.assertEqual(2, report["retained_positive_not_entered"])
         self.assertEqual(1, report["unresolved_retained"])
         self.assertEqual(["monster", "small"], [r["token"] for r in report["review_candidates"]])

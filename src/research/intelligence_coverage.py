@@ -96,7 +96,7 @@ class IntelligenceCoverage:
             self.db.execute("DELETE FROM intelligence_snapshots WHERE id < (SELECT max(id)-100 FROM intelligence_snapshots)")
         self.error = ""
 
-    def plan(self):
+    def propose_round(self):
         count = self.db.execute("SELECT count(*) FROM intelligence_rounds").fetchone()[0]
         slots = max(1, min(16, int(self.scope["policy"]["total_proposals_per_round"])))
         explore = max(1, min(slots, int(self.scope["policy"]["explore_slots_per_round"])))
@@ -134,7 +134,7 @@ class IntelligenceCoverage:
                     self.ingest(await venues.get("http://127.0.0.1:18081", "/intelligence-coverage"))
                 except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, RuntimeError) as exc:
                     self.error = type(exc).__name__
-                self.plan()
+                self.propose_round()
                 await asyncio.sleep(120)
 
     def report(self):

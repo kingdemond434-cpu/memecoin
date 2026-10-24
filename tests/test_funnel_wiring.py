@@ -61,6 +61,7 @@ def test_the_funnel_list_covers_every_public_transition():
     not_a_transition = {
         "report", "state", "save", "load", "resolve", "knows",
         "missed_monster_report", "mints_pending_death_classification",
+        "positive_opportunity_review",
     }
     assert public - not_a_transition - set(FUNNEL) == set(), (
         "a public LaunchCensus method is neither a known read nor in FUNNEL; "
