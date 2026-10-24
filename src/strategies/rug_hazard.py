@@ -357,13 +357,20 @@ class ContinuousRugHazardModel:
     async def _monitor_loop(self):
         while self._running:
             try:
+                # One contemporaneous ranking per sweep. Re-ranking every
+                # wallet for every token multiplies global research work into
+                # the token loop and can starve the desk's HTTP/receive loop.
+                smart_wallets = self.wallet_intel.followable_wallets(limit=50) if self.hazard_states else {}
                 for token in list(self.hazard_states):
-                    await self._compute_hazard(token)
+                    if not self._running: break
+                    if token not in self.hazard_states: continue
+                    await self._compute_hazard(token, smart_wallets=smart_wallets)
+                    await asyncio.sleep(0)
             except Exception as exc:
                 logger.error("Hazard monitor error: %s", exc)
             await asyncio.sleep(2)
 
-    async def _compute_hazard(self, token: str) -> HazardState:
+    async def _compute_hazard(self, token: str, *, smart_wallets=None) -> HazardState:
         state = self.register_token(token)
         observations = list(self.observations.get(token, ()))
         if not observations:
@@ -371,7 +378,7 @@ class ContinuousRugHazardModel:
             state.blocked_reason = "no_market_observations"
             state.last_update = time.time()
             return state
-        signals = await self._collect_hazard_signals(token)
+        signals = await self._collect_hazard_signals(token, smart_wallets=smart_wallets)
         state.signals = signals[-50:]
         survival = 1.0
         for signal in signals:
@@ -414,7 +421,7 @@ class ContinuousRugHazardModel:
             return "LOW"
         return "NONE"
 
-    async def _collect_hazard_signals(self, token: str) -> List[HazardSignal]:
+    async def _collect_hazard_signals(self, token: str, *, smart_wallets=None) -> List[HazardSignal]:
         observations = list(self.observations.get(token, ()))
         if not observations:
             return []
@@ -471,7 +478,8 @@ class ContinuousRugHazardModel:
         # straight into the hazard signal, so it has to mean "how much this
         # wallet's exit is worth knowing about" rather than "how well it
         # scored on a weighted sum".
-        smart_wallets = self.wallet_intel.followable_wallets(limit=50)
+        if smart_wallets is None:
+            smart_wallets = self.wallet_intel.followable_wallets(limit=50)
         for item in trades_recent:
             if item.get("side") != "sell":
                 continue

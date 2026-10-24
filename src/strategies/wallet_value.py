@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 WALLET_VALUE_SCHEMA_VERSION = "v1"
+_UNSET_PRIOR = object()
 
 # Below this a wallet has no value estimate at all -- not a low one. Twelve
 # followed trades is already generous for a heavy-tailed distribution; it is
@@ -206,7 +207,7 @@ class WalletValueModel:
         return (total / count) if count else None
 
     def value(self, wallet: str, regime: str = "",
-              now: Optional[float] = None) -> WalletValue:
+              now: Optional[float] = None, *, _population_prior=_UNSET_PRIOR) -> WalletValue:
         """This wallet's forward value, or DATA_BLOCKED with the reason."""
         outcomes = [item for item in self._outcomes.get(wallet, ())
                     if not regime or item.regime == regime]
@@ -222,7 +223,7 @@ class WalletValueModel:
         variance = sum((value - mean) ** 2 for value in returns) / max(1, count - 1)
         stdev = math.sqrt(max(0.0, variance))
 
-        prior = self.population_mean()
+        prior = self.population_mean() if _population_prior is _UNSET_PRIOR else _population_prior
         if prior is None or self.shrinkage_strength <= 0:
             shrunk = mean
         else:
@@ -247,7 +248,8 @@ class WalletValueModel:
         Not by mean. Ranking on the mean is what puts a wallet with six lucky
         trades at the top of the list and keeps it there.
         """
-        values = [self.value(wallet, regime) for wallet in self._outcomes]
+        prior = self.population_mean()
+        values = [self.value(wallet, regime, _population_prior=prior) for wallet in self._outcomes]
         usable = [value for value in values
                   if value.ok and (value.followable or not followable_only)]
         usable.sort(key=lambda value: value.lower_bound, reverse=True)
@@ -257,7 +259,8 @@ class WalletValueModel:
         """Whether the model can rank anything yet, and on what evidence."""
         tracked = len(self._outcomes)
         observations = sum(len(items) for items in self._outcomes.values())
-        estimable = [self.value(wallet) for wallet in self._outcomes]
+        prior = self.population_mean()
+        estimable = [self.value(wallet, _population_prior=prior) for wallet in self._outcomes]
         ok = [value for value in estimable if value.ok]
         followable = [value for value in ok if value.followable]
         return {
@@ -270,8 +273,8 @@ class WalletValueModel:
             "wallets_estimable": len(ok), "wallets_followable": len(followable),
             "rejected_outcomes": self.rejected,
             "min_samples": self.min_samples,
-            "population_mean_log_return": self.population_mean(),
-            "top": [value.to_dict() for value in self.rank(limit=10)],
+            "population_mean_log_return": prior,
+            "top": [value.to_dict() for value in sorted(followable, key=lambda v: v.lower_bound, reverse=True)[:10]],
         }
 
 

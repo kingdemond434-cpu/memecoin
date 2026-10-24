@@ -35,6 +35,11 @@ no signer, live authority, executable strategy scheduler or promotion path.
   promotion-state replacement. The same write retries up to five times only
   for Windows sharing/access error codes. Persistent denial raises and leaves
   the previous authoritative file intact. Promotion criteria are unchanged.
+- Two VPS stack samples found wallet valuation inside the continuous hazard
+  sweep while HTTP health timed out. Wallet rankings and reports now compute
+  their common population prior once per call, preserving exact value/rank
+  results. Each hazard sweep shares one contemporaneous wallet ranking and
+  yields between tokens; tokens evicted during a yield are skipped.
 
 ## Requirements that software alone cannot complete
 
