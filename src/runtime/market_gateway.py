@@ -116,6 +116,10 @@ def make_app(broker, *, token, port=18082, bridge=None, start_runner=True, predi
         data = await request.json()
         return web.json_response(documented_phantom_fee(data['contracts'], data['price']))
 
+    async def native_markets(request):
+        if prediction_scope != 'phantom': raise web.HTTPNotFound()
+        return web.json_response(runner.native.page(request.query.get('after', ''), int(request.query.get('limit', '100'))))
+
     async def robustness(request):
         data = await request.json()
         if data["method"] == "cpcv":
@@ -175,6 +179,7 @@ def make_app(broker, *, token, port=18082, bridge=None, start_runner=True, predi
     app.router.add_get("/api/status", status)
     app.router.add_post("/api/decisions/evaluate", evaluate)
     app.router.add_post('/api/phantom-predictions/fee-scenario', phantom_fee_scenario)
+    app.router.add_get('/api/phantom-predictions/markets', native_markets)
     app.router.add_post("/api/research/robustness", robustness)
     app.router.add_post("/api/phantom/challenge", wallet_challenge)
     app.router.add_post("/api/phantom/connect", wallet_connect)
