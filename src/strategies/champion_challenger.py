@@ -163,6 +163,11 @@ class ChampionChallengerFramework:
         self._evaluation_task: Optional[asyncio.Task] = None
         self._load_state()
         self._load_component_checkpoints()
+        if self.state_path and not self.state_path.exists():
+            # Keep the framework snapshot present for existing readers. Only
+            # initial creation needs the global write; subsequent research
+            # updates commit independently to their component files.
+            self._save_state()
 
     async def start(self):
         self._running = True
