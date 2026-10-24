@@ -69,6 +69,27 @@ class StructureTests(unittest.TestCase):
 
 
 class PublicMinerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_identical_observed_wallet_inputs_reuse_structure_after_restart(self):
+        with tempfile.TemporaryDirectory() as temp:
+            broker = PaperBroker(Path(temp) / "paper.sqlite")
+            trade = raw()
+            class Venue:
+                async def get(self, base, path, params):
+                    if path.endswith("leaderboard"):
+                        return {"data": [{"user_id": trade["proxy_wallet"]}], "pagination": {"next_cursor": None}}
+                    return {"data": [trade], "pagination": {"next_cursor": None}}
+            try:
+                await PublicWalletResearch(broker).cycle(Venue())
+                second = PublicWalletResearch(broker)
+                await second.cycle(Venue())
+                row = second.report()["research_memory"]["families"][0]
+                self.assertEqual(1, row["distinct_studies"])
+                self.assertEqual(1, row["exact_reuse_hits"])
+                self.assertIsNone(row["economic_roi"])
+                report = json.loads(broker.db.execute("SELECT payload FROM public_forensics").fetchone()[0])
+                self.assertEqual(trade["proxy_wallet"], report["wallet"])
+            finally: broker.close()
+
     async def test_real_producer_to_consumer_path_with_restart_and_pagination(self):
         with tempfile.TemporaryDirectory() as temp:
             broker = PaperBroker(Path(temp) / "paper.sqlite")

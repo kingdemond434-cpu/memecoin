@@ -530,6 +530,32 @@ class LaunchCensus:
                        "and is reported as null rather than as perfect"),
         }
 
+    def positive_opportunity_review(self, limit: int = 100) -> Dict[str, Any]:
+        """Review every retained positive peak, not just the 10x tail.
+
+        A post-event peak is a review lead. Native paired entry/exit quotes,
+        costs, availability, size and a causal decision rule are still needed
+        before it can be called a missed executable profit.
+        """
+        import math
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("bounded opportunity review limit required")
+        positive = [r for r in self._records.values() if r.peak_multiple is not None
+                    and math.isfinite(r.peak_multiple) and r.peak_multiple > 1]
+        missed = [r for r in positive if r.stage != Stage.ENTERED]
+        missed.sort(key=lambda r: (-r.peak_multiple, r.mint))
+        return {"coverage": "retained_observed_launches_only", "global_denominator_known": False,
+                "retained_positive_peaks": len(positive), "retained_positive_not_entered": len(missed),
+                "unresolved_retained": sum(r.peak_multiple is None for r in self._records.values()),
+                "review_candidates": [{"token": r.mint, "detected_at": r.detected_at,
+                    "peak_multiple": r.peak_multiple, "resolved_at": r.resolved_at,
+                    "stage": r.stage.value, "reason": r.disposition_reason or r.screen_reason,
+                    "classification": "HINDSIGHT_POSITIVE_REQUIRES_EXECUTABLE_REVIEW",
+                    "executable_after_cost_profit": None, "trade_authority": False} for r in missed[:limit]],
+                "detail_truncated": len(missed) > limit,
+                "historical_spilled_records_not_included": True,
+                "policy_change_authority": False}
+
     def mints_pending_death_classification(self) -> List[str]:
         """Resolved launches with no rug verdict yet -- candidates to classify.
 

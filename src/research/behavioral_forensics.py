@@ -17,6 +17,8 @@ import time
 import asyncio
 import shutil
 from collections import defaultdict
+from pathlib import Path
+from src.research.research_memory import ResearchMemory
 
 from src.research.prediction_markets import encode, number, PublicVenues
 
@@ -156,6 +158,8 @@ class PublicWalletResearch:
         CREATE TABLE IF NOT EXISTS public_claim_hints(id TEXT PRIMARY KEY,chain TEXT NOT NULL,address TEXT NOT NULL,payload TEXT NOT NULL);
         """)
         self.cycles, self.errors, self.last_success = 0, {}, 0
+        self.memory = ResearchMemory(self.db)
+        self.algorithm_hash = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
     def retain_page(self, path, response):
         checksum = hashlib.sha256(encode(response).encode()).hexdigest()
@@ -207,8 +211,15 @@ class PublicWalletResearch:
                         cursor = older.get("pagination", {}).get("next_cursor")
                     elif cursor is None:
                         cursor = response.get("pagination", {}).get("next_cursor")
-                    rows = self.db.execute("SELECT payload FROM public_trades WHERE wallet=? ORDER BY at DESC LIMIT 5000", (address,)).fetchall()
-                    report = structure([json.loads(r[0]) for r in rows])
+                    rows = self.db.execute("SELECT id,payload FROM public_trades WHERE wallet=? ORDER BY at DESC,id DESC LIMIT 5000", (address,)).fetchall()
+                    inputs = [r[0] for r in rows]
+                    context = {"venue": "polymarket", "wallet": address, "kind": "public_structure_only"}
+                    report = self.memory.recall("public_wallet_structure", context, inputs, self.algorithm_hash)
+                    if report is None:
+                        started = time.perf_counter()
+                        report = structure([json.loads(r[1]) for r in rows])
+                        self.memory.retain("public_wallet_structure", context, inputs, self.algorithm_hash, report,
+                                           seconds=time.perf_counter() - started, records=len(rows))
                     total = self.db.execute("SELECT count(*) FROM public_trades WHERE wallet=?", (address,)).fetchone()[0]
                     report.update(wallet=address, selection_origin=wallet["origin"],
                                   history_complete=not cursor and total <= 5000, analysis_window_limit=5000,
@@ -262,4 +273,5 @@ class PublicWalletResearch:
                 "forensic_reports": self.db.execute("SELECT count(*) FROM public_forensics").fetchone()[0],
                 "public_claim_mentions": self.db.execute("SELECT count(*) FROM public_claim_hints").fetchone()[0],
                 "public_claim_chains": dict(self.db.execute("SELECT chain,count(*) FROM public_claim_hints GROUP BY chain")),
-                "source_errors": self.errors, "promotion_authority": False, "edge": "UNMEASURED"}
+                "source_errors": self.errors, "research_memory": self.memory.report(),
+                "promotion_authority": False, "edge": "UNMEASURED"}

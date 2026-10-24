@@ -1049,6 +1049,7 @@ class ReportingSurface:
         app.router.add_get("/metrics", self._metrics_endpoint)
         app.router.add_get("/status", self._status_endpoint)
         app.router.add_get("/public-claims", self._public_claims_endpoint)
+        app.router.add_get("/intelligence-coverage", self._intelligence_coverage_endpoint)
         # Force the evidence ledgers to disk. The supervisor calls this when
         # persistence goes stale, because the alternative -- restarting -- is
         # the one action that would LOSE the very data the check is worried
@@ -1089,6 +1090,19 @@ class ReportingSurface:
         return web.json_response(_jsonable({"portfolio": self.elogw_engine.get_portfolio_state(),
                                             "total_pnl": self.total_pnl, "trade_count": self.trade_count,
                                             "successful_exits": self.successful_exits}))
+
+    async def _intelligence_coverage_endpoint(self, request):
+        mesh = getattr(self, "source_mesh", None)
+        census = getattr(self, "launch_census", None)
+        sources = []
+        for source in getattr(mesh, "sources", []):
+            health = source.health()
+            sources.append({"source_id": health.source_id, "state": health.state.value,
+                            "last_poll_ok_at": health.last_poll_ok_at, "last_event_at": health.last_event_at})
+        return web.json_response({"observed_at": time.time(), "sources": sources,
+            "launches": census.report().get("funnel", {}) if census else {},
+            "misses": census.positive_opportunity_review() if census else {},
+            "coverage_denominator": "supported_observed_streams_only", "trade_authority": False})
 
     async def _public_claims_endpoint(self, request):
         try:

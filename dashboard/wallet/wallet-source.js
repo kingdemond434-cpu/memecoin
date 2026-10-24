@@ -62,6 +62,13 @@ async function refresh() {
   const status = await api('status');
   const data = status.prediction_markets;
   const research = status.public_wallet_research;
+  const coverage = status.global_coverage;
+  if (coverage) {
+    el('coverage').textContent = `${coverage.observed_ok_sources} healthy declared sources of ${coverage.declared_sources} targets · ${coverage.dynamic_source_rows.length} additional observed sources · ${coverage.debt_records} recorded gaps · ${coverage.completed_planning_rounds} planning rounds`;
+    el('coverage-detail').textContent = JSON.stringify({fresh_main_observations: coverage.fresh_main_snapshot,
+      main_link_error: coverage.main_link_error, proposals: coverage.latest_plan,
+      research_memory: research?.research_memory}, null, 2);
+  }
   if (research) {
     el('public-research').textContent = `${research.wallets} public wallets · ${research.trades} retained trades · ${research.forensic_reports} mechanism reports · ${research.public_claim_mentions} source/address links`;
     el('research-status').textContent = JSON.stringify({local_models: status.local_decisions, research_errors: research.source_errors}, null, 2);
