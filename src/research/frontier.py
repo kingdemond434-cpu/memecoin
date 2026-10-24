@@ -207,6 +207,8 @@ class FrontierIndex:
             had_active_tags = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='active_job_tags'").fetchone()
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS conversion_receipts(
+                    result_key TEXT PRIMARY KEY, evidence_ref TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS coordinates(
                     coordinate_id TEXT PRIMARY KEY, axes TEXT NOT NULL, state TEXT NOT NULL,
                     evidence_refs TEXT NOT NULL, coverage_debt REAL,
@@ -345,6 +347,23 @@ class FrontierIndex:
                 yield db
         finally:
             db.close()
+
+    def conversion_receipt(self, result_key: str) -> Optional[str]:
+        with self._db() as db:
+            row = db.execute('SELECT evidence_ref FROM conversion_receipts WHERE result_key=?', (result_key,)).fetchone()
+            return row[0] if row else None
+
+    def retain_conversion_receipts(self, refs: Mapping[str, str]) -> None:
+        # References only. Canonical payloads stay in the hash-chained ledger.
+        if any(not isinstance(key, str) or len(key) != 64 or any(c not in '0123456789abcdef' for c in key)
+               or not isinstance(ref, str) or not ref.startswith('evidence:') for key, ref in refs.items()):
+            raise ValueError('conversion result digests and canonical evidence references required')
+        with self._db() as db:
+            for key, ref in refs.items():
+                existing = db.execute('SELECT evidence_ref FROM conversion_receipts WHERE result_key=?', (key,)).fetchone()
+                if existing and existing[0] != ref:
+                    raise ValueError('conflicting conversion evidence reference')
+                db.execute('INSERT OR IGNORE INTO conversion_receipts VALUES(?,?)', (key, ref))
 
     @staticmethod
     def _event(db: sqlite3.Connection, subject: str, action: str,
