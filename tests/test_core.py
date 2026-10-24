@@ -13747,14 +13747,15 @@ class TestEachSourceMinesOnItsOwnClock(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["registered"], 1)
         self.assertEqual(report["runnable"], 0)
 
-    async def test_a_flood_is_truncated_rather_than_passed_on(self):
-        """A source suddenly returning fifty thousand rows is backfilling or
-        broken, and handing all of them downstream is worse."""
+    async def test_large_batch_is_delivered_in_yielding_chunks_without_dropping_tail(self):
         pool = self._pool()
         pool.register(self._spec(max_records=5),
                       self._fetch(records=[{"mint": f"m{i}"} for i in range(500)]))
         result = (await pool.run_due(time.time() + 1_000))[0]
-        self.assertEqual(len(result.records), 5)
+        self.assertEqual(len(result.records), 500)
+        self.assertEqual(len(pool.seen), 100)
+        self.assertTrue(all(len(rows) == 5 for _, rows in pool.seen))
+        self.assertEqual(pool.seen[-1][1][-1]['mint'], 'm499')
 
     async def test_the_consumer_sees_records_as_they_arrive(self):
         pool = self._pool()

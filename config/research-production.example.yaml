@@ -3,7 +3,9 @@
 # requires a sealed, observed corpus; DATA_BLOCKED audit output is not a split.
 global:
   onion_auto_discovery: false
-  onion_max_sources: 16
+  # Persistent expanding frontier: no source/page/depth admission ceiling.
+  # Workers and request pacing bound active work; all pending URLs stay on disk.
+  onion_frontier_path: data/state/public_onion_frontier.sqlite
   research_replay:
     enabled: false
     episode_path: data/research/sealed-corpus

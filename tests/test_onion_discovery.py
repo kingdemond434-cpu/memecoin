@@ -23,9 +23,9 @@ class Framework:
         self.state[name] = copy.deepcopy(state)
 
 
-def desk(framework=None):
+def desk(path, framework=None):
     return SimpleNamespace(unknown_engine=SimpleNamespace(framework=framework or Framework()),
-        http_client=HttpClient(), global_config={"onion_auto_discovery": True, "onion_max_sources": 1},
+        http_client=HttpClient(), global_config={"onion_auto_discovery": True, "onion_frontier_path": path},
         transports={}, source_fetchers={}, source_mesh=SourceMesh())
 
 
@@ -35,40 +35,36 @@ def event():
                  metadata={"discovered_onion_links": ["http://" + host(2) + "/discussion"]})
 
 
-def test_links_are_bound_to_durable_origin_and_capacity_debt_is_retained(monkeypatch):
+def test_links_survive_restart_without_source_caps_or_framework_rewrites(monkeypatch, tmp_path):
     monkeypatch.setenv("MEMECOIN_TOR_PROXY_URL", "socks5://127.0.0.1:9050")
-    current = desk()
+    current = desk(tmp_path / 'onions.sqlite')
     discover(current, event(), None)
     assert not current.transports
     discover(current, event(), "durable-origin-job")
-    state = current.unknown_engine.framework.state[COMPONENT]
-    assert len(current.transports) == len(state["admitted"]) == 1
-    assert len(state["pending"]) == 1
-    admitted = next(iter(state["admitted"].values()))
-    assert admitted["source_ref"] == "frontier_job:durable-origin-job"
-    assert admitted["identity_status"] == "UNVERIFIED_PUBLIC_LINK"
+    frontier = current.onion_frontier
+    assert len(current.transports) == 1
+    assert frontier.report()['discovered_hosts'] == 2
+    assert {row[0] for row in frontier.db.execute('SELECT source_ref FROM urls')} == {'frontier_job:durable-origin-job'}
     discover(current, event(), "same-observation-again")
     assert len(current.transports) == 1
-    assert current.unknown_engine.framework.writes == 1
-    current.global_config["onion_max_sources"] = 2
-    drain(current)  # works without a fresh event from the first onion host
-    assert len(current.transports) == 2
-    assert not current.unknown_engine.framework.state[COMPONENT]["pending"]
-    assert current.unknown_engine.framework.writes == 2
-    restored = desk(current.unknown_engine.framework)
-    assert restore(restored) == 1
+    assert current.unknown_engine.framework.writes == 0
+    drain(current)
+    assert len(current.transports) == 1
+    restored = desk(tmp_path / 'onions.sqlite', current.unknown_engine.framework)
+    assert restore(restored) == 2
     asyncio.run(stop_transports(current.transports, current.http_client))
     asyncio.run(stop_transports(restored.transports, restored.http_client))
 
 
-def test_missing_proxy_retains_candidates_and_disabled_discovery_opens_nothing(monkeypatch):
+def test_missing_proxy_retains_candidates_and_disabled_discovery_opens_nothing(monkeypatch, tmp_path):
     monkeypatch.delenv("MEMECOIN_TOR_PROXY_URL", raising=False)
-    current = desk()
+    current = desk(tmp_path / 'onions.sqlite')
     discover(current, event(), "durable-origin-job")
     assert not current.transports
-    assert len(current.unknown_engine.framework.state[COMPONENT]["pending"]) == 2
+    assert current.onion_frontier.report()['pending_pages'] == 2
     current.global_config["onion_auto_discovery"] = False
     assert restore(current) == 0
+    asyncio.run(current.onion_frontier.stop())
 
 
 def test_public_announcement_page_exposes_link_provenance_to_discovery():

@@ -15,6 +15,7 @@ def test_large_checkpoint_roundtrips_and_failed_encoding_preserves_durable_state
     state = {"observations": [{"id": index, "refs": ["canonical:fixture"],
         "clock": 1000. + index, "value": None} for index in range(2000)]}
     framework.checkpoint_research_component("observed", state)
+    framework._save_state()
     before = path.read_bytes()
     assert json.loads(before)["research_components"]["observed"] == state
     framework.frozen_specs["invalid_legacy_value"] = float("nan")
@@ -24,6 +25,21 @@ def test_large_checkpoint_roundtrips_and_failed_encoding_preserves_durable_state
     restored = ChampionChallengerFramework(state_path=str(path))
     assert restored.get_research_component("observed") == state
     assert not restored.champions and not restored.canary_models
+
+
+def test_component_update_is_durable_without_rewriting_global_state(tmp_path, monkeypatch):
+    path = tmp_path / 'framework.json'
+    framework = ChampionChallengerFramework(state_path=path)
+    framework.checkpoint_research_component('observed', {'count': 1})
+    framework._save_state()
+    before = path.read_bytes()
+    def global_write_forbidden():
+        raise AssertionError('component update rewrote the entire framework')
+    monkeypatch.setattr(framework, '_save_state', global_write_forbidden)
+    framework.checkpoint_research_component('observed', {'count': 2})
+    assert path.read_bytes() == before
+    restored = ChampionChallengerFramework(state_path=path)
+    assert restored.get_research_component('observed') == {'count': 2}
 
 
 def test_unchanged_block_is_noop_but_new_reason_or_stale_authority_persists(monkeypatch):

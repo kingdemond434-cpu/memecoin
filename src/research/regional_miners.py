@@ -49,12 +49,6 @@ from src.research.source_substitution import Endpoint, SubstitutionRegistry
 
 logger = logging.getLogger(__name__)
 
-#: Records kept from one venue pass. A ticker endpoint returns every market it
-#: lists -- thousands, most of them irrelevant -- and handing all of them
-#: downstream costs more than the handful that matter are worth.
-VENUE_RECORD_CAP = 400
-
-
 async def _fetch_json(client: Any, url: str,
                       headers: Optional[Dict[str, str]] = None) -> Any:
     """One JSON fetch, with a rate limit distinguished from a failure.
@@ -120,13 +114,20 @@ class LadderFetcher:
         #: Faults that were ours, kept separate from anything an endpoint did.
         self.local_faults = 0
         self.last_local_fault = ""
+        self._coverage_cursors = {}
 
-    async def get(self, domain: str, **params: Any) -> tuple:
+    async def get(self, domain: str, *, rotate_coverage: bool = False, **params: Any) -> tuple:
         """Returns (payload, endpoint). Raises only when the ladder is spent."""
         errors: List[str] = []
         rate_limited = False
         for _ in range(self.max_attempts):
-            endpoint = self.registry.current(domain)
+            if rotate_coverage:
+                eligible = self.registry.eligible(domain)
+                cursor = self._coverage_cursors.get(domain, 0)
+                endpoint = eligible[cursor % len(eligible)] if eligible else None
+                self._coverage_cursors[domain] = cursor + 1
+            else:
+                endpoint = self.registry.current(domain)
             if endpoint is None:
                 break
             url = endpoint.format(**params)
@@ -313,7 +314,7 @@ def _parse_supply(payload: Any, endpoint: Endpoint, mint: str) -> Optional[Dict[
 # --- regional flow -------------------------------------------------------
 
 def venue_ticker_miner(fetcher: LadderFetcher, domain: str,
-                       *, symbols: Sequence[str] = ("SOL", "BTC"),
+                       *, symbols: Sequence[str] = (),
                        ) -> Callable[[], Awaitable[List[Dict[str, Any]]]]:
     """One venue's markets, normalised to (symbol, quote, last, volume).
 
@@ -326,7 +327,7 @@ def venue_ticker_miner(fetcher: LadderFetcher, domain: str,
     wanted = tuple(symbol.upper() for symbol in symbols)
 
     async def fetch() -> List[Dict[str, Any]]:
-        payload, endpoint = await fetcher.get(domain)
+        payload, endpoint = await fetcher.get(domain, rotate_coverage=True)
         rows = _parse_tickers(payload, endpoint)
         if wanted:
             focused = [row for row in rows
@@ -340,7 +341,7 @@ def venue_ticker_miner(fetcher: LadderFetcher, domain: str,
             "venue": endpoint.name, "kind": "venue_summary",
             "markets": len(rows), "symbol": "",
         })
-        return [summary, *focused[:VENUE_RECORD_CAP]]
+        return [summary, *focused]
 
     return fetch
 

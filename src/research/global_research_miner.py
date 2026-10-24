@@ -315,7 +315,7 @@ class GlobalResearchMiner:
                     return
                 raw = await resp.text()
             root = ET.fromstring(raw)
-            for item in root.findall(".//item")[:100]:
+            for item in root.findall(".//item"):
                 title = (item.findtext("title") or "").strip()
                 link = (item.findtext("link") or item.findtext("guid") or "").strip()
                 summary = (item.findtext("description") or "").strip()

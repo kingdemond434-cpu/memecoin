@@ -42,7 +42,7 @@ class PublicClaimLinks:
             raise ValueError("canonical public source job and observation time required")
         labels = sorted({str(t)[:64] for t in topics})[:20]
         with self.db:
-            for value in list(addresses)[:100]:
+            for value in addresses:
                 address = public_address(value)
                 if not address: continue
                 chain, normalized = address

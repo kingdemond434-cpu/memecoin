@@ -209,7 +209,7 @@ REGIONAL_NEWS: Sequence[Endpoint] = (
 
 
 REGIONAL_VENUES: Sequence[Endpoint] = (
-    Endpoint("upbit_markets", "https://api.upbit.com/v1/market/all?isDetails=false",
+    Endpoint("upbit_markets", "https://api.upbit.com/v1/market/all?is_details=false",
              region="kr", shape="upbit_markets",
              detail="Korea's dominant venue; a new KRW market is a step change"),
     Endpoint("bithumb", "https://api.bithumb.com/public/ticker/ALL_KRW",

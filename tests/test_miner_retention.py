@@ -6,7 +6,7 @@ from src.research.data_miners import DataMinerPool, Enriches, MinerSpec
 
 
 @pytest.mark.asyncio
-async def test_full_batch_retained_before_bounded_delivery_and_explicit_debt():
+async def test_full_batch_retained_before_chunked_delivery_without_losing_tail():
     retained, delivered, dispositions = [], [], []
     def retain(name, rows, now):
         retained.extend(rows)
@@ -19,9 +19,9 @@ async def test_full_batch_retained_before_bounded_delivery_and_explicit_debt():
     pool.register(MinerSpec("fixture", Enriches.NARRATIVE, 60, max_records=2), fetch)
     result = (await pool.run_due(time.time() + 100))[0]
     assert [row["index"] for row in retained] == list(range(5))
-    assert len(delivered) == 2 and result.status == "OK"
-    assert dispositions[0][1] == "DEFERRED"
-    assert "deferred=3" in dispositions[0][2]
+    assert len(delivered) == 5 and result.status == "OK"
+    assert dispositions[0][1] == "DELIVERED"
+    assert "deferred=0" in dispositions[0][2]
 
 
 @pytest.mark.asyncio
