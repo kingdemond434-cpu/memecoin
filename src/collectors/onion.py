@@ -337,11 +337,14 @@ class OnionDirectoryTransport(HttpTransport):
     """Discover public onion links from a selected ordinary public page/feed."""
     kind = "onion_directory"
 
-    def __init__(self, source_id, url, client):
+    def __init__(self, source_id, url, client, *, max_bytes=MAX_BODY):
         parts = urlsplit(url)
         if parts.scheme != "https" or not parts.hostname or parts.username or parts.password or parts.hostname.endswith(".onion"):
             raise TransportError("public HTTPS announcement/directory URL required")
         super().__init__(source_id, url, client)
+        self.max_bytes = int(max_bytes)
+        if not 1024 <= self.max_bytes <= 4 * 1024 * 1024:
+            raise TransportError('invalid public directory document size')
         self.digest = None
         self.pending = []
 
@@ -359,18 +362,19 @@ class OnionDirectoryTransport(HttpTransport):
         text = await self.body()
         if text is None:
             return []
-        if len(text.encode()) > MAX_BODY:
+        if len(text.encode()) > self.max_bytes:
             raise TransportError("public onion announcement exceeds document budget")
         document = _Document(link_limit=None)
         document.feed(text)
         content = " ".join(" ".join(document.text).split())
-        links = []
+        links, seen = [], set()
         for candidate in PATTERN.findall(html.unescape(text) + " " + " ".join(document.links)):
             try:
                 url = candidate_url(candidate)
             except TransportError:
                 continue
-            if url not in links:
+            if url not in seen:
+                seen.add(url)
                 links.append(url)
         digest = hashlib.sha256((content + json.dumps(links)).encode()).hexdigest()
         if digest == self.digest:

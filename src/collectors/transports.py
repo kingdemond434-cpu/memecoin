@@ -1017,7 +1017,8 @@ def build_transport(declaration: Any, client: HttpClient) -> Any:
 
     if kind == "onion_directory":
         from src.collectors.onion import OnionDirectoryTransport
-        return OnionDirectoryTransport(source_id, str(options["url"]), client)
+        return OnionDirectoryTransport(source_id, str(options["url"]), client,
+                                       max_bytes=options.get('max_bytes', 512 * 1024))
 
     if kind == "onion":
         from src.collectors.onion import OnionResearchTransport

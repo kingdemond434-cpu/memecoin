@@ -41,7 +41,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
 from src.research.data_miners import (
     CADENCE_FAST, CADENCE_MINUTE, CADENCE_QUARTER, CADENCE_REALTIME,
-    DataMinerPool, Enriches, MinerSpec,
+    DataMinerPool, Enriches, MinerSpec, rotating_selector,
 )
 
 logger = logging.getLogger(__name__)
@@ -75,8 +75,9 @@ def priority_fee_miner(rpc: Any, accounts: Callable[[], Sequence[str]],
     unit-price context for the requested write-lock set, not total lamports
     charged to a transaction. A percentile is not a landing probability.
     """
+    select_accounts = rotating_selector(accounts, 16)
     async def fetch() -> List[Dict[str, Any]]:
-        watched = [a for a in accounts() if a][:16]
+        watched = select_accounts()
         params: List[Any] = [watched] if watched else []
         samples = await rpc.request("getRecentPrioritizationFees", params)
         fees = []
@@ -165,9 +166,10 @@ def lp_supply_miner(rpc: Any, lp_mints: Callable[[], Sequence[str]],
     holding through a drawdown and one worth exiting on the first wobble, and
     no candle shows it.
     """
+    select_mints = rotating_selector(lp_mints, 12)
     async def fetch() -> List[Dict[str, Any]]:
         records: List[Dict[str, Any]] = []
-        for lp_mint in list(lp_mints())[:12]:
+        for lp_mint in select_mints():
             try:
                 supply = await rpc.request(
                     "getTokenSupply", [lp_mint, {"commitment": "confirmed"}])
@@ -218,10 +220,11 @@ def deployer_history_miner(rpc: Any, deployers: Callable[[], Sequence[str]],
     This is behavioural inference from public chain data only. It reads what
     the account did in the open ledger and nothing else.
     """
+    select_deployers = rotating_selector(deployers, per_pass)
     async def fetch() -> List[Dict[str, Any]]:
         now = time.time()
         records: List[Dict[str, Any]] = []
-        for address in list(deployers())[:per_pass]:
+        for address in select_deployers():
             try:
                 sigs = await rpc.request(
                     "getSignaturesForAddress",
@@ -267,8 +270,9 @@ def account_balance_miner(rpc: Any, accounts: Callable[[], Sequence[str]],
     wallet's balance falling sharply is it deploying capital somewhere; rising
     sharply is it having exited something.
     """
+    select_accounts = rotating_selector(accounts, per_pass)
     async def fetch() -> List[Dict[str, Any]]:
-        watched = [a for a in accounts() if a][:per_pass]
+        watched = select_accounts()
         if not watched:
             return []
         result = await rpc.request(
