@@ -1048,6 +1048,7 @@ class ReportingSurface:
         app.router.add_get("/health", self._health_endpoint)
         app.router.add_get("/metrics", self._metrics_endpoint)
         app.router.add_get("/status", self._status_endpoint)
+        app.router.add_get("/public-claims", self._public_claims_endpoint)
         # Force the evidence ledgers to disk. The supervisor calls this when
         # persistence goes stale, because the alternative -- restarting -- is
         # the one action that would LOSE the very data the check is worried
@@ -1088,6 +1089,22 @@ class ReportingSurface:
         return web.json_response(_jsonable({"portfolio": self.elogw_engine.get_portfolio_state(),
                                             "total_pnl": self.total_pnl, "trade_count": self.trade_count,
                                             "successful_exits": self.successful_exits}))
+
+    async def _public_claims_endpoint(self, request):
+        try:
+            after, limit = int(request.query.get("after", "0")), int(request.query.get("limit", "100"))
+            if after < 0 or not 1 <= limit <= 200: raise ValueError("invalid cursor")
+            store = getattr(self, "public_claim_links", None)
+            if store is None:
+                from src.research.public_claim_links import PublicClaimLinks
+                path = Path(getattr(self, "global_config", {}).get("ops_state_dir", "data/state")) / "public_claim_links.sqlite"
+                if path.exists():
+                    self.public_claim_links = store = PublicClaimLinks(path)
+            if not store:
+                return web.json_response({"items": [], "next_cursor": after, "has_more": False, "status": "NO_PUBLIC_ADDRESS_OBSERVATIONS"})
+            return web.json_response(store.page(after, limit))
+        except ValueError:
+            return web.json_response({"error": "invalid public claim cursor"}, status=400)
 
     async def _status_endpoint(self, request):
         starting = getattr(self, "_starting_phase", "")

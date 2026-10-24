@@ -43,9 +43,24 @@ unattended or that a Solana signature authenticates a prediction exchange.
 Official public Polymarket Gamma/CLOB and Kalshi REST APIs provide discovery,
 market rules, order books, fee schedules and resolution. Catalog pages rotate;
 held and pending markets are revisited before they can disappear from a page.
-Only binary YES/NO CTF Polymarket positions and binary Kalshi markets are
+Only binary YES/NO or UP/DOWN CTF Polymarket positions and binary Kalshi markets are
 currently supported. Unsupported position systems, closed/challenged markets,
 unknown fee models and unavailable APIs remain explicit exclusions.
+
+The expanded experiment rotates BTC/ETH/SOL public search and recently traded
+market condition hints alongside the broad volume-ranked catalog. Positive
+controls map YES/UP and negative controls map NO/DOWN by explicit labels.
+The public-wallet lab reads v2 leaderboard and contemporaneous activity cohorts,
+persists opaque pagination cursors and original responses, and infers behavioral
+mechanisms without claiming private strategy code, historical fees or profits.
+Main-desk public source address mentions flow through `/public-claims` with
+canonical source jobs; claimed insider addresses remain unverified and their
+wallet/token roles remain unknown. The API exports no raw post text or secrets.
+
+Authenticated `/api/research/robustness` exposes bounded purged combinatorial
+splits and a stationary-block family reality check. These are diagnostics on
+supplied research inputs, never new earned promotion evidence. See the dated
+quant transfer audit for provenance, existing equivalents and exclusions.
 
 The experiment freezes a specification and implementation hash before collecting
 orders. Separate simulated $1,000 accounts per venue hold YES controls, NO
