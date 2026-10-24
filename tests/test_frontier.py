@@ -53,6 +53,65 @@ def test_exploration_lease_does_not_scan_retained_tag_history(tmp_path, monkeypa
     index.close()
 
 
+def test_rare_tag_lease_does_not_scan_unrelated_active_backlog(tmp_path, monkeypatch):
+    index = FrontierIndex(tmp_path / "active.sqlite", exploration_floors={"rare": .5})
+    active = index.enqueue("DATA_REQUEST", "lake:rare", auction=priced(), exploration_tags=["rare"], now=100)
+    with index._db() as db:
+        template = dict(db.execute("SELECT * FROM jobs WHERE job_id=?", (active,)).fetchone())
+        columns = list(template)
+        rows = [{**template, "job_id": "common:" + str(number), "created_at": 1.} for number in range(12000)]
+        db.executemany("INSERT INTO jobs (" + ",".join(columns) + ") VALUES (" +
+                       ",".join("?" for _ in columns) + ")", [tuple(row[key] for key in columns) for row in rows])
+        db.executemany("INSERT INTO job_tags VALUES (?,?)", [(row["job_id"], "common") for row in rows])
+    real_db = index._db
+    operations = [0]
+    @contextmanager
+    def bounded_db():
+        with real_db() as db:
+            def progress():
+                operations[0] += 100
+                return int(operations[0] > 15000)
+            db.set_progress_handler(progress, 100)
+            yield db
+    monkeypatch.setattr(index, "_db", bounded_db)
+    assert [row["job_id"] for row in index.lease_jobs("worker", limit=1, now=101)] == [active]
+    assert operations[0] < 15000
+    index.close()
+
+
+def test_active_tag_cache_migrates_and_tracks_atomic_state_changes(tmp_path):
+    path = tmp_path / "migration.sqlite"
+    index = FrontierIndex(path, exploration_floors={"rare": .5})
+    job = index.enqueue("DATA_REQUEST", "lake:retained", exploration_tags=["rare"], now=100)
+    with index._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM active_job_tags").fetchone()[0] == 0
+    assert index.price_pending_job(job, auction=priced(), evidence_refs=["lake:cost"], reason="declared bounded test", now=101)
+    index.close()
+    with sqlite3.connect(path) as db:
+        db.execute("DROP TABLE active_job_tags")
+        db.execute("DELETE FROM metadata WHERE key='active_job_tags_v1'")
+    migrated = FrontierIndex(path, exploration_floors={"rare": .5})
+    def cached():
+        with migrated._db() as db:
+            return db.execute("SELECT job_id FROM active_job_tags ORDER BY job_id").fetchall()
+    assert [row[0] for row in cached()] == [job]
+    with pytest.raises(RuntimeError):
+        with migrated._db() as db:
+            db.execute("UPDATE jobs SET state='ACKED' WHERE job_id=?", (job,))
+            assert db.execute("SELECT COUNT(*) FROM active_job_tags").fetchone()[0] == 0
+            raise RuntimeError("simulate rollback")
+    assert [row[0] for row in cached()] == [job]
+    migrated.hibernate_job(job, enabling_change="new-data", reason="test", now=102)
+    assert cached() == []
+    migrated.wake_job(job, enabling_change="new-data", evidence_refs=["lake:new"], now=103)
+    lease = migrated.lease_jobs("worker", limit=1, now=104)[0]
+    assert [row[0] for row in cached()] == [job]
+    migrated.ack(job, "worker", lease["lease_token"], disposition="NEGATIVE_KNOWLEDGE", evidence_refs=["lake:receipt"], now=105)
+    assert cached() == []
+    assert migrated.job(job)["payload_ref"] == "lake:retained"
+    migrated.close()
+
+
 def test_reference_index_uses_full_durability_wal_and_writer_can_commit_during_reader(tmp_path):
     path = tmp_path / "concurrent.sqlite"
     index = FrontierIndex(path)
