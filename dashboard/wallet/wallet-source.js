@@ -81,9 +81,13 @@ async function refresh() {
   el('prediction-scope').textContent = native ? data.scope : 'Separate legacy Polymarket/Kalshi paper experiment; this is not Phantom native prediction trading.';
   el('prediction-limitations').textContent = native ? data.executable_paper_status : 'YES/NO controls and complete-set candidates are simulated. These venue results do not establish a Phantom trading edge.';
   if (native) {
+    const discovery = data.native_market_discovery;
     el('mode').textContent = 'PHANTOM WORLD RESEARCH · live submission locked · executable paper study blocked';
+    el('experiment').textContent = `Started ${new Date(data.started_at * 1000).toLocaleString()} · ${discovery?.current_candidates ?? 0} native candidates · ${data.snapshots} executable book snapshots`;
     el('public-research').textContent = `World catalog: ${data.catalog_status} · Native program: ${data.program_observation}`;
     el('research-status').textContent = JSON.stringify({local_models: status.local_decisions, phantom_public_api: data.phantom_external_api,
+      native_discovery: discovery, execution_blockers: data.execution_blockers,
+      authorized_agent_connector: data.authorized_agent_connector,
       verified_contracts_and_executable_quotes_required: true}, null, 2);
   }
   el('errors').textContent = JSON.stringify(data.source_errors, null, 2);

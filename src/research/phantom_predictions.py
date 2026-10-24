@@ -1,8 +1,8 @@
 """Phantom's native World scope: public research, never substitute venues.
 
-Phantom currently publishes no external API for this mobile feature. World's
-current public frontend names its metadata host, but the observed request is
-401. On-chain observations remain research candidates, not verified market
+Phantom currently publishes no external API for this mobile feature. Native
+discovery continues independently when World's HTTP metadata denies access.
+On-chain observations remain research candidates, not verified market
 identity, executable quotes, paper fills or permission to sign transactions.
 """
 import asyncio
@@ -19,16 +19,17 @@ from urllib.parse import quote
 import aiohttp
 
 from src.chains.rpc_manager import ChainConfig, ChainType, RPCEndpointConfig, RPCManager
+from src.research import world_native
 
 SUPPORT = 'https://help.phantom.com/articles/trade-predictions-in-phantom-47187740851731'
 DISCLOSURE = 'https://phantom.com/prediction-market-disclosures'
 FRONTEND = 'https://world.xyz/assets/api-CcCaG8Rc.js'
-CATALOG = 'https://markets-api-proxy.world-xyz.workers.dev/api/v1/markets'
+CATALOG = 'https://markets-api-proxy.world-xyz.workers.dev/api/v1/events'
 # Independent public-chain research identifies this candidate. Operator docs
 # are access-restricted, so its relationship to a user's Phantom market must
 # still be verified against that market's exact public transaction/contracts.
-PROGRAM_CANDIDATE = 'prediCtPZCttYMvm2W3PtxmMxLmT1dtN7riU6Cxh6tM'
-PROGRAM_SOURCE = 'https://github.com/chainstacklabs/world-xyz-research'
+PROGRAM_CANDIDATE = world_native.PROGRAM_CANDIDATE
+PROGRAM_SOURCE = world_native.PROGRAM_SOURCE
 LOADER = 'BPFLoaderUpgradeab1e11111111111111111111111'
 
 
@@ -44,7 +45,8 @@ class PhantomResearchStore:
         CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY,at REAL NOT NULL,kind TEXT NOT NULL,payload TEXT NOT NULL);
         ''')
         spec = {'scope': 'phantom_world_only', 'live_authority': False, 'executable_paper_fills': False,
-                'implementation': hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+                'implementation': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                'native_implementation': hashlib.sha256(Path(world_native.__file__).read_bytes()).hexdigest()}
         self.spec_hash = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
         previous = self.db.execute("SELECT value FROM phantom_meta WHERE key='spec_hash'").fetchone()
         if previous and previous[0] != self.spec_hash:
@@ -97,11 +99,13 @@ class PhantomPredictions:
         self.catalog_status = 'UNOBSERVED'
         self.program_status = 'UNOBSERVED'
         self.last_success = None
+        self.native = world_native.NativeWorldCensus(store)
 
     async def cycle(self, session, rpc=None):
         if time.time() >= self.catalog_next:
             try:
-                async with session.get(CATALOG, params={'limit': 100}, allow_redirects=False) as response:
+                async with session.get(CATALOG, params={'withNestedMarkets': 'true', 'limit': 200,
+                        'status': 'active', 'sortBy': 'volume24h', 'sortOrder': 'desc'}, allow_redirects=False) as response:
                     self.catalog_status = 'PUBLIC_METADATA_OBSERVED' if response.status == 200 else f'HTTP_{response.status}'
                     self.catalog_next = time.time() + (3600 if response.status in {401, 403, 429} else 300)
                     if response.status != 200:
@@ -131,6 +135,7 @@ class PhantomPredictions:
                 self.store.event('world_candidate_program', {'observation': proof, 'native_response': raw})
                 self.program_status, self.last_success = 'EXECUTABLE_ACCOUNT_OBSERVED_IDENTITY_UNVERIFIED', time.time()
                 self.errors.pop('native_rpc', None)
+                await self.native.poll(rpc)
             except Exception as exc:
                 self.program_status = 'DATA_BLOCKED'
                 self.errors['native_rpc'] = type(exc).__name__
@@ -164,6 +169,12 @@ class PhantomPredictions:
                 'last_native_observation': self.last_success, 'source_errors': self.errors,
                 'phantom_external_api': 'NOT_PUBLICLY_SUPPORTED', 'support_source': SUPPORT,
                 'provider_disclosure': DISCLOSURE, 'metadata_host_provenance': FRONTEND,
+                'native_market_discovery': self.native.report(),
+                'authorized_agent_connector': {'url': 'https://api.paybox.sh/mcp?app=world',
+                    'status': 'OWNER_OAUTH_CONNECTION_REQUIRED', 'source': 'https://world.xyz/',
+                    'grants_or_wallet_access_observed': False},
+                'execution_blockers': ['AUTHORIZED_PHANTOM_MARKET_MAPPING', 'FIRM_EXECUTABLE_QUOTES',
+                    'EXACT_MARKET_RULES_AND_SETTLEMENT', 'REGIONAL_ELIGIBILITY'],
                 'real_fills': 0, 'simulated_fills': 0, 'production_performance': 'UNMEASURED',
                 'executable_paper_status': 'DATA_BLOCKED_AUTHORIZED_MARKET_MAPPING_QUOTES_RULES_AND_SETTLEMENT_REQUIRED',
                 'markets': 0, 'snapshots': 0, 'order_counts': {}, 'accounts': [], 'settlement_records': 0,
