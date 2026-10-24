@@ -13,6 +13,24 @@ from test_candidate_replay import episode
 WINDOWS = {"train": [1, 950], "validation": [1000, 1950], "test": [2000, 2950]}
 
 
+def test_audit_recognizes_decoded_pump_program_but_retains_all_execution_gaps(tmp_path):
+    from src.chains.idl import PUMP_IDL, program_id
+    def native_labels(rows):
+        for row in rows:
+            row.update(chain="Solana Mainnet", factory=program_id(PUMP_IDL))
+    root, rows = corpus(tmp_path, native_labels)
+    assert audit_corpus(root)["replay_input_complete"] == 3
+    path = next(root.glob("*/*.json.gz"))
+    original = path.read_bytes()
+    assert freeze_corpus(root, tmp_path / "frozen-native", windows=WINDOWS, now=3000)["status"] == "SEALED_NOT_EVALUATED"
+    assert path.read_bytes() == original
+    from src.research.replay_corpus import replay_gaps
+    row = copy.deepcopy(rows[0]);row.pop("replay_execution")
+    gaps = replay_gaps(row)
+    assert "native_replay_protocol_mapping_missing" not in gaps
+    assert "native_route_depth_fill_cost_missing" in gaps
+
+
 def corpus(tmp_path, mutate=None):
     root = tmp_path / "source"
     rows = [episode(index) for index in (0, 10, 20)]

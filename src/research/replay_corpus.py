@@ -15,7 +15,7 @@ import math
 from pathlib import Path
 import time
 
-from src.research.candidate_replay import CandidateReplayHandler, ReplayBlocked, _digest
+from src.research.candidate_replay import CandidateReplayHandler, ReplayBlocked, _digest, native_replay_identity
 from src.research.gauntlet import LATENCY_GRID_S
 
 MAX_OBJECT_BYTES = 4_000_000
@@ -39,7 +39,7 @@ def replay_gaps(row: dict) -> list[str]:
         gaps.append("unresolved_outcome")
     if not row.get("token") or type(row.get("created_at")) not in (int, float) or not math.isfinite(row["created_at"]) or row["created_at"] <= 0:
         gaps.append("launch_identity_or_clock_missing")
-    if row.get("chain") != "solana" or row.get("factory") not in {"pump", "pump.fun"}:
+    if native_replay_identity(row.get("chain"), row.get("factory")) is None:
         gaps.append("native_replay_protocol_mapping_missing")
     if not row.get("snapshots"):
         gaps.append("point_in_time_snapshots_missing")

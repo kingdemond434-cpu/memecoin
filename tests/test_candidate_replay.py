@@ -19,6 +19,25 @@ from test_scientific_core import spec
 DELAYS = (0.1, 1.0, 3.0)
 
 
+def test_actual_producer_chain_name_and_program_id_map_without_rewriting_evidence():
+    from src.chains.idl import PUMP_IDL, program_id
+    from src.research.candidate_replay import native_replay_identity
+    candidate = replay_spec().exact_candidate
+    row = episode(0)
+    row.update(chain="Solana Mainnet", factory=program_id(PUMP_IDL))
+    before = copy.deepcopy(row)
+    compiled = compile_candidate(candidate)
+    assert compiled.mechanism.rule(EpisodeView(row)) is True
+    assert CandidateReplayHandler._execution(row, candidate) == row["replay_execution"]
+    assert row == before
+    assert native_replay_identity("ethereum", program_id(PUMP_IDL)) is None
+    assert native_replay_identity("Solana Mainnet", "unreviewed-program") is None
+    assert native_replay_identity("Solana Mainnet", program_id(PUMP_IDL).lower()) is None
+    row.pop("replay_execution")
+    with pytest.raises(ReplayBlocked):
+        CandidateReplayHandler._execution(row, candidate)
+
+
 def replay_spec(hid="c1"):
     proposal = spec(hid)
     candidate = proposal.exact_candidate

@@ -30,6 +30,22 @@ class ReplayBlocked(ValueError):
     pass
 
 
+def native_replay_identity(chain: Any, factory: Any) -> tuple[str, str] | None:
+    """Recognize retained producer labels without rewriting sealed episodes.
+
+    The desk stores its configured chain display name and decoded program ID.
+    Only the existing reviewed Pump adapter is mapped; other native programs
+    still require their own replay implementation and execution evidence.
+    """
+    if not isinstance(chain, str) or not isinstance(factory, str) or chain not in {"solana", "Solana Mainnet", "Solana"}:
+        return None
+    from src.chains.idl import IDL_STATUS, PUMP_IDL, program_id
+    protocols = {"pump", "pump.fun"}
+    if IDL_STATUS == "OK":
+        protocols.add(program_id(PUMP_IDL))
+    return ("solana", "pump") if factory in protocols else None
+
+
 def _finite(value: Any, *, positive: bool = False) -> bool:
     return (type(value) in (int, float) and math.isfinite(value)
             and (not positive or value > 0))
@@ -162,7 +178,8 @@ def compile_candidate(candidate: Mapping, *, mechanism_name: str | None = None) 
             raise ReplayBlocked("future/outcome fields cannot become replay features")
 
     def select(view: EpisodeView) -> bool | None:
-        if view.raw.get("chain") != candidate["chain"] or view.raw.get("factory") != candidate["protocol"]:
+        identity = native_replay_identity(view.raw.get("chain"), view.raw.get("factory"))
+        if identity is None or identity != native_replay_identity(candidate["chain"], candidate["protocol"]):
             return False
         row = view.snapshot(offset)
         if not isinstance(row, dict):
@@ -244,7 +261,7 @@ class _ExactFeed(GauntletFeed):
         # Gauntlet cost stress needs observed cost, not the base class's default.
         worst_cost = max(cell["round_trip_cost_fraction"] for cell in self.execution["fills_by_latency"].values())
         for row in rows:
-            row.chain = view.raw["chain"]
+            row.chain = self.compiled.candidate["chain"]
             row.cost_fraction = worst_cost
         return rows
 
@@ -307,7 +324,8 @@ class CandidateReplayHandler:
     @staticmethod
     def _execution(episode: dict, candidate: dict) -> dict:
         execution = episode.get("replay_execution")
-        if (episode.get("chain") != candidate["chain"] or episode.get("factory") != candidate["protocol"]
+        identity = native_replay_identity(episode.get("chain"), episode.get("factory"))
+        if (identity is None or identity != native_replay_identity(candidate["chain"], candidate["protocol"])
                 or not isinstance(execution, dict) or execution.get("native_unit") != "SOL"
                 or not execution.get("route") or not isinstance(execution.get("fills_by_latency"), dict)):
             raise ReplayBlocked("native chain/protocol/route/fill metadata absent or mismatched")
