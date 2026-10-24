@@ -117,6 +117,36 @@ class CoverageTests(unittest.TestCase):
             with self.assertRaises(ValueError): self.coverage.ingest(snap)
         self.assertEqual(0, self.db.execute("SELECT count(*) FROM intelligence_snapshots").fetchone()[0])
 
+    def test_planning_seeks_a_bounded_indexed_window_of_large_history(self):
+        with self.db:
+            self.db.executemany("INSERT INTO intelligence_debt VALUES(?,?,?,?,?,?,?,?)",
+                ((f"old-{i:06}", "HINDSIGHT_POSITIVE_REVIEW", f"token-{i}", "{}", i+1, i+1, 1, 1) for i in range(20000)))
+        steps = 0
+        def guard():
+            nonlocal steps
+            steps += 100
+            return steps > 20000
+        self.db.set_progress_handler(guard, 100)
+        try:
+            first = self.coverage.propose_round()
+            self.assertLessEqual(steps, 20000)
+        finally: self.db.set_progress_handler(None, 0)
+        second = IntelligenceCoverage(SimpleNamespace(db=self.db)).propose_round()
+        a = {j["debt_id"] for j in first if "debt_id" in j}
+        b = {j["debt_id"] for j in second if "debt_id" in j}
+        self.assertEqual(6, len(a))
+        self.assertTrue(a.isdisjoint(b))
+
+    def test_old_schema_migrates_without_losing_history(self):
+        db = sqlite3.connect(":memory:")
+        try:
+            db.execute("CREATE TABLE intelligence_debt(id TEXT PRIMARY KEY,kind TEXT,subject TEXT,evidence TEXT,first_seen REAL,last_seen REAL,observations INTEGER)")
+            db.execute("INSERT INTO intelligence_debt VALUES('historic','SOURCE_HEALTH','historic','{}',1,2,3)")
+            report = IntelligenceCoverage(SimpleNamespace(db=db)).report()
+            self.assertEqual(1, report["debt_records"])
+            self.assertEqual(1, report["active_debt_records"])
+        finally: db.close()
+
 
 class OpportunityTests(unittest.TestCase):
     def test_small_positive_peaks_are_reviewed_without_inventing_executable_profit(self):

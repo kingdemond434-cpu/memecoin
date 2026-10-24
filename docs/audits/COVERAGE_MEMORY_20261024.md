@@ -22,6 +22,8 @@ no signer, live authority, executable strategy scheduler or promotion path.
   reported separately from declared targets. Healthy polling and actual event
   observation are separate fields. Recovered-source history remains retained
   without consuming current repair proposals.
+  Proposal selection seeks a bounded indexed window with a durable cursor;
+  it does not reload the complete accumulated gap history into memory.
 - Public wallet analysis recalls exact prior work only for the identical native
   venue, wallet, ordered input IDs and algorithm hash. Changed inputs, venue or
   algorithm trigger fresh work. Result checksums and conflict rejection guard

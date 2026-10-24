@@ -32,13 +32,18 @@ class IntelligenceCoverage:
         CREATE TABLE IF NOT EXISTS intelligence_debt(id TEXT PRIMARY KEY,kind TEXT NOT NULL,subject TEXT NOT NULL,
           evidence TEXT NOT NULL,first_seen REAL NOT NULL,last_seen REAL NOT NULL,observations INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS intelligence_rounds(id INTEGER PRIMARY KEY,at REAL NOT NULL,scope_hash TEXT NOT NULL,plan TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS intelligence_cursor(id INTEGER PRIMARY KEY CHECK(id=1),first_seen REAL NOT NULL,debt_id TEXT NOT NULL);
         """)
+        if "active" not in {row[1] for row in self.db.execute("PRAGMA table_info(intelligence_debt)")}:
+            self.db.execute("ALTER TABLE intelligence_debt ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+        self.db.execute("CREATE INDEX IF NOT EXISTS intelligence_debt_work ON intelligence_debt(active,first_seen,id)")
+        self.db.commit()
         self.error = "MAIN_OBSERVATIONS_NOT_YET_AVAILABLE"
 
     def finding(self, kind, subject, evidence):
         key = hashlib.sha256(encode([kind, subject]).encode()).hexdigest()
         now = time.time()
-        self.db.execute("INSERT INTO intelligence_debt VALUES(?,?,?,?,?,?,1) ON CONFLICT(id) DO UPDATE SET evidence=excluded.evidence,last_seen=excluded.last_seen,observations=observations+1",
+        self.db.execute("INSERT INTO intelligence_debt(id,kind,subject,evidence,first_seen,last_seen,observations,active) VALUES(?,?,?,?,?,?,1,1) ON CONFLICT(id) DO UPDATE SET evidence=excluded.evidence,last_seen=excluded.last_seen,observations=observations+1,active=1",
                         (key, kind, str(subject)[:200], encode(evidence), now, now))
 
     def ingest(self, snapshot):
@@ -90,6 +95,9 @@ class IntelligenceCoverage:
             self.db.execute("INSERT INTO intelligence_snapshots(at,payload) VALUES(?,?)", (time.time(), encode(retained)))
             for row in sources:
                 if row["state"] != "OK": self.finding("SOURCE_HEALTH", row["source_id"], row)
+                else:
+                    key = hashlib.sha256(encode(["SOURCE_HEALTH", row["source_id"]]).encode()).hexdigest()
+                    self.db.execute("UPDATE intelligence_debt SET active=0 WHERE id=?", (key,))
             for row in retained["misses"].get("review_candidates", [])[:100]:
                 self.finding("HINDSIGHT_POSITIVE_REVIEW", row["token"], row)
             # Keep complete durable debt/round history, bound repeated bulky snapshots.
@@ -97,7 +105,7 @@ class IntelligenceCoverage:
         self.error = ""
 
     def propose_round(self):
-        count = self.db.execute("SELECT count(*) FROM intelligence_rounds").fetchone()[0]
+        count = self.db.execute("SELECT coalesce(max(id),0) FROM intelligence_rounds").fetchone()[0]
         slots = max(1, min(16, int(self.scope["policy"]["total_proposals_per_round"])))
         explore = max(1, min(slots, int(self.scope["policy"]["explore_slots_per_round"])))
         with self.db:
@@ -105,19 +113,23 @@ class IntelligenceCoverage:
                 if not source.get("options"):
                     self.finding("SOURCE_TARGET_WITHOUT_ENDPOINT", source["id"], {"kind": source["kind"],
                         "region": source.get("region", "UNKNOWN"), "language": source.get("language", "UNKNOWN")})
-            debts = self.db.execute("SELECT id,kind,subject FROM intelligence_debt ORDER BY first_seen,id").fetchall()
-            # Retain recovered-source history, but spend no repair slots on it.
-            report = self.report()
-            healthy = {r["source_id"] for r in report["source_rows"] if r["runtime_state"] == "OK"}
-            healthy.update(r["source_id"] for r in report["dynamic_source_rows"] if r["state"] == "OK")
-            debts = [row for row in debts if row[1] != "SOURCE_HEALTH" or row[2] not in healthy]
+                else:
+                    key = hashlib.sha256(encode(["SOURCE_TARGET_WITHOUT_ENDPOINT", source["id"]]).encode()).hexdigest()
+                    self.db.execute("UPDATE intelligence_debt SET active=0 WHERE id=?", (key,))
+            # Seek through an indexed bounded working set; retained history can
+            # grow without an offset scan or loading every old launch into RAM.
+            cursor = self.db.execute("SELECT first_seen,debt_id FROM intelligence_cursor WHERE id=1").fetchone()
+            point = tuple(cursor) if cursor else (0, "")
+            budget = slots - explore
+            debts = self.db.execute("SELECT id,kind,subject,first_seen FROM intelligence_debt WHERE active=1 AND (first_seen,id)>(?,?) ORDER BY first_seen,id LIMIT ?", (*point, budget)).fetchall()
+            if len(debts) < budget:
+                debts += self.db.execute("SELECT id,kind,subject,first_seen FROM intelligence_debt WHERE active=1 AND (first_seen,id)<=(?,?) ORDER BY first_seen,id LIMIT ?", (*point, budget-len(debts))).fetchall()
             jobs = []
             if debts:
-                offset = count * max(1, slots - explore) % len(debts)
-                ordered = list(debts[offset:]) + list(debts[:offset])
                 jobs.extend({"kind": row[1], "subject": row[2], "debt_id": row[0],
                              "status": "PROPOSED_REQUIRES_VERIFIED_INPUTS", "promotion_authority": False}
-                            for row in ordered[:slots - explore])
+                            for row in debts)
+                self.db.execute("INSERT OR REPLACE INTO intelligence_cursor VALUES(1,?,?)", (debts[-1][3], debts[-1][0]))
             domains = self.scope["domains"]
             for index in range(explore):
                 domain = domains[(count * explore + index) % len(domains)]
@@ -164,6 +176,7 @@ class IntelligenceCoverage:
                 "observed_sources_with_events": sum(r["last_event_at"] is not None for r in rows),
                 "dynamic_source_rows": dynamic,
                 "debt_records": self.db.execute("SELECT count(*) FROM intelligence_debt").fetchone()[0],
+                "active_debt_records": self.db.execute("SELECT count(*) FROM intelligence_debt WHERE active=1").fetchone()[0],
                 "completed_planning_rounds": self.db.execute("SELECT count(*) FROM intelligence_rounds").fetchone()[0],
                 "latest_plan": json.loads(last_plan[0]) if last_plan else [],
                 "all_global_sources_observed": False, "global_launch_coverage_fraction": None,
