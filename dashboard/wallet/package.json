@@ -1,0 +1,7 @@
+{
+  "name": "memecoin-phantom-operator",
+  "private": true,
+  "scripts": {"build": "esbuild wallet-source.js --bundle --minify --legal-comments=inline --outfile=wallet.js"},
+  "dependencies": {"@solana/web3.js": "1.98.4"},
+  "devDependencies": {"esbuild": "0.25.12"}
+}

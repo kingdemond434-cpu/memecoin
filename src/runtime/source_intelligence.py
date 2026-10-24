@@ -175,6 +175,8 @@ class SourceIntelligence:
             "token_id": tokens[0] if len(tokens) == 1 else None,
             "observation_id": hashlib.sha256(json.dumps([event.source_id, metadata.get("message_id") or metadata.get("link"),
                 event.content_hash, event.source_at], sort_keys=True).encode()).hexdigest()}
+        from src.research.local_decisions import annotate_public_text
+        payload["local_decision_shadow"] = annotate_public_text(event.text)
         # Only explicit reviewed provenance can assert operator independence
         # or original/clone/promotion labels. Author handles are not operators.
         for key in ("operator_id", "operator_verified", "operator_evidence_refs", "label", "label_provenance"):

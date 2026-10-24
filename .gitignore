@@ -60,6 +60,7 @@ wheels/
 native/solana_fastpath/target/
 config/sources.verified.yaml
 config/entities.verified.yaml
+node_modules/
 
 # Rust build artifacts. 1569 of these were tracked, which bloats every clone
 # and every pull on the node for files cargo regenerates in seconds.
