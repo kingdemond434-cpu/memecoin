@@ -104,8 +104,8 @@ class MinerSpec:
     endpoint: str = ""
     requires_env: Tuple[str, ...] = ()
     detail: str = ""
-    # Bound immediate downstream work; a configured retention sink persists
-    # the full batch before the remainder becomes explicit deferred work.
+    # Per-consumer-call work quantum. All retained records are delivered in
+    # successive chunks, yielding between them; this is not a discovery cap.
     max_records: int = 500
 
     def missing_credentials(self) -> List[str]:
@@ -307,10 +307,9 @@ class DataMinerPool:
                 health.last_error = f"retention failed: {type(exc).__name__}"
                 return MinerResult(miner_id=miner_id, status="DATA_BLOCKED",
                                    fetched_at=now, detail=health.last_error)
-        stamped = all_stamped[:spec.max_records]
-        deferred = len(all_stamped) - len(stamped)
-        delivery_status = "DEFERRED" if deferred else "DELIVERED"
-        delivery_detail = f"delivered={len(stamped)}; deferred={deferred}"
+        stamped = all_stamped
+        delivery_status = "DELIVERED"
+        delivery_detail = f"delivered={len(stamped)}; deferred=0"
         health.passes += 1
         health.records += len(stamped)
         health.last_ok_at = received_at
@@ -321,14 +320,18 @@ class DataMinerPool:
         health.backoff_seconds = 0.0
         self.total_records += len(stamped)
         if stamped and self.on_records is not None:
-            try:
-                self.on_records(miner_id, stamped)
-            except Exception as exc:
-                delivery_status = "RETRY_REQUIRED"
-                delivery_detail = f"consumer failed: {type(exc).__name__}; batch retained={bool(batch_ref)}"
-                health.failures += 1
-                health.last_error = delivery_detail
-                logger.warning("miner %s consumer raised: %s", miner_id, exc)
+            chunk_size = max(1, int(spec.max_records))
+            for offset in range(0, len(stamped), chunk_size):
+                try:
+                    self.on_records(miner_id, stamped[offset:offset + chunk_size])
+                except Exception as exc:
+                    delivery_status = "RETRY_REQUIRED"
+                    delivery_detail = f"consumer failed: {type(exc).__name__}; delivered={offset}; deferred={len(stamped)-offset}; batch retained={bool(batch_ref)}"
+                    health.failures += 1
+                    health.last_error = delivery_detail
+                    logger.warning("miner %s consumer raised: %s", miner_id, exc)
+                    break
+                await asyncio.sleep(0)
         if batch_ref and self.retain_disposition is not None:
             try:
                 self.retain_disposition(batch_ref, delivery_status, delivery_detail, received_at)

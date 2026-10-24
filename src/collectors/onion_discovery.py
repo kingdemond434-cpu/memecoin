@@ -1,14 +1,14 @@
-"""Automatic, bounded admission of public onion links into the existing mesh."""
+"""Continuous, provenance-bound admission into a disk-backed public frontier."""
 from __future__ import annotations
 
-import hashlib
 import os
 import re
-from urllib.parse import urlsplit
+from pathlib import Path
 
 from src.collectors.onion import PROXY_ENV, onion_url
 from src.collectors.transports import TransportError
 
+# Legacy archive remains readable for migration and historical capacity debt.
 COMPONENT = "public_onion_discovery_v1"
 PATTERN = re.compile(r"(?<![a-z0-9])(?:https?://)?[a-z2-7]{56}\.onion(?:/[^\s<>\"']*)?", re.I)
 
@@ -21,99 +21,56 @@ def candidate_url(text):
 def candidate_urls(event):
     metadata = getattr(event, "metadata", {}) or {}
     material = " ".join([getattr(event, "text", ""), *getattr(event, "urls", ()),
-                         *metadata.get("discovered_onion_links", [])])
-    result = []
-    for match in PATTERN.findall(material):
+                         metadata.get('url') or '', *metadata.get("discovered_onion_links", [])])
+    result = {}
+    for match in PATTERN.finditer(material):
         try:
-            url = candidate_url(match)
+            result[candidate_url(match.group())] = None
         except TransportError:
             continue
-        if url not in result:
-            result.append(url)
-        if len(result) == 128:
-            break
-    return result
+    return list(result)
 
 
-def _register(desk, entry):
-    from src.collectors.registry import SourceDeclaration, build_sources
-    from src.collectors.transports import build_transports
-    source_id = entry["source_id"]
-    if source_id in desk.transports:
-        return True
-    declaration = SourceDeclaration(source_id, "onion", tier=3,
-        poll_interval_seconds=120, poll_timeout_seconds=45,
-        options={"url": entry["url"], "source_ref": entry["source_ref"],
-                 "max_pages": 128, "max_depth": 6, "pages_per_poll": 1})
-    transports, report, _ = build_transports([declaration], desk.http_client)
-    if source_id not in transports:
-        return False
-    sources, _ = build_sources([declaration], transports)
-    if not sources:
-        return False
-    desk.transports.update(transports)
-    desk.source_fetchers.update(transports)
-    desk.source_mesh.add(sources[0])
-    return True
+def _frontier(desk):
+    config = getattr(desk, "global_config", {})
+    if not getattr(desk, "unknown_engine", None) or not config.get("onion_auto_discovery", False):
+        return None
+    current = getattr(desk, "onion_frontier", None)
+    if current is None:
+        from src.collectors.onion_frontier import OnionFrontierTransport
+        current = OnionFrontierTransport(config.get("onion_frontier_path") or
+            Path(config.get("ops_state_dir", "data/state")) / "public_onion_frontier.sqlite")
+        current.migrate(desk.unknown_engine.framework.get_research_component(COMPONENT) or {},
+                        config.get('onion_legacy_state_dir', 'data/research/onion'))
+        desk.onion_frontier = current
+    if os.getenv(PROXY_ENV) and current.source_id not in desk.transports:
+        from src.collectors.adapters import onion_source
+        source = onion_source(current.source_id, current)
+        source.poll_interval_seconds = 2
+        source.poll_timeout_seconds = 45
+        desk.transports[current.source_id] = current
+        desk.source_fetchers[current.source_id] = current
+        desk.source_mesh.add(source)
+    return current
 
 
 def restore(desk):
-    engine = getattr(desk, "unknown_engine", None)
-    if not engine or not os.getenv(PROXY_ENV) or not getattr(desk, "global_config", {}).get("onion_auto_discovery", False):
-        return 0
-    state = engine.framework.get_research_component(COMPONENT) or {}
-    restored = 0
-    maximum = max(1, min(32, int(getattr(desk, "global_config", {}).get("onion_max_sources", 16))))
-    for entry in list(state.get("admitted", {}).values())[:maximum]:
-        restored += int(_register(desk, entry))
-    return restored
-
-
-def _admit_pending(desk, state):
-    if not os.getenv(PROXY_ENV):
-        return False
-    maximum = max(1, min(32, int(getattr(desk, "global_config", {}).get("onion_max_sources", 16))))
-    active = sum(getattr(transport, "kind", None) == "onion" for transport in desk.transports.values())
-    changed = False
-    for identity, entry in list(state["pending"].items())[:2]:
-        if active >= maximum:
-            break
-        if _register(desk, entry):
-            state["admitted"][identity] = state["pending"].pop(identity)
-            active += 1
-            changed = True
-    return changed
+    frontier = _frontier(desk)
+    return frontier.report()["discovered_hosts"] if frontier and os.getenv(PROXY_ENV) else 0
 
 
 def drain(desk):
-    engine = getattr(desk, "unknown_engine", None)
-    if not engine or not getattr(desk, "global_config", {}).get("onion_auto_discovery", False):
-        return
-    state = engine.framework.get_research_component(COMPONENT)
-    if state and _admit_pending(desk, state):
-        engine.framework.checkpoint_research_component(COMPONENT, state)
+    _frontier(desk)
 
 
 def discover(desk, event, canonical_job_id):
-    engine = getattr(desk, "unknown_engine", None)
-    if not engine or not canonical_job_id or not getattr(desk, "global_config", {}).get("onion_auto_discovery", False):
+    if not canonical_job_id:
         return
-    state = engine.framework.get_research_component(COMPONENT) or {"admitted": {}, "pending": {}, "capacity_debt": 0}
-    admitted, pending = state["admitted"], state["pending"]
-    changed = False
-    for url in candidate_urls(event):
-        host = urlsplit(url).hostname
-        identity = hashlib.sha256(host.encode()).hexdigest()
-        if identity in admitted or identity in pending:
-            continue
-        if len(pending) >= 512:
-            state["capacity_debt"] += 1
-            changed = True
-            continue
-        pending[identity] = {"source_id": "onion:discovered-" + identity[:20], "url": url,
-            "source_ref": "frontier_job:" + canonical_job_id,
-            "discovered_at": event.observed_at, "identity_status": "UNVERIFIED_PUBLIC_LINK"}
-        changed = True
-    changed = _admit_pending(desk, state) or changed
-    if changed:
-        engine.framework.checkpoint_research_component(COMPONENT, state)
+    frontier = _frontier(desk)
+    if frontier is None:
+        return
+    if event.source_id == frontier.source_id:
+        # Child admission is committed with canonical acknowledgement by the
+        # transport, retaining the exact parent URL and crawl depth.
+        return
+    frontier.enqueue(candidate_urls(event), "frontier_job:" + canonical_job_id, event.observed_at)

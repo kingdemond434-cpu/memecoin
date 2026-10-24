@@ -203,14 +203,17 @@ def onion_research_report(desk: Any) -> Dict[str, Any]:
     observed = [row for row in rows if row.get("last_observed_at") is not None]
     engine = getattr(desk, "unknown_engine", None)
     framework = getattr(engine, "framework", None)
-    discovery = (framework.get_research_component("public_onion_discovery_v1") or {}) if framework else {}
+    frontier = getattr(desk, "onion_frontier", None)
+    progress = frontier.report() if frontier else {}
+    discovery = (framework.get_research_component("public_onion_discovery_v1") or {}) if framework and not frontier else {}
     return {"status": "OBSERVED" if observed else "DATA_BLOCKED", "authority": "none",
-            "scope": "DECLARED_PUBLIC_ONION_SOURCES_ONLY", "all_onion_coverage": False,
+            "scope": "CONTINUOUS_PUBLIC_ONION_DISCOVERY", "all_onion_coverage": False,
             "sources": rows, "observed_sources": len(observed),
             "automatic_discovery_enabled": bool(getattr(desk, "global_config", {}).get("onion_auto_discovery", False)),
-            "admitted_discovered_sources": len(discovery.get("admitted", {})),
-            "pending_discovered_sources": len(discovery.get("pending", {})),
-            "candidate_capacity_debt": discovery.get("capacity_debt", 0),
+            "admitted_discovered_sources": progress.get("discovered_hosts", len(discovery.get("admitted", {}))),
+            "pending_discovered_sources": progress.get("pending_pages", len(discovery.get("pending", {}))),
+            "candidate_capacity_debt": progress.get("legacy_candidate_capacity_debt", discovery.get("capacity_debt", 0)),
+            "continuous_frontier": progress,
             "unverified_claims_only": True,
             "detail": "" if observed else "no declared onion source has produced a successful observation"}
 

@@ -52,6 +52,7 @@ def test_observation_commits_before_return_without_rewriting_framework(tmp_path)
     path = tmp_path / "champion.json"
     framework = ChampionChallengerFramework(state_path=str(path))
     hunter = PopulationHunter(framework)
+    framework._save_state()
     before = path.read_bytes()
     assert framework.get_research_component(COMPONENT)["storage"] == STORAGE
     result = hunter.consume("NARRATIVE_OBSERVATION", mention(), ["fixture:canonical"], 11.)

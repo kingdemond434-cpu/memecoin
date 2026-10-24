@@ -128,14 +128,15 @@ class TorHttpClient(HttpClient):
 
 
 class _Document(HTMLParser):
-    def __init__(self):
+    def __init__(self, link_limit=128):
         super().__init__(convert_charrefs=True)
         self.text, self.links, self.hidden = [], [], []
+        self.link_limit = link_limit
 
     def handle_starttag(self, tag, attrs):
         if tag in {"script", "style", "noscript", "template"}:
             self.hidden.append(tag)
-        if not self.hidden and tag == "a" and len(self.links) < 128:
+        if not self.hidden and tag == "a" and (self.link_limit is None or len(self.links) < self.link_limit):
             href = dict(attrs).get("href")
             if href:
                 self.links.append(href)
@@ -360,7 +361,7 @@ class OnionDirectoryTransport(HttpTransport):
             return []
         if len(text.encode()) > MAX_BODY:
             raise TransportError("public onion announcement exceeds document budget")
-        document = _Document()
+        document = _Document(link_limit=None)
         document.feed(text)
         content = " ".join(" ".join(document.text).split())
         links = []
@@ -371,8 +372,6 @@ class OnionDirectoryTransport(HttpTransport):
                 continue
             if url not in links:
                 links.append(url)
-            if len(links) == 128:
-                break
         digest = hashlib.sha256((content + json.dumps(links)).encode()).hexdigest()
         if digest == self.digest:
             return []

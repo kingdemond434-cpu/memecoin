@@ -51,6 +51,7 @@ import logging
 import os
 import re
 import time
+import tempfile
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -194,7 +195,7 @@ def extract_mints(text: str) -> List[str]:
             continue
         seen.add(candidate)
         out.append(candidate)
-    return out[:12]
+    return out
 
 
 def extract_handles(text: str) -> List[str]:
@@ -207,7 +208,7 @@ def extract_handles(text: str) -> List[str]:
             continue
         seen.add(lowered)
         out.append(candidate)
-    return out[:20]
+    return out
 
 
 @dataclass
@@ -246,17 +247,16 @@ class ChannelBook:
     """Which public channels we mine, how each got there, and which are dead.
 
     Persisted, because discovery is slow and a restart that forgets four
-    hundred verified handles has thrown away days of it. Bounded, because an
-    unbounded candidate set is a slow memory leak fed by every link in every
-    message the desk has ever read.
+    hundred verified handles has thrown away days of it. Admission has no
+    default ceiling; rotating batches bound active requests, not discovery.
     """
 
     def __init__(self, path: str = "data/telegram/channels.json", *,
-                 max_verified: int = 600, max_candidates: int = 4_000,
+                 max_verified: Optional[int] = None, max_candidates: Optional[int] = None,
                  promote_after_mentions: int = 1):
         self.path = path
-        self.max_verified = int(max_verified)
-        self.max_candidates = int(max_candidates)
+        self.max_verified = int(max_verified) if max_verified is not None else None
+        self.max_candidates = int(max_candidates) if max_candidates is not None else None
         self.promote_after_mentions = max(1, int(promote_after_mentions))
         self.channels: Dict[str, ChannelRecord] = {}
         self._cursor = 0
@@ -284,7 +284,7 @@ class ChannelBook:
         if existing is not None:
             existing.mentions += 1
             return False
-        if self._count("CANDIDATE") >= self.max_candidates:
+        if self.max_candidates is not None and self._count("CANDIDATE") >= self.max_candidates:
             return False
         self.channels[key.lower()] = ChannelRecord(
             handle=key, discovered_from=source, first_seen=moment, mentions=1)
@@ -357,7 +357,7 @@ class ChannelBook:
 
     def pending(self) -> List[str]:
         """Candidates with enough independent mentions to be worth a check."""
-        return [record.handle for record in self.channels.values()
+        return [record.handle for record in sorted(self.channels.values(), key=lambda row: (row.checks, row.first_seen, row.handle))
                 if record.state == "CANDIDATE"
                 and record.mentions >= self.promote_after_mentions]
 
@@ -381,6 +381,8 @@ class ChannelBook:
         channel full of chat is worth less than a quiet one that only posts
         calls, and message volume would rank them the other way round.
         """
+        if self.max_verified is None:
+            return
         verified = [record for record in self.channels.values()
                     if record.state == "VERIFIED"]
         if len(verified) <= self.max_verified:
@@ -407,18 +409,27 @@ class ChannelBook:
 
     def save(self) -> bool:
         directory = os.path.dirname(self.path)
+        temporary = None
         try:
             if directory:
                 os.makedirs(directory, exist_ok=True)
-            with open(self.path, "w", encoding="utf-8") as handle:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory or '.',
+                                             prefix='.channels-', delete=False) as handle:
+                temporary = handle.name
                 json.dump({"schema": TELEGRAM_MINER_SCHEMA_VERSION,
                            "saved_at": time.time(),
                            "channels": [vars(record) for record
                                         in self.channels.values()]}, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
             return True
         except OSError as exc:
             logger.warning("channel book save failed: %s", exc)
             return False
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
 
     # --- reporting -------------------------------------------------------
 
@@ -438,6 +449,8 @@ class ChannelBook:
         producing = [row for row in verified if row.mints_seen > 0]
         return {
             "schema": TELEGRAM_MINER_SCHEMA_VERSION,
+            "verified_admission_limit": self.max_verified,
+            "candidate_admission_limit": self.max_candidates,
             "status": ("DATA_BLOCKED" if not verified
                        else "DEGRADED" if silent or never else "OK"),
             "detail": ("no verified public channel yet; discovery has not "

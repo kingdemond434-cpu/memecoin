@@ -162,6 +162,12 @@ class ChampionChallengerFramework:
         self._running = False
         self._evaluation_task: Optional[asyncio.Task] = None
         self._load_state()
+        self._load_component_checkpoints()
+        if self.state_path and not self.state_path.exists():
+            # Keep the framework snapshot present for existing readers. Only
+            # initial creation needs the global write; subsequent research
+            # updates commit independently to their component files.
+            self._save_state()
 
     async def start(self):
         self._running = True
@@ -581,8 +587,55 @@ class ChampionChallengerFramework:
     def checkpoint_research_component(self, name: str, state: Dict[str, Any]) -> None:
         if not isinstance(name, str) or not name.strip():
             raise ValueError("named research component required")
-        self.research_components[name] = self._research_checkpoint(state)
-        self._save_state()
+        value = self._research_checkpoint(state)
+        with self._state_write_lock:
+            if self.state_path:
+                directory = Path(str(self.state_path) + '.components')
+                directory.mkdir(parents=True, exist_ok=True)
+                target = directory / (hashlib.sha256(name.encode()).hexdigest() + '.json')
+                payload = {'schema_version': 1, 'name': name, 'state': value}
+                descriptor, filename = tempfile.mkstemp(prefix='.component-', suffix='.tmp', dir=directory)
+                temporary = Path(filename)
+                try:
+                    with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+                        handle.write(json.dumps(payload, sort_keys=True, allow_nan=False))
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    for attempt in range(5):
+                        try:
+                            os.replace(temporary, target)
+                            break
+                        except PermissionError:
+                            if attempt == 4:
+                                raise
+                            time.sleep(.02 * 2 ** attempt)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            # Publish only after the independent checkpoint is durable. A
+            # catalogue update must not serialize every hypothesis/trial and
+            # all other growing components on the collection event loop.
+            self.research_components[name] = value
+
+    def _load_component_checkpoints(self):
+        if not self.state_path:
+            return
+        directory = Path(str(self.state_path) + '.components')
+        if not directory.exists():
+            return
+        restored = {}
+        for path in directory.glob('*.json'):
+            try:
+                payload = json.loads(path.read_text(encoding='utf-8'))
+                name = payload['name']
+                if (payload.get('schema_version') != 1 or not isinstance(name, str) or not name.strip()
+                        or path.name != hashlib.sha256(name.encode()).hexdigest() + '.json'):
+                    raise ValueError('component identity mismatch')
+                restored[name] = self._research_checkpoint(payload['state'])
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                raise RuntimeError('research component checkpoint unreadable: ' + path.name) from exc
+        # Sidecars are newer than the legacy full snapshot. Never promote a
+        # model or overwrite capital/trial state from a research sidecar.
+        self.research_components.update(restored)
 
     def _save_state(self):
         with self._state_write_lock:
