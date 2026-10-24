@@ -278,6 +278,17 @@ def onion_source(source_id: str, fetch) -> CallableSource:
     return CallableSource(source_id, SourceClass.WEB, fetch, to_event)
 
 
+def onion_directory_source(source_id: str, fetch) -> CallableSource:
+    def to_event(record, now):
+        return normalise(source_id, SourceClass.WEB, record["text"],
+            source_at=record["observed_at"], observed_at=record["observed_at"],
+            metadata={"url": record["url"], "content_hash": record["content_hash"],
+                "source_ref": record["url"], "onion_directory_observation_id": record["observation_id"],
+                "publication_time_known": False, "claim_status": "UNVERIFIED",
+                "discovered_onion_links": record["discovered_onion_links"]})
+    return CallableSource(source_id, SourceClass.WEB, fetch, to_event)
+
+
 def code_repository_source(source_id: str, fetch) -> CallableSource:
     """Public repository activity, which occasionally names a mint before marketing."""
     def to_event(record: Dict[str, Any], now: float) -> Optional[Event]:

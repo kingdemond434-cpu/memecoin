@@ -981,6 +981,7 @@ class TransportReport:
 #: built for it. Stated as data so a missing option is reported by name rather
 #: than discovered as a TypeError at construction.
 REQUIRED_OPTIONS: Dict[str, Tuple[str, ...]] = {
+    "onion_directory": ("url",),
     "onion": ("url", "source_ref"),
     "rss": ("url",),
     "official_site": ("url",),
@@ -1013,6 +1014,10 @@ def build_transport(declaration: Any, client: HttpClient) -> Any:
     if missing:
         raise TransportError(f"declaration is missing options: {', '.join(missing)}")
     source_id = declaration.source_id
+
+    if kind == "onion_directory":
+        from src.collectors.onion import OnionDirectoryTransport
+        return OnionDirectoryTransport(source_id, str(options["url"]), client)
 
     if kind == "onion":
         from src.collectors.onion import OnionResearchTransport

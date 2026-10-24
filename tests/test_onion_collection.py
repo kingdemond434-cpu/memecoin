@@ -25,7 +25,7 @@ class Pages:
     def __init__(self, responses):
         self.responses, self.calls = list(responses), []
 
-    async def get(self, url):
+    async def get(self, url, **kwargs):
         self.calls.append(url)
         result = self.responses.pop(0)
         if isinstance(result, Exception):

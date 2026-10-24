@@ -2,6 +2,8 @@
 # configuration. No wallet keys or API values belong here. Enabling replay
 # requires a sealed, observed corpus; DATA_BLOCKED audit output is not a split.
 global:
+  onion_auto_discovery: false
+  onion_max_sources: 16
   research_replay:
     enabled: false
     episode_path: data/research/sealed-corpus

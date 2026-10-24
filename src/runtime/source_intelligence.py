@@ -180,16 +180,29 @@ class SourceIntelligence:
         for key in ("operator_id", "operator_verified", "operator_evidence_refs", "label", "label_provenance"):
             if key in metadata:
                 payload[key] = metadata[key]
-        if getattr(transport, "kind", None) == "onion":
+        from src.collectors.onion_discovery import candidate_urls
+        discovered_onions = candidate_urls(event)
+        if discovered_onions:
+            payload["discovered_onion_links"] = discovered_onions
+        if getattr(transport, "kind", None) in {"onion", "onion_directory"}:
             payload["public_source_evidence"] = {key: metadata.get(key) for key in (
                 "url", "source_ref", "content_hash", "publication_time_known", "published_at",
                 "observation_kind", "claim_status", "claim_topics", "evm_address_mentions",
                 "address_role_status", "text_truncated", "onion_observation_id")}
         job_id = self._enqueue_population_work("NARRATIVE_OBSERVATION", payload,
             evidence_refs=metadata.get("evidence_refs") or (), now=event.observed_at)
-        if job_id and getattr(transport, "kind", None) == "onion":
+        discovery_stored = True
+        if job_id and discovered_onions:
+            from src.collectors.onion_discovery import discover
             try:
-                transport.acknowledge(metadata.get("onion_observation_id"), job_id)
+                discover(self, event, job_id)
+            except Exception as exc:
+                discovery_stored = False
+                logger.warning("onion source discovery deferred: %s", type(exc).__name__)
+        if job_id and discovery_stored and getattr(transport, "kind", None) in {"onion", "onion_directory"}:
+            try:
+                transport.acknowledge(metadata.get("onion_observation_id") or
+                                      metadata.get("onion_directory_observation_id"), job_id)
             except Exception as exc:
                 logger.warning("onion canonical acknowledgement deferred: %s", type(exc).__name__)
         return job_id
@@ -427,6 +440,11 @@ class SourceIntelligence:
         # The collector's client, when it has one: it is already connected
         # and already authorised, and it holds the session file every other
         # Telegram client in this process would otherwise fail to open.
+        from src.collectors.onion_discovery import restore
+        try:
+            restore(self)
+        except Exception as exc:
+            logger.warning("onion source restore deferred: %s", type(exc).__name__)
         failures = await start_transports(
             self.transports,
             telegram_client=getattr(self.social_intel, "_telegram_client", None))

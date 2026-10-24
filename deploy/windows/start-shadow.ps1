@@ -3,7 +3,11 @@ param(
     [Parameter(Mandatory=$true)][string]$PythonExe,
     [Parameter(Mandatory=$true)][string]$LogRoot,
     [ValidateRange(1024,65535)][int]$HealthPort = 18081,
-    [string]$ConfigPath = ''
+    [string]$ConfigPath = '',
+    [string]$TorExe = '',
+    [string]$TorConfig = '',
+    [string]$TorExeSha256 = '',
+    [string]$TorProxyUrl = 'socks5://127.0.0.1:9152'
 )
 $ErrorActionPreference = 'Stop'
 $taskRepo = [IO.Path]::GetFullPath($RepoRoot)
@@ -38,5 +42,35 @@ if ($ConfigPath) {
     $taskCliArguments += @('--config', $taskConfig)
 }
 $ErrorActionPreference = 'Continue'
-& $taskPython @taskCliArguments 1>> $taskOut 2>> $taskErr
-exit $LASTEXITCODE
+$taskTorProcess = $null
+$taskExitCode = 1
+try {
+    if ($TorExe -or $TorConfig) {
+        $ErrorActionPreference = 'Stop'
+        if (-not $TorExe -or -not $TorConfig -or $TorExeSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+            throw 'Optional Tor client requires executable, config and verified executable SHA256'
+        }
+        $taskTorExe = [IO.Path]::GetFullPath($TorExe)
+        $taskTorConfig = [IO.Path]::GetFullPath($TorConfig)
+        if (-not (Test-Path -LiteralPath $taskTorExe -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $taskTorConfig -PathType Leaf)) { throw 'Tor client files missing' }
+        if ((Get-FileHash -LiteralPath $taskTorExe -Algorithm SHA256).Hash -ne $TorExeSha256) {
+            throw 'Tor executable differs from verified deployment hash'
+        }
+        if ($TorProxyUrl -notmatch '^socks5://127\.0\.0\.1:[0-9]{2,5}$') {
+            throw 'Managed Windows Tor proxy must bind to localhost'
+        }
+        $taskTorProcess = Start-Process -FilePath $taskTorExe -ArgumentList @('-f', ('"' + $taskTorConfig + '"')) -WindowStyle Hidden -PassThru
+        $env:MEMECOIN_TOR_PROXY_URL = $TorProxyUrl
+        $ErrorActionPreference = 'Continue'
+    }
+    & $taskPython @taskCliArguments 1>> $taskOut 2>> $taskErr
+    $taskExitCode = $LASTEXITCODE
+} finally {
+    # The job object also owns this child if Task Scheduler ends the launcher.
+    # A normal stop closes only the Tor process created by this invocation.
+    if ($taskTorProcess -and -not $taskTorProcess.HasExited) {
+        Stop-Process -Id $taskTorProcess.Id -ErrorAction SilentlyContinue
+    }
+}
+exit $taskExitCode

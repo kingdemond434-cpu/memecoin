@@ -17,8 +17,21 @@ verified token mint.
 Declared forum pages and same-host discussion links are polled at a bounded
 cadence. A source can explore up to 256 pages and eight link levels, with at
 most two requests per poll. Other onion links are retained as source candidates
-without automatically authorizing an unrelated host. Dread can use this same
-transport when its current public endpoint and provenance are verified.
+for the automatic discovery frontier. Dread can use this same transport; a
+discovered link remains an unverified source identity rather than proof that
+its service is the genuine forum.
+
+Set `global.onion_auto_discovery: true` and append
+`config/sources.onion-discovery.yaml` to the source registry to discover public
+links from the selected announcement page. Links found in other collected
+public messages, Telegram content and onion pages enter the same discovery
+path. Their original canonical research work item is retained as provenance.
+At most two new hosts are admitted per event, up to
+`global.onion_max_sources` (default 16, hard maximum 32); up to 512 additional
+hosts stay pending with explicit capacity debt. Sources resume after restart.
+Each added source starts polling immediately even when the mesh is already
+running. No source gains authenticity from its domain spelling or discovery
+origin. Current Dread identity still needs independent verification.
 
 Records retain their source URL, provenance, content hash, original observation
 time, launch/wallet/claimed-insider/claimed-coordination topics and address
@@ -51,6 +64,14 @@ bound to localhost on a native deployment, then set
 `MEMECOIN_TOR_PROXY_URL=socks5://127.0.0.1:9050` in that deployment's environment.
 This value is a proxy endpoint, not an API credential. Tor client state and
 executables should live outside the source checkout.
+
+The Windows paper launcher accepts optional `-TorExe`, `-TorConfig`,
+`-TorExeSha256` and `-TorProxyUrl` arguments. Verify the official release
+signature and executable hash before supplying them. The launcher checks that
+hash, starts a hidden Tor child bound to a localhost proxy, and owns it in the
+same Windows process job as the paper desk. Normal exit and task termination
+clean up that child. It does not change the scheduled task's account/logon
+mode, install an unattended task, or unlock trading.
 
 For Docker, use the explicit overlay:
 

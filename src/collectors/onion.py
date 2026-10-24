@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import html
 import copy
 import json
 import os
@@ -20,7 +21,7 @@ from collections import deque
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
-from src.collectors.transports import HttpClient, Transport, TransportError
+from src.collectors.transports import HttpClient, HttpTransport, Transport, TransportError
 
 MAX_BODY = 512 * 1024
 PROXY_ENV = "MEMECOIN_TOR_PROXY_URL"
@@ -329,3 +330,55 @@ class OnionResearchTransport(Transport):
             "last_observed_at": self.last_observed_at,
             "candidate_links": sorted(self.candidate_links),
             "status": "OBSERVED" if self.last_observed_at is not None else "NOT_OBSERVED"}
+
+
+class OnionDirectoryTransport(HttpTransport):
+    """Discover public onion links from a selected ordinary public page/feed."""
+    kind = "onion_directory"
+
+    def __init__(self, source_id, url, client):
+        parts = urlsplit(url)
+        if parts.scheme != "https" or not parts.hostname or parts.username or parts.password or parts.hostname.endswith(".onion"):
+            raise TransportError("public HTTPS announcement/directory URL required")
+        super().__init__(source_id, url, client)
+        self.digest = None
+        self.pending = []
+
+    def acknowledge(self, observation_id, canonical_job_id):
+        if not canonical_job_id:
+            raise TransportError("canonical discovery intake acknowledgement required")
+        if self.pending and self.pending[0]["observation_id"] == observation_id:
+            self.digest = self.pending[0]["content_hash"]
+            self.pending = []
+
+    async def fetch(self):
+        from src.collectors.onion_discovery import PATTERN, candidate_url
+        if self.pending:
+            return copy.deepcopy(self.pending)
+        text = await self.body()
+        if text is None:
+            return []
+        if len(text.encode()) > MAX_BODY:
+            raise TransportError("public onion announcement exceeds document budget")
+        document = _Document()
+        document.feed(text)
+        content = " ".join(" ".join(document.text).split())
+        links = []
+        for candidate in PATTERN.findall(html.unescape(text) + " " + " ".join(document.links)):
+            try:
+                url = candidate_url(candidate)
+            except TransportError:
+                continue
+            if url not in links:
+                links.append(url)
+            if len(links) == 128:
+                break
+        digest = hashlib.sha256((content + json.dumps(links)).encode()).hexdigest()
+        if digest == self.digest:
+            return []
+        observed = time.time()
+        self.pending = [{"text": content[:16000] or "Public onion link observation", "url": self.url,
+            "observed_at": observed, "content_hash": digest,
+            "observation_id": hashlib.sha256(json.dumps([self.url, digest, observed]).encode()).hexdigest(),
+            "discovered_onion_links": links}]
+        return copy.deepcopy(self.pending)
