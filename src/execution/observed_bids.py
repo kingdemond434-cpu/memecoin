@@ -87,18 +87,23 @@ class ComputeBudget:
         return self.unit_price_micro_lamports is not None
 
     @property
-    def priority_lamports(self) -> Optional[float]:
+    def priority_lamports(self) -> Optional[int]:
         """What the priority actually costs, which is price TIMES limit.
 
         A unit price alone is not comparable across transactions: paying
         1,000 micro-lamports per unit on a 40,000-unit budget and on a
         400,000-unit budget are ten times apart in what the leader
-        receives, and the leader is ordering by the total.
+        receives. Scheduling also depends on transaction cost and contention.
         """
         if self.unit_price_micro_lamports is None:
             return None
-        limit = self.unit_limit if self.unit_limit else 200_000
-        return self.unit_price_micro_lamports * limit / 1_000_000.0
+        if self.unit_price_micro_lamports == 0:
+            return 0
+        if self.unit_limit is None or not 0 <= self.unit_limit <= 1_400_000:
+            # The default depends on the full instruction mix/runtime, not
+            # a universal 200k budget. Do not invent a measured total.
+            return None
+        return (self.unit_price_micro_lamports * self.unit_limit + 999_999) // 1_000_000
 
 
 def decode_compute_budget(instructions: Sequence[Tuple[str, bytes]]
@@ -134,6 +139,7 @@ class BidBucket:
     #: Transactions that declared no priority at all. Counted separately,
     #: never as a zero bid -- see ComputeBudget.stated.
     silent: int = 0
+    unpriced: int = 0
 
     def percentile(self, fraction: float) -> Optional[float]:
         if len(self.samples) < MIN_SAMPLES:
@@ -147,6 +153,7 @@ class BidBucket:
             "bucket": self.label,
             "samples": len(self.samples),
             "silent": self.silent,
+            "unpriced_declared_budgets": self.unpriced,
             "silent_share": (self.silent / (self.silent + len(self.samples))
                              if (self.silent or self.samples) else None),
             "p50_lamports": self.percentile(0.50),
@@ -195,7 +202,10 @@ class ObservedBidCorpus:
             bucket.silent += 1
             return False
         priority = budget.priority_lamports
-        if priority is None or priority <= 0:
+        if priority is None:
+            bucket.unpriced += 1
+            return False
+        if priority <= 0:
             bucket.silent += 1
             return False
         bucket.samples.append(priority)

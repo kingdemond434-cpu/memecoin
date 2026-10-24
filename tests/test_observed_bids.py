@@ -46,11 +46,13 @@ class TheDecoderReadsTheDeclaredPriority(unittest.TestCase):
         self.assertAlmostEqual(large.priority_lamports,
                                small.priority_lamports * 10)
 
-    def test_a_missing_limit_uses_the_runtime_default(self):
+    def test_missing_limit_does_not_invent_a_total_priority_fee(self):
         budget = decode_compute_budget([_price(1_000)])
-        # 1,000 micro-lamports per unit over the default 200,000-unit budget
-        # is 200,000,000 micro-lamports, which is 200 lamports.
-        self.assertAlmostEqual(200.0, budget.priority_lamports)
+        self.assertIsNone(budget.priority_lamports)
+
+    def test_total_fee_uses_integer_ceiling_and_keeps_explicit_zero_limit(self):
+        self.assertEqual(1, decode_compute_budget([_limit(1), _price(1)]).priority_lamports)
+        self.assertEqual(0, decode_compute_budget([_limit(0), _price(1000)]).priority_lamports)
 
     def test_a_transaction_with_no_budget_states_nothing(self):
         # Not a zero bid: it took the default, and mixing those into a bid

@@ -892,6 +892,7 @@ class PointInTimeDatasetBuilder:
                 median = float(np.median(values))
                 p90 = float(np.percentile(values, 90))
                 result.update(priority_fee_median=median, priority_fee_p90=p90,
+                              priority_fee_unit='micro_lamports_per_compute_unit',
                               fee_pressure=min(p90 / max(median, 1.0), 100.0))
                 result["sources"]["solana_priority_fees"] = "OK"
             else:

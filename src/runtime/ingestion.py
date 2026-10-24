@@ -457,7 +457,7 @@ class MinedRecordIngestion:
             if record.get("slot_time_ratio") is not None:
                 self._network_health = dict(record)
                 continue
-            if record.get("fee_p50_lamports") is not None:
+            if record.get("cu_price_p50_micro_lamports") is not None:
                 self._priority_fees = dict(record)
                 continue
             # Supply control on a migrated pool, keyed by LP mint rather than
