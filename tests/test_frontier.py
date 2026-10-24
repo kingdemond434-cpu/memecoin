@@ -425,3 +425,59 @@ def test_new_sightings_cannot_bypass_a_coordinates_low_voi_hibernation(tmp_path)
     index.wake_coordinate(axes, enabling_change="new-independent-data", evidence_refs=["lake:new-data"], now=104)
     index.wake_job(new_job, enabling_change="new-independent-data", evidence_refs=["lake:new-data"], now=104)
     assert len(index.lease_jobs("worker", now=105)) == 2
+
+
+def test_legacy_coordinate_reference_array_migrates_without_losing_refs(tmp_path):
+    import json
+    path = tmp_path / 'frontier.sqlite'
+    index = FrontierIndex(path)
+    axes = {'chain': 'solana'}
+    identity = index.observe_coordinate(axes, state='TESTED', evidence_refs=['old:0'])
+    with index._db() as db:
+        db.execute('DELETE FROM coordinate_refs WHERE coordinate_id=?', (identity,))
+        db.execute('UPDATE coordinates SET evidence_refs=? WHERE coordinate_id=?',
+                   (json.dumps(['old:' + str(i) for i in range(3000)]), identity))
+    index.enqueue('fixture', 'new:one', axes=axes)
+    row = index.coordinate(axes)
+    assert row['state'] == 'TESTED'
+    assert len(row['evidence_refs']) == 3001
+    with index._db() as db:
+        assert db.execute('SELECT evidence_refs FROM coordinates WHERE coordinate_id=?', (identity,)).fetchone()[0] == '[]'
+    index.close()
+    restarted = FrontierIndex(path)
+    assert restarted.coordinate(axes)['evidence_refs'] == row['evidence_refs']
+    restarted.close()
+
+
+def test_pending_cursor_preserves_global_order_across_kinds_and_states(tmp_path):
+    index = FrontierIndex(tmp_path / 'frontier.sqlite')
+    for name, kind in [('z', 'b'), ('a', 'a'), ('c', 'b'), ('b', 'a')]:
+        index.enqueue(kind, 'ref:' + name, job_id=name)
+    assert [job['job_id'] for job in index.pending_work(kinds=('a','b'), limit=3)] == ['a','b','c']
+    assert [job['job_id'] for job in index.pending_work(limit=3, after_job_id='b')] == ['c','z']
+    index.close()
+
+
+def test_pending_cursor_does_not_scan_large_unrelated_backlog(tmp_path, monkeypatch):
+    index = FrontierIndex(tmp_path / 'frontier.sqlite')
+    active = index.enqueue('DATA_REQUEST', 'ref:active', job_id='z:active')
+    with index._db() as db:
+        template = dict(db.execute('SELECT * FROM jobs WHERE job_id=?', (active,)).fetchone())
+        columns = list(template)
+        rows = [{**template, 'job_id': 'a:' + str(i), 'kind': 'UNRELATED'} for i in range(12000)]
+        db.executemany('INSERT INTO jobs (' + ','.join(columns) + ') VALUES (' + ','.join('?' for _ in columns) + ')',
+                       [tuple(row[key] for key in columns) for row in rows])
+    actual = index._db
+    operations = [0]
+    @contextmanager
+    def bounded():
+        with actual() as db:
+            def progress():
+                operations[0] += 100
+                return int(operations[0] > 5000)
+            db.set_progress_handler(progress, 100)
+            yield db
+    monkeypatch.setattr(index, '_db', bounded)
+    assert [job['job_id'] for job in index.pending_work(kinds=('DATA_REQUEST',), limit=1)] == [active]
+    assert operations[0] < 5000
+    index.close()

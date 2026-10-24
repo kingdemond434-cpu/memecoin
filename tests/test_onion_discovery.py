@@ -77,6 +77,15 @@ def test_public_announcement_page_exposes_link_provenance_to_discovery():
     assert record.metadata["publication_time_known"] is False
 
 
+def test_large_public_index_retains_all_valid_addresses_in_accepted_document():
+    links = [URL + 'thread/' + str(i) for i in range(8000)]
+    body = '\n'.join(links)
+    assert len(body.encode()) > 512 * 1024
+    transport = OnionDirectoryTransport('index:public', 'https://example.test/public-index', Pages([body]), max_bytes=4 * 1024 * 1024)
+    record = asyncio.run(transport.fetch())[0]
+    assert record['discovered_onion_links'] == links
+
+
 def test_bare_forum_and_telegram_onion_addresses_are_discovered():
     bare = Event("public:chat", SourceClass.CHAT, 1., 2., text="Public forum " + host() + "/thread")
     assert candidate_urls(bare) == [URL + "thread"]

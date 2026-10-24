@@ -212,6 +212,9 @@ class FrontierIndex:
                     evidence_refs TEXT NOT NULL, coverage_debt REAL,
                     expected_value REAL, enabling_change TEXT, hibernation_reason TEXT,
                     created_at REAL NOT NULL, updated_at REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS coordinate_refs(
+                    coordinate_id TEXT NOT NULL, ref TEXT NOT NULL,
+                    PRIMARY KEY(coordinate_id,ref));
                 CREATE TABLE IF NOT EXISTS chains(
                     chain_id TEXT NOT NULL, version TEXT NOT NULL, family TEXT NOT NULL,
                     stage TEXT NOT NULL, metrics TEXT NOT NULL, evidence_refs TEXT NOT NULL,
@@ -233,6 +236,8 @@ class FrontierIndex:
                 CREATE TABLE IF NOT EXISTS job_tags(
                     job_id TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(job_id, tag));
                 CREATE INDEX IF NOT EXISTS jobs_due ON jobs(state, available_at, priority DESC, created_at);
+                CREATE INDEX IF NOT EXISTS jobs_pending_kind_cursor ON jobs(state,kind,job_id);
+                CREATE INDEX IF NOT EXISTS jobs_pending_cursor ON jobs(state,job_id);
                 CREATE INDEX IF NOT EXISTS tag_jobs ON job_tags(tag, job_id);
                 CREATE INDEX IF NOT EXISTS jobs_active_created ON jobs(cost_unit,created_at,job_id)
                     WHERE total_cost IS NOT NULL AND state IN ('READY','RETRY','LEASED');
@@ -359,7 +364,12 @@ class FrontierIndex:
         identity = coordinate_id(axes)
         with self._db() as db:
             row = db.execute("SELECT * FROM coordinates WHERE coordinate_id=?", (identity,)).fetchone()
-        return self._coordinate_row(row) if row else {
+            if row:
+                result = self._coordinate_row(row)
+                result['evidence_refs'] = sorted(set(result['evidence_refs']) | {
+                    saved[0] for saved in db.execute('SELECT ref FROM coordinate_refs WHERE coordinate_id=?', (identity,))})
+                return result
+        return {
             "coordinate_id": identity, "axes": normalize_axes(axes), "state": "UNSEEN",
             "evidence_refs": [], "coverage_debt": None, "expected_value": None,
             "enabling_change": None, "hibernation_reason": None,
@@ -386,7 +396,6 @@ class FrontierIndex:
             old = db.execute("SELECT * FROM coordinates WHERE coordinate_id=?", (identity,)).fetchone()
             if old and old["state"] == "HIBERNATED_LOW_VOI" and state != old["state"]:
                 raise ValueError("use wake_coordinate with the named enabling change")
-            merged = sorted(set(refs + (json.loads(old["evidence_refs"]) if old else [])))
             db.execute("""INSERT INTO coordinates VALUES(?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(coordinate_id) DO UPDATE SET state=excluded.state,
                 evidence_refs=excluded.evidence_refs,
@@ -395,8 +404,9 @@ class FrontierIndex:
                 enabling_change=COALESCE(excluded.enabling_change,coordinates.enabling_change),
                 hibernation_reason=COALESCE(excluded.hibernation_reason,coordinates.hibernation_reason),
                 updated_at=excluded.updated_at""",
-                       (identity, _json(normalized), state, _json(merged), debt, value,
+                       (identity, _json(normalized), state, '[]', debt, value,
                         enabling_change, hibernation_reason, moment, moment))
+            self._append_coordinate_refs(db, identity, refs, old['evidence_refs'] if old else '[]')
             self._event(db, identity, "coordinate", old["state"] if old else "UNSEEN",
                         state, hibernation_reason or "observation", refs, moment)
         return identity
@@ -413,9 +423,9 @@ class FrontierIndex:
                 raise ValueError("coordinate is not hibernated")
             if row["enabling_change"] != enabling_change:
                 raise ValueError("enabling change does not match")
-            merged = sorted(set(refs + json.loads(row["evidence_refs"])))
-            db.execute("UPDATE coordinates SET state='DISCOVERED', evidence_refs=?, updated_at=? "
-                       "WHERE coordinate_id=?", (_json(merged), moment, identity))
+            self._append_coordinate_refs(db, identity, refs, row['evidence_refs'])
+            db.execute("UPDATE coordinates SET state='DISCOVERED', updated_at=? "
+                       "WHERE coordinate_id=?", (moment, identity))
             self._event(db, identity, "wake", row["state"], "DISCOVERED", enabling_change, refs, moment)
         return identity
 
@@ -542,6 +552,17 @@ class FrontierIndex:
             result[name] = json.loads(result[name])
         return result
 
+    @staticmethod
+    def _append_coordinate_refs(db, identity, refs, legacy):
+        # Lazily migrate each old JSON reference array once, atomically with
+        # the next observation. The hot path inserts only new edges instead
+        # of re-sorting/re-writing an ever-growing source-reference array.
+        old_refs = json.loads(legacy)
+        db.executemany('INSERT OR IGNORE INTO coordinate_refs VALUES(?,?)',
+                       ((identity, ref) for ref in (*old_refs, *refs)))
+        if old_refs:
+            db.execute("UPDATE coordinates SET evidence_refs='[]' WHERE coordinate_id=?", (identity,))
+
     def _discover_in_db(self, db: sqlite3.Connection, axes: Mapping[str, Any],
                         refs: Sequence[str], at: float) -> str:
         """An observation and its registry/job index commit together.
@@ -553,13 +574,12 @@ class FrontierIndex:
         identity = coordinate_id(normalized)
         old = db.execute("SELECT * FROM coordinates WHERE coordinate_id=?", (identity,)).fetchone()
         if old:
-            merged = sorted(set(refs + json.loads(old["evidence_refs"])))
-            db.execute("UPDATE coordinates SET evidence_refs=?,updated_at=? WHERE coordinate_id=?",
-                       (_json(merged), at, identity))
+            db.execute("UPDATE coordinates SET updated_at=? WHERE coordinate_id=?", (at, identity))
         else:
             db.execute("INSERT INTO coordinates VALUES(?,?,?,?,?,?,?,?,?,?)",
-                       (identity, _json(normalized), "DISCOVERED", _json(refs), None,
+                       (identity, _json(normalized), "DISCOVERED", '[]', None,
                         None, None, None, at, at))
+        self._append_coordinate_refs(db, identity, refs, old['evidence_refs'] if old else '[]')
         self._event(db, identity, "discovery", old["state"] if old else "UNSEEN",
                     old["state"] if old else "DISCOVERED", "dynamic observation", refs, at)
         return identity
@@ -770,18 +790,31 @@ class FrontierIndex:
         """A bounded cursor scan for consumer migration and evidence wakes."""
         if not 1 <= int(limit) <= _MAX_BATCH or not states or len(states) > 8 or len(kinds) > 64:
             raise ValueError("invalid bounded pending-work query")
-        where = ["state IN (" + ",".join("?" for _ in states) + ")", "job_id>?"]
-        params: list = [*states, after_job_id]
-        if kinds:
-            where.append("kind IN (" + ",".join("?" for _ in kinds) + ")")
-            params.extend(kinds)
-        if enabling_change is not None:
-            where.append("enabling_change=?")
-            params.append(enabling_change)
         with self._db() as db:
-            rows = db.execute("SELECT job_id FROM jobs WHERE " + " AND ".join(where) +
-                              " ORDER BY job_id LIMIT ?", (*params, int(limit))).fetchall()
-        return [self.job(row[0]) for row in rows]
+            identities = set()
+            # Separate equality seeks avoid sorting/scanning the retained
+            # queue for each IN-list combination before applying LIMIT.
+            for state in sorted(set(states)):
+                for kind in sorted(set(kinds)) if kinds else (None,):
+                    clauses, values = ['state=?', 'job_id>?'], [state, after_job_id]
+                    if kind is not None:
+                        clauses.append('kind=?'); values.append(kind)
+                    if enabling_change is not None:
+                        clauses.append('enabling_change=?'); values.append(enabling_change)
+                    index = 'jobs_pending_kind_cursor' if kind is not None else 'jobs_pending_cursor'
+                    rows = db.execute('SELECT job_id FROM jobs INDEXED BY ' + index + ' WHERE ' + ' AND '.join(clauses) +
+                                      ' ORDER BY job_id LIMIT ?', (*values, int(limit))).fetchall()
+                    identities.update(row[0] for row in rows)
+            result = []
+            for identity in sorted(identities)[:int(limit)]:
+                row = db.execute('SELECT j.*,c.axes FROM jobs j JOIN coordinates c USING(coordinate_id) WHERE job_id=?', (identity,)).fetchone()
+                if row is None:
+                    continue
+                item = self._job_row(row)
+                item['axes'] = json.loads(item['axes'])
+                item['exploration_tags'] = [tag[0] for tag in db.execute('SELECT tag FROM job_tags WHERE job_id=? ORDER BY tag', (identity,))]
+                result.append(item)
+            return result
 
     def due_kinds(self, kinds: Sequence[str], *, resource_budget: float, now: float) -> List[str]:
         """Costed consumer groups due inside this pass's resource envelope."""

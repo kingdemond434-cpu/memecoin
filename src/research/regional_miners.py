@@ -43,7 +43,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
 from src.research.data_miners import (
     CADENCE_DAILY, CADENCE_FAST, CADENCE_HOURLY, CADENCE_MINUTE,
-    CADENCE_QUARTER, DataMinerPool, Enriches, MinerSpec, RateLimited,
+    CADENCE_QUARTER, DataMinerPool, Enriches, MinerSpec, RateLimited, rotating_selector,
 )
 from src.research.source_substitution import Endpoint, SubstitutionRegistry
 
@@ -271,8 +271,9 @@ def supply_control_miner(fetcher: LadderFetcher,
     which is worth a round trip when the alternative is four RPC calls per
     token at the exact moment latency matters.
     """
+    select_tokens = rotating_selector(tokens, per_pass)
     async def fetch() -> List[Dict[str, Any]]:
-        watched = [mint for mint in tokens() if mint][:per_pass]
+        watched = select_tokens()
         records: List[Dict[str, Any]] = []
         for mint in watched:
             try:

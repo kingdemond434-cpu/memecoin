@@ -16037,14 +16037,14 @@ class TestTheMinerSelectorsAskAboutWhatWeActuallyTrade(unittest.TestCase):
         self.assertEqual(MemecoinQuantDesk._name_search_terms(desk),
                          ["WIF", "dogwifhat"])
 
-    def test_tracked_wallets_are_bounded_and_deduplicated(self):
+    def test_all_tracked_wallets_are_exposed_without_duplicates(self):
         desk = self._desk()
         desk.wallet_intel = SimpleNamespace(
             elite_wallets={f"W{i}": {} for i in range(200)})
         desk._recent_funders = {"W0": {}}
         wallets = MemecoinQuantDesk._tracked_wallets(desk)
-        self.assertEqual(len(wallets), 100)
-        self.assertEqual(len(set(wallets)), 100)
+        self.assertEqual(len(wallets), 200)
+        self.assertEqual(len(set(wallets)), 200)
 
 
 class TestTheAuthorizeToolDiagnosesItsOwnFailure(unittest.TestCase):

@@ -64,6 +64,28 @@ CADENCE_QUARTER = 900.0
 CADENCE_HOURLY = 3_600.0
 CADENCE_DAILY = 86_400.0
 
+
+def rotating_selector(provider, quantum):
+    """Limit active polling work, without limiting the target universe.
+
+    Retain the next identity so prepended discoveries do not push existing
+    remaining targets back each pass. Guarantees progress for stable sets;
+    continuously expiring targets and provider outages remain coverage gaps.
+    """
+    if type(quantum) is not int or quantum <= 0:
+        raise ValueError('positive polling work quantum required')
+    next_identity = None
+    def select():
+        nonlocal next_identity
+        values = list(dict.fromkeys(value for value in provider() if value))
+        if not values:
+            return []
+        start = values.index(next_identity) if next_identity in values else 0
+        chosen = [values[(start + offset) % len(values)] for offset in range(min(quantum, len(values)))]
+        next_identity = values[(start + len(chosen)) % len(values)]
+        return chosen
+    return select
+
 # How long a miner sits out after being rate limited, doubling each time. A
 # pool that retries straight into a limit gets its address blocked and then
 # reports every source as dead, which is the same outcome as not having them.
