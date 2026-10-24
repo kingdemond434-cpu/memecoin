@@ -15638,7 +15638,7 @@ class TestTheChainTellsUsWhatLandingCosts(unittest.TestCase):
         self.assertEqual(row["scope"], "accounts")
         self.assertEqual(row["slots_sampled"], 4)
         self.assertAlmostEqual(row["contested_share"], 0.75)
-        self.assertLess(row["fee_p50_lamports"], row["fee_p90_lamports"])
+        self.assertLess(row["cu_price_p50_micro_lamports"], row["cu_price_p90_micro_lamports"])
 
     def test_no_sample_is_not_a_free_chain(self):
         rpc = _StubRpc({"getRecentPrioritizationFees": []})
@@ -15990,12 +15990,12 @@ class TestExecutionConditionsChangeTheBid(unittest.TestCase):
         report = MemecoinQuantDesk.execution_conditions_report(desk)
         self.assertEqual(report["status"], "DATA_BLOCKED")
         self.assertIn("unknown congestion bucket", report["detail"])
-        desk._priority_fees = {"fee_p50_lamports": 10_000.0,
-                               "fee_p90_lamports": 90_000.0,
+        desk._priority_fees = {"cu_price_p50_micro_lamports": 10_000.0,
+                               "cu_price_p90_micro_lamports": 90_000.0,
                                "contested_share": 0.5, "accounts_sampled": 3}
         report = MemecoinQuantDesk.execution_conditions_report(desk)
         self.assertEqual(report["status"], "OK")
-        self.assertEqual(report["fee_p90_lamports"], 90_000.0)
+        self.assertEqual(report["cu_price_p90_micro_lamports"], 90_000.0)
 
 
 class TestTheMinerSelectorsAskAboutWhatWeActuallyTrade(unittest.TestCase):

@@ -67,24 +67,23 @@ def _percentile(values: Sequence[float], fraction: float) -> float:
 
 def priority_fee_miner(rpc: Any, accounts: Callable[[], Sequence[str]],
                        ) -> Callable[[], Awaitable[List[Dict[str, Any]]]]:
-    """The fee distribution actually paid in recent slots.
+    """The RPC node's recent per-slot minimum compute-unit price samples.
 
     `getRecentPrioritizationFees` reports, per slot, the minimum
     prioritization fee among transactions that touched the given accounts.
     Asked about the accounts we are about to write to, that is the real
-    clearing price for the contention we are about to join -- which is a
-    different and much more useful number than the chain-wide average.
-
-    The percentiles are what the bidder wants: p50 is the going rate, p90 is
-    what it costs to be confident, and the gap between them is how contested
-    this particular account is right now.
+    unit-price context for the requested write-lock set, not total lamports
+    charged to a transaction. A percentile is not a landing probability.
     """
     async def fetch() -> List[Dict[str, Any]]:
         watched = [a for a in accounts() if a][:16]
         params: List[Any] = [watched] if watched else []
         samples = await rpc.request("getRecentPrioritizationFees", params)
-        fees = [float(row.get("prioritizationFee", 0) or 0)
-                for row in (samples or []) if isinstance(row, dict)]
+        fees = []
+        for row in samples or []:
+            if not isinstance(row, dict) or type(row.get('prioritizationFee')) is not int or row['prioritizationFee'] < 0:
+                raise ValueError('native nonnegative compute-unit price required')
+            fees.append(row['prioritizationFee'])
         if not fees:
             # No sample is not "fees are zero". Nothing is emitted, so the
             # bidder keeps its previous reading and the gap is visible in
@@ -99,10 +98,15 @@ def priority_fee_miner(rpc: Any, accounts: Callable[[], Sequence[str]],
             # is low the chain is quiet and any bid lands; when it is high the
             # p50 below is a floor, not a target.
             "contested_share": len(paying) / len(fees),
-            "fee_p50_lamports": _percentile(fees, 0.50),
-            "fee_p75_lamports": _percentile(fees, 0.75),
-            "fee_p90_lamports": _percentile(fees, 0.90),
-            "fee_max_lamports": max(fees),
+            "cu_price_p50_micro_lamports": _percentile(fees, 0.50),
+            "cu_price_p75_micro_lamports": _percentile(fees, 0.75),
+            "cu_price_p90_micro_lamports": _percentile(fees, 0.90),
+            "cu_price_max_micro_lamports": max(fees),
+            "unit": "micro_lamports_per_compute_unit",
+            "total_transaction_priority_lamports": None,
+            "measurement": "recent_slot_minimum_CU_prices_not_full_winning_bid_distribution",
+            "slot_cu_prices": [{"slot": row.get('slot'), "micro_lamports_per_CU": row['prioritizationFee']}
+                               for row in samples],
             "data_status": "OK",
         }]
 

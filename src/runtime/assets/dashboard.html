@@ -443,7 +443,7 @@ const EMPTY = {
   calibration:{status:"DATA_BLOCKED",models_tracked:0,models_measured:0,
     models_miscalibrated:0,models:[]},
   execution_conditions:{status:"DATA_BLOCKED",congestion:null,slot_time_ratio:null,
-    tps:null,fee_p50_lamports:null,fee_p90_lamports:null,contested_share:null,
+    tps:null,cu_price_p50_micro_lamports:null,cu_price_p90_micro_lamports:null,contested_share:null,
     accounts_sampled:null,unattributed_wallet_readings:0},
   bid_explorer:{status:"DATA_BLOCKED",explorations:0,cells_covered:0,cells_total:24,
     coverage_target_per_cell:25,cells:[]},
@@ -513,7 +513,7 @@ function render(d){
     ["Rug share",pct(o.rug_share_of_resolved,1),num(o.rugs)+" of "+num(o.resolved)+" resolved"],
     ["Congestion",cond.congestion===null||cond.congestion===undefined?"—":fix(cond.congestion,2),
       "slot ratio "+fix(cond.slot_time_ratio,2)+"×"],
-    ["Fee p90",num(cond.fee_p90_lamports),"p50 "+num(cond.fee_p50_lamports)+" lamports"],
+    ["CU price p90",num(cond.cu_price_p90_micro_lamports),"p50 "+num(cond.cu_price_p50_micro_lamports)+" micro-lamports/CU"],
     ["Miners live",num(mine.producing)+"/"+num(mine.registered),num(mine.total_records)+" records"]
   ];
   $("strip").innerHTML=cells.map(([k,v,n])=>
@@ -551,8 +551,8 @@ function render(d){
 
   /* conditions */
   const cl=[["Congestion",fix(cond.congestion,2)],["Slot time vs nominal",fix(cond.slot_time_ratio,2)+"×"],
-    ["Transactions / sec",num(Math.round(cond.tps||0))],["Fee p50 (lamports)",num(cond.fee_p50_lamports)],
-    ["Fee p90 (lamports)",num(cond.fee_p90_lamports)],["Slots with any fee",pct(cond.contested_share,0)],
+    ["Transactions / sec",num(Math.round(cond.tps||0))],["CU price p50 (micro-lamports/CU)",num(cond.cu_price_p50_micro_lamports)],
+    ["CU price p90 (micro-lamports/CU)",num(cond.cu_price_p90_micro_lamports)],["Slots with any fee",pct(cond.contested_share,0)],
     ["Accounts sampled",num(cond.accounts_sampled)]];
   $("conditions").innerHTML=cl.map(([k,v])=>
     `<tr><td style="color:var(--ink-dim)">${k}</td><td class="num">${v}</td></tr>`).join("");
