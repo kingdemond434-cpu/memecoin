@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -207,6 +208,19 @@ class SourceIntelligence:
                                       metadata.get("onion_directory_observation_id"), job_id)
             except Exception as exc:
                 logger.warning("onion canonical acknowledgement deferred: %s", type(exc).__name__)
+        if job_id:
+            try:
+                from src.research.public_claim_links import PublicClaimLinks
+                if getattr(self, "public_claim_links", None) is None:
+                    self.public_claim_links = PublicClaimLinks(
+                        Path(getattr(self, "global_config", {}).get("ops_state_dir", "data/state")) / "public_claim_links.sqlite")
+                flags = payload.get("local_decision_shadow", {}).get("rules", {}).get("flags", {})
+                self.public_claim_links.record(source_job=job_id, source_id=event.source_id,
+                    addresses=[*tokens, *metadata.get("evm_address_mentions", []), *metadata.get("solana_address_mentions", [])],
+                    topics=[*metadata.get("claim_topics", []), *[name for name, present in flags.items() if present]],
+                    observed_at=float(event.observed_at), publication_known=metadata.get("publication_time_known") is True)
+            except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+                logger.warning("public claim index deferred: %s", type(exc).__name__)
         return job_id
 
     def _record_population_follow_outcome(self, payload: Dict[str, Any], *, evidence_refs=(),

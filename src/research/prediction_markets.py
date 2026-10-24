@@ -116,6 +116,8 @@ class PublicVenues:
         self.fee_evidence = {}
         self.offset = 0
         self.cursor = ""
+        self.search_index = 0
+        self.condition_hints = []
 
     async def get(self, base, path, params=None):
         # All hosts and path templates are chosen here, never from market prose.
@@ -136,8 +138,9 @@ class PublicVenues:
         if isinstance(tokens, str): tokens = json.loads(tokens)
         if isinstance(outcomes, str): outcomes = json.loads(outcomes)
         labels = [str(x).lower() for x in outcomes]
-        if len(tokens) != 2 or sorted(labels) != ["no", "yes"]:
-            raise ValueError("only binary YES/NO CTF markets are currently supported")
+        if len(tokens) != 2 or set(labels) not in ({"yes", "no"}, {"up", "down"}):
+            raise ValueError("only binary YES/NO or UP/DOWN CTF markets are currently supported")
+        positive, negative = ("yes", "no") if "yes" in labels else ("up", "down")
         if not all(str(x).isdigit() for x in tokens):
             raise ValueError("unsupported position identifier")
         schedule = row.get("feeSchedule") or {}
@@ -156,11 +159,11 @@ class PublicVenues:
             if len(prices) == 2:
                 exact = [number(x) for x in prices]
                 if sorted(exact) == [ZERO, ONE]:
-                    result = labels[exact.index(ONE)]
+                    result = "yes" if labels[exact.index(ONE)] == positive else "no"
         active = (row.get("active") is True and row.get("closed") is False
                   and row.get("acceptingOrders") is True and row.get("enableOrderBook") is True)
         return Market("polymarket", str(row["id"]), str(row.get("question", "")),
-                      str(tokens[labels.index("yes")]), str(tokens[labels.index("no")]),
+                      str(tokens[labels.index(positive)]), str(tokens[labels.index(negative)]),
                       "open" if active else "closed", rate, "polymarket_quadratic",
                       str(row.get("orderMinSize", "1")), result)
 
@@ -215,11 +218,41 @@ class PublicVenues:
                 "closed": "false", "active": "true", "limit": 50, "offset": self.offset,
                 "order": "volume24hr", "ascending": "false"})
             self.offset = (self.offset + 50) % 500 if rows else 0
+            highlighted = []
+            query = ("bitcoin up or down", "ethereum up or down", "solana up or down")[self.search_index % 3]
+            self.search_index += 1
+            try:
+                search = await self.get("https://gamma-api.polymarket.com", "/public-search",
+                                        {"q": query, "limit_per_type": 4, "events_status": "active"})
+                highlighted.extend(m for e in search.get("events", []) for m in e.get("markets", []))
+                self.errors.pop("crypto_search", None)
+            except (RuntimeError, ValueError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                self.errors["crypto_search"] = type(exc).__name__
+            crypto_rows = list(highlighted)
+            highlighted = []
+            hints = [c for c in self.condition_hints[:8] if re.fullmatch(r"0x[0-9a-fA-F]{64}", c)]
+            if hints:
+                try:
+                    recent = await self.get("https://gamma-api.polymarket.com", "/markets", {"condition_ids": hints, "limit": 8})
+                    highlighted.extend(r for r in recent if r.get("conditionId") in hints)
+                    self.errors.pop("recent_market_lookup", None)
+                except (RuntimeError, ValueError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    self.errors["recent_market_lookup"] = type(exc).__name__
             result = []
-            for row in rows:
+            crypto = []
+            broad = []
+            for row in highlighted:
                 try: result.append(self.polymarket(row))
                 except (ValueError, KeyError, TypeError): continue
-            return [m for m in result if m.status == "open"][:limit]
+            for row in crypto_rows:
+                try: crypto.append(self.polymarket(row))
+                except (ValueError, KeyError, TypeError): continue
+            for row in rows:
+                try: broad.append(self.polymarket(row))
+                except (ValueError, KeyError, TypeError): continue
+            result = ([m for m in result if m.status == "open"][:max(1, limit // 4)]
+                      + [m for m in crypto if m.status == "open"][:max(1, limit // 4)] + broad)
+            return list({m.key: m for m in result if m.status == "open"}.values())[:limit]
         data = await self.get("https://external-api.kalshi.com/trade-api/v2", "/markets", {
             "status": "open", "limit": 100, "mve_filter": "exclude", "cursor": self.cursor})
         self.cursor = str(data.get("cursor", ""))
@@ -443,6 +476,7 @@ class PredictionPaperRunner:
         self.limit = min(20, max(1, markets_per_venue))
         self.errors, self.last_success, self.cycles = {}, {}, 0
         self.decisions = {}
+        self.condition_hints = lambda: []
         self.seen = set(r[0] for r in broker.db.execute("SELECT key FROM meta WHERE key LIKE 'entered:%'"))
 
     def process(self, market, books):
@@ -493,6 +527,7 @@ class PredictionPaperRunner:
         self.decisions.pop(market.key, None)
 
     async def cycle(self, venues):
+        venues.condition_hints = self.condition_hints()
         for venue in ("polymarket", "kalshi"):
             try:
                 discovered = await venues.discover(venue, self.limit)
@@ -528,6 +563,9 @@ class PredictionPaperRunner:
             except (ValueError, KeyError, RuntimeError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 self.errors[venue] = type(exc).__name__ + ": " + str(exc)[:150]
         self.errors = dict(list(self.errors.items())[-100:])
+        for key in list(self.errors):
+            if key.startswith("public_catalog:"): self.errors.pop(key)
+        self.errors.update({"public_catalog:" + k: v for k, v in venues.errors.items()})
         self.cycles += 1
 
     async def run(self):

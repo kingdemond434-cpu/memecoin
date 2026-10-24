@@ -730,6 +730,8 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
                 except asyncio.CancelledError:
                     pass
         await self._close_health_server()
+        if getattr(self, "public_claim_links", None) is not None:
+            self.public_claim_links.close()
         for component in (self.global_research, self.dataset_builder, self.execution_engine, self.rug_hazard,
                           self.info_graph, self.prelaunch, self.social_intel, self.wallet_intel, self.genealogy,
                           self.detection_engine, self.rpc_program_stream, self.champion_challenger, self.chain_registry):

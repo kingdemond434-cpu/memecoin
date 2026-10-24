@@ -179,6 +179,14 @@ class AdapterTests(unittest.TestCase):
         m = PublicVenues.polymarket({"id": "m", "clobTokenIds": '["1","2"]', "outcomes": '["Yes","No"]', "feesEnabled": True, "feeSchedule": {"rate": .07, "exponent": 2}})
         self.assertIsNone(m.fee_rate)
 
+    def test_crypto_up_down_outcomes_are_mapped_and_settled_explicitly(self):
+        row = {"id": "m", "clobTokenIds": '["2","1"]', "outcomes": '["Down","Up"]',
+               "closed": True, "outcomePrices": '["0","1"]', "umaResolutionStatus": "resolved"}
+        market = PublicVenues.polymarket(row)
+        self.assertEqual("1", market.yes)
+        self.assertEqual("2", market.no)
+        self.assertEqual("yes", market.result)
+
 
 class PublicTransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_kalshi_asks_are_complements_of_opposite_bids(self):

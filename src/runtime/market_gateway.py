@@ -20,9 +20,12 @@ from src.execution.phantom import PhantomBridge
 from src.execution.signer import SignerPolicy
 from src.research.prediction_markets import PaperBroker, PredictionPaperRunner
 from src.research.local_decisions import LocalDecisions
+from src.research.behavioral_forensics import PublicWalletResearch
+from src.research.market_robustness import cpcv_splits, reality_check
 
 ASSETS = Path(__file__).resolve().parents[2] / "dashboard" / "wallet"
 PAPER_TASK = web.AppKey("paper_task", asyncio.Task)
+FORENSICS_TASK = web.AppKey("forensics_task", asyncio.Task)
 
 
 def token_at(path: Path):
@@ -39,6 +42,9 @@ def token_at(path: Path):
 
 def make_app(broker, *, token, port=18082, bridge=None, start_runner=True):
     runner = PredictionPaperRunner(broker)
+    forensics = PublicWalletResearch(broker)
+    runner.condition_hints = lambda: [row[0] for row in broker.db.execute(
+        "SELECT json_extract(payload,'$.market') FROM public_trades WHERE at>? ORDER BY at DESC LIMIT 8", (time.time() - 300,))]
     bridge = bridge or PhantomBridge()
     sessions = set()
     started_at = time.time()
@@ -87,11 +93,23 @@ def make_app(broker, *, token, port=18082, bridge=None, start_runner=True):
 
     async def status(request):
         return web.json_response({"prediction_markets": runner.report(), "phantom": bridge.report(),
-                                  "local_decisions": local_decisions.report()})
+                                  "local_decisions": local_decisions.report(),
+                                  "public_wallet_research": forensics.report()})
 
     async def evaluate(request):
         data = await request.json()
         return web.json_response(local_decisions.evaluate(data["text"], data["questions"]))
+
+    async def robustness(request):
+        data = await request.json()
+        if data["method"] == "cpcv":
+            result = cpcv_splits(data["decision_at"], data["label_end"], **data.get("settings", {}))
+        elif data["method"] == "reality_check":
+            result = reality_check(data["strategy_returns"], data["control_returns"], **data["settings"])
+        else: raise ValueError("unknown research diagnostic")
+        # User-supplied diagnostic inputs are never inserted into an earned
+        # evidence ledger or promoted into real execution authority.
+        return web.json_response(result)
 
     async def pair(request):
         data = await request.json()
@@ -140,6 +158,7 @@ def make_app(broker, *, token, port=18082, bridge=None, start_runner=True):
     app.router.add_post("/api/pair", pair)
     app.router.add_get("/api/status", status)
     app.router.add_post("/api/decisions/evaluate", evaluate)
+    app.router.add_post("/api/research/robustness", robustness)
     app.router.add_post("/api/phantom/challenge", wallet_challenge)
     app.router.add_post("/api/phantom/connect", wallet_connect)
     app.router.add_post("/api/phantom/disconnect", wallet_disconnect)
@@ -150,14 +169,15 @@ def make_app(broker, *, token, port=18082, bridge=None, start_runner=True):
     app.router.add_get("/wallet/{name}", asset)
 
     async def startup(app):
-        if start_runner: app[PAPER_TASK] = asyncio.create_task(runner.run(), name="prediction-paper")
+        if start_runner:
+            app[PAPER_TASK] = asyncio.create_task(runner.run(), name="prediction-paper")
+            app[FORENSICS_TASK] = asyncio.create_task(forensics.run(), name="public-wallet-forensics")
 
     async def cleanup(app):
         bridge.disconnect()
-        task = app.get(PAPER_TASK)
-        if task:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        tasks = [app[key] for key in (PAPER_TASK, FORENSICS_TASK) if key in app]
+        for task in tasks: task.cancel()
+        if tasks: await asyncio.gather(*tasks, return_exceptions=True)
         broker.close()
 
     app.on_startup.append(startup)

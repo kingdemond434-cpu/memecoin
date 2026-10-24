@@ -61,6 +61,11 @@ async function refresh() {
   if (!paired) return;
   const status = await api('status');
   const data = status.prediction_markets;
+  const research = status.public_wallet_research;
+  if (research) {
+    el('public-research').textContent = `${research.wallets} public wallets · ${research.trades} retained trades · ${research.forensic_reports} mechanism reports · ${research.public_claim_mentions} source/address links`;
+    el('research-status').textContent = JSON.stringify({local_models: status.local_decisions, research_errors: research.source_errors}, null, 2);
+  }
   el('mode').textContent = 'PAPER MODE · live submission locked · no real funds used';
   el('experiment').textContent = `Started ${new Date(data.started_at * 1000).toLocaleString()} · ${data.markets} markets · ${data.snapshots} retained book snapshots`;
   el('counts').textContent = `${JSON.stringify(data.order_counts)} · ${data.settlement_records} simulated settlements · ${data.real_fills} real fills`;
