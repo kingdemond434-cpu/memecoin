@@ -204,6 +204,7 @@ class FrontierIndex:
             mode = db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
             if str(mode).lower() != "wal":
                 raise RuntimeError("frontier requires WAL for concurrent research intake")
+            had_active_tags = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='active_job_tags'").fetchone()
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS coordinates(
@@ -239,6 +240,45 @@ class FrontierIndex:
                     WHERE total_cost IS NOT NULL AND state IN ('READY','RETRY','LEASED');
                 CREATE INDEX IF NOT EXISTS jobs_active_priority ON jobs(cost_unit,priority DESC,created_at,job_id)
                     WHERE total_cost IS NOT NULL AND state IN ('READY','RETRY','LEASED');
+                CREATE TABLE IF NOT EXISTS active_job_tags(
+                    tag TEXT NOT NULL, job_id TEXT NOT NULL, cost_unit TEXT NOT NULL,
+                    kind TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY(tag,job_id));
+                CREATE INDEX IF NOT EXISTS active_tags_created ON active_job_tags(tag,cost_unit,created_at,job_id);
+                CREATE INDEX IF NOT EXISTS active_tags_kind_created ON active_job_tags(tag,cost_unit,kind,created_at,job_id);
+                CREATE INDEX IF NOT EXISTS active_tags_job ON active_job_tags(job_id);
+                CREATE TRIGGER IF NOT EXISTS active_tags_job_insert AFTER INSERT ON jobs BEGIN
+                    INSERT OR REPLACE INTO active_job_tags
+                    SELECT t.tag,NEW.job_id,NEW.cost_unit,NEW.kind,NEW.created_at FROM job_tags t
+                    WHERE t.job_id=NEW.job_id AND NEW.total_cost IS NOT NULL
+                      AND NEW.state IN ('READY','RETRY','LEASED');
+                END;
+                CREATE TRIGGER IF NOT EXISTS active_tags_job_update
+                AFTER UPDATE OF state,total_cost,cost_unit,kind,created_at ON jobs BEGIN
+                    DELETE FROM active_job_tags WHERE job_id=NEW.job_id;
+                    INSERT OR REPLACE INTO active_job_tags
+                    SELECT t.tag,NEW.job_id,NEW.cost_unit,NEW.kind,NEW.created_at FROM job_tags t
+                    WHERE t.job_id=NEW.job_id AND NEW.total_cost IS NOT NULL
+                      AND NEW.state IN ('READY','RETRY','LEASED');
+                END;
+                CREATE TRIGGER IF NOT EXISTS active_tags_job_delete AFTER DELETE ON jobs BEGIN
+                    DELETE FROM active_job_tags WHERE job_id=OLD.job_id;
+                END;
+                CREATE TRIGGER IF NOT EXISTS active_tags_tag_insert AFTER INSERT ON job_tags BEGIN
+                    INSERT OR REPLACE INTO active_job_tags
+                    SELECT NEW.tag,j.job_id,j.cost_unit,j.kind,j.created_at FROM jobs j
+                    WHERE j.job_id=NEW.job_id AND j.total_cost IS NOT NULL
+                      AND j.state IN ('READY','RETRY','LEASED');
+                END;
+                CREATE TRIGGER IF NOT EXISTS active_tags_tag_update AFTER UPDATE ON job_tags BEGIN
+                    DELETE FROM active_job_tags WHERE job_id=OLD.job_id AND tag=OLD.tag;
+                    INSERT OR REPLACE INTO active_job_tags
+                    SELECT NEW.tag,j.job_id,j.cost_unit,j.kind,j.created_at FROM jobs j
+                    WHERE j.job_id=NEW.job_id AND j.total_cost IS NOT NULL
+                      AND j.state IN ('READY','RETRY','LEASED');
+                END;
+                CREATE TRIGGER IF NOT EXISTS active_tags_tag_delete AFTER DELETE ON job_tags BEGIN
+                    DELETE FROM active_job_tags WHERE job_id=OLD.job_id AND tag=OLD.tag;
+                END;
                 CREATE TABLE IF NOT EXISTS transitions(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, subject TEXT NOT NULL,
                     action TEXT NOT NULL, previous_state TEXT, next_state TEXT,
@@ -251,6 +291,15 @@ class FrontierIndex:
             db.execute("INSERT OR IGNORE INTO metadata VALUES('schema_version', ?)",
                        (str(SCHEMA_VERSION),))
             db.execute("INSERT OR IGNORE INTO metadata VALUES('exploration_cursor', '0')")
+            if not had_active_tags or not db.execute("SELECT 1 FROM metadata WHERE key='active_job_tags_v1'").fetchone():
+                # Derived queue only: old jobs/tags remain the source of truth.
+                # Backfill and its completion marker commit in one transaction;
+                # triggers keep every later transition in that same transaction.
+                db.execute("DELETE FROM active_job_tags")
+                db.execute("INSERT INTO active_job_tags SELECT t.tag,j.job_id,j.cost_unit,j.kind,j.created_at "
+                           "FROM jobs j JOIN job_tags t ON t.job_id=j.job_id "
+                           "WHERE j.total_cost IS NOT NULL AND j.state IN ('READY','RETRY','LEASED')")
+                db.execute("INSERT OR REPLACE INTO metadata VALUES('active_job_tags_v1','1')")
             # Keep WAL open across short transactions. Closing the last
             # connection after every event would checkpoint/delete it again,
             # turning each source record back into repeated database flushes.
@@ -664,18 +713,18 @@ class FrontierIndex:
                     break
                 visited += 1
                 count = max(1, int(math.floor(limit * self.exploration_floors[tag])))
-                # Driving this from tag_jobs visits every historical tagged
-                # job before sorting. Production profiling found that scan
-                # monopolizing the event loop after days of retained work.
-                # Scan only active costed jobs, preserving the same FIFO and
-                # exploration-floor semantics and retaining all old evidence.
-                fifo_index = ("jobs_active_kind_created" if kinds is not None and len(names) == 1
-                              else "jobs_active_created")
-                rows = db.execute(f"SELECT j.* FROM jobs j INDEXED BY {fifo_index} "
-                                  f"WHERE {eligible} AND EXISTS (SELECT 1 FROM job_tags t "
-                                  "WHERE t.job_id=j.job_id AND t.tag=?) "
-                                  "ORDER BY j.created_at,j.job_id LIMIT ?",
-                                  (*params, tag, int(scan_limit))).fetchall()
+                # A rare tag must not scan unrelated active work, while a
+                # common tag must not scan completed tagged history either.
+                # This transactionally maintained sparse index excludes both.
+                one_kind = kinds is not None and len(names) == 1
+                fifo_index = "active_tags_kind_created" if one_kind else "active_tags_created"
+                tag_kind = " AND a.kind=?" if one_kind else ""
+                tag_params = (tag, cost_unit, names[0]) if one_kind else (tag, cost_unit)
+                rows = db.execute(f"SELECT j.* FROM active_job_tags a INDEXED BY {fifo_index} "
+                                  "JOIN jobs j ON j.job_id=a.job_id "
+                                  f"WHERE a.tag=? AND a.cost_unit=?{tag_kind} AND {eligible} "
+                                  "ORDER BY a.created_at,a.job_id LIMIT ?",
+                                  (*tag_params, *params, int(scan_limit))).fetchall()
                 take(rows, count)
             if tags:
                 db.execute("UPDATE metadata SET value=? WHERE key='exploration_cursor'",
