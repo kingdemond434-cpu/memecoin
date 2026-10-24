@@ -192,7 +192,7 @@ class SourceIntelligence:
         job_id = self._enqueue_population_work("NARRATIVE_OBSERVATION", payload,
             evidence_refs=metadata.get("evidence_refs") or (), now=event.observed_at)
         discovery_stored = True
-        if job_id and discovered_onions:
+        if job_id and (discovered_onions or getattr(self, "global_config", {}).get("onion_auto_discovery", False)):
             from src.collectors.onion_discovery import discover
             try:
                 discover(self, event, job_id)
@@ -458,7 +458,18 @@ class SourceIntelligence:
                     started, len(self.transports), len(self.transports) - len(failures))
         while self._running:
             try:
-                event = await self.source_mesh.next_event()
+                if getattr(self, "global_config", {}).get("onion_auto_discovery", False):
+                    async with asyncio.timeout(120):
+                        event = await self.source_mesh.next_event()
+                else:
+                    event = await self.source_mesh.next_event()
+            except asyncio.TimeoutError:
+                from src.collectors.onion_discovery import drain
+                try:
+                    drain(self)
+                except Exception as exc:
+                    logger.warning("pending onion source admission deferred: %s", type(exc).__name__)
+                continue
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pragma: no cover - defensive

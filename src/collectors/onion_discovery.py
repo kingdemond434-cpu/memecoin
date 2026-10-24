@@ -69,12 +69,38 @@ def restore(desk):
     return restored
 
 
+def _admit_pending(desk, state):
+    if not os.getenv(PROXY_ENV):
+        return False
+    maximum = max(1, min(32, int(getattr(desk, "global_config", {}).get("onion_max_sources", 16))))
+    active = sum(getattr(transport, "kind", None) == "onion" for transport in desk.transports.values())
+    changed = False
+    for identity, entry in list(state["pending"].items())[:2]:
+        if active >= maximum:
+            break
+        if _register(desk, entry):
+            state["admitted"][identity] = state["pending"].pop(identity)
+            active += 1
+            changed = True
+    return changed
+
+
+def drain(desk):
+    engine = getattr(desk, "unknown_engine", None)
+    if not engine or not getattr(desk, "global_config", {}).get("onion_auto_discovery", False):
+        return
+    state = engine.framework.get_research_component(COMPONENT)
+    if state and _admit_pending(desk, state):
+        engine.framework.checkpoint_research_component(COMPONENT, state)
+
+
 def discover(desk, event, canonical_job_id):
     engine = getattr(desk, "unknown_engine", None)
     if not engine or not canonical_job_id or not getattr(desk, "global_config", {}).get("onion_auto_discovery", False):
         return
     state = engine.framework.get_research_component(COMPONENT) or {"admitted": {}, "pending": {}, "capacity_debt": 0}
     admitted, pending = state["admitted"], state["pending"]
+    changed = False
     for url in candidate_urls(event):
         host = urlsplit(url).hostname
         identity = hashlib.sha256(host.encode()).hexdigest()
@@ -82,17 +108,12 @@ def discover(desk, event, canonical_job_id):
             continue
         if len(pending) >= 512:
             state["capacity_debt"] += 1
+            changed = True
             continue
         pending[identity] = {"source_id": "onion:discovered-" + identity[:20], "url": url,
             "source_ref": "frontier_job:" + canonical_job_id,
             "discovered_at": event.observed_at, "identity_status": "UNVERIFIED_PUBLIC_LINK"}
-    maximum = max(1, min(32, int(getattr(desk, "global_config", {}).get("onion_max_sources", 16))))
-    if os.getenv(PROXY_ENV):
-        active = sum(getattr(transport, "kind", None) == "onion" for transport in desk.transports.values())
-        for identity, entry in list(pending.items())[:2]:
-            if active >= maximum:
-                break
-            if _register(desk, entry):
-                admitted[identity] = pending.pop(identity)
-                active += 1
-    engine.framework.checkpoint_research_component(COMPONENT, state)
+        changed = True
+    changed = _admit_pending(desk, state) or changed
+    if changed:
+        engine.framework.checkpoint_research_component(COMPONENT, state)
