@@ -76,6 +76,16 @@ async function refresh() {
   el('mode').textContent = 'PAPER MODE · live submission locked · no real funds used';
   el('experiment').textContent = `Started ${new Date(data.started_at * 1000).toLocaleString()} · ${data.markets} markets · ${data.snapshots} retained book snapshots`;
   el('counts').textContent = `${JSON.stringify(data.order_counts)} · ${data.settlement_records} simulated settlements · ${data.real_fills} real fills`;
+  const native = data.venue === 'phantom_world';
+  el('accounts').closest('.scroll').hidden = native;
+  el('prediction-scope').textContent = native ? data.scope : 'Separate legacy Polymarket/Kalshi paper experiment; this is not Phantom native prediction trading.';
+  el('prediction-limitations').textContent = native ? data.executable_paper_status : 'YES/NO controls and complete-set candidates are simulated. These venue results do not establish a Phantom trading edge.';
+  if (native) {
+    el('mode').textContent = 'PHANTOM WORLD RESEARCH · live submission locked · executable paper study blocked';
+    el('public-research').textContent = `World catalog: ${data.catalog_status} · Native program: ${data.program_observation}`;
+    el('research-status').textContent = JSON.stringify({local_models: status.local_decisions, phantom_public_api: data.phantom_external_api,
+      verified_contracts_and_executable_quotes_required: true}, null, 2);
+  }
   el('errors').textContent = JSON.stringify(data.source_errors, null, 2);
   const rows = data.accounts.map(account => {
     const row = document.createElement('tr');

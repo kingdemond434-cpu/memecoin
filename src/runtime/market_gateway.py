@@ -23,6 +23,7 @@ from src.research.local_decisions import LocalDecisions
 from src.research.behavioral_forensics import PublicWalletResearch
 from src.research.market_robustness import cpcv_splits, reality_check
 from src.research.intelligence_coverage import IntelligenceCoverage
+from src.research.phantom_predictions import PhantomResearchStore, PhantomPredictions, documented_phantom_fee
 
 ASSETS = Path(__file__).resolve().parents[2] / "dashboard" / "wallet"
 PAPER_TASK = web.AppKey("paper_task", asyncio.Task)
@@ -42,12 +43,16 @@ def token_at(path: Path):
     return token
 
 
-def make_app(broker, *, token, port=18082, bridge=None, start_runner=True):
-    runner = PredictionPaperRunner(broker)
-    forensics = PublicWalletResearch(broker)
+def make_app(broker, *, token, port=18082, bridge=None, start_runner=True, prediction_scope='phantom'):
+    if prediction_scope not in {'phantom', 'legacy-paper'}: raise ValueError('explicit prediction scope required')
+    if prediction_scope == 'phantom' and not isinstance(broker, PhantomResearchStore):
+        raise ValueError('Phantom research requires its own native-scope store; legacy venue data cannot be relabeled')
+    runner = PhantomPredictions(broker) if prediction_scope == 'phantom' else PredictionPaperRunner(broker)
+    forensics = PublicWalletResearch(broker) if prediction_scope == 'legacy-paper' else None
     coverage = IntelligenceCoverage(broker)
-    runner.condition_hints = lambda: [row[0] for row in broker.db.execute(
-        "SELECT json_extract(payload,'$.market') FROM public_trades WHERE at>? ORDER BY at DESC LIMIT 8", (time.time() - 300,))]
+    if forensics is not None:
+        runner.condition_hints = lambda: [row[0] for row in broker.db.execute(
+            "SELECT json_extract(payload,'$.market') FROM public_trades WHERE at>? ORDER BY at DESC LIMIT 8", (time.time() - 300,))]
     bridge = bridge or PhantomBridge()
     sessions = set()
     started_at = time.time()
@@ -88,10 +93,11 @@ def make_app(broker, *, token, port=18082, bridge=None, start_runner=True):
     app = web.Application(middlewares=[boundary], client_max_size=16 * 1024)
 
     async def health(request):
-        components = {name: not start_runner or app.get(key) is not None and not app[key].done()
-                      for name, key in (("paper", PAPER_TASK), ("wallet_research", FORENSICS_TASK), ("coverage", COVERAGE_TASK))}
+        required = [('prediction_research' if prediction_scope == 'phantom' else 'paper', PAPER_TASK), ('coverage', COVERAGE_TASK)]
+        if forensics is not None: required.append(('wallet_research', FORENSICS_TASK))
+        components = {name: not start_runner or app.get(key) is not None and not app[key].done() for name, key in required}
         healthy = all(components.values())
-        return web.json_response({"status": "healthy" if healthy else "failed", "mode": "PAPER",
+        return web.json_response({"status": "healthy" if healthy else "failed", "mode": 'PHANTOM_RESEARCH' if prediction_scope == 'phantom' else 'PAPER',
                                   "components": components,
                                   "live_submission_locked": True, "uptime_seconds": time.time() - started_at},
                                  status=200 if healthy else 503)
@@ -99,12 +105,16 @@ def make_app(broker, *, token, port=18082, bridge=None, start_runner=True):
     async def status(request):
         return web.json_response({"prediction_markets": runner.report(), "phantom": bridge.report(),
                                   "local_decisions": local_decisions.report(),
-                                  "public_wallet_research": forensics.report(),
+                                  "public_wallet_research": forensics.report() if forensics is not None else None,
                                   "global_coverage": coverage.report()})
 
     async def evaluate(request):
         data = await request.json()
         return web.json_response(local_decisions.evaluate(data["text"], data["questions"]))
+
+    async def phantom_fee_scenario(request):
+        data = await request.json()
+        return web.json_response(documented_phantom_fee(data['contracts'], data['price']))
 
     async def robustness(request):
         data = await request.json()
@@ -164,6 +174,7 @@ def make_app(broker, *, token, port=18082, bridge=None, start_runner=True):
     app.router.add_post("/api/pair", pair)
     app.router.add_get("/api/status", status)
     app.router.add_post("/api/decisions/evaluate", evaluate)
+    app.router.add_post('/api/phantom-predictions/fee-scenario', phantom_fee_scenario)
     app.router.add_post("/api/research/robustness", robustness)
     app.router.add_post("/api/phantom/challenge", wallet_challenge)
     app.router.add_post("/api/phantom/connect", wallet_connect)
@@ -176,8 +187,9 @@ def make_app(broker, *, token, port=18082, bridge=None, start_runner=True):
 
     async def startup(app):
         if start_runner:
-            app[PAPER_TASK] = asyncio.create_task(runner.run(), name="prediction-paper")
-            app[FORENSICS_TASK] = asyncio.create_task(forensics.run(), name="public-wallet-forensics")
+            app[PAPER_TASK] = asyncio.create_task(runner.run(), name='phantom-world-research' if prediction_scope == 'phantom' else 'legacy-prediction-paper')
+            if forensics is not None:
+                app[FORENSICS_TASK] = asyncio.create_task(forensics.run(), name="public-wallet-forensics")
             app[COVERAGE_TASK] = asyncio.create_task(coverage.run(), name="intelligence-coverage")
 
     async def cleanup(app):
@@ -196,15 +208,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--port", type=int, default=18082)
+    parser.add_argument('--prediction-scope', choices=('phantom', 'legacy-paper'), default='phantom')
     args = parser.parse_args()
     if not 1024 <= args.port <= 65535: parser.error("invalid loopback port")
-    broker = PaperBroker(args.state_dir / "prediction-paper.sqlite")
+    if args.prediction_scope == 'phantom':
+        if (args.state_dir/'prediction-paper.sqlite').exists(): parser.error('retain the legacy experiment and use a fresh Phantom directory')
+        broker = PhantomResearchStore(args.state_dir/'phantom-research.sqlite')
+    else:
+        if (args.state_dir/'phantom-research.sqlite').exists(): parser.error('retain the Phantom study and use a separate legacy directory')
+        broker = PaperBroker(args.state_dir / "prediction-paper.sqlite")
     # This entry point is exclusively PAPER; it cannot be armed by inherited
     # secrets, environment acknowledgements, or a browser connection.
     os.environ.pop("ALLOW_LIVE_TRADING", None)
     os.environ.pop("SOLANA_PRIVATE_KEY", None)
     bridge = PhantomBridge(policy=SignerPolicy(), live_authority=lambda: False)
-    app = make_app(broker, token=token_at(args.state_dir / "gateway.token"), port=args.port, bridge=bridge)
+    app = make_app(broker, token=token_at(args.state_dir / "gateway.token"), port=args.port, bridge=bridge, prediction_scope=args.prediction_scope)
     web.run_app(app, host="127.0.0.1", port=args.port, print=None)
 
 

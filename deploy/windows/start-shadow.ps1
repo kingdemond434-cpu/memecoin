@@ -4,6 +4,8 @@ param(
     [Parameter(Mandatory=$true)][string]$LogRoot,
     [ValidateRange(1024,65535)][int]$HealthPort = 18081,
     [string]$ConfigPath = '',
+    [string]$ConnectionFile = '',
+    [string]$RpcBudgetPath = '',
     [string]$TorExe = '',
     [string]$TorConfig = '',
     [string]$TorExeSha256 = '',
@@ -22,6 +24,11 @@ if (-not (Test-Path -LiteralPath $taskPython -PathType Leaf)) {
 New-Item -ItemType Directory -Path $taskLogs -Force | Out-Null
 Add-Type -Path (Join-Path $PSScriptRoot 'ShadowProcessJob.cs')
 [MemecoinShadowProcessJob]::AttachCurrentProcess()
+if($ConnectionFile){
+    . (Join-Path $PSScriptRoot 'ReadBotConnections.ps1')
+    Import-BotConnections -Path $ConnectionFile
+}
+if($RpcBudgetPath){$env:MEMECOIN_RPC_BUDGET_DB=[IO.Path]::GetFullPath($RpcBudgetPath)}
 Set-Location -LiteralPath $taskRepo
 # This launcher only collects and simulates. It cannot inherit an armed
 # wallet or an isolated signer from the machine's environment.

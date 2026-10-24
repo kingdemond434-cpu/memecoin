@@ -134,12 +134,15 @@ class RateLimitedEndpointsAreDemotedAndParked(unittest.TestCase):
             chosen = manager._select_endpoint()
             self.assertIsNot(chosen, manager.endpoints[0])
 
-    def test_every_endpoint_cooling_still_returns_one(self):
-        """Degraded enrichment beats none: the caller sees the real refusal."""
+    def test_every_endpoint_cooling_waits_until_retry_after_expires(self):
+        """A refusal must not trigger another request during provider cooldown."""
         manager = self.manager()
         for endpoint in manager.endpoints:
             manager._penalise(endpoint, 429, cooldown=30.0)
-        self.assertIsNotNone(manager._select_endpoint())
+        self.assertIsNone(manager._select_endpoint())
+        ready_at = max(endpoint.cooldown_until for endpoint in manager.endpoints)
+        with patch('src.chains.rpc_manager.time.time', return_value=ready_at + 1):
+            self.assertIsNotNone(manager._select_endpoint())
 
     def test_retry_after_is_honoured_but_bounded(self):
         class Response:
