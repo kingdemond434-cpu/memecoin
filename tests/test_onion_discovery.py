@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from src.collectors.adapters import onion_directory_source
 from src.collectors.event_source import Event, EventSource, SourceClass, SourceMesh
 from src.collectors.onion import OnionDirectoryTransport
-from src.collectors.onion_discovery import COMPONENT, candidate_urls, discover, restore
+from src.collectors.onion_discovery import COMPONENT, candidate_urls, discover, drain, restore
 from src.collectors.transports import HttpClient, stop_transports
 from tests.test_onion_collection import URL, Pages, host
 
@@ -13,11 +13,13 @@ from tests.test_onion_collection import URL, Pages, host
 class Framework:
     def __init__(self):
         self.state = {}
+        self.writes = 0
 
     def get_research_component(self, name):
         return copy.deepcopy(self.state.get(name))
 
     def checkpoint_research_component(self, name, state):
+        self.writes += 1
         self.state[name] = copy.deepcopy(state)
 
 
@@ -47,6 +49,12 @@ def test_links_are_bound_to_durable_origin_and_capacity_debt_is_retained(monkeyp
     assert admitted["identity_status"] == "UNVERIFIED_PUBLIC_LINK"
     discover(current, event(), "same-observation-again")
     assert len(current.transports) == 1
+    assert current.unknown_engine.framework.writes == 1
+    current.global_config["onion_max_sources"] = 2
+    drain(current)  # works without a fresh event from the first onion host
+    assert len(current.transports) == 2
+    assert not current.unknown_engine.framework.state[COMPONENT]["pending"]
+    assert current.unknown_engine.framework.writes == 2
     restored = desk(current.unknown_engine.framework)
     assert restore(restored) == 1
     asyncio.run(stop_transports(current.transports, current.http_client))
@@ -76,6 +84,17 @@ def test_public_announcement_page_exposes_link_provenance_to_discovery():
 def test_bare_forum_and_telegram_onion_addresses_are_discovered():
     bare = Event("public:chat", SourceClass.CHAT, 1., 2., text="Public forum " + host() + "/thread")
     assert candidate_urls(bare) == [URL + "thread"]
+
+
+def test_unaccepted_durable_claim_can_be_redelivered_through_mesh_dedupe():
+    mesh = SourceMesh()
+    claim = Event("onion:source", SourceClass.WEB, 1., 2., text="claimed launch",
+                  metadata={"onion_observation_id": "stable-observation"})
+    assert mesh._admit(claim, 2.)
+    assert mesh._admit(claim, 3.)
+    ordinary = Event("public:source", SourceClass.WEB, 1., 2., text="ordinary post")
+    assert mesh._admit(ordinary, 2.)
+    assert not mesh._admit(ordinary, 3.)
 
 
 def test_dynamically_discovered_source_really_starts_after_mesh_start():
