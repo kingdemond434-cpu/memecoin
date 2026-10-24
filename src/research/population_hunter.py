@@ -2,7 +2,7 @@
 
 Facts and source text belong to the canonical evidence ledger. This component
 keeps reference-only observations, frozen control assignments and measured
-outcomes in the framework checkpoint; it starts no worker and has no trading
+outcomes in a durable incremental index; it starts no worker and has no trading
 interface. Identity labels, language and source operators require provenance.
 """
 from __future__ import annotations
@@ -16,6 +16,7 @@ import unicodedata
 from typing import Any, Mapping, Optional, Sequence
 
 from src.research.actor_store import ActorStore, EdgeKind, native_node
+from src.research.population_index import BUCKETS, STORAGE, PopulationIndex
 from src.strategies.wallet_value import FollowOutcome, WalletValueModel
 
 
@@ -69,9 +70,28 @@ class PopulationHunter:
         self.state = framework.get_research_component(COMPONENT) or {
             "schema": 1, "actors": {}, "outcomes": {}, "narratives": {},
             "source_outcomes": {}, "controls": {}, "receipts": {}, "receipt_observed_at": {}}
+        self.index = None
+        state_path = getattr(framework, "state_path", None)
+        if state_path:
+            from pathlib import Path
+            path = Path(state_path).with_suffix(".population.sqlite")
+            if self.state.get("storage") == STORAGE:
+                if self.state.get("file") != path.name:
+                    raise RuntimeError("population index descriptor path mismatch")
+                self.index = PopulationIndex(path, required=True)
+                self.state = framework._research_checkpoint(self.index.load())
+            else:
+                self.state.setdefault("receipt_observed_at", {})
+                self.index = PopulationIndex(path)
+                self.index.initialize(self.state)
+                framework.checkpoint_research_component(COMPONENT, self.index.descriptor)
         self.state.setdefault("receipt_observed_at", {})
         for row in self.state["actors"].values():
             self._graph(row)
+
+    def close(self) -> None:
+        if self.index is not None:
+            self.index.close()
 
     def _graph(self, row: dict) -> None:
         relation = row.get("relation")
@@ -124,13 +144,23 @@ class PopulationHunter:
                 return deepcopy(self.state["receipts"][identity])
             if len(self.state["receipts"]) >= self.max_observations:
                 return {"disposition": "BLOCKED", "detail": {"reason": "compact index capacity reached; retain canonical input and increase reviewed capacity"}, "children": []}
-            state = deepcopy(self.state)
+            # All per-identity rows are immutable. Copy the seven maps, not
+            # every historical receipt and child request for each new fact.
+            state = {"schema": self.state["schema"], **{name: dict(self.state[name]) for name in BUCKETS}}
             method = getattr(self, "_" + kind.lower())
             detail, children = method(state, p, refs, identity)
             result = {"disposition": "OBSERVED", "detail": detail, "children": children}
             state["receipts"][identity] = result
             state["receipt_observed_at"][identity] = observed_at
-            self.framework.checkpoint_research_component(COMPONENT, state)
+            if self.index is None:
+                self.framework.checkpoint_research_component(COMPONENT, state)
+            else:
+                changes = {name: {key: value for key, value in state[name].items()
+                                  if key not in self.state[name] or value is not self.state[name][key]}
+                           for name in BUCKETS}
+                changes = {name: rows for name, rows in changes.items() if rows}
+                changes = self.framework._research_checkpoint(changes)
+                self.index.apply(changes)
             self.state = state
             return deepcopy(result)
         except (ValueError, TypeError, KeyError) as exc:

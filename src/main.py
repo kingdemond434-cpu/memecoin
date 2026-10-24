@@ -741,6 +741,10 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
         if self.yellowstone:
             await self.yellowstone.close()
         self._flush_ledgers()
+        workflows = getattr(getattr(self, "unknown_engine", None), "workflows", None)
+        population = getattr(workflows, "population", None)
+        if population is not None:
+            population.close()
         frontier = getattr(self, "research_frontier", None)
         if frontier is not None:
             frontier.close()
