@@ -111,6 +111,8 @@ class ResearchRuntime:
             # Durable product-specific indexing stays on the miner worker.
             # A full main-loop handoff queue cannot discard this derived data.
             self.phantom_perps.ingest_batch(records, ref)
+        if miner_id == "chain:local_fork_roundtrip":
+            self.fork_probe.acknowledge(records, ref)
         return ref
 
     def _retain_mined_disposition(self, ref: str, status: str, detail: str, now: float) -> None:
