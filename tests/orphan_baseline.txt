@@ -59,7 +59,6 @@ watched_programs	D	registry reporting surface
 fee_lamports	D	fee quote convenience property
 ready_share_or_zero	D	registry reporting surface
 score_gain	D	displacement reporting surface
-peek	D	cache inspection without touching TTL
 owns_account	D	entity membership predicate
 loops	D	loop inventory, reporting surface
 runtime_task_report	D	supervision reporting surface
