@@ -13,7 +13,8 @@ version has passed. The launch registry's global simulation evidence fields
 are deliberately not populated with a generic implementation filename.
 
 The worker verifies mint owner/layout, route identities and token-account
-authorities, reads quote-mint and mode flags rather than guessing them, and
+authorities, reads quote-mint and mode flags using Pump's documented trailing
+field defaults, and
 loads executable ELF bytes from the sampled immutable/upgradeable loader
 accounts. ProgramData pointers, owners, metadata and upgrade slots are checked.
 Every final account group must have exactly the same context slot, including
@@ -23,8 +24,11 @@ smaller groups; rate limits do not. Inconsistent banks remain unknown.
 Only the public, deterministic virtual payer is funded locally. Its existing
 on-chain account or ATAs make a probe unavailable; no existing holder balances,
 pool reserves, authorities, extension flags or program state are patched to
-force success. Both adapters create real ATAs and wrap virtual SOL through
-program instructions. The initial scheduling size is 1,000,000 quote lamports.
+force success. Both adapters create real ATAs through program instructions.
+Pump v2 receives WSOL as an interface mint but uses
+**native payer lamports** for SOL-paired curves, whose stored quote mint is
+`Pubkey::default()`. Only PumpSwap wraps quote funding into a WSOL account.
+The initial scheduling size is 1,000,000 quote lamports.
 The job schema supports other representable sizes; a small successful probe
 does **not** establish transferability at a larger intended order size.
 
@@ -33,6 +37,8 @@ compressed executable blobs, durable jobs and results. VM execution reads the
 archived, hash-checked frame. A raw result must be canonically retained before
 its ACK makes it available to episode research. The canonical receipt binds
 the archive's input hash; preserve this SQLite database with canonical backups.
+ACK compares the archived body after removing only the six declared miner
+transport stamp fields; additional or modified body fields remain refused.
 Availability is the ACK time, never backdated to the sampled slot. Restart
 retries unacknowledged results. New targets cannot leapfrog an older backlog.
 There is no top-N or lifetime token ceiling; cadence, provider quota and VM
@@ -47,6 +53,10 @@ prevent a valid real-world sell. A failed local sell is recorded as
 `FORK_SELL_FAILED`, not a proven honeypot. Setup/buy/environment failures are
 unknown. A successful round trip records positive returned WSOL and zero
 remaining purchased units; it is not a future sell guarantee or profit proof.
+Native-SOL proceeds measure payer lamport change plus the modeled transaction
+fee and may include rent refunds. The receipt labels that basis and retains
+quote balances around both legs; it does not assert pure sale principal or
+cost-adjusted profit.
 It neither overrides existing safety checks nor unlocks live trading.
 
 The native fee adapter's standalone RPC simulations remain separately useful
@@ -64,4 +74,6 @@ Primary interfaces:
 
 - [Solders LiteSVM](https://kevinheavey.github.io/solders/tutorials/litesvm.html)
 - [Solana getMultipleAccounts](https://solana.com/docs/rpc/http/getmultipleaccounts)
+- [Pump quote-marker and trailing-field compatibility](https://github.com/pump-fun/pump-public-docs/blob/main/docs/PUMP_PROGRAM_README.md)
+- [Pump v2 native-SOL account semantics](https://github.com/pump-fun/pump-public-docs/blob/main/docs/instructions/SELL.md)
 - Reviewed vendored `idl/pump.json`, `idl/pump_amm.json`, `idl/pump_fees.json`

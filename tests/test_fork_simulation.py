@@ -95,8 +95,11 @@ def transfer(source, destination, amount):
 
 
 @pytest.mark.parametrize('broken_sell', [False, True])
-def test_real_spl_vm_sells_actual_post_buy_balance(monkeypatch, broken_sell):
+@pytest.mark.parametrize('native_sol', [False, True])
+def test_real_spl_vm_sells_actual_post_buy_balance(monkeypatch, broken_sell, native_sol):
     frame, treasury, quote_treasury = synthetic_frame()
+    if not native_sol:
+        frame['target']['venue'] = 'pumpswap'
     mint = frame['target']['token']
     user = str(f.virtual_owner().pubkey())
     ata = associated_token_address(user, mint, TOKEN_PROGRAM)
@@ -114,7 +117,15 @@ def test_real_spl_vm_sells_actual_post_buy_balance(monkeypatch, broken_sell):
         if len(stages) == 3:
             # Synthetic exchange repays quote in the same atomic transaction.
             quote_ata = associated_token_address(user, WSOL_MINT, TOKEN_PROGRAM)
-            instructions = [*instructions, f._instruction(transfer(quote_treasury, quote_ata, 50_000))]
+            if native_sol:
+                # Close an owned native account to return real lamports in
+                # this fixture; the receipt explicitly includes rent refunds.
+                repay = PreparedInstruction('OK', TOKEN_PROGRAM,
+                    [AccountMeta(quote_treasury, False, True), AccountMeta(user, False, True),
+                     AccountMeta(user, True, False)], b'\x09')
+            else:
+                repay = transfer(quote_treasury, quote_ata, 50_000)
+            instructions = [*instructions, f._instruction(repay)]
         return original(vm, instructions)
     monkeypatch.setattr(f, '_transact', transact)
     result = f.execute_frame(frame)
@@ -127,7 +138,9 @@ def test_real_spl_vm_sells_actual_post_buy_balance(monkeypatch, broken_sell):
         assert result['status'] == 'FORK_SELL_FAILED'
     else:
         assert result['status'] == 'ROUNDTRIP_SUCCEEDED_IN_FORK'
-        assert result['remaining_token_units'] == 0 and result['returned_quote_units'] == 50_000
+        assert result['remaining_token_units'] == 0
+        assert result['returned_quote_units'] == (1_003_000_000 if native_sol else 50_000)
+        assert result['cost_adjusted_profit'] is None
 
 
 def test_program_loader_binding_and_future_upgrade_rejected():
@@ -198,7 +211,12 @@ def test_curve_adapter_uses_observed_quote_mint_flags_and_owner():
     buy, sell, program = f._route(target, accounts)
     assert buy.ok and program == TOKEN_PROGRAM and sell(123).ok
     assert int.from_bytes(sell(123).data[8:16], 'little') == 123
-    for altered in (curve[:82], curve[:83] + bytes(Pubkey.new_unique()), curve[:81] + b'\x02' + curve[82:]):
+    # Per Pump's published compatibility rule, missing trailing fields are
+    # zero/default; default quote mint means SOL, not an unsupported asset.
+    for valid in (curve[:49], curve[:81], curve[:82], curve[:83] + bytes(32), curve):
+        accounts[key] = wire(valid, f.PUMP_PROGRAM)
+        assert f._route(target, accounts)[0].ok
+    for altered in (curve[:83] + bytes(Pubkey.new_unique()), curve[:81] + b'\x02' + curve[82:]):
         accounts[key] = wire(altered, f.PUMP_PROGRAM)
         with pytest.raises(f.ForkUnavailable):
             f._route(target, accounts)
@@ -268,3 +286,32 @@ def test_runtime_retains_result_before_acknowledging():
                           fork_probe=SimpleNamespace(acknowledge=ack))
     ref = ResearchRuntime._retain_mined_batch(bot, 'chain:local_fork_roundtrip', [{'token': 'synthetic'}], 1000)
     assert ref == 'canonical:fork' and called == ['retain', 'ack']
+
+
+@pytest.mark.asyncio
+async def test_real_miner_transport_stamps_do_not_block_canonical_ack(monkeypatch, tmp_path):
+    from src.research import fork_probe as p
+    from src.research.data_miners import DataMinerPool
+    async def unavailable(rpc, target):
+        raise f.ForkUnavailable('synthetic provider diagnostic')
+    monkeypatch.setattr(p, 'acquire', unavailable)
+    probe = ForkProbe(tmp_path/'fork.sqlite')
+    delivered = []
+    def retain(miner, rows, now):
+        assert miner == p.MINER and rows[0]['_miner'] == p.MINER
+        assert rows[0]['_request_started_at'] <= rows[0]['_fetched_at']
+        probe.acknowledge(rows, 'canonical:stamped')
+        return 'canonical:stamped'
+    pool = DataMinerPool(retain_batch=retain, on_records=lambda miner, rows: delivered.extend(rows))
+    target = {'token': str(Pubkey.new_unique()), 'venue': 'pump_curve', 'quote_budget': 1_000_000}
+    probe.register(pool, None, lambda: [target])
+    result = await pool._run_one(p.MINER, p.time.time())
+    assert result.status == 'OK' and len(delivered) == 1
+    assert probe.report()['awaiting_canonical_ack'] == 0
+    assert probe.latest(target['token'], as_of=10**12)['source_ref'] == 'canonical:stamped'
+    # Only the declared transport envelope is ignored. New/tampered body
+    # fields and another miner's identity still fail closed.
+    for altered in ({**delivered[0], 'invented': True}, {**delivered[0], '_miner': 'untrusted'}):
+        with pytest.raises(ValueError):
+            probe.acknowledge([altered], 'canonical:forged')
+    probe.close()

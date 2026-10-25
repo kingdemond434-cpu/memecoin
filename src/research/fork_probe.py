@@ -13,6 +13,8 @@ from src.research.data_miners import Enriches, MinerSpec
 from src.research.fork_simulation import SCHEMA, ForkUnavailable, acquire, digest, run_isolated
 
 MINER = 'chain:local_fork_roundtrip'
+TRANSPORT_FIELDS = frozenset({'_miner', '_enriches', '_endpoint', '_fetched_at',
+                              '_request_started_at', '_scheduled_at'})
 
 
 class ForkProbe:
@@ -128,7 +130,8 @@ class ForkProbe:
         with self.lock, self.db:
             for row in records:
                 original = self.db.execute('SELECT body FROM results WHERE id=?', (row.get('probe_id'),)).fetchone()
-                if original is None or json.loads(original[0]) != row:
+                raw = {key: value for key, value in row.items() if key not in TRANSPORT_FIELDS}
+                if row.get('_miner', MINER) != MINER or original is None or json.loads(original[0]) != raw:
                     raise ValueError('canonical fork result does not match archived result')
                 self.db.execute('UPDATE results SET ref=COALESCE(ref,?),available=COALESCE(available,?) WHERE id=?',
                                 (ref, time.time(), row['probe_id']))
