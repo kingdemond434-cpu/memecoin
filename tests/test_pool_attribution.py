@@ -13,11 +13,11 @@ from src.research.pool_attribution import PoolAttribution, bind_trade, mint_deci
 POOL, BASE = str(Pubkey(bytes([7])*32)), str(Pubkey(bytes([8])*32))
 
 
-def account():
+def account(base=BASE):
     body = bytearray(POOL_DISCRIMINATOR)
     for name, width, kind in _POOL_LAYOUT:
         if kind == 'pubkey':
-            body.extend(bytes(Pubkey.from_string(BASE if name == 'base_mint' else WSOL_MINT if name == 'quote_mint' else str(Pubkey(bytes([9])*32)))))
+            body.extend(bytes(Pubkey.from_string(base if name == 'base_mint' else WSOL_MINT if name == 'quote_mint' else str(Pubkey(bytes([9])*32)))))
         else:
             body.extend(bytes(width))
     return {'owner': PUMPSWAP_PROGRAM, 'data': [base64.b64encode(body).decode(), 'base64']}
@@ -190,6 +190,39 @@ async def test_explicit_provider_batch_limit_is_learned_without_discarding_other
     calls.clear()
     await book.fetch(SimpleNamespace(request=request))
     assert calls == [10,1] and book.report()['pool_read_batch_limit'] == 10
+    book._batch_observed -= 3601
+    async def upgraded(method, params):
+        values = [mint()] if params[0] == [BASE] else [account() for _ in params[0]]
+        return {'context': {'slot': 60}, 'value': values}
+    rows = await book.fetch(SimpleNamespace(request=upgraded))
+    assert sum(row['attribution_kind']=='identity' for row in rows) == 91
+    assert book.report()['pool_read_batch_limit'] == 100
+    book.close()
+
+
+@pytest.mark.asyncio
+async def test_mint_batch_can_learn_a_different_endpoint_bound_without_shifting_proofs(tmp_path):
+    from src.chains.rpc_manager import RPCError
+    book = PoolAttribution(tmp_path/'attribution.sqlite')
+    other_pool, other_base = str(Pubkey(bytes([15])*32)), str(Pubkey(bytes([16])*32))
+    for pool in (POOL, other_pool):
+        book._capture({**event(), 'pool': pool})
+    async def request(method, params):
+        addresses = params[0]
+        if POOL in addresses:
+            values = [account(BASE if p == POOL else other_base) for p in addresses]
+        elif len(addresses) > 1:
+            raise RPCError({'code': -32602, 'message': 'A maximum of 1 accounts is allowed.'})
+        else:
+            values = [mint()]
+        return {'context': {'slot': 50}, 'value': values}
+    rows = await book.fetch(SimpleNamespace(request=request))
+    identities = [row for row in rows if row['attribution_kind']=='identity']
+    assert len(identities) == 2
+    assert sum(row['base_decimals'] is not None for row in identities) == 1
+    assert sum(row['base_mint_slot_context'] is not None for row in identities) == 1
+    book.acknowledge(rows, 'canonical:partial-mint-proof')
+    assert book.report()['mapping_gaps'] == 1 and book.report()['pool_read_batch_limit'] == 1
     book.close()
 
 
