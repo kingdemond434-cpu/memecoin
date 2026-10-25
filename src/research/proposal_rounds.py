@@ -307,13 +307,7 @@ class ProposalRoundRunner:
                 "providers": rows, "network_requests": 0, "authority": "none"}
 
     def _previous(self, round_id: str) -> list[dict]:
-        if not self.ledger.path.exists():
-            return []
-        valid, _, _ = TradeEvidenceLedger.verify(self.ledger.path)
-        if not valid:
-            raise ValueError("existing evidence chain failed verification")
-        return [row for line in self.ledger.path.read_text(encoding="utf-8").splitlines() if line.strip()
-                for row in [json.loads(line)] if row.get("payload", {}).get("round_id") == round_id]
+        return self.ledger.matching_snapshot('round_id', round_id)
 
     async def run_round(self, *, round_id: str, facts: Sequence[Mapping], schemas: Mapping,
                         training_memory: Sequence[Mapping] = ()) -> dict:
@@ -324,7 +318,7 @@ class ProposalRoundRunner:
                 raise ValueError("stable round_id required")
             envelope = _envelope(facts, schemas, training_memory)
             input_hash = _hash(envelope)
-            previous = self._previous(round_id)
+            previous = await asyncio.to_thread(self._previous, round_id)
             if any(row["payload"].get("input_hash", input_hash) != input_hash for row in previous):
                 raise ValueError("round identity cannot be reused for changed facts")
             for row in previous:
