@@ -1,0 +1,42 @@
+# First-party domain observations, reviewed 25 October 2026.
+# Domain ownership is the only assertion. No account ids, wallets or token endorsements.
+entities:
+  - entity_id: meteora
+    display_name: Meteora
+    official_domains: [meteora.ag]
+    accounts: {}
+    known_wallets: []
+    aliases: [Meteora, MeteoraAG]
+    verified_from: "https://docs.meteora.ag/get-started.md"
+    verified_at: "2026-10-25T14:03:42+00:00"
+    metadata:
+      verification_scope: FIRST_PARTY_DOMAIN_ONLY
+      page_hashes:
+        "https://docs.meteora.ag/get-started.md": f7bd7d47f36764452082137e61f28a966b746c158be977a5d69a1eb47e1bc9a9
+      published_handle_candidates:
+        telegram: [meteora_dev]
+        x: [MeteoraAG]
+  - entity_id: raydium
+    display_name: Raydium
+    official_domains: [raydium.io]
+    accounts: {}
+    known_wallets: []
+    aliases: [Raydium]
+    verified_from: "https://raydium.io/swap/"
+    verified_at: "2026-10-25T14:03:42+00:00"
+    metadata:
+      verification_scope: FIRST_PARTY_DOMAIN_ONLY
+      page_hashes:
+        "https://raydium.io/swap/": e3220ab670eb0d2da6d0edec1546a37743f22a6db6e4cc85bfeda4fdcee7f83f
+  - entity_id: solana
+    display_name: Solana
+    official_domains: [solana.com]
+    accounts: {}
+    known_wallets: []
+    aliases: [Solana]
+    verified_from: "https://solana.com/community"
+    verified_at: "2026-10-25T14:03:42+00:00"
+    metadata:
+      verification_scope: FIRST_PARTY_DOMAIN_ONLY
+      page_hashes:
+        "https://solana.com/community": b21ab76d5089ae830c8dbd090ddac0f745017f91c28e486519cca4a472149347

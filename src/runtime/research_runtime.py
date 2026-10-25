@@ -105,6 +105,8 @@ class ResearchRuntime:
             for observation in self.free_discovery.discovery_records(page, ref):
                 self._retain_chain_scout_record(observation)
             self.free_discovery.acknowledge(records, ref)
+        if miner_id == "chain:pool_attribution":
+            self.pool_attribution.acknowledge(records, ref)
         return ref
 
     def _retain_mined_disposition(self, ref: str, status: str, detail: str, now: float) -> None:

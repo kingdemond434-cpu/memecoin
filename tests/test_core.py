@@ -10252,6 +10252,13 @@ class TestNativeRouteIsTheCanonicalPath(unittest.TestCase):
         engine.native_route_attempts["blocked:DATA_BLOCKED"] = 1
         self.assertAlmostEqual(engine.native_route_report()["prepared_share"], 0.75)
 
+    def test_token_to_usdc_cannot_silently_build_a_sol_settled_sell(self):
+        from src.execution.jupiter_jito import USDC_MINT
+        engine = self._engine(route=NativePumpRoute(), curve=self._curve(creator=self.MINT))
+        self.assertIsNone(engine.prepare_native_route(self.OTHER, USDC_MINT, 1_000_000, 100))
+        self.assertIsNone(engine._native_quote(self.OTHER, USDC_MINT, 1_000_000))
+        self.assertIsNone(engine.prepare_native_route(self.MINT, self.MINT, 1_000_000, 100))
+
 
 class TestOnChainFeeConfig(unittest.TestCase):
     """The fee block was lifted by reading an account, not by squinting at a picture.
@@ -10591,7 +10598,7 @@ class TestGraduationKeepsNativeExecution(unittest.IsolatedAsyncioTestCase):
     OTHER = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 
     def _pool_account(self, **overrides):
-        base = dict(status="OK", pool=self.OTHER, base_mint=self.MINT,
+        base = dict(status="OK", pool=self.OTHER, base_mint=self.OTHER,
                     quote_mint=self.MINT, pool_base_token_account=self.OTHER,
                     pool_quote_token_account=self.OTHER, creator=self.OTHER,
                     coin_creator=self.MINT)
@@ -10599,7 +10606,7 @@ class TestGraduationKeepsNativeExecution(unittest.IsolatedAsyncioTestCase):
         return PoolState(**base)
 
     def _reserves(self, **overrides):
-        args = dict(pool=self.OTHER, base_mint=self.MINT, quote_mint=self.MINT,
+        args = dict(pool=self.OTHER, base_mint=self.OTHER, quote_mint=self.MINT,
                     base_reserves=1_000_000_000_000, quote_reserves=100_000_000_000,
                     total_fee_bps=30, updated_at=time.time(), source="test")
         args.update(overrides)
@@ -10647,6 +10654,16 @@ class TestGraduationKeepsNativeExecution(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prepared.status, "OK")
         self.assertEqual(prepared.venue, "pumpswap")
         self.assertEqual(len(prepared.accounts), 21)
+
+    def test_non_sol_or_mismatched_pool_assets_do_not_price_a_sol_trade(self):
+        from src.execution.jupiter_jito import USDC_MINT
+        engine = self._engine(reserves=self._reserves(quote_mint=USDC_MINT),
+                              account=self._pool_account(quote_mint=USDC_MINT))
+        self.assertIsNone(engine.prepare_native_route(self.MINT, self.OTHER, 1000, 100))
+        self.assertIsNone(engine._native_quote(self.MINT, self.OTHER, 1000, "pumpswap"))
+        engine = self._engine(reserves=self._reserves(), account=self._pool_account(base_mint=self.MINT))
+        self.assertEqual(engine.prepare_native_route(self.MINT, self.OTHER, 1000, 100).status,
+                         "DATA_BLOCKED")
 
     def test_the_max_quote_in_bounds_the_amm_leg_not_the_whole_budget(self):
         """The protocol takes its fee on top of the leg it is given."""
@@ -10805,7 +10822,10 @@ class TestDeskMaintainsPoolState(unittest.IsolatedAsyncioTestCase):
         desk = self._desk()
         from solders.pubkey import Pubkey
         body = (b"\x01" + (7).to_bytes(2, "little")
-                + bytes(Pubkey.from_string(self.POOL)) * 6
+                + bytes(Pubkey.from_string(self.POOL))
+                + bytes(Pubkey.from_string(self.TOKEN))
+                + bytes(Pubkey.from_string(WSOL_MINT))
+                + bytes(Pubkey.from_string(self.POOL)) * 3
                 + (123).to_bytes(8, "little")
                 + bytes(Pubkey.from_string(self.TOKEN))
                 + b"\x00\x00" + (0).to_bytes(16, "little", signed=True))
@@ -10814,7 +10834,7 @@ class TestDeskMaintainsPoolState(unittest.IsolatedAsyncioTestCase):
 
         async def request(method, params):
             calls.append(params[0])
-            return {"value": {"data": [encoded, "base64"]}}
+            return {"value": {"owner": PumpSwapMonitor.PUMP_AMM_PROGRAM, "data": [encoded, "base64"]}}
 
         desk.solana_rpc = SimpleNamespace(request=request)
         MemecoinQuantDesk._seed_pool_state(desk, self.TOKEN, self._created())

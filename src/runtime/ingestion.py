@@ -39,6 +39,45 @@ class MinedRecordIngestion:
     it answers the same question from the other end -- what is worth
     collecting, and where does what we collected go."""
 
+    async def _attribute_pool_event(self, event):
+        from src.chains.pumpswap_route import PUMPSWAP_PROGRAM
+        from src.research.pool_attribution import bind_trade
+        book = getattr(self, "pool_attribution", None)
+        if book is None or event.get("program") != PUMPSWAP_PROGRAM or event.get("type") != "token_trade":
+            return event
+        identity = book.lookup(event.get("pool"))
+        if identity is not None:
+            return bind_trade(event, identity, available_at=time.time())
+        await book.capture(event)
+        return event
+
+    async def _retain_foreign_quote_event(self, event):
+        """Retain other quote assets without mixing them into SOL price state."""
+        from src.chains.pump_route import WSOL_MINT
+        if (event.get("type") not in {"token_trade", "pool_created"}
+                or event.get("quote_mint") in (None, "", WSOL_MINT)):
+            return False
+        book = getattr(self, "pool_attribution", None)
+        from src.chains.pumpswap_route import PUMPSWAP_PROGRAM
+        if (book is not None and event.get("program") == PUMPSWAP_PROGRAM
+                and event.get("type") == "token_trade"):
+            await book.capture(event)
+        evidence = getattr(self, "trade_evidence", None)
+        if evidence is not None:
+            evidence.record("non_sol_quote_observation", event)
+        counters = self._stream_events
+        key = str(event.get("type")) + ":observation_only_quote"
+        counters[key] = counters.get(key, 0) + 1
+        return True
+
+    def _record_hot_creator(self, token, event):
+        hot = getattr(self, "hot_state", None)
+        observer = getattr(hot, "observe_creator", None)
+        census = getattr(self, "launch_census", None)
+        creator = str(event.get("creator") or "")
+        if creator and callable(observer) and census is not None and not census.knows(token):
+            observer(creator, now=time.time())
+
     async def _fetch_pool_account(self, token: str, pool: str) -> bool:
         """Decode the pool's actual vaults/creator before native route use."""
         if not pool or not self.solana_rpc or pool in self._pool_account_pending:
@@ -48,12 +87,17 @@ class MinedRecordIngestion:
             result = await self.solana_rpc.request(
                 "getAccountInfo", [pool, {"encoding": "base64", "commitment": "confirmed"}])
             value = (result or {}).get("value") or {}
+            from src.chains.pumpswap_route import PUMPSWAP_PROGRAM
+            if value.get("owner") != PUMPSWAP_PROGRAM:
+                return False
             encoded = (value.get("data") or [None])[0]
             if not encoded:
                 return False
             decoded = parse_pool(base64.b64decode(encoded), pool)
             if not decoded.ok:
                 logger.warning("pool %s did not decode: %s", pool, decoded.detail)
+                return False
+            if decoded.base_mint != token:
                 return False
             self._pool_accounts[token] = decoded
             state = self._latest_pool_state.get(token)
@@ -92,6 +136,7 @@ class MinedRecordIngestion:
         # Archive before enrichment/admission; unknown executable prices cannot
         # erase a launch from the collection denominator.
         self.trade_evidence.record("native_launch", event)
+        self._record_hot_creator(token, event)
         self.launch_census.see(token, creator=creator, at=observed_at,
                                regime=str(self.current_regime or "unknown"))
         self.wallet_intel.record_token_lifecycle(token, launch_at=observed_at)
@@ -543,7 +588,20 @@ class MinedRecordIngestion:
         """
         if getattr(self, "channel_book", None) is not None:
             self._harvest_channels(miner_id, records)
+        attribution_delivered = []
         for record in records:
+            if record.get("provider") == "native_pool_attribution":
+                if record.get("attribution_kind") == "recovered_trade":
+                    event = record["event"]
+                    # Retained as late knowledge. Never call the hot event
+                    # handler, reseed prices, launch an entry or fake arrival.
+                    observation = {**event, "type": "late_attributed_trade", "late_attribution": True,
+                        "amount": event.get("actual_token_amount_ui"), "price": event.get("price_sol_per_token"),
+                        "original_source_ref": record["original_source_ref"]}
+                    self.dataset_builder.record_market_observation(event["token"], observation)
+                    self.wallet_intel.record_live_trade(event["token"], observation)
+                    attribution_delivered.append(record["event_id"])
+                continue
             if record.get("provider") == "geckoterminal" and record.get("discovery_kind"):
                 if record["discovery_kind"] == "pool_observation" and record.get("network_id") == "solana":
                     # Explicit provider namespace and indicative prices stay
@@ -613,6 +671,9 @@ class MinedRecordIngestion:
                     "freeze_renounced": record.get("freeze_renounced"),
                     "data_status": "OK"})
 
+        if attribution_delivered and getattr(self, "pool_attribution", None) is not None:
+            self.pool_attribution.queue_delivery_ack(attribution_delivered)
+
     def _harvest_channels(self, miner_id: str,
                           records: List[Dict[str, Any]]) -> None:
         """Pull public Telegram handles out of whatever any miner just returned.
@@ -661,8 +722,12 @@ class MinedRecordIngestion:
             mints = [mint for mint in (record.get("mints") or []) if mint]
             if watch is not None and channel and mints:
                 try:
-                    watch.note_channel_message(
-                        channel, mints, at=self._telegram_timestamp(record))
+                    recorded = watch.note_channel_message(
+                        channel, mints, at=self._telegram_timestamp(record),
+                        available_at=float(record.get("_fetched_at", time.time())))
+                    if recorded:
+                        MinedRecordIngestion._refresh_identity_mentions(
+                            self, mints, float(record.get("_fetched_at", time.time())))
                 except Exception as exc:  # pragma: no cover - defensive
                     logger.debug("telegram corroboration: %s", exc)
             # Views are the closest thing to a MEASURED crowd reading that
@@ -714,9 +779,10 @@ class MinedRecordIngestion:
             mint = str(record.get("mint", "") or "")
             if not mint:
                 continue
+            first_seen = mint not in self._discovered_pools
             self._discovered_pools[mint] = float(
                 record.get("_fetched_at", time.time()))
-            if census is not None and not census.knows(mint):
+            if first_seen and census is not None and not census.knows(mint):
                 self._discovery_misses += 1
             try:
                 self.dataset_builder.record_market_observation(
@@ -729,6 +795,28 @@ class MinedRecordIngestion:
                            "data_status": "OK"})
             except Exception as exc:
                 logger.debug("discovered pool %s not recorded: %s", mint, exc)
+
+    def _refresh_identity_mentions(self, mints, available_at):
+        """New owned corroboration revises a current view, never its old PIT row."""
+        cache = getattr(self, "_identity_claims", {})
+        census = getattr(self, "launch_census", None)
+        watch = getattr(self, "identity_watch", None)
+        if census is None or watch is None:
+            return
+        for mint in mints:
+            previous = cache.get(mint)
+            birth = getattr(census, "_records", {}).get(mint)
+            if previous is None or not previous.claims or birth is None:
+                continue
+            assessment = watch.assess(mint,
+                name=" ".join(claim.display for claim in previous.claims),
+                deployer=previous.deployer, created_at=birth.detected_at, now=available_at)
+            if assessment.verdict == previous.verdict and assessment.corroborated_by == previous.corroborated_by:
+                continue
+            cache[mint] = assessment
+            self.dataset_builder.record_market_observation(mint, {
+                "type": "identity_corroboration_update", "timestamp": available_at,
+                "available_at": available_at, "measurement": "identity_watch", **assessment.to_dict()})
 
     def _assess_identity(self, mint: str, event: Dict[str, Any]) -> None:
         """Who does this launch claim to be, and did that name confirm it.

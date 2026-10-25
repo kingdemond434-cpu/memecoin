@@ -192,6 +192,7 @@ async def test_runtime_archives_all_launches_without_pump_reserves_or_execution_
         _prelaunch_context=Mock(return_value={}),
     )
     value._note_launch_venue = lambda event: MemecoinQuantDesk._note_launch_venue(value, event)
+    value._record_hot_creator = lambda token, event: MinedRecordIngestion._record_hot_creator(value, token, event)
     for tx in transactions():
         events, _ = await decode(tx)
         await MinedRecordIngestion._on_launchpad_event(value, events[0])

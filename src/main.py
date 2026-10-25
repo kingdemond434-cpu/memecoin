@@ -748,6 +748,9 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
                     logger.error("Error stopping %s: %s", component.__class__.__name__, exc)
         if self.yellowstone:
             await self.yellowstone.close()
+        if getattr(self, "pool_attribution", None) is not None:
+            await self.pool_attribution.finish_delivery_acks()
+            await asyncio.to_thread(self.pool_attribution.close)
         self._flush_ledgers()
         workflows = getattr(getattr(self, "unknown_engine", None), "workflows", None)
         population = getattr(workflows, "population", None)
@@ -1275,7 +1278,7 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
         trade_info = {**trade_info, "execution_readiness": pre_trade_readiness(
             self, token, int(trade_info.get("expected_tokens", 0) or 0), age_s)}
         result = await self.execution_engine.execute_swap(
-            candidate.base_token or WSOL_MINT, token, int(trade_info["position_size_sol"] * 1e9),
+            WSOL_MINT, token, int(trade_info["position_size_sol"] * 1e9),
             slippage_bps=100,
             priority_fee=priority_fee,
             jito_tip=self.fee_optimizer.get_jito_tip(trade_info["position_value_usd"], "MEDIUM"),
@@ -1964,7 +1967,7 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
         every graduated coin as though it were cheaper to trade than it is.
         """
         pool = str(event.get("pool", "") or "")
-        if not token or not pool:
+        if not token or not pool or event.get("quote_mint") != WSOL_MINT:
             return
         existing = self._latest_pool_state.get(token)
         state = PumpSwapPoolState(
@@ -1998,7 +2001,8 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
         """
         reserves_base = int(event.get("pool_base_reserves", 0) or 0)
         reserves_quote = int(event.get("pool_quote_reserves", 0) or 0)
-        if not token or reserves_base <= 0 or reserves_quote <= 0:
+        if (not token or reserves_base <= 0 or reserves_quote <= 0
+                or event.get("quote_mint") not in (None, "", WSOL_MINT)):
             return
         previous = self._latest_pool_state.get(token)
         pool = str(event.get("pool", "") or (previous.pool if previous else ""))
@@ -2762,7 +2766,7 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
             return
         measurement_decision_at = time.time()
         result = await self.execution_engine.execute_swap(
-            candidate.base_token or WSOL_MINT, token, lamports,
+            WSOL_MINT, token, lamports,
             slippage_bps=slippage_bps,
             priority_fee=self.fee_optimizer.get_optimal_fee(
                 add_usd, fee_competition(getattr(self, "latency", None))),
@@ -3682,6 +3686,11 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
         if schedule is not None and event.get("slot"):
             schedule.observe_slot(event["slot"])
         token = event.get("token", "")
+        if not token and event.get("pool"):
+            event = await self._attribute_pool_event(event)
+            token = event.get("token", "")
+        if await MinedRecordIngestion._retain_foreign_quote_event(self, event):
+            return
         # What the competition paid to land this. Free: the transaction
         # carried its own ComputeBudget instructions and the desk was walking
         # past them. The landing model has almost no data because a bid model
@@ -3727,6 +3736,7 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
             return
         if event.get("type") == "token_created":
             # Counted before anything can filter it. This is the denominator.
+            self._record_hot_creator(token, event)
             self.launch_census.see(
                 token, creator=str(event.get("creator", "") or ""),
                 at=float(event.get("timestamp", time.time())),
