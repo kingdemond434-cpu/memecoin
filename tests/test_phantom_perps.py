@@ -79,6 +79,20 @@ def test_misaligned_catalog_and_foreign_funding_cannot_corrupt_existing_state(tm
     state.close()
 
 
+def test_recent_funding_never_skips_the_unfinished_history_cursor(tmp_path):
+    state=PhantomPerpsResearch(tmp_path/'perps.sqlite')
+    now=time.time()
+    old={'perps_role':'funding','observed_at':now,'coin':'BTC','start_time':0,
+         'rows':[{'coin':'BTC','time':1000,'fundingRate':'0.001'}]}
+    state.ingest(old)
+    recent={**old,'funding_lane':'recent','start_time':int((now//3600-1)*3600000),
+            'rows':[{'coin':'BTC','time':int((now//3600-1)*3600000)+47,'fundingRate':'0.0001'}]}
+    state.ingest(recent)
+    assert state.next_funding('BTC')==1001
+    assert state.report()['funding_records']==2
+    state.close()
+
+
 @pytest.mark.asyncio
 async def test_public_info_cannot_query_accounts_or_submit_orders():
     for request in ({"type":"order"},{"type":"clearinghouseState","user":"wallet"},

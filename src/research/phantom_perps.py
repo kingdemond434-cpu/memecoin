@@ -5,6 +5,7 @@ The provider universe is broader than Phantom's verified UI listing universe.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import sqlite3
@@ -16,6 +17,8 @@ from pathlib import Path
 
 from src.research.data_miners import Enriches, MinerSpec, RateLimited, rotating_selector
 from src.research.perps_acquisition import PublicPerpsAcquisition
+from src.research.perps_paper import PerpsPaperLedger
+from src.research.perps_snapshots import _fetch_snapshots, _marks, WS
 
 INFO = "https://api.hyperliquid.xyz/info"
 PHANTOM_REFERENCE = "https://help.phantom.com/articles/42292249388307"
@@ -118,14 +121,17 @@ class PhantomPerpsResearch:
           CREATE TABLE IF NOT EXISTS collateral_tokens(token_index INTEGER PRIMARY KEY,metadata TEXT NOT NULL,observed REAL NOT NULL);
           CREATE TABLE IF NOT EXISTS markets(dex TEXT NOT NULL,coin TEXT NOT NULL,active INTEGER NOT NULL,
             spec TEXT NOT NULL,context TEXT NOT NULL,observed REAL NOT NULL,PRIMARY KEY(dex,coin));
+          CREATE INDEX IF NOT EXISTS perps_market_identity ON markets(coin,active);
           CREATE TABLE IF NOT EXISTS books(coin TEXT PRIMARY KEY,body TEXT NOT NULL,observed REAL NOT NULL,scenario TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS funding(coin TEXT NOT NULL,time INTEGER NOT NULL,body TEXT NOT NULL,observed REAL NOT NULL,PRIMARY KEY(coin,time));
           CREATE TABLE IF NOT EXISTS cursors(coin TEXT PRIMARY KEY,next_time INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS retained_batches(ref TEXT PRIMARY KEY,observed REAL NOT NULL);
           CREATE TABLE IF NOT EXISTS ingestion_errors(ref TEXT NOT NULL,record_index INTEGER NOT NULL,
             error TEXT NOT NULL,PRIMARY KEY(ref,record_index));
+          CREATE TABLE IF NOT EXISTS pp_ws_attempts(at REAL NOT NULL,subscriptions INTEGER NOT NULL);
         """)
         self.acquisition = PublicPerpsAcquisition(self, lambda http, payload: public_info(http, payload))
+        self.paper = PerpsPaperLedger(self)
 
     def dex_names(self):
         with self.lock:
@@ -152,7 +158,9 @@ class PhantomPerpsResearch:
                     raise ValueError("foreign record in perps batch")
                 self.db.execute("SAVEPOINT perps_record")
                 try:
-                    self._ingest(record)
+                    accepted = self._ingest(record)
+                    if accepted:
+                        self.paper.on_record(record,source_ref)
                 except (ValueError, TypeError, KeyError, ArithmeticError) as exc:
                     self.db.execute("ROLLBACK TO perps_record")
                     # Retain the canonical reference and explicit parse error;
@@ -224,6 +232,8 @@ class PhantomPerpsResearch:
                             (coin, json.dumps(book, allow_nan=False), at, json.dumps(scenario, allow_nan=False)))
         elif role == "funding":
             coin, start, rows = record["coin"], record["start_time"], record["rows"]
+            lane = record.get('funding_lane','history')
+            if lane not in {'history','recent'}: raise ValueError('invalid perps funding lane')
             if type(start) is not int or start < 0:
                 raise ValueError("invalid funding history cursor")
             for row in rows:
@@ -234,16 +244,24 @@ class PhantomPerpsResearch:
                     raise ValueError("conflicting immutable perps funding observation")
             self.db.executemany("INSERT OR IGNORE INTO funding VALUES(?,?,?,?)",
                                 ((coin, row["time"], json.dumps(row, allow_nan=False), at) for row in rows))
-            if rows:
+            if rows and lane=='history':
                 next_time = max(row["time"] for row in rows) + 1
                 self.db.execute("INSERT INTO cursors VALUES(?,?) ON CONFLICT(coin) DO UPDATE SET next_time=MAX(next_time,excluded.next_time)",
                                 (coin, next_time))
+        elif role == "mark_snapshot":
+            _marks(record['frame'])
+        elif role == "asset_context":
+            frame = record['frame']
+            if frame.get('channel')!='activeAssetCtx' or not isinstance(frame.get('data',{}).get('coin'),str):
+                raise ValueError('keyed active asset context required')
+            if not isinstance(frame['data'].get('ctx'),dict): raise ValueError('asset context object required')
         elif role == "request_error":
             # An explicit retained HTTP failure is not a book or zero value.
-            if record.get("request_role") != "book" or not record.get("error"):
+            if record.get("request_role") not in {"book","snapshot","recent_funding"} or not record.get("error"):
                 raise ValueError("invalid perps acquisition failure")
         else:
             raise ValueError("unknown perps observation")
+        return True
 
     def report(self):
         with self.lock:
@@ -260,6 +278,7 @@ class PhantomPerpsResearch:
                 (now-10, int((now-10)*1000), int(now*1000))).fetchone()[0]
             batches = self.db.execute("SELECT count(*) FROM retained_batches").fetchone()[0]
             errors = self.db.execute("SELECT count(*) FROM ingestion_errors").fetchone()[0]
+            paper = self.paper.report()
         return {"status": "PUBLIC_MARKET_RESEARCH" if markets[0] else "NOT_OBSERVED",
             "underlying_venue": "Hyperliquid", "phantom_reference": PHANTOM_REFERENCE,
             "discovered_dexes": dexes, "observed_catalog_dexes": markets[2], "active_markets": markets[0],
@@ -271,7 +290,8 @@ class PhantomPerpsResearch:
             "derived_record_errors":errors, "derived_error_archive":"ingestion_errors; original records in canonical batch",
             "phantom_listing_verified_by_market": False, "live_eligibility": "UNVERIFIED",
             "execution_authority": False, "real_fills": 0, "simulated_strategy_fills": 0,
-            "paper_scope": "static displayed-book cost scenarios; no strategy positions or fills",
+            "simulated_control_fills":paper['simulated_fills'], "paper_ledger":paper,
+            "paper_scope": "independent forward book controls with fees, positions, margin, funding and liquidation scenarios; no validated alpha",
             "scope": "all discovered underlying perp DEXes; individual Phantom listings not asserted"}
 
     def register(self, pool, http):
@@ -314,9 +334,24 @@ class PhantomPerpsResearch:
                 if values is None: continue
                 rows.append(observation("funding", coin=coin, start_time=start, rows=values))
             return rows
+        async def recent_funding():
+            # Current payments must not wait for the historical backfill.
+            # This lane never advances that separate history cursor.
+            quantum = max(1,math.ceil(len(self.market_names())/60))
+            start = max(0,int((time.time()//3600-1)*3600000))
+            async def one(coin):
+                try:
+                    values = await self.acquisition.fetch(http,{'type':'fundingHistory','coin':coin,'startTime':start},role='funding_recent',target=coin)
+                    return observation('funding',coin=coin,start_time=start,rows=values,funding_lane='recent') if values is not None else None
+                except Exception as exc:
+                    return observation('request_error',request_role='recent_funding',coin=coin,error=type(exc).__name__)
+            rows = await asyncio.gather(*(one(coin) for coin in self.acquisition.targets('funding_recent',quantum)))
+            return [row for row in rows if row is not None]
         return {spec.miner_id: pool.register(spec, fetch) for spec, fetch in (
             (MinerSpec("perps:catalog", Enriches.MARKET_CONTEXT, 15, endpoint=INFO, detail="underlying full perp DEX inventory and rotating catalogs"), catalog),
             (MinerSpec("perps:books", Enriches.VENUE_LIQUIDITY, 5, endpoint=INFO, detail="fair adaptive public book batches; shared durable provider budget and cooldown"), book),
+            (MinerSpec("perps:snapshots", Enriches.EXECUTION_CONDITIONS, 5, endpoint=WS, detail="keyed public mark and oracle snapshots; adaptive fair rotation, not continuous ticks"), lambda:_fetch_snapshots(self,http)),
+            (MinerSpec("perps:recent_funding", Enriches.EXECUTION_CONDITIONS, 60, endpoint=INFO, detail="current funding round-robin independent of historical backfill; shared provider budget"),recent_funding),
             (MinerSpec("perps:funding", Enriches.EXECUTION_CONDITIONS, 60, endpoint=INFO, detail="resumable provider-available funding history; no invented cashflows"), funding))}
 
     def close(self):
