@@ -1216,6 +1216,7 @@ class PointInTimeDatasetBuilder:
 
     @staticmethod
     def _episode_to_dict(episode: LaunchEpisode) -> Dict[str, Any]:
+        from src.research.execution_measurement import episode_measurements
         return {
             "token": episode.token,
             "chain": episode.chain,
@@ -1256,6 +1257,7 @@ class PointInTimeDatasetBuilder:
             },
             "final_outcome": episode.final_outcome,
             "execution_attempts": episode.execution_attempts,
+            "execution_measurement": episode_measurements(episode, as_of=time.time()),
             "counterfactuals": episode.counterfactuals,
             "market_observations": episode.market_observations,
             "risk_report": episode.risk_report,

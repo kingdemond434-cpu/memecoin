@@ -125,6 +125,7 @@ class ExecutionResult:
     landed: bool = False
     filled: bool = False
     slot: Optional[int] = None
+    measurement_context: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def output_amount(self) -> int:
@@ -1237,6 +1238,7 @@ class ExecutionEngine:
             landed=bool(fill.get("landed")),
             filled=bool(fill.get("filled")),
             slot=fill.get("slot"),
+            measurement_context={**fill.get("measurement_context", {}), "arrival_at": started},
             error=None if fill.get("filled") else "landed transaction had no verified output balance delta",
         )
         self._record(result, decision_id)
@@ -1365,6 +1367,7 @@ class ExecutionEngine:
             route_type=RouteType.JITO_BUNDLE if use_jito else route_type,
             submitted=True, landed=bool(fill.get("landed")),
             filled=bool(fill.get("filled")), slot=fill.get("slot"),
+            measurement_context={**fill.get("measurement_context", {}), "arrival_at": started},
             error=None if fill.get("filled")
             else "landed transaction had no verified output balance delta",
         )
@@ -1575,7 +1578,7 @@ class ExecutionEngine:
             try:
                 tx = await self.rpc.request(
                     "getTransaction",
-                    [signature, {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}],
+                    [signature, {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 1}],
                 )
                 if tx:
                     meta = tx.get("meta") or {}
@@ -1584,6 +1587,7 @@ class ExecutionEngine:
                     output = self._token_balance_delta(meta, output_mint, self.tx_builder.public_key)
                     input_used = self._token_balance_decrease(meta, input_mint, self.tx_builder.public_key)
                     native_delta = self._native_balance_delta(tx, self.tx_builder.public_key)
+                    measurement_message = (tx.get("transaction") or {}).get("message") or {}
                     return {
                         "landed": True,
                         "filled": output > 0,
@@ -1592,6 +1596,25 @@ class ExecutionEngine:
                         "native_balance_delta_lamports": native_delta,
                         "slot": tx.get("slot"),
                         "fee": meta.get("fee", 0),
+                        "measurement_context": {
+                            "amount_proof": "confirmed_owner_balance_deltas",
+                            "signature": signature, "slot": tx.get("slot"),
+                            "input_mint": input_mint, "output_mint": output_mint,
+                            "input_amount_raw": input_used, "output_amount_raw": output,
+                            "confirmation_observed_at": time.time(),
+                            "transaction_block_time": tx.get("blockTime"),
+                            "network_fee_lamports": meta.get("fee"),
+                            "native_balance_delta_lamports": native_delta,
+                            "external_costs_complete": False,
+                            "missing_costs": ["rent reconciliation", "bundle tip confirmation", "cross-asset fee conversion"],
+                            "balance_evidence": {
+                                "pre_token_balances": meta.get("preTokenBalances"),
+                                "post_token_balances": meta.get("postTokenBalances"),
+                                "pre_native_balances": meta.get("preBalances"),
+                                "post_native_balances": meta.get("postBalances"),
+                                "account_keys": measurement_message.get("accountKeys"),
+                            },
+                        },
                     }
             except Exception:
                 pass
