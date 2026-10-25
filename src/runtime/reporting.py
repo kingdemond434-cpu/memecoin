@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from aiohttp import web
 from src.research.funnel_invariant import check_desk
 from src.runtime.research_reads import research_report
+from src.research.global_research_miner import GlobalResearchMiner
 from src.chains.yellowstone_grpc import (
     NATIVE_FASTPATH_STATUS, PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
     create_combined_subscription,
@@ -535,7 +536,11 @@ class ReportingSurface:
             "path": str(path),
         }
 
-    def readiness(self) -> Dict[str, Any]:
+    def readiness(self, *, unknown_engine_report=None) -> Dict[str, Any]:
+        engine = getattr(self, 'unknown_engine', None)
+        if unknown_engine_report is None:
+            unknown_engine_report = engine.report() if engine is not None else {
+                'status': 'DATA_BLOCKED', 'detail': 'research engine not initialized'}
         return {
             "mode": "DRY_RUN" if self.dry_run else "LIVE",
             "live_submission_locked": os.getenv("ALLOW_LIVE_TRADING", "").lower() != "yes-i-understand",
@@ -723,9 +728,7 @@ class ReportingSurface:
                                   else {"status": "DATA_BLOCKED",
                                         "detail": "channel book not built yet"}),
             "identity_watch": self.identity_report(),
-            "unknown_opportunity_engine": (
-                self.unknown_engine.report() if getattr(self, "unknown_engine", None) is not None
-                else {"status": "DATA_BLOCKED", "detail": "research engine not initialized"}),
+            "unknown_opportunity_engine": unknown_engine_report,
             "asymmetric_tail": (
                 self.asymmetric_tail.report(now=time.time())
                 if getattr(self, "asymmetric_tail", None) is not None
@@ -853,7 +856,9 @@ class ReportingSurface:
                            and hasattr(self.rug_detector, "sell_route_report")
                            else {"status": "DATA_BLOCKED"}),
             "dataset": self.dataset_builder.get_stats() if self.dataset_builder else {},
-            "research": self.global_research.get_stats() if self.global_research else {},
+            "research": (self.global_research.get_stats(engine_report=unknown_engine_report)
+                if isinstance(self.global_research, GlobalResearchMiner) else self.global_research.get_stats()
+                if self.global_research else {}),
             # The hourly world crawler, its search backends, the canonical
             # event ledger and the provider-terms watcher. On the health
             # surface because a discovery organ nobody can see is a discovery
@@ -871,6 +876,14 @@ class ReportingSurface:
             "champions": self.champion_challenger.get_stats() if self.champion_challenger else {},
         }
 
+    async def _readiness_snapshot(self):
+        engine = getattr(self, 'unknown_engine', None)
+        if engine is not None and callable(getattr(engine, 'frontier_snapshot', None)):
+            frontier = await engine.frontier_snapshot()
+            report = engine.report(frontier_snapshot=frontier)
+            return _jsonable(self.readiness(unknown_engine_report=report))
+        return _jsonable(self.readiness())
+
     async def _health_loop(self):
         while self._running:
             # Checked far more often than health is logged: an allocation
@@ -883,7 +896,7 @@ class ReportingSurface:
                 except Exception as exc:  # pragma: no cover - defensive
                     logger.debug("memory governor read failed: %s", exc)
                 await asyncio.sleep(10)
-            snapshot = _jsonable(self.readiness())
+            snapshot = await self._readiness_snapshot()
             logger.info("HEALTH %s", json.dumps(snapshot, separators=(",", ":")))
             self._persist_readiness(snapshot)
 
@@ -1131,7 +1144,7 @@ class ReportingSurface:
                 {"status": "starting", "phase": starting,
                  "uptime_seconds": time.time() - self.start_time},
                 status=503)
-        return web.json_response(_jsonable(self.readiness()))
+        return web.json_response(await self._readiness_snapshot())
 
     async def _close_health_server(self):
         if self._web_runner:

@@ -407,7 +407,14 @@ class GlobalResearchMiner:
         with self.ledger_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(asdict(lead), separators=(",", ":")) + "\n")
 
-    def get_stats(self) -> Dict[str, Any]:
+    def current_market_state(self) -> Dict[str, Any]:
+        # This miner discovers research leads, not measured launch/price state.
+        return {}
+
+    def get_stats(self, *, engine_report=None) -> Dict[str, Any]:
+        if engine_report is None:
+            engine_report = self.unknown_engine.report() if self.unknown_engine is not None else {
+                'status': 'NOT_CONFIGURED', 'authority': 'none'}
         return {
             "leads": len(self.leads),
             "mechanisms": len([lead for lead in self.leads if lead.mechanism]),
@@ -416,9 +423,7 @@ class GlobalResearchMiner:
             "multi_chain_observation": dict(self.observation_status),
             "conversion": dict(self.conversion_status),
             "license_blocked": sum(lead.status == "DATA_BLOCKED_LICENSE" for lead in self.leads),
-            "unknown_opportunity_engine": (self.unknown_engine.report()
-                                           if self.unknown_engine is not None
-                                           else {"status": "NOT_CONFIGURED", "authority": "none"}),
+            "unknown_opportunity_engine": engine_report,
             "top_sources": [
                 {"title": lead.title, "url": lead.url, "mechanism": lead.mechanism,
                  "quality": lead.source_quality, "license": lead.license_spdx, "status": lead.status}

@@ -50,7 +50,8 @@ class RegimeAndEvidence:
         if (stats.get("meme_launch_rate_1h") is None
                 or stats.get("sol_change_24h") is None):
             research = getattr(self, "global_research", None)
-            fallback = (research.get_stats() if research else {}) or {}
+            market_state = getattr(research, 'current_market_state', None)
+            fallback = (market_state() if callable(market_state) else research.get_stats() if research else {}) or {}
             if fallback.get("meme_launch_rate_1h") is not None:
                 stats = fallback
         launch_rate = stats.get("meme_launch_rate_1h")
