@@ -27,13 +27,14 @@ client pointed at the same provider is a second thing to rate limit.
 from __future__ import annotations
 
 import json
+import math
 import logging
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
 from src.research.data_miners import (
     CADENCE_DAILY, CADENCE_FAST, CADENCE_HOURLY, CADENCE_MINUTE, CADENCE_QUARTER,
-    DataMinerPool, Enriches, MinerSpec, RateLimited,
+    DataMinerPool, Enriches, MinerSpec, RateLimited, rotating_selector,
 )
 
 logger = logging.getLogger(__name__)
@@ -94,8 +95,9 @@ def holder_structure_miner(rpc: Any, tokens: Callable[[], Sequence[str]],
     mining the holder structure of every mint on Solana is both impossible and
     useless -- the ones that matter are the ones a position might be taken in.
     """
+    select = rotating_selector(tokens, per_pass)
     async def fetch() -> List[Dict[str, Any]]:
-        watched = list(tokens())[:per_pass]
+        watched = select()
         records: List[Dict[str, Any]] = []
         for mint in watched:
             try:
@@ -141,9 +143,10 @@ def token_metadata_miner(rpc: Any, tokens: Callable[[], Sequence[str]],
     the account rather than an inference from behaviour -- so it is worth
     reading directly rather than predicting.
     """
+    select = rotating_selector(tokens, per_pass)
     async def fetch() -> List[Dict[str, Any]]:
         records: List[Dict[str, Any]] = []
-        for mint in list(tokens())[:per_pass]:
+        for mint in select():
             try:
                 info = await rpc.request(
                     "getAccountInfo",
@@ -239,8 +242,9 @@ def dexscreener_pairs_miner(client: Any, tokens: Callable[[], Sequence[str]],
     already left -- and an exit priced on one venue while the depth sits on
     another is an exit priced wrong.
     """
+    select = rotating_selector(tokens, DEXSCREENER_BATCH)
     async def fetch() -> List[Dict[str, Any]]:
-        watched = list(tokens())[:DEXSCREENER_BATCH]
+        watched = select()
         if not watched:
             return []
         payload = await _get_json(
@@ -260,12 +264,56 @@ def dexscreener_pairs_miner(client: Any, tokens: Callable[[], Sequence[str]],
                 "volume_24h": (pair.get("volume") or {}).get("h24"),
                 "txns_5m": (pair.get("txns") or {}).get("m5"),
                 "price_change_5m": (pair.get("priceChange") or {}).get("m5"),
+                "chain_id": pair.get("chainId") or "UNKNOWN",
+                "quote_mint": (pair.get("quoteToken") or {}).get("address"),
+                "window_measurements": dexscreener_window_measurements(pair),
+                "volume_windows": pair.get("volume") or {},
+                "transaction_windows": pair.get("txns") or {},
+                "price_change_windows": pair.get("priceChange") or {},
+                "paid_boosts": pair.get("boosts"),
+                "quote_status": "INDICATIVE_PROVIDER_OBSERVATION",
                 "created_at": pair.get("pairCreatedAt"),
                 "data_status": "OK",
             })
         return [row for row in records if row.get("mint")]
 
     return fetch
+
+
+def dexscreener_window_measurements(pair: Dict[str, Any]) -> Dict[str, Any]:
+    """Comparable public windows, without turning paid attention into alpha.
+
+    Counts measure transactions, not independent wallets; volume is reported,
+    not certified organic. Missing/zero denominators remain unavailable.
+    """
+    def finite(value):
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+            return number if math.isfinite(number) else None
+        except (ValueError, TypeError):
+            return None
+    liquidity = finite((pair.get("liquidity") or {}).get("usd"))
+    result = {}
+    for window, minutes in (("m5", 5), ("h1", 60), ("h6", 360), ("h24", 1440)):
+        counts = (pair.get("txns") or {}).get(window) or {}
+        buys, sells = finite(counts.get("buys")), finite(counts.get("sells"))
+        complete = buys is not None and sells is not None and buys >= 0 and sells >= 0
+        total = buys + sells if complete else None
+        volume = finite((pair.get("volume") or {}).get(window))
+        if volume is not None and volume < 0:
+            volume = None
+        result[window] = {
+            "window_minutes": minutes, "buys": buys, "sells": sells,
+            "transactions_per_minute": total / minutes if total is not None else None,
+            "buy_fraction": buys / total if total else None,
+            "transaction_imbalance": (buys - sells) / total if total else None,
+            "volume_usd_per_minute": volume / minutes if volume is not None else None,
+            "volume_to_liquidity": volume / liquidity if volume is not None and liquidity is not None and liquidity > 0 else None,
+            "price_change_percent": finite((pair.get("priceChange") or {}).get(window)),
+        }
+    return result
 
 
 def market_context_miner(client: Any) -> Callable[[], Awaitable[List[Dict]]]:

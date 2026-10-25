@@ -1,7 +1,7 @@
 function Import-BotConnections {
     param([Parameter(Mandatory=$true)][string]$Path)
     $taskAllowed=@('HELIUS_API_KEY','YELLOWSTONE_GRPC_URL','YELLOWSTONE_GRPC_TOKEN','YELLOWSTONE_X_TOKEN',
-                  'MEMECOIN_RPC_RPS','MEMECOIN_RPC_DAILY_UNITS','MEMECOIN_RPC_MONTHLY_UNITS')
+                  'MEMECOIN_RPC_RPS','MEMECOIN_RPC_DAILY_UNITS','MEMECOIN_RPC_MONTHLY_UNITS','GMGN_API_KEY')
     $taskFile=[IO.Path]::GetFullPath($Path)
     if(-not(Test-Path -LiteralPath $taskFile -PathType Leaf)){throw 'Private connection file missing'}
     if((Get-Item -LiteralPath $taskFile).Length -gt 16384){throw 'Private connection file exceeds size bound'}
