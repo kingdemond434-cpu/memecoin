@@ -273,6 +273,7 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
         self.start_time = time.time()
         self.last_intelligence_update = 0.0
         self.sol_price_usd = 0.0
+        self.phantom_perps = None
         self.wallet_equity_usd = 0.0
         self.equity_status = "DATA_BLOCKED"
         self.trade_count = 0
@@ -731,6 +732,8 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
                 except asyncio.CancelledError:
                     pass
         await self._close_health_server()
+        if getattr(self, "phantom_perps", None) is not None:
+            await asyncio.to_thread(self.phantom_perps.close)
         if getattr(self, "public_claim_links", None) is not None:
             self.public_claim_links.close()
         for component in (self.global_research, self.dataset_builder, self.execution_engine, self.rug_hazard,

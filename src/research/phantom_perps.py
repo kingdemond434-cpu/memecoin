@@ -1,0 +1,247 @@
+"""Phantom perps' underlying Hyperliquid public market research.
+
+No wallet queries, account credentials, exchange/order methods or signing.
+The provider universe is broader than Phantom's verified UI listing universe.
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+import time
+from decimal import Decimal, ROUND_UP, InvalidOperation
+from pathlib import Path
+
+from src.research.data_miners import Enriches, MinerSpec, RateLimited, rotating_selector
+
+INFO = "https://api.hyperliquid.xyz/info"
+PHANTOM_REFERENCE = "https://help.phantom.com/articles/42292249388307"
+
+
+async def public_info(http, payload):
+    allowed = {"perpDexs": {"type"}, "spotMeta": {"type"}, "metaAndAssetCtxs": {"type", "dex"},
+               "l2Book": {"type", "coin"}, "fundingHistory": {"type", "coin", "startTime"}}
+    if payload.get("type") not in allowed or set(payload) - allowed[payload["type"]]:
+        raise ValueError("unreviewed public perps information request")
+    session = await http.session()
+    async with session.post(INFO, json=payload, allow_redirects=False) as response:
+        if response.status == 429:
+            raise RateLimited("Hyperliquid public information rate limited")
+        if response.status != 200:
+            raise RuntimeError("Hyperliquid public information HTTP " + str(response.status))
+        return await response.json()
+
+
+def _decimal(value):
+    try:
+        number = Decimal(str(value))
+    except InvalidOperation:
+        raise ValueError("invalid perps measurement") from None
+    if not number.is_finite():
+        raise ValueError("non-finite perps measurement")
+    return number
+
+
+def book_cost_scenario(book, size_decimals, *, observed_at, now=None,
+                       fee_bps="9.5", notional_usdc="10.25", collateral_verified=False):
+    """Static displayed-depth scenario, not an order or a confirmed paper fill.
+
+    Fee is Phantom's published baseline scenario, not a verified account tier
+    or deployer-specific fee. Future funding and dynamic impact remain unknown.
+    """
+    now = time.time() if now is None else now
+    if not collateral_verified:
+        return {"status": "DATA_BLOCKED_COLLATERAL_MAPPING"}
+    book_time = book.get("time")
+    if type(book_time) is not int or not 0 <= now - book_time / 1000 <= 10 or not 0 <= now - observed_at <= 10:
+        return {"status": "DATA_BLOCKED_STALE_BOOK"}
+    if type(size_decimals) is not int or not 0 <= size_decimals <= 18:
+        raise ValueError("invalid perps size precision")
+    levels = book.get("levels")
+    if not isinstance(levels, list) or len(levels) != 2 or not all(levels):
+        return {"status": "DATA_BLOCKED_BOOK_DEPTH"}
+    parsed = [[(_decimal(row["px"]), _decimal(row["sz"])) for row in side] for side in levels]
+    bids, asks = parsed
+    if any(px <= 0 or size < 0 for side in parsed for px, size in side):
+        raise ValueError("invalid perps book level")
+    if ([row[0] for row in bids] != sorted((row[0] for row in bids), reverse=True)
+            or [row[0] for row in asks] != sorted(row[0] for row in asks) or bids[0][0] >= asks[0][0]):
+        raise ValueError("unordered or crossed perps book")
+    notional, fee = _decimal(notional_usdc), _decimal(fee_bps)
+    if notional <= 0 or fee < 0:
+        raise ValueError("positive probe notional and nonnegative fees required")
+    quantity = (notional / asks[0][0]).quantize(Decimal(1).scaleb(-size_decimals), rounding=ROUND_UP)
+    def walk(side):
+        left, cash = quantity, Decimal(0)
+        for price, available in side:
+            take = min(left, available)
+            cash += price * take
+            left -= take
+            if not left:
+                break
+        return cash if not left else None
+    buy, sell = walk(asks), walk(bids)
+    if buy is None or sell is None:
+        return {"status": "DATA_BLOCKED_BOOK_DEPTH", "quantity": str(quantity)}
+    fees = (buy + sell) * fee / 10000
+    return {"status": "STATIC_OBSERVED_BOOK_SCENARIO", "quantity": str(quantity),
+            "buy_notional_usdc": str(buy), "sell_notional_usdc": str(sell),
+            "spread_and_depth_cost_usdc": str(buy - sell), "scenario_fees_usdc": str(fees),
+            "roundtrip_cost_usdc": str(buy - sell + fees), "fee_bps_per_leg": str(fee),
+            "fee_basis": "scenario input; published baseline 9.5bps; account/deployer fee unverified",
+            "missing_costs": ["future funding", "latency/adverse selection", "dynamic market impact", "liquidation"],
+            "order_submitted": False, "real_fill": False, "simulated_strategy_fill": False}
+
+
+class PhantomPerpsResearch:
+    def __init__(self, path):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(path, check_same_thread=False, timeout=3)
+        self.lock = threading.RLock()
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=FULL")
+        self.db.executescript("""
+          CREATE TABLE IF NOT EXISTS dexes(name TEXT PRIMARY KEY,observed REAL NOT NULL);
+          CREATE TABLE IF NOT EXISTS catalogs(dex TEXT PRIMARY KEY,metadata TEXT NOT NULL,observed REAL NOT NULL);
+          CREATE TABLE IF NOT EXISTS collateral_tokens(token_index INTEGER PRIMARY KEY,metadata TEXT NOT NULL,observed REAL NOT NULL);
+          CREATE TABLE IF NOT EXISTS markets(dex TEXT NOT NULL,coin TEXT NOT NULL,active INTEGER NOT NULL,
+            spec TEXT NOT NULL,context TEXT NOT NULL,observed REAL NOT NULL,PRIMARY KEY(dex,coin));
+          CREATE TABLE IF NOT EXISTS books(coin TEXT PRIMARY KEY,body TEXT NOT NULL,observed REAL NOT NULL,scenario TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS funding(coin TEXT NOT NULL,time INTEGER NOT NULL,body TEXT NOT NULL,observed REAL NOT NULL,PRIMARY KEY(coin,time));
+          CREATE TABLE IF NOT EXISTS cursors(coin TEXT PRIMARY KEY,next_time INTEGER NOT NULL);
+        """)
+
+    def dex_names(self):
+        with self.lock:
+            return ["native", *["dex:" + row[0] for row in self.db.execute("SELECT name FROM dexes WHERE name<>'' ORDER BY name")]]
+
+    def market_names(self):
+        with self.lock:
+            return [row[0] for row in self.db.execute("SELECT DISTINCT coin FROM markets WHERE active=1 ORDER BY coin")]
+
+    def next_funding(self, coin):
+        with self.lock:
+            row = self.db.execute("SELECT next_time FROM cursors WHERE coin=?", (coin,)).fetchone()
+            return row[0] if row else 0
+
+    def ingest(self, record):
+        role, at = record["perps_role"], float(record["observed_at"])
+        with self.lock, self.db:
+            if role == "dex_inventory":
+                self.db.executemany("INSERT INTO dexes VALUES(?,?) ON CONFLICT(name) DO UPDATE SET observed=excluded.observed",
+                                    ((name, at) for name in record["dexes"]))
+            elif role == "collateral_inventory":
+                tokens = record["tokens"]
+                if any(type(token.get("index")) is not int for token in tokens):
+                    raise ValueError("invalid collateral token index")
+                self.db.executemany("INSERT INTO collateral_tokens VALUES(?,?,?) ON CONFLICT(token_index) DO UPDATE SET metadata=excluded.metadata,observed=excluded.observed",
+                                    ((token["index"], json.dumps(token, allow_nan=False), at) for token in tokens))
+            elif role == "catalog":
+                dex, meta, contexts = record["dex"], record["meta"], record["contexts"]
+                universe = meta["universe"]
+                if len(universe) != len(contexts) or len({m["name"] for m in universe}) != len(universe):
+                    raise ValueError("perps metadata/context alignment failed")
+                self.db.execute("INSERT INTO catalogs VALUES(?,?,?) ON CONFLICT(dex) DO UPDATE SET metadata=excluded.metadata,observed=excluded.observed",
+                                (dex, json.dumps({key:value for key,value in meta.items() if key != "universe"}, allow_nan=False), at))
+                self.db.execute("UPDATE markets SET active=0 WHERE dex=?", (dex,))
+                self.db.executemany("""INSERT INTO markets VALUES(?,?,?,?,?,?) ON CONFLICT(dex,coin) DO UPDATE SET
+                    active=excluded.active,spec=excluded.spec,context=excluded.context,observed=excluded.observed""",
+                    ((dex, market["name"], int(not market.get("isDelisted", False)),
+                      json.dumps({"asset": market, "collateral_token":meta.get("collateralToken")}, allow_nan=False),
+                      json.dumps(context, allow_nan=False), at) for market, context in zip(universe, contexts)))
+            elif role == "book":
+                coin, book = record["coin"], record["book"]
+                if book.get("coin") != coin:
+                    raise ValueError("perps book identity mismatch")
+                row = self.db.execute("SELECT spec FROM markets WHERE coin=? AND active=1", (coin,)).fetchone()
+                if row is None:
+                    raise ValueError("perps book has no observed contract")
+                spec = json.loads(row[0])
+                token = self.db.execute("SELECT metadata FROM collateral_tokens WHERE token_index=?", (spec["collateral_token"],)).fetchone()
+                token_meta = json.loads(token[0]) if token else {}
+                # Native canonical USDC is index zero; retain all other token
+                # identities without manufacturing USD-to-collateral parity.
+                verified = (type(spec["collateral_token"]) is int and spec["collateral_token"] == 0
+                            and token_meta.get("name") == "USDC" and token_meta.get("isCanonical") is True)
+                scenario = book_cost_scenario(book, spec["asset"]["szDecimals"], observed_at=at, collateral_verified=verified)
+                scenario["collateral_token_index"] = spec["collateral_token"]
+                self.db.execute("INSERT INTO books VALUES(?,?,?,?) ON CONFLICT(coin) DO UPDATE SET body=excluded.body,observed=excluded.observed,scenario=excluded.scenario",
+                                (coin, json.dumps(book, allow_nan=False), at, json.dumps(scenario, allow_nan=False)))
+            elif role == "funding":
+                coin, start, rows = record["coin"], record["start_time"], record["rows"]
+                for row in rows:
+                    if row.get("coin") != coin or type(row.get("time")) is not int or row["time"] < start:
+                        raise ValueError("perps funding identity/time mismatch")
+                self.db.executemany("INSERT OR IGNORE INTO funding VALUES(?,?,?,?)",
+                                    ((coin, row["time"], json.dumps(row, allow_nan=False), at) for row in rows))
+                if rows:
+                    next_time = max(row["time"] for row in rows) + 1
+                    self.db.execute("INSERT INTO cursors VALUES(?,?) ON CONFLICT(coin) DO UPDATE SET next_time=MAX(next_time,excluded.next_time)",
+                                    (coin, next_time))
+            else:
+                raise ValueError("unknown perps observation")
+
+    def report(self):
+        with self.lock:
+            dexes = self.db.execute("SELECT count(*) FROM dexes").fetchone()[0]
+            markets = self.db.execute("SELECT count(*),max(observed),count(DISTINCT dex) FROM markets WHERE active=1").fetchone()
+            books = self.db.execute("SELECT count(*),max(observed) FROM books").fetchone()
+            funding = self.db.execute("SELECT count(*) FROM funding").fetchone()[0]
+            examples = [{"coin":row[0], "observed_at":row[2], **json.loads(row[1])} for row in self.db.execute(
+                "SELECT coin,scenario,observed FROM books ORDER BY observed DESC LIMIT 5")]
+        return {"status": "PUBLIC_MARKET_RESEARCH" if markets[0] else "NOT_OBSERVED",
+            "underlying_venue": "Hyperliquid", "phantom_reference": PHANTOM_REFERENCE,
+            "discovered_dexes": dexes, "observed_catalog_dexes": markets[2], "active_markets": markets[0],
+            "last_catalog_observed_at": markets[1], "books_recorded": books[0], "last_book_observed_at": books[1],
+            "funding_records": funding, "funding_backfill_complete": False,
+            "latest_cost_examples": examples,
+            "phantom_listing_verified_by_market": False, "live_eligibility": "UNVERIFIED",
+            "execution_authority": False, "real_fills": 0, "simulated_strategy_fills": 0,
+            "paper_scope": "static displayed-book cost scenarios; no strategy positions or fills",
+            "scope": "all discovered underlying perp DEXes; individual Phantom listings not asserted"}
+
+    def register(self, pool, http):
+        select_dex = rotating_selector(self.dex_names, 1)
+        select_book = rotating_selector(self.market_names, 1)
+        select_funding = rotating_selector(self.market_names, 1)
+        inventory_due = 0.0
+        collateral_due = 0.0
+        def observation(role, **fields):
+            return {"provider": "hyperliquid", "product": "perpetual", "perps_role": role,
+                    "observed_at": time.time(), "execution_authority": False, **fields}
+        async def catalog():
+            nonlocal inventory_due, collateral_due
+            if time.monotonic() >= inventory_due:
+                raw = await public_info(http, {"type": "perpDexs"})
+                if not isinstance(raw, list) or any(row is not None and
+                        (not isinstance(row, dict) or not isinstance(row.get("name"), str)) for row in raw):
+                    raise ValueError("invalid perpetual DEX inventory")
+                inventory_due = time.monotonic() + 900
+                return [observation("dex_inventory", dexes=["", *[r["name"] for r in raw if r is not None]])]
+            if time.monotonic() >= collateral_due:
+                raw = await public_info(http, {"type":"spotMeta"})
+                if not isinstance(raw, dict) or not isinstance(raw.get("tokens"), list):
+                    raise ValueError("invalid collateral inventory")
+                collateral_due = time.monotonic() + 900
+                return [observation("collateral_inventory", tokens=raw["tokens"])]
+            dex_key = select_dex()[0]
+            dex = "" if dex_key == "native" else dex_key[4:]
+            meta, contexts = await public_info(http, {"type": "metaAndAssetCtxs", "dex": dex})
+            return [observation("catalog", dex=dex, meta=meta, contexts=contexts)]
+        async def book():
+            return [observation("book", coin=coin, book=await public_info(http, {"type": "l2Book", "coin": coin})) for coin in select_book()]
+        async def funding():
+            rows = []
+            for coin in select_funding():
+                start = self.next_funding(coin)
+                values = await public_info(http, {"type": "fundingHistory", "coin": coin, "startTime": start})
+                rows.append(observation("funding", coin=coin, start_time=start, rows=values))
+            return rows
+        return {spec.miner_id: pool.register(spec, fetch) for spec, fetch in (
+            (MinerSpec("perps:catalog", Enriches.MARKET_CONTEXT, 15, endpoint=INFO, detail="underlying full perp DEX inventory and rotating catalogs"), catalog),
+            (MinerSpec("perps:books", Enriches.VENUE_LIQUIDITY, 5, endpoint=INFO, detail="all retained markets rotate; recorded depth and static cost scenarios"), book),
+            (MinerSpec("perps:funding", Enriches.EXECUTION_CONDITIONS, 60, endpoint=INFO, detail="resumable provider-available funding history; no invented cashflows"), funding))}
+
+    def close(self):
+        with self.lock:
+            self.db.close()
