@@ -31,3 +31,15 @@ This avoids measured futile work. Its live latency benefit requires a new
 deployment/profile; no speedup is inferred from the software checks alone.
 Other sampled work includes the main hazard sweep, wallet recomputation and
 dataset flush. They remain candidates for further measurement and optimization.
+
+## Attribution throughput
+
+The live orphan outbox was growing while the initial mapper read only eight
+pools per pass. It now packs up to Solana's documented 100-account protocol
+maximum into each `getMultipleAccounts` call, and deduplicates base-mint reads.
+RPC manager admission, provider quotas, pacing and refusal reporting remain.
+The next queued pool is retained; this is batching rather than dropping work
+or asserting unlimited provider capacity. A regression checks 101 pending
+pools across two batches and canonical/delivery acknowledgement separation.
+
+Protocol reference: https://solana.com/docs/rpc/http/getmultipleaccounts

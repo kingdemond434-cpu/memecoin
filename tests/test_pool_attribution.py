@@ -141,6 +141,30 @@ def test_mint_owner_layout_and_initialization_are_checked():
     assert mint_decimals(bad) is None
 
 
+@pytest.mark.asyncio
+async def test_recovery_uses_full_protocol_batch_without_dropping_the_next_pool(tmp_path):
+    book = PoolAttribution(tmp_path/'attribution.sqlite')
+    for index in range(1,102):
+        book._capture({**event(), 'pool': str(Pubkey(bytes([index])*32))})
+    calls = []
+    async def request(method, params):
+        assert method == 'getMultipleAccounts' and len(params[0]) <= 100
+        calls.append(len(params[0]))
+        values = [mint()] if params[0] == [BASE] else [account() for _ in params[0]]
+        return {'context': {'slot': 50}, 'value': values}
+    rows = await book.fetch(SimpleNamespace(request=request))
+    assert calls == [100,1]
+    assert sum(row['attribution_kind']=='identity' for row in rows) == 100
+    book.acknowledge(rows, 'canonical:full-protocol-batch')
+    assert book.report()['resolved_pools'] == 100
+    calls.clear()
+    rows = await book.fetch(SimpleNamespace(request=request))
+    assert calls == [1,1]
+    assert sum(row['attribution_kind']=='identity' for row in rows) == 1
+    assert book.report()['pending_events'] == 101  # no owner-loop delivery ACK yet
+    book.close()
+
+
 def test_log_mention_is_not_emitter_identity_and_failed_scope_is_not_a_trade():
     expected, other = PUMPSWAP_PROGRAM, TOKEN_PROGRAM
     encoded = 'Program data: ' + base64.b64encode(b'trade').decode()

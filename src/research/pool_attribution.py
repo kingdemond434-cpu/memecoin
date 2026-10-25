@@ -22,6 +22,8 @@ from src.chains.pump_route import TOKEN_PROGRAM, TOKEN_2022_PROGRAM, WSOL_MINT
 from src.research.data_miners import Enriches, MinerSpec
 
 MINER = 'chain:pool_attribution'
+# Solana's getMultipleAccounts protocol limit, not a lifetime source ceiling.
+RPC_ACCOUNT_BATCH = 100
 logger = logging.getLogger(__name__)
 
 
@@ -113,7 +115,7 @@ class PoolAttribution:
         with self.lock:
             pending = list(self.db.execute('SELECT id,body,first_seen FROM events WHERE ref IS NULL ORDER BY first_seen LIMIT 250'))
             recovered = list(self.db.execute("SELECT e.id,e.body,e.first_seen,e.ref FROM events e JOIN identities i ON e.pool=i.pool WHERE e.ref IS NOT NULL AND json_extract(i.body,'$.base_decimals') IS NOT NULL ORDER BY e.first_seen LIMIT 250"))
-            pools = [row[0] for row in self.db.execute("SELECT j.pool FROM jobs j LEFT JOIN identities i ON j.pool=i.pool WHERE (i.pool IS NULL OR json_extract(i.body,'$.base_decimals') IS NULL) AND j.due<=? ORDER BY j.due,j.pool LIMIT 8", (now,))]
+            pools = [row[0] for row in self.db.execute("SELECT j.pool FROM jobs j LEFT JOIN identities i ON j.pool=i.pool WHERE (i.pool IS NULL OR json_extract(i.body,'$.base_decimals') IS NULL) AND j.due<=? ORDER BY j.due,j.pool LIMIT ?", (now, RPC_ACCOUNT_BATCH))]
         rows = [{'provider': 'native_pool_attribution', 'attribution_kind': 'raw_orphan',
                  'event_id': key, 'original_event': json.loads(body), 'first_seen': at,
                  'available_at': now, 'execution_eligible': False} for key, body, at in pending]
@@ -236,6 +238,7 @@ class PoolAttribution:
                 'mapping_gaps': gaps, 'recovered_events': recovered[0] if recovered else 0,
                 'capture_failures': self.capture_failures, 'delivery_ack_failures': self.delivery_failures,
                 'pending_delivery_acks': len(self._delivery_tasks),
+                'pool_read_batch_limit': RPC_ACCOUNT_BATCH,
                 'historical_loss_before_capture': 'UNRECOVERED; NO_BACKDATED_COVERAGE', 'execution_eligible': False}
 
     def close(self):
