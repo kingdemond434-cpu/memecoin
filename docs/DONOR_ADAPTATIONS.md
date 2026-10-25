@@ -76,6 +76,41 @@ fields directly. An ambiguous old protobuf packet without version/config
 evidence is unpriced, not assigned a guessed fee. This does not change the
 versions this desk's signer can build or approve.
 
+## Market-window adaptation
+
+The existing Dexscreener pair miner now retains all returned m5/h1/h6/h24
+transaction, volume and price-change windows. It records transaction imbalance,
+buy fraction, transactions/volume per minute and volume relative to liquidity
+with explicit missing denominators. These are independently implemented
+measurements, not the donor's hand-weighted score. Transactions are not unique
+people, reported volume is not verified organic volume, paid boosts remain
+separate attention evidence, and indicative prices are not firm fills.
+
+The pair, holder-structure and mint-metadata miners rotate through all retained
+targets instead of repeatedly taking the first batch. Provider batch sizes and
+polling work quanta remain; they no longer define the target universe. Targets
+that disappear before their turn or provider outages remain coverage gaps.
+
+## External integrations left inactive
+
+Automatic approval review initially rejected GMGN requests that disclose
+internally selected public wallet/deployer addresses. The owner then explicitly
+authorized that connection after being told what it sends; the renewed patch
+was accepted. Eight key-gated read miners now cover token metadata/security,
+pools, holders, traders, wallet activity/statistics and creator launches.
+They use only fixed reviewed GET routes and refuse redirects, remote signing,
+wallet-key loading and order methods. No `GMGN_API_KEY` is currently provisioned,
+so registration reports that dependency and makes no request. The Helius key
+is never reused. Provider payloads remain unverified claims with observation
+time and pagination incompleteness; native safety facts are not overwritten.
+
+SendAI's Pyth helper was inspected: it selects a feed by symbol and formats a
+price without carrying the confidence interval and publication freshness.
+That implementation is not imported. An ordinary request to the documented
+public Hermes feed inventory returned HTTP 403 from the local environment;
+no bypass or claim of a working oracle feed is made. Independent oracle
+cross-checks require an accessible, verified feed and remain unavailable.
+
 ## Claims deliberately not promoted to facts
 
 “0.3 seconds” is not a measured end-to-end confirmed fill on our VPS; “100% of

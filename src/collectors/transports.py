@@ -172,14 +172,18 @@ class HttpClient:
         self._sessions[loop] = created
         return created
 
-    async def get(self, url: str, *, headers: Optional[Dict[str, str]] = None
+    async def get(self, url: str, *, headers: Optional[Dict[str, str]] = None,
+                  allow_redirects: bool = True
                   ) -> Tuple[int, str, Dict[str, str]]:
         """Status, body and response headers. Raises only on transport failure."""
         if (urlparse(url).hostname or "").lower().rstrip(".").endswith(".onion"):
             raise TransportError("onion destinations require the dedicated Tor transport")
         session = await self.session()
         try:
-            async with session.get(url, headers=headers or {}) as response:
+            options = {"headers": headers or {}}
+            if not allow_redirects:
+                options["allow_redirects"] = False
+            async with session.get(url, **options) as response:
                 body = await response.text()
                 return response.status, body, dict(response.headers)
         except asyncio.TimeoutError as exc:
