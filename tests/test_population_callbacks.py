@@ -32,6 +32,8 @@ def test_nonempty_source_queue_yields_between_durable_records(monkeypatch):
             if not pending:
                 value._running = False
         value._index_source_event = index
+        async def no_population(event): return None
+        value._record_population_narrative_async = no_population
         monkeypatch.setattr("src.runtime.source_intelligence.start_transports", start)
         async def health():
             await asyncio.sleep(0)

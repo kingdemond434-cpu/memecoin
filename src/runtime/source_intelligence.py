@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -38,6 +39,7 @@ from src.strategies.ignition import IgnitionModel, touches_from_events
 import logging
 
 logger = logging.getLogger(__name__)
+_NOT_ENQUEUED = object()
 
 
 class SourceIntelligence:
@@ -66,7 +68,6 @@ class SourceIntelligence:
         if engine is None or not callable(getattr(engine, "enqueue_work", None)):
             return None
         observed = now if now is not None else payload.get("observed_at")
-        previous = getattr(self, "population_research_intake", {})
         try:
             observed = float(observed)
             job = engine.enqueue_work(kind, payload, axes={key: value for key, value in {
@@ -78,15 +79,19 @@ class SourceIntelligence:
                 evidence_refs=tuple(evidence_refs), now=observed)
             if not job:
                 raise RuntimeError("canonical research intake returned no durable job reference")
-            self.population_research_intake = {"status": "OBSERVED", "kind": kind, "job_id": job, "observed_at": observed,
-                "failed_inputs": int(previous.get("failed_inputs", 0)),
-                "last_failure": previous.get("last_failure")}
+            with self.__dict__.setdefault("_population_intake_lock", threading.RLock()):
+                previous = getattr(self, "population_research_intake", {})
+                self.population_research_intake = {"status": "OBSERVED", "kind": kind, "job_id": job, "observed_at": observed,
+                    "failed_inputs": int(previous.get("failed_inputs", 0)),
+                    "last_failure": previous.get("last_failure")}
             return job
         except Exception as exc:
-            self.population_research_intake = {"status": "DATA_BLOCKED", "kind": kind,
-                "reason": f"{type(exc).__name__}: {exc}", "observed_at": observed,
-                "failed_inputs": int(previous.get("failed_inputs", 0)) + 1,
-                "last_failure": {"kind": kind, "observed_at": observed, "reason": str(exc)}}
+            with self.__dict__.setdefault("_population_intake_lock", threading.RLock()):
+                previous = getattr(self, "population_research_intake", {})
+                self.population_research_intake = {"status": "DATA_BLOCKED", "kind": kind,
+                    "reason": f"{type(exc).__name__}: {exc}", "observed_at": observed,
+                    "failed_inputs": int(previous.get("failed_inputs", 0)) + 1,
+                    "last_failure": {"kind": kind, "observed_at": observed, "reason": str(exc)}}
             logger.error("population canonical intake DATA_BLOCKED (%s): %s", kind, exc)
             return None
 
@@ -154,12 +159,13 @@ class SourceIntelligence:
             engine.framework.checkpoint_research_component("population_sampling_frame_v1", frame)
             return frame
         except Exception as exc:
-            self.population_research_intake = {"status": "DATA_BLOCKED", "kind": "SAMPLING_FRAME",
-                "reason": str(exc), "failed_inputs": int(getattr(self, "population_research_intake", {}).get("failed_inputs", 0)) + 1}
+            with self.__dict__.setdefault("_population_intake_lock", threading.RLock()):
+                self.population_research_intake = {"status": "DATA_BLOCKED", "kind": "SAMPLING_FRAME",
+                    "reason": str(exc), "failed_inputs": int(getattr(self, "population_research_intake", {}).get("failed_inputs", 0)) + 1}
             logger.error("population sampling frame DATA_BLOCKED: %s", exc)
             return None
 
-    def _record_population_narrative(self, event: Any, *, defer_onion_io: bool = False) -> Optional[str]:
+    def _population_narrative_payload(self, event: Any) -> Dict[str, Any]:
         metadata = dict(getattr(event, "metadata", None) or {})
         transport = (getattr(self, "transports", {}) or {}).get(event.source_id)
         tokens = list(getattr(event, "token_addresses", ()) or ())
@@ -192,8 +198,35 @@ class SourceIntelligence:
                 "url", "source_ref", "content_hash", "publication_time_known", "published_at",
                 "observation_kind", "claim_status", "claim_topics", "evm_address_mentions", "solana_address_mentions",
                 "address_role_status", "text_truncated", "onion_observation_id")}
-        job_id = self._enqueue_population_work("NARRATIVE_OBSERVATION", payload,
+        return payload
+
+    async def _record_population_narrative_async(self, event: Any) -> Optional[str]:
+        payload = SourceIntelligence._population_narrative_payload(self, event)
+        metadata = dict(getattr(event, "metadata", None) or {})
+        pending = asyncio.create_task(asyncio.to_thread(
+            self._enqueue_population_work, "NARRATIVE_OBSERVATION", payload,
+            evidence_refs=metadata.get("evidence_refs") or (), now=event.observed_at))
+        try:
+            job_id = await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            # Finish the already-started durable transaction before shutdown
+            # closes its owner. The unacknowledged source can replay safely.
+            await pending
+            raise
+        # PublicClaimLinks owns a thread-bound SQLite connection. Finish its
+        # indexing, and all source/lead-graph mutations, on the owner loop.
+        return self._record_population_narrative(event, defer_onion_io=True,
+            prepared_payload=payload, canonical_job_result=job_id)
+
+    def _record_population_narrative(self, event: Any, *, defer_onion_io: bool = False,
+                                     prepared_payload=None, canonical_job_result=_NOT_ENQUEUED) -> Optional[str]:
+        payload = (prepared_payload if prepared_payload is not None
+                   else SourceIntelligence._population_narrative_payload(self, event))
+        metadata = dict(getattr(event, "metadata", None) or {})
+        tokens = list(getattr(event, "token_addresses", ()) or ())
+        job_id = (self._enqueue_population_work("NARRATIVE_OBSERVATION", payload,
             evidence_refs=metadata.get("evidence_refs") or (), now=event.observed_at)
+            if canonical_job_result is _NOT_ENQUEUED else canonical_job_result)
         if job_id and not defer_onion_io:
             from src.collectors.onion_discovery import deliver
             deliver(self, event, job_id)
@@ -482,7 +515,8 @@ class SourceIntelligence:
                 await asyncio.sleep(0.01)
                 continue
             try:
-                job_id = self._index_source_event(event, defer_onion_io=True)
+                job_id = await self._record_population_narrative_async(event)
+                self._index_source_event(event, defer_onion_io=True, record_population=False)
                 if job_id:
                     from src.collectors.onion_discovery import _frontier, deliver
                     # SourceMesh.add may start an asyncio task, so preparation
@@ -498,11 +532,12 @@ class SourceIntelligence:
             # burst cannot monopolize health, market and shutdown callbacks.
             await asyncio.sleep(0)
 
-    def _index_source_event(self, event: Any, *, defer_onion_io: bool = False) -> Optional[str]:
+    def _index_source_event(self, event: Any, *, defer_onion_io: bool = False,
+                            record_population: bool = True) -> Optional[str]:
         """One event into the per-token index and the lead-lag graph."""
         population_recorder = getattr(self, "_record_population_narrative", None)
         job_id = None
-        if callable(population_recorder):
+        if record_population and callable(population_recorder):
             job_id = population_recorder(event, defer_onion_io=defer_onion_io)
         # A post from an account this launch NAMED in its own metadata is the
         # only verifiable social link available: the account controls what it
