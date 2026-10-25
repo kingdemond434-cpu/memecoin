@@ -34,6 +34,7 @@ from __future__ import annotations
 import io
 import logging
 import zipfile
+from urllib.parse import urlparse
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,10 @@ def parse_lastupdate(body: str) -> Dict[str, str]:
         if len(parts) != 3:
             continue
         url = _https(parts[2])
+        parsed = urlparse(url)
+        if (parsed.scheme != "https" or parsed.netloc != "data.gdeltproject.org"
+                or not parsed.path.startswith("/gdeltv2/") or parsed.query or parsed.fragment):
+            continue
         lowered = url.lower()
         for kind in ("gkg", "mentions", "export"):
             if f".{kind}." in lowered:
@@ -104,7 +109,7 @@ def parse_lastupdate(body: str) -> Dict[str, str]:
 
 
 def parse_gkg(payload: bytes, terms: Sequence[str] = DEFAULT_TERMS,
-              max_records: int = 200) -> List[Dict[str, Any]]:
+              max_records: Optional[int] = None) -> List[Dict[str, Any]]:
     """Rows from one GKG slice that mention any term, as flat records.
 
     Filtered here rather than downstream because a slice is a few thousand
@@ -123,7 +128,7 @@ def parse_gkg(payload: bytes, terms: Sequence[str] = DEFAULT_TERMS,
     wanted = tuple(term.lower() for term in terms)
     records: List[Dict[str, Any]] = []
     for line in text.splitlines():
-        if len(records) >= max_records:
+        if max_records is not None and len(records) >= max_records:
             break
         lowered = line.lower()
         matched = [term for term in wanted if term in lowered]
@@ -172,10 +177,24 @@ def gdelt_world_news_miner(client: Any, terms: Sequence[str] = DEFAULT_TERMS
         url = feeds.get("gkg")
         if not url:
             raise RuntimeError("GDELT manifest carried no gkg entry")
-        payload = await _get_bytes(client, url)
-        return parse_gkg(payload, terms)
+        try:
+            payload = await _get_bytes(client, url)
+        except ArchiveUnavailable:
+            # The publication manifest may race CDN availability. Re-read the
+            # actual manifest once; never manufacture past archive filenames.
+            refreshed = (await _get_bytes(client, GDELT_LASTUPDATE_URL)).decode("utf-8", "replace")
+            current = parse_lastupdate(refreshed).get("gkg")
+            if not current or current == url:
+                raise
+            url = current
+            payload = await _get_bytes(client, url)
+        return [{**row, "archive_url": url} for row in parse_gkg(payload, terms)]
 
     return fetch
+
+
+class ArchiveUnavailable(RuntimeError):
+    """Published archive is not yet available at the provider."""
 
 
 async def _get_bytes(client: Any, url: str,
@@ -199,7 +218,12 @@ async def _get_bytes(client: Any, url: str,
 
     session = await client.session()
     async with session.get(
-            url, timeout=aiohttp.ClientTimeout(total=timeout_s)) as response:
-        if response.status >= 400:
+            url, timeout=aiohttp.ClientTimeout(total=timeout_s), allow_redirects=False) as response:
+        if response.status == 429:
+            from src.research.data_miners import RateLimited
+            raise RateLimited("GDELT public provider cooldown")
+        if response.status == 404:
+            raise ArchiveUnavailable("GDELT published archive unavailable")
+        if response.status != 200:
             raise RuntimeError(f"HTTP {response.status} from {url.split('?')[0]}")
         return await response.read()

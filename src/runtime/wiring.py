@@ -51,6 +51,7 @@ from src.runtime.offload import OffloadedPool, install_fast_event_loop
 from src.research.data_miners import DataMinerPool
 from src.research.solana_miners import register_solana_miners
 from src.research.gmgn_observations import register_gmgn_miners
+from src.research.free_market_discovery import FreeMarketDiscovery
 from src.research.phantom_perps import PhantomPerpsResearch
 from src.research.source_catalogue import default_registry
 from src.research.regional_miners import register_regional_miners
@@ -1037,7 +1038,7 @@ class SubsystemWiring:
         if kind not in ("chain", "protocol"):
             raise ValueError("unsupported scout record")
         ref = str(record["source_response_ref"])
-        axes = {"chain": record["chain_id"], "data_source": "dexscreener:public-api"}
+        axes = {"chain": record["chain_id"], "data_source": record.get("data_source", "dexscreener:public-api")}
         self.research_frontier.observe_discovery(kind, str(record["identity"]), axes=axes,
             family=str(record.get("chain_family") or "UNKNOWN"),
             version=str(record.get("version") or "1"), metrics=record.get("metrics"),
@@ -1289,6 +1290,9 @@ class SubsystemWiring:
         self.miner_registration.update(register_gmgn_miners(
             self.data_miners, http=self.http_client, watched_tokens=self._mineable_tokens,
             watched_wallets=self._tracked_wallets, deployers=self._known_deployers))
+        self.free_discovery = FreeMarketDiscovery(
+            Path(self.global_config.get("ops_state_dir", "data/state")) / "free_market_discovery.sqlite")
+        self.miner_registration.update(self.free_discovery.register(self.data_miners, self.http_client))
         self.phantom_perps = PhantomPerpsResearch(
             Path(self.global_config.get("ops_state_dir", "data/state")) / "phantom_perps.sqlite")
         self.miner_registration.update(self.phantom_perps.register(self.data_miners, self.http_client))
