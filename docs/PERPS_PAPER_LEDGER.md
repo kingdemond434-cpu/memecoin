@@ -63,6 +63,9 @@ Actual retained settlements are often a few milliseconds after the nominal
 hour. Liabilities match that hourly bucket, while exposure and oracle
 availability use the actual settlement timestamp. Entries and exits between
 those two instants therefore receive the correct treatment.
+A separate fair recent-history acquisition lane revisits the active universe
+under the shared request budget. Current payments do not wait for the long
+historical backfill, and this lane cannot advance its unfinished cursor.
 
 With a sufficiently recent prior oracle sample, the ledger can calculate a
 separate sampled-oracle scenario using signed size × oracle × settled rate.

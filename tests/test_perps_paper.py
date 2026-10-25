@@ -189,6 +189,37 @@ def test_large_liquidation_begins_with_twenty_percent(desk):
     order=json.loads(desk.state.db.execute("SELECT body FROM pp_orders WHERE status='PENDING'").fetchone()[0])
     assert D(order['quantity'])==D('-400')
     assert order['reason']=='OBSERVED_MARK_LIQUIDATION'
+    assert order['initial_liquidation_partial'] is True
+    assert desk.paper._account('account').get('last_partial_liquidation',0)==0
+
+
+def test_isolated_entry_cannot_consume_cross_position_required_margin(desk):
+    submit(desk,'20',mode='cross',leverage='40')
+    depth=book(desk.clock.now+1)
+    depth['levels']=[[{'px':'99','sz':'100'}],[{'px':'101','sz':'100'}]]
+    desk.ingest('book',book=depth)
+    before=desk.paper._account('account')
+    eth=catalog(dex='other',coin='ETH')
+    desk.ingest('catalog',dex=eth['dex'],meta=eth['meta'],contexts=eth['contexts'])
+    with desk.state.db:
+        desk.paper.submit('account','ETH','1',at=desk.clock.now,ref='canonical:isolated',mode='isolated')
+    depth={**depth,'coin':'ETH','time':int((desk.clock.now+1)*1000)}
+    desk.ingest('book',coin='ETH',book=depth)
+    after=desk.paper._account('account')
+    assert before['cash']==after['cash']
+    assert 'ETH' not in after['positions']
+    assert desk.paper.report()['orders']['REJECTED_MARGIN']==1
+
+
+def test_recovered_margin_cancels_pending_liquidation_before_future_book(desk):
+    submit(desk,'0.1',leverage='40');desk.ingest('book')
+    crash=catalog();crash['contexts'][0].update(markPx='1',oraclePx='1')
+    desk.ingest('catalog',meta=crash['meta'],contexts=crash['contexts'])
+    assert desk.paper.report()['orders']['PENDING']==1
+    desk.ingest('catalog')
+    desk.ingest('book')
+    assert desk.paper.report()['orders']['CANCELLED_MARGIN_RECOVERED']==1
+    assert desk.paper.report()['simulated_fills']==1
 
 
 def test_report_command_reads_all_accounts_by_pages_without_writing(desk,capsys,monkeypatch):

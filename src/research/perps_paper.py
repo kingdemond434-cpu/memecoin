@@ -205,7 +205,7 @@ class PerpsPaperLedger:
                 'maintenance':maintenance,'isolated':isolated}
 
     def submit(self, account_id, coin, quantity, *, at, ref, leverage='2', mode='isolated',
-               reduce_only=False, limit=None, reason='PIPELINE_CONTROL'):
+               reduce_only=False, limit=None, reason='PIPELINE_CONTROL', initial_liquidation_partial=False):
         """Durable research IOC intent; matching requires a future observed book."""
         account = self._account(account_id)
         if _dump(self._plan)!=self._spec: raise ValueError('paper specification changed; new study required')
@@ -229,9 +229,11 @@ class PerpsPaperLedger:
         order = {'id':identity,'account':account_id,'coin':coin,'quantity':str(q),'leverage':str(lev),
             'mode':mode,'reduce_only':bool(reduce_only),'limit':str(limit) if limit is not None else None,
             'eligible_after':at+self._plan['latency_seconds'],'reason':reason,'decision_ref':ref}
+        order['initial_liquidation_partial'] = bool(initial_liquidation_partial)
         self.db.execute('INSERT OR IGNORE INTO pp_orders VALUES(?,?,?,?,?,?)',
                         (identity,account_id,coin,at,'PENDING',_dump(order)))
-        self._event(account,at,'INTENT',order,ref)
+        if self.db.execute('SELECT changes()').fetchone()[0]:
+            self._event(account,at,'INTENT',order,ref)
         return identity
 
     def _fill(self, order, book, at, ref):
@@ -245,6 +247,11 @@ class PerpsPaperLedger:
         p = account['positions'].get(coin)
         previous = _d(p['quantity']) if p else ZERO
         q = _d(order['quantity'])
+        if order['reason']=='OBSERVED_MARK_LIQUIDATION' and previous:
+            risk = self._risk(account,at)
+            if risk['status']!='OBSERVED_MARK_SCENARIO': return 'UNMEASURED_LIQUIDATION_RISK'
+            bucket = risk['isolated'][coin] if p['mode']=='isolated' else {'equity':risk['cross_equity'],'maintenance':risk['maintenance']}
+            if bucket['equity']>=bucket['maintenance']: return 'CANCELLED_MARGIN_RECOVERED'
         if order['reduce_only']:
             if not previous or q*previous>=0: return 'CANCELLED_REDUCE_ONLY'
             q = min(abs(q),abs(previous))*(1 if q>0 else -1)
@@ -289,7 +296,9 @@ class PerpsPaperLedger:
             full_ratio = abs(q/filled)
             if order['mode']=='isolated':
                 required += max(ZERO,-entry_pnl)
-                if _d(account['cash'])<(required+fee)*full_ratio: return 'REJECTED_MARGIN'
+                if (_d(account['cash'])<(required+fee)*full_ratio
+                        or risk['cross_equity']-(required+fee)*full_ratio<risk['initial']):
+                    return 'REJECTED_MARGIN'
                 account['cash'] = str(_d(account['cash'])-required-fee)
             elif risk['cross_equity']+(entry_pnl-fee)*full_ratio<risk['initial']+required*full_ratio:
                 return 'REJECTED_MARGIN'
@@ -301,6 +310,8 @@ class PerpsPaperLedger:
                 'mode':order['mode'],'leverage':str(lev),'opened_at':p['opened_at'] if p and previous else at}
             account['positions'][coin] = p
         account['fees'] = str(_d(account['fees'])+fee)
+        if order['initial_liquidation_partial']:
+            account['last_partial_liquidation'] = at
         account['realized_pnl'] = str(_d(account['realized_pnl'])+realized)
         receipt = {'order':order['id'],'quantity':str(filled),'price':str(px),'notional_usdc':str(notional),'fee_usdc':str(fee),
             'realized_usdc':str(realized),'book_time':book['time'],'effective_at':at,'source_ref':ref,
@@ -394,15 +405,14 @@ class PerpsPaperLedger:
                 'notional':abs(_d(p['quantity']))*_d(json.loads(self.db.execute('SELECT body FROM pp_marks WHERE coin=?',(coin,)).fetchone()[0])['markPx'])}
             if bucket['equity']>=bucket['maintenance']: continue
             q = -_d(p['quantity'])
+            partial = False
             if bucket['notional']>100000 and at-account.get('last_partial_liquidation',0)>=30:
                 asset,_ = self._contract(coin)
                 q = (q*Decimal('.2')).quantize(Decimal(1).scaleb(-asset['szDecimals']),rounding=ROUND_DOWN)
                 if not q: q = -_d(p['quantity'])
-            identity = self.submit(account['id'],coin,q,at=at,ref=ref,leverage=p['leverage'],
-                mode=p['mode'],reduce_only=True,reason='OBSERVED_MARK_LIQUIDATION')
-            if identity:
-                account['last_partial_liquidation'] = at
-        self._save(account)
+                else: partial = True
+            self.submit(account['id'],coin,q,at=at,ref=ref,leverage=p['leverage'],
+                mode=p['mode'],reduce_only=True,reason='OBSERVED_MARK_LIQUIDATION',initial_liquidation_partial=partial)
 
     def _backstop(self, account, coin, at, ref):
         risk = self._risk(account,at)

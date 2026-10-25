@@ -5,6 +5,7 @@ The provider universe is broader than Phantom's verified UI listing universe.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import sqlite3
@@ -231,6 +232,8 @@ class PhantomPerpsResearch:
                             (coin, json.dumps(book, allow_nan=False), at, json.dumps(scenario, allow_nan=False)))
         elif role == "funding":
             coin, start, rows = record["coin"], record["start_time"], record["rows"]
+            lane = record.get('funding_lane','history')
+            if lane not in {'history','recent'}: raise ValueError('invalid perps funding lane')
             if type(start) is not int or start < 0:
                 raise ValueError("invalid funding history cursor")
             for row in rows:
@@ -241,7 +244,7 @@ class PhantomPerpsResearch:
                     raise ValueError("conflicting immutable perps funding observation")
             self.db.executemany("INSERT OR IGNORE INTO funding VALUES(?,?,?,?)",
                                 ((coin, row["time"], json.dumps(row, allow_nan=False), at) for row in rows))
-            if rows:
+            if rows and lane=='history':
                 next_time = max(row["time"] for row in rows) + 1
                 self.db.execute("INSERT INTO cursors VALUES(?,?) ON CONFLICT(coin) DO UPDATE SET next_time=MAX(next_time,excluded.next_time)",
                                 (coin, next_time))
@@ -254,7 +257,7 @@ class PhantomPerpsResearch:
             if not isinstance(frame['data'].get('ctx'),dict): raise ValueError('asset context object required')
         elif role == "request_error":
             # An explicit retained HTTP failure is not a book or zero value.
-            if record.get("request_role") not in {"book","snapshot"} or not record.get("error"):
+            if record.get("request_role") not in {"book","snapshot","recent_funding"} or not record.get("error"):
                 raise ValueError("invalid perps acquisition failure")
         else:
             raise ValueError("unknown perps observation")
@@ -331,10 +334,24 @@ class PhantomPerpsResearch:
                 if values is None: continue
                 rows.append(observation("funding", coin=coin, start_time=start, rows=values))
             return rows
+        async def recent_funding():
+            # Current payments must not wait for the historical backfill.
+            # This lane never advances that separate history cursor.
+            quantum = max(1,math.ceil(len(self.market_names())/60))
+            start = max(0,int((time.time()//3600-1)*3600000))
+            async def one(coin):
+                try:
+                    values = await self.acquisition.fetch(http,{'type':'fundingHistory','coin':coin,'startTime':start},role='funding_recent',target=coin)
+                    return observation('funding',coin=coin,start_time=start,rows=values,funding_lane='recent') if values is not None else None
+                except Exception as exc:
+                    return observation('request_error',request_role='recent_funding',coin=coin,error=type(exc).__name__)
+            rows = await asyncio.gather(*(one(coin) for coin in self.acquisition.targets('funding_recent',quantum)))
+            return [row for row in rows if row is not None]
         return {spec.miner_id: pool.register(spec, fetch) for spec, fetch in (
             (MinerSpec("perps:catalog", Enriches.MARKET_CONTEXT, 15, endpoint=INFO, detail="underlying full perp DEX inventory and rotating catalogs"), catalog),
             (MinerSpec("perps:books", Enriches.VENUE_LIQUIDITY, 5, endpoint=INFO, detail="fair adaptive public book batches; shared durable provider budget and cooldown"), book),
             (MinerSpec("perps:snapshots", Enriches.EXECUTION_CONDITIONS, 5, endpoint=WS, detail="keyed public mark and oracle snapshots; adaptive fair rotation, not continuous ticks"), lambda:_fetch_snapshots(self,http)),
+            (MinerSpec("perps:recent_funding", Enriches.EXECUTION_CONDITIONS, 60, endpoint=INFO, detail="current funding round-robin independent of historical backfill; shared provider budget"),recent_funding),
             (MinerSpec("perps:funding", Enriches.EXECUTION_CONDITIONS, 60, endpoint=INFO, detail="resumable provider-available funding history; no invented cashflows"), funding))}
 
     def close(self):
