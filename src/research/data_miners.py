@@ -215,6 +215,8 @@ class DataMinerPool:
         # a plain semaphore leak a waiter per call until the box died.
         self._semaphore = loop_local_semaphore(self.concurrency, "miners")
         self._task: Optional[asyncio.Task] = None
+        self._inflight: Dict[str, asyncio.Task] = {}
+        self._active: set[str] = set()
         self._running = False
         self.total_records = 0
 
@@ -257,11 +259,30 @@ class DataMinerPool:
             except (asyncio.CancelledError, Exception):
                 pass
             self._task = None
+        tasks = list(self._inflight.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._inflight.clear()
 
     async def _loop(self) -> None:
         while self._running:
             try:
-                await self.run_due()
+                # Each miner keeps its own clock. Waiting for a gather of ALL
+                # due sources made a slow holder/social request stall even
+                # unrelated books for its entire duration.
+                for name, task in list(self._inflight.items()):
+                    if task.done():
+                        if not task.cancelled() and task.exception() is not None:
+                            logger.warning("data miner task failed: %s", name)
+                        del self._inflight[name]
+                now = time.time()
+                due = sorted((name for name, at in self._next_due.items()
+                    if at <= now and name in self._callables and name not in self._inflight
+                    and self._health[name].backoff_until <= now), key=self._next_due.get)
+                for name in due:
+                    self._inflight[name] = asyncio.create_task(self._run_one(name, now))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pragma: no cover - defensive
@@ -275,6 +296,7 @@ class DataMinerPool:
         now = time.time() if now is None else now
         due = [miner_id for miner_id, at in self._next_due.items()
                if at <= now and miner_id in self._callables
+               and miner_id not in self._active and miner_id not in self._inflight
                and self._health[miner_id].backoff_until <= now]
         if not due:
             return []
@@ -290,6 +312,16 @@ class DataMinerPool:
         return out
 
     async def _run_one(self, miner_id: str, now: float) -> MinerResult:
+        if miner_id in self._active:
+            return MinerResult(miner_id=miner_id, status="IDLE", fetched_at=now,
+                               detail="source acquisition already in flight")
+        self._active.add(miner_id)
+        try:
+            return await self._perform_one(miner_id, now)
+        finally:
+            self._active.discard(miner_id)
+
+    async def _perform_one(self, miner_id: str, now: float) -> MinerResult:
         spec = self._specs[miner_id]
         health = self._health[miner_id]
         self._next_due[miner_id] = now + spec.cadence_seconds
@@ -442,6 +474,8 @@ class DataMinerPool:
             "awaiting_credentials": [row["miner_id"] for row in keyless],
             "silent": [row["miner_id"] for row in silent],
             "total_records": self.total_records,
+            "source_tasks_in_flight": len(self._active),
+            "scheduler": "independent source clocks; shared bounded concurrency",
             "enrichments_covered": dict(sorted(by_enrichment.items())),
             "cadences": {spec.miner_id: spec.cadence_seconds
                          for spec in sorted(self._specs.values(),

@@ -107,6 +107,10 @@ class ResearchRuntime:
             self.free_discovery.acknowledge(records, ref)
         if miner_id == "chain:pool_attribution":
             self.pool_attribution.acknowledge(records, ref)
+        if miner_id.startswith("perps:"):
+            # Durable product-specific indexing stays on the miner worker.
+            # A full main-loop handoff queue cannot discard this derived data.
+            self.phantom_perps.ingest_batch(records, ref)
         return ref
 
     def _retain_mined_disposition(self, ref: str, status: str, detail: str, now: float) -> None:

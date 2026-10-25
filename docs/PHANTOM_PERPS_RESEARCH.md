@@ -17,7 +17,7 @@ actions. This is not a live Phantom trading integration.
 - Retain exact contract names, delisting flags, precision, leverage metadata,
   margin tables, collateral token IDs, mark/oracle prices, current funding and
   open interest. Resolve collateral identities against the public spot metadata.
-- Rotate book observations over all retained active contracts. The provider
+- Poll book observations over all retained active contracts. The provider
   returns at most 20 levels per side; displayed depth is not unlimited depth.
 - Backfill provider-available funding history using a per-contract durable
   millisecond cursor. Advance only after the canonical miner batch is retained
@@ -34,8 +34,33 @@ this SQLite database with SQLite's backup API along with the canonical ledger.
 SQLite keeps the latest catalog/book view per observed contract and all
 retained funding rows without a lifetime market/source ceiling. Every raw
 catalog/book/funding response is retained in the canonical miner-batch archive;
-SQLite does not duplicate that entire snapshot history. Polling quanta limit
-work per pass, not the universe.
+SQLite does not duplicate that entire snapshot history. Product indexing now
+runs on the miner worker immediately after canonical retention, before the
+bounded main-loop handoff queue. A full queue cannot discard perps indexing,
+and the hot-loop product dispatch does no perps SQLite writes. Batch references
+are idempotent; malformed records have an explicit `ingestion_errors` receipt
+with their canonical reference/index and do not discard valid sibling books.
+Transport/database failures still fail the transaction. Retained raw evidence
+is the authority for rebuilding rejected derived records.
+
+Public books use four concurrent HTTP slots and a batch sized from the active
+universe to aim for a one-minute revisit. This is an objective, not a guarantee:
+the global miner concurrency, network, source quotas and retained-work cost can
+make it slower. Durable least-recent-attempted scheduling survives restarts and
+continues past a failing contract. Successful responses survive another
+request's failure in the same pass. Catalog/collateral/book snapshots cannot
+rewind when older responses are delivered. Conflicting or future funding rows
+cannot advance a history cursor.
+
+All three public perps miners share a durable rolling request-weight budget
+and provider cooldown. The collector reserves a cooperative 900 weight/minute
+share below Hyperliquid's [documented 1200/minute per-IP limit](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/rate-limits-and-user-limits),
+including response-dependent funding weight. Other IP consumers are unknown;
+a 429 pauses every local public perps method. These service quanta and provider
+quotas do not impose a lifetime market/source ceiling. Status reports fresh
+active books separately from historical book count, recent request errors,
+derived-record errors, and canonical batches indexed. Zero fresh books remains
+visible even when many historical snapshots exist.
 The status count `observed_catalog_dexes` counts DEX groups with active observed
 contracts. Empty/delisted-only catalog responses remain in the `catalogs`
 table and raw archive; that active count alone cannot prove every catalog was

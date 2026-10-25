@@ -1,4 +1,5 @@
 import time
+import asyncio
 
 import pytest
 
@@ -52,3 +53,53 @@ async def test_consumer_failure_preserves_batch_and_retry_reference():
     result = (await pool.run_due(time.time() + 100))[0]
     assert result.status == "DATA_BLOCKED"
     assert receipts[0][0:2] == ("evidence:retained:0", "RETRY_REQUIRED")
+
+
+@pytest.mark.asyncio
+async def test_slow_source_does_not_hold_unrelated_sources_to_its_cadence():
+    held, fast_twice = asyncio.Event(), asyncio.Event()
+    fast_calls = 0
+    cancelled = asyncio.Event()
+    async def slow():
+        held.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+    async def fast():
+        nonlocal fast_calls
+        fast_calls += 1
+        if fast_calls == 2: fast_twice.set()
+        return [{'reading':fast_calls}]
+    pool = DataMinerPool(concurrency=2)
+    pool.register(MinerSpec('slow',Enriches.NARRATIVE,60),slow)
+    pool.register(MinerSpec('fast',Enriches.MARKET_CONTEXT,.01),fast)
+    pool._next_due = {'slow':0,'fast':0}
+    await pool.start()
+    try:
+        await asyncio.wait_for(held.wait(), 2)
+        await asyncio.wait_for(fast_twice.wait(), 3)
+        assert not cancelled.is_set() and fast_calls >= 2
+    finally:
+        await pool.stop()
+    assert cancelled.is_set() and not pool._inflight and not pool._active
+
+
+@pytest.mark.asyncio
+async def test_acquisition_workflow_cannot_overlap_same_miner_already_running():
+    held, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+    async def fetch():
+        nonlocal calls
+        calls += 1
+        held.set()
+        await release.wait()
+        return [{'reading':1}]
+    pool = DataMinerPool()
+    pool.register(MinerSpec('one',Enriches.NARRATIVE,1),fetch)
+    task = asyncio.create_task(pool._run_one('one',time.time()))
+    await held.wait()
+    duplicate = await pool._run_one('one',time.time()+10)
+    assert duplicate.status == 'IDLE' and calls == 1
+    release.set()
+    assert (await task).ok

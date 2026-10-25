@@ -617,8 +617,8 @@ class MinedRecordIngestion:
                         "venue": "geckoterminal", "_source": "geckoterminal:public-api"}])
                 continue  # network/DEX/page envelopes are never spot regime values
             if record.get("provider") == "hyperliquid" and record.get("product") == "perpetual":
-                self.phantom_perps.ingest(record)
-                continue  # separate contracts, funding and collateral from spot/World
+                # Already durably indexed on the worker after canonical ACK.
+                continue  # never write perps SQLite on the hot spot/World loop
             # Chain-wide execution conditions belong to no episode: they are
             # the state of the world every decision in this moment is made in.
             if record.get("slot_time_ratio") is not None:
