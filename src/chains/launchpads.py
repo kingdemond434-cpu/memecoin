@@ -344,6 +344,9 @@ def default_specs() -> List[LaunchpadSpec]:
     pump = load_idl("pump")
     create = next(instruction for instruction in pump["instructions"] if instruction["name"] == "create")
     mint_index = next(index for index, account in enumerate(create["accounts"]) if account["name"] == "mint")
+    launchlab = load_idl("raydium_launchlab")
+    launchlab_create = next(row for row in launchlab["instructions"] if row["name"] == "initialize_v2")
+    launchlab_positions = {row["name"]: index for index, row in enumerate(launchlab_create["accounts"])}
     return [
         LaunchpadSpec(
             name="pump.fun", program_id=pump["address"],
@@ -357,8 +360,15 @@ def default_specs() -> List[LaunchpadSpec]:
             note="native IDL/fixture verification; runtime observations reported separately"),
         LaunchpadSpec(
             name="raydium_launchlab", program_id="LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj",
-            create_instructions=("initialize",), mint_account_index=None,
-            note="LaunchLab / LetsBONK curve; account layout unconfirmed"),
+            create_instructions=("initialize", "initialize_v2", "initialize_with_token_2022"),
+            mint_account_index=launchlab_positions["base_mint"], creator_account_index=launchlab_positions["creator"],
+            layout_verified=True, protocol_version="raydium_launchpad-0.2.0",
+            source_ref="https://github.com/raydium-io/raydium-sdk-V2/blob/e2e8bcd865189c994682a9477ec8eaf1e2da8aaf/src/raydium/launchpad/instrument.ts",
+            idl_ref="idl/raydium_launchlab.json",
+            verification_provenance="docs/DONOR_ADAPTATIONS.md",
+            fixture_refs=("tests/fixtures/launchlab_launches.json",), decoder_parity=True,
+            execution_support="DATA_BLOCKED_NATIVE_CURVE_EXECUTION",
+            note="IDL/native fixture-backed discovery across all platform configs; runtime observations separate"),
         LaunchpadSpec(
             name="meteora_dbc", program_id="dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN",
             create_instructions=("initialize_virtual_pool_with_spl_token",
