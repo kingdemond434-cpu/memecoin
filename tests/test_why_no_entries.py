@@ -132,6 +132,25 @@ def test_every_remedy_matches_a_reason_the_desk_actually_emits():
     assert _remedy("something_nobody_emits") == ""
 
 
+def test_model_block_does_not_invent_training_status():
+    from tools.why_no_entries import _remedy
+    text = _remedy('DATA_BLOCKED_prediction_model')
+    assert 'predictor is not trained' not in text
+    assert 'rejected after-cost training' in text
+
+
+def test_active_blocks_and_duplicate_refusal_buckets_are_reported(tmp_path, capsys):
+    _census(tmp_path, screened_by_reason={'same_reason': 20}, rejected_by_reason={'same_reason': 10})
+    path = tmp_path/'launch_census.json'
+    payload = json.loads(path.read_text())
+    payload['records'] = [{'disposition': 'data_blocked', 'disposition_reason': 'rpc_snapshot_missing'}]
+    path.write_text(json.dumps(payload))
+    main(['--state-dir', str(tmp_path)])
+    output = capsys.readouterr().out
+    assert 'same_reason (30,' in output and 'rpc_snapshot_missing' in output
+    assert 'not lifetime totals' in output
+
+
 def test_launches_in_flight_are_not_reported_as_missing(tmp_path, capsys):
     """`seen - screened - decided` counts every in-flight launch as lost.
 

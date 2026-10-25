@@ -603,6 +603,13 @@ class MinedRecordIngestion:
             self._harvest_channels(miner_id, records)
         attribution_delivered = []
         for record in records:
+            if miner_id == 'local:neural_sentiment' and record.get('provider') == 'offline_neural_sentiment':
+                proof = self.neural_sentiment.observation(record['annotation_id'], as_of=time.time())
+                if proof:
+                    for token in proof['tokens']:
+                        self.dataset_builder.record_market_observation(token,
+                            {**proof, 'type': 'document_sentiment_window', 'timestamp': proof['available_at']})
+                continue
             if miner_id == "chain:local_fork_roundtrip" and record.get("provider") == "local_svm":
                 # Raw result and bank archive are already canonical. This is a
                 # research observation; it never triggers an order or labels

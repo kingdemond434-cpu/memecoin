@@ -179,7 +179,7 @@ class SourceIntelligence:
             "platform": metadata.get("platform") or getattr(transport, "kind", None) or "UNKNOWN", "language": event.language or "UNKNOWN",
             "region": metadata.get("region"), "event_at": event.source_at, "observed_at": event.observed_at,
             "text": event.text, "stage": "MENTION", "chain_id": metadata.get("chain_id"),
-            "token_id": tokens[0] if len(tokens) == 1 else None,
+            "token_id": tokens[0] if len(tokens) == 1 else None, "token_addresses": tokens,
             "observation_id": hashlib.sha256(json.dumps([event.source_id, metadata.get("message_id") or metadata.get("link"),
                 event.content_hash, event.source_at], sort_keys=True).encode()).hexdigest()}
         from src.research.local_decisions import annotate_public_text
@@ -231,6 +231,17 @@ class SourceIntelligence:
             from src.collectors.onion_discovery import deliver
             deliver(self, event, job_id)
         if job_id:
+            neural = getattr(self, 'neural_sentiment', None)
+            if neural is not None:
+                try:
+                    source_job = self.unknown_engine.frontier.job(job_id)
+                    if not source_job or not source_job.get('payload_ref'):
+                        raise ValueError('canonical narrative source reference unavailable')
+                    neural.enqueue(payload, source_job=job_id, source_ref=source_job['payload_ref'], tokens=tokens)
+                except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+                    neural.last_intake_error = type(exc).__name__
+                    neural.intake_failures += 1
+                    logger.warning('neural sentiment intake deferred: %s', type(exc).__name__)
             try:
                 from src.research.public_claim_links import PublicClaimLinks
                 if getattr(self, "public_claim_links", None) is None:

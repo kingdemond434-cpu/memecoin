@@ -78,6 +78,8 @@ class ResearchRuntime:
                 chain="solana" if spec.endpoint.startswith("rpc:") else None)
 
     async def _close_research_worker_resources(self) -> None:
+        if getattr(self, 'neural_sentiment', None) is not None:
+            await self.neural_sentiment.stop()
         await self.http_client.close_current_loop()
         await self.solana_rpc.close_current_loop()
 
@@ -113,6 +115,8 @@ class ResearchRuntime:
             self.phantom_perps.ingest_batch(records, ref)
         if miner_id == "chain:local_fork_roundtrip":
             self.fork_probe.acknowledge(records, ref)
+        if miner_id == 'local:neural_sentiment':
+            self.neural_sentiment.acknowledge(records, ref)
         return ref
 
     def _retain_mined_disposition(self, ref: str, status: str, detail: str, now: float) -> None:
