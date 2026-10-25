@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 import threading
 from pathlib import Path
@@ -17,6 +18,20 @@ GENESIS = "0" * 64
 def _canonical(payload: Dict[str, Any]) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"),
                       default=str).encode("utf-8")
+
+
+def _verified_row(line, previous, expected_sequence):
+    if isinstance(line, bytes): line = line.decode('utf-8')
+    row = json.loads(line)
+    digest = row.pop('hash')
+    if int(row.get('sequence', -1)) != expected_sequence:
+        raise ValueError('sequence gap')
+    if row.get('previous_hash') != previous:
+        raise ValueError('previous hash mismatch')
+    if hashlib.sha256(_canonical(row)).hexdigest() != digest:
+        raise ValueError('row hash mismatch')
+    row['hash'] = digest
+    return row, digest
 
 
 class TradeEvidenceLedger:
@@ -96,19 +111,35 @@ class TradeEvidenceLedger:
                 for line in handle:
                     if not line.strip():
                         continue
-                    row = json.loads(line)
-                    digest = row.pop("hash")
-                    if int(row.get("sequence", -1)) != expected_sequence:
-                        return False, "sequence gap", expected_sequence - 1
-                    if row.get("previous_hash") != previous:
-                        return False, "previous hash mismatch", expected_sequence - 1
-                    if hashlib.sha256(_canonical(row)).hexdigest() != digest:
-                        return False, "row hash mismatch", expected_sequence - 1
-                    previous = digest
+                    _, previous = _verified_row(line, previous, expected_sequence)
                     expected_sequence += 1
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
             return False, str(exc), expected_sequence - 1
         return True, "OK", expected_sequence - 1
+
+    def matching_snapshot(self, payload_key: str, payload_value: Any) -> list[dict]:
+        """Verify one committed prefix, streaming only matching rows to memory.
+
+        Capture EOF under the writer lock, then release it before scanning.
+        Appends can continue without extending or partially entering this read.
+        Call this disk/CPU work outside the collection event loop.
+        """
+        with self._append_lock:
+            if not self.path.exists(): return []
+            handle = self.path.open('rb')
+            end = os.fstat(handle.fileno()).st_size
+        previous, sequence, matches = GENESIS, 1, []
+        with handle:
+            while handle.tell() < end:
+                line = handle.readline(end-handle.tell())
+                if not line or not line.endswith(b'\n'):
+                    raise ValueError('incomplete committed evidence prefix')
+                if not line.strip(): continue
+                row, previous = _verified_row(line, previous, sequence)
+                sequence += 1
+                if row.get('payload', {}).get(payload_key) == payload_value:
+                    matches.append(row)
+        return matches
 
     def report(self) -> Dict[str, Any]:
         return {"status": "OK" if self.last_hash else "DATA_BLOCKED",
