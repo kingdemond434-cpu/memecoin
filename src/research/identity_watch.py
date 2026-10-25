@@ -56,6 +56,7 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -140,6 +141,8 @@ class Figure:
     #: claiming them while this exists is contradicted by construction.
     canonical_mint: str = ""
     notes: str = ""
+    channels_verified_at: float = 0.0
+    channels_source_ref: str = ""
 
     def terms(self) -> Tuple[str, ...]:
         return tuple({_normalise(term) for term
@@ -254,7 +257,7 @@ class IdentityWatch:
         #: handle (lowered) -> figure key, for corroboration.
         self._channel_owner: Dict[str, str] = {}
         #: mint -> (handle, first seen at) for mentions from OWNED channels.
-        self._owned_mentions: Dict[str, Tuple[str, float]] = {}
+        self._owned_mentions: Dict[Tuple[str, str], Tuple[str, float, float]] = {}
         #: deployer -> how many uncorroborated claims it has minted.
         self._impersonations: Dict[str, int] = {}
         self.outcomes: Dict[str, VerdictOutcomes] = {
@@ -290,6 +293,7 @@ class IdentityWatch:
             logger.warning("figure registry at %s is malformed: %s", path, exc)
             return 0
         loaded = 0
+        from src.strategies.authenticity import parse_verified_at
         for row in payload.get("figures") or []:
             try:
                 figure = Figure(
@@ -301,7 +305,9 @@ class IdentityWatch:
                     region=str(row.get("region", "global")),
                     language=str(row.get("language", "en")),
                     canonical_mint=str(row.get("canonical_mint", "")),
-                    notes=str(row.get("notes", "")))
+                    notes=str(row.get("notes", "")),
+                    channels_verified_at=parse_verified_at(row.get("channels_verified_at")) or 0.0,
+                    channels_source_ref=str(row.get("channels_source_ref", "")))
             except (KeyError, ValueError) as exc:
                 logger.warning("skipping malformed figure row: %s", exc)
                 continue
@@ -312,7 +318,7 @@ class IdentityWatch:
     # --- corroboration input ---------------------------------------------
 
     def note_channel_message(self, handle: str, mints: Sequence[str],
-                             at: Optional[float] = None) -> int:
+                             at: Optional[float] = None, available_at: Optional[float] = None) -> int:
         """A public message from a channel. Only OWNED channels can confirm.
 
         Every channel the desk reads is passed through here; the filter is
@@ -321,16 +327,22 @@ class IdentityWatch:
         supplying its own corroboration by naming a channel it controls.
         """
         moment = time.time() if at is None else at
+        available = moment if available_at is None else available_at
+        if (type(moment) not in (int, float) or type(available) not in (int, float)
+                or not math.isfinite(moment) or not math.isfinite(available)
+                or moment <= 0 or available < moment):
+            return 0
         owner = self._channel_owner.get((handle or "").lower().lstrip("@"))
         if owner is None:
             return 0
         recorded = 0
         for mint in mints:
-            if not mint or mint in self._owned_mentions:
+            key = (mint, owner)
+            if not mint or key in self._owned_mentions:
                 continue
             if len(self._owned_mentions) >= self.max_mentions:
                 self._owned_mentions.pop(next(iter(self._owned_mentions)), None)
-            self._owned_mentions[mint] = (handle, moment)
+            self._owned_mentions[key] = (handle, moment, available)
             recorded += 1
         return recorded
 
@@ -422,10 +434,15 @@ challenge" becomes a claim; fuzzy matching a six-character symbol is how a
             return IdentityAssessment(mint=mint, verdict=Verdict.NO_CLAIM,
                                       deployer=deployer)
 
-        mention = self._owned_mentions.get(mint)
-        if mention is not None:
-            handle, seen_at = mention
-            owner = self._channel_owner.get(handle.lower())
+        mentions = [(claim.figure_key, self._owned_mentions.get((mint, claim.figure_key))) for claim in claims]
+        for owner, mention in mentions:
+            if mention is None:
+                continue
+            handle, seen_at, available_at = mention
+            figure = self.figures.get(owner)
+            if (available_at > moment or seen_at > moment or figure is None
+                    or figure.channels_verified_at > birth):
+                continue
             lag = max(0.0, seen_at - birth)
             if owner in {claim.figure_key for claim in claims}:
                 if lag <= self.announcement_window_s:
@@ -494,13 +511,14 @@ challenge" becomes a claim; fuzzy matching a six-character symbol is how a
         with_channels = sum(1 for figure in self.figures.values() if figure.channels)
         return {
             "schema": IDENTITY_SCHEMA_VERSION,
-            "status": "OK" if with_channels else "DEGRADED",
-            "detail": ("" if with_channels else
+            "status": ("OK" if with_channels == len(self.figures) and with_channels else "PARTIAL" if with_channels else "DEGRADED"),
+            "detail": (f"{with_channels} of {len(self.figures)} figures have registered public channels" if with_channels else
                        "no figure has a registered public channel, so no claim "
                        "can ever be corroborated; every celebrity launch will "
                        "read UNCORROBORATED regardless of the truth"),
             "figures": len(self.figures),
             "figures_with_channels": with_channels,
+            "figures_without_channels": len(self.figures) - with_channels,
             "terms_indexed": len(self._terms),
             "by_category": dict(sorted(by_category.items())),
             "assessed": self.assessed,

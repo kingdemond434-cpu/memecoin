@@ -381,6 +381,9 @@ class SourceIntelligence:
             return
         seen.add(wallet)
         self.hot_state.touch_token(token)
+        observer = getattr(self.hot_state, "observe_wallet_entry", None)
+        if callable(observer):
+            observer(str(wallet), now=time.time())
         # The per-token wallet sets are unbounded otherwise: a day of launches
         # would accumulate every buyer of every token that ever traded.
         for stale in [key for key in self._actor_seen

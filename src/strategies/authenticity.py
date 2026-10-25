@@ -207,7 +207,8 @@ class WatchedEntity:
         ago and never rechecked is a claim about the past, and the strongest
         proof levels are exactly where that matters.
         """
-        return self.age_days(now) > max_age_days
+        moment = time.time() if now is None else now
+        return self.verified_at > moment or self.age_days(moment) > max_age_days
 
 
 @dataclass

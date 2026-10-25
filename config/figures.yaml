@@ -143,6 +143,14 @@ figures:
      aliases: [viratkohli, kohli], region: in}
 
   # ---- projects, venues and brands ----------------------------------------
+  - key: meteora
+    display: Meteora
+    category: project
+    aliases: [meteora, meteoraag]
+    channels: [meteora_dev]
+    channels_verified_at: "2026-10-25T14:03:42+00:00"
+    channels_source_ref: "https://docs.meteora.ag/get-started.md#sha256=f7bd7d47f36764452082137e61f28a966b746c158be977a5d69a1eb47e1bc9a9"
+    notes: "Official documentation explicitly links Developer Updates to this Telegram channel. No wallet or canonical mint assertion."
   - {key: pumpfun, display: Pump.fun, category: project,
      aliases: [pumpfun, pumpdotfun], region: global}
   - {key: solana, display: Solana, category: project,

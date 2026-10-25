@@ -52,6 +52,7 @@ from src.research.data_miners import DataMinerPool
 from src.research.solana_miners import register_solana_miners
 from src.research.gmgn_observations import register_gmgn_miners
 from src.research.free_market_discovery import FreeMarketDiscovery
+from src.research.pool_attribution import PoolAttribution
 from src.research.phantom_perps import PhantomPerpsResearch
 from src.research.source_catalogue import default_registry
 from src.research.regional_miners import register_regional_miners
@@ -634,18 +635,14 @@ class SubsystemWiring:
         # position can take: `Action.REENTER` is only scorable at zero held
         # fraction, so the book lives outside the position loop and gates
         # the ordinary entry path instead of running a parallel one.
-        # Whether a token is the entity it claims to be. The registry ships
-        # empty on purpose -- an entity entry asserts that an account or
-        # wallet canonically IS a named public figure, and a wrong one makes
-        # an impersonator look verified. Until entries are filled in from
-        # each entity's own published account, every verdict is DATA_BLOCKED,
-        # which is the honest reading of an empty registry: not "nothing is a
-        # copycat" but "we cannot tell".
+        # Reviewed domain-only seeds are separate from node-specific account
+        # and wallet verification. A domain declaration never supplies a
+        # missing stable platform identity or an official-token endorsement.
         self._watched_entities = load_entities(
             # Schema and policy in the repository; verified entities on the
             # node that could actually reach their pages.
             self.global_config.get(
-                "entities_path", "config/entities.yaml,config/entities.verified.yaml"))
+                "entities_path", "config/entities.yaml,config/entities.public.yaml,config/entities.verified.yaml"))
         self.entity_registry = EntityRegistry(self._watched_entities)
         self.authenticity = AuthenticityResolver(self.entity_registry)
         # Which source spoke first, and whether its posts have historically
@@ -1293,6 +1290,9 @@ class SubsystemWiring:
         self.free_discovery = FreeMarketDiscovery(
             Path(self.global_config.get("ops_state_dir", "data/state")) / "free_market_discovery.sqlite")
         self.miner_registration.update(self.free_discovery.register(self.data_miners, self.http_client))
+        self.pool_attribution = PoolAttribution(
+            Path(self.global_config.get("ops_state_dir", "data/state")) / "native_pool_attribution.sqlite")
+        self.miner_registration.update(self.pool_attribution.register(self.data_miners, self.solana_rpc))
         self.phantom_perps = PhantomPerpsResearch(
             Path(self.global_config.get("ops_state_dir", "data/state")) / "phantom_perps.sqlite")
         self.miner_registration.update(self.phantom_perps.register(self.data_miners, self.http_client))

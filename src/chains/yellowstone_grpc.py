@@ -12,6 +12,7 @@ import hashlib
 import importlib
 import json
 import logging
+import re
 import struct
 import time
 from dataclasses import dataclass, field
@@ -37,6 +38,40 @@ except ImportError:
     NATIVE_FASTPATH_STATUS = "DEGRADED: Python fallback"
 
 B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def scoped_program_data(logs, expected_program):
+    """RPC mention filters are not emitter identity; honor runtime call scopes."""
+    stack = []
+    for index, line in enumerate(logs):
+        if not isinstance(line, str):
+            continue
+        invoke = re.fullmatch(r"Program ([1-9A-HJ-NP-Za-km-z]{32,44}) invoke \[(\d+)\]", line)
+        if invoke:
+            depth = int(invoke[2])
+            if 1 <= depth <= len(stack) + 1:
+                stack = stack[:depth-1] + [{'program': invoke[1], 'records': []}]
+            else:
+                stack = []
+            continue
+        end = re.match(r"^Program ([1-9A-HJ-NP-Za-km-z]{32,44}) (success|failed:)", line)
+        if end:
+            if stack and stack[-1]['program'] == end[1]:
+                frame = stack.pop()
+                if end[2] == 'success':
+                    if stack:
+                        stack[-1]['records'].extend(frame['records'])
+                    else:
+                        yield from frame['records']
+            else:
+                stack = []
+            continue
+        if stack and stack[-1]['program'] == expected_program and line.startswith('Program data: '):
+            try:
+                raw = base64.b64decode(line.split(': ', 1)[1], validate=True)
+            except (ValueError, binascii.Error):
+                continue
+            stack[-1]['records'].append((index, raw))
 
 
 def b58encode(raw: bytes) -> str:
@@ -453,16 +488,11 @@ class SolanaRpcProgramStream:
                         logs = value.get("logs") or []
                         slot = int((result.get("context") or {}).get("slot", 0))
                         received_ns = time.time_ns()
-                        for line in logs:
-                            if not isinstance(line, str) or not line.startswith("Program data: "):
-                                continue
-                            try:
-                                raw = base64.b64decode(line.split(": ", 1)[1], validate=True)
-                            except (ValueError, binascii.Error):
-                                continue
+                        for log_index, raw in scoped_program_data(logs, program):
                             await self._dispatch("program_data", {
                                 "program": program, "signature": signature, "slot": slot,
-                                "data": raw, "received_ns": received_ns,
+                                "data": raw, "received_ns": received_ns, "log_index": log_index,
+                                "source_commitment": "processed",
                             })
                         if program not in {PumpFunMonitor.PUMP_FUN_PROGRAM, PumpSwapMonitor.PUMP_AMM_PROGRAM}:
                             if self._looks_like_pool_creation(logs):
@@ -858,6 +888,9 @@ class PumpFunMonitor:
             return
         event["received_ns"] = int(update.get("received_ns", time.time_ns()))
         event["decoded_ns"] = time.time_ns()
+        event["program_event_hash"] = hashlib.sha256(data).hexdigest()
+        event["log_index"] = update.get("log_index")
+        event["source_commitment"] = update.get("source_commitment", "UNKNOWN")
         result = self.callback(event)
         if asyncio.iscoroutine(result):
             await result
@@ -1172,6 +1205,9 @@ class PumpSwapMonitor:
             return
         event["received_ns"] = int(update.get("received_ns", time.time_ns()))
         event["decoded_ns"] = time.time_ns()
+        event["program_event_hash"] = hashlib.sha256(data).hexdigest()
+        event["log_index"] = update.get("log_index")
+        event["source_commitment"] = update.get("source_commitment", "UNKNOWN")
         result = self.callback(event)
         if asyncio.iscoroutine(result):
             await result

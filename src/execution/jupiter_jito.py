@@ -783,6 +783,10 @@ class ExecutionEngine:
         invented: the sizing decision already chose the risk limit, and this
         only expresses it in the units the instruction takes.
         """
+        # Native Pump routes settle the quote leg in SOL. A token/USDC
+        # request must reach a router that actually returns USDC.
+        if input_mint == output_mint or WSOL_MINT not in {input_mint, output_mint}:
+            return None
         buying = input_mint == WSOL_MINT
         mint = output_mint if buying else input_mint
         curve = self.curve_state_provider(mint) if self.curve_state_provider else None
@@ -833,11 +837,17 @@ class ExecutionEngine:
         reserves = self.pool_state_provider(mint)
         if reserves is None:
             return None
+        if reserves.base_mint != mint or reserves.quote_mint != WSOL_MINT:
+            return None
         account = self.pool_account_provider(mint) if self.pool_account_provider else None
         if account is None or not getattr(account, "ok", False):
             return PreparedInstruction(
                 status="DATA_BLOCKED", venue="pumpswap",
                 detail="pool account not decoded; vaults and coin_creator unavailable")
+        if (account.base_mint != mint or account.quote_mint != WSOL_MINT
+                or account.pool != reserves.pool):
+            return PreparedInstruction(status="DATA_BLOCKED", venue="pumpswap",
+                                       detail="pool account assets do not match requested SOL pair")
         user = self.tx_builder.public_key
         if buying:
             quote = pool_quote_buy(reserves, amount)
@@ -904,12 +914,17 @@ class ExecutionEngine:
         accounts belong to the pool would be a valid-looking number about the
         wrong market.
         """
+        if input_mint == output_mint or WSOL_MINT not in {input_mint, output_mint}:
+            return None
         if venue == "pumpswap":
             if self.pool_state_provider is None:
                 return None
             buying = input_mint == WSOL_MINT
             reserves = self.pool_state_provider(output_mint if buying else input_mint)
             if reserves is None:
+                return None
+            if (reserves.base_mint != (output_mint if buying else input_mint)
+                    or reserves.quote_mint != WSOL_MINT):
                 return None
             quote = (pool_quote_buy(reserves, amount) if buying
                      else pool_quote_sell(reserves, amount))

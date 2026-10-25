@@ -888,11 +888,13 @@ class WalletIntelligenceEngine:
             "wallet": event.get("wallet", ""), "token": token, "side": side,
             "amount": float(event.get("amount", 0) or 0), "price": float(event.get("price", 0) or 0),
             "timestamp": float(event.get("timestamp", time.time())), "signature": event.get("signature"),
+            "available_at": float(event.get("available_at", time.time())),
+            "late_attribution": bool(event.get("late_attribution", False)),
             "data_status": "OK" if event.get("price") else "DATA_BLOCKED_PRICE",
         }
         (self._recent_buys if side == "buy" else self._recent_sells).append(record)
         wallet = record["wallet"]
-        if wallet:
+        if wallet and not record["late_attribution"]:
             # The stream carried this wallet, so the poll does not have to.
             self._stream_seen_at[wallet] = time.time()
             self._note_observation_lag("stream", record["timestamp"])

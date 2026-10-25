@@ -40,7 +40,7 @@ import math
 import threading
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
 
@@ -89,6 +89,7 @@ class CompactWalletDNA:
     # Set when the distillation ran against too little history to conclude
     # anything. A caller must treat this as "unknown", never as "average".
     status: str = "OK"
+    observed_entries: int = 0
 
     @property
     def information_value(self) -> float:
@@ -123,6 +124,7 @@ class CompactCreatorDNA:
     cluster_id: str = ""
     last_active: float = 0.0
     status: str = "OK"
+    observed_creations: int = 0
 
     @property
     def information_value(self) -> float:
@@ -318,6 +320,16 @@ class HotState:
         self.active_tokens: Dict[str, float] = {}
         self.archive = AsyncArchiveWriter(
             archive_root or Path("data/spool"), self.budget)
+
+    def observe_wallet_entry(self, wallet: str, now: Optional[float] = None) -> None:
+        now = time.time() if now is None else now
+        previous = self.wallets.peek(wallet) or CompactWalletDNA(wallet=wallet, status="UNMEASURED")
+        self.wallets.put(wallet, replace(previous, observed_entries=previous.observed_entries + 1, last_active=now), now)
+
+    def observe_creator(self, creator: str, now: Optional[float] = None) -> None:
+        now = time.time() if now is None else now
+        previous = self.creators.peek(creator) or CompactCreatorDNA(creator=creator, status="UNMEASURED")
+        self.creators.put(creator, replace(previous, observed_creations=previous.observed_creations + 1, last_active=now), now)
 
     def touch_token(self, token: str, now: Optional[float] = None) -> None:
         now = time.time() if now is None else now

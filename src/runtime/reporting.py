@@ -384,20 +384,25 @@ class ReportingSurface:
         decoder -- and a decoder with a gap reports a quiet market, not a gap.
         """
         seen = len(self._discovered_pools)
-        missed = self._discovery_misses
+        census = getattr(self, "launch_census", None)
+        missed = sum(not census.knows(token) for token in self._discovered_pools) if census is not None else None
         if not seen:
             return {"status": "DATA_BLOCKED", "external_pools_seen": 0,
                     "missed_by_our_stream": 0, "coverage": None,
                     "detail": "no external pool discovery yet this run"}
+        if missed is None:
+            return {"status": "DATA_BLOCKED", "external_pools_seen": seen,
+                    "missed_by_our_stream": None, "coverage": None, "detail": "native census unavailable"}
         coverage = 1.0 - (missed / seen)
         return {
             "status": "OK" if coverage >= 0.9 else "DEGRADED",
             "external_pools_seen": seen,
             "missed_by_our_stream": missed,
             "coverage": round(coverage, 4),
+            "coverage_scope": "unique_external_token_sample_vs_current_retained_census; not_global_launch_coverage",
             "detail": ("" if coverage >= 0.9 else
                        f"{missed} of {seen} pools seen by outside operators "
-                       "never reached our census; that is a decoder or "
+                       "are absent from the current retained census; possible decoder or "
                        "program-coverage gap, not a quiet market"),
         }
 
@@ -593,6 +598,8 @@ class ReportingSurface:
             # never returned a record reads differently from one that is
             # failing, and the two need different fixes.
             "data_miners": self.data_miners.report(),
+            "pool_attribution": (self.pool_attribution.report()
+                if getattr(self, "pool_attribution", None) is not None else {"status": "NOT_OBSERVED"}),
             "free_market_discovery": (self.free_discovery.report()
                 if getattr(self, "free_discovery", None) is not None else {"status": "NOT_OBSERVED"}),
             "phantom_perps": (self.phantom_perps.report()
