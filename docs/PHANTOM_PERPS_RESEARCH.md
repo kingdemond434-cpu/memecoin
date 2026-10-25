@@ -31,8 +31,15 @@ Trade[XYZ] equity perps; that does not establish every other DEX's support.
 The derived SQLite view is `ops_state_dir/phantom_perps.sqlite`; original
 observations pass through the existing retained miner-batch ledger. Back up
 this SQLite database with SQLite's backup API along with the canonical ledger.
-It stores all observed catalogs/books and funding history without a lifetime
-market/source ceiling. Polling quanta limit work per pass, not the universe.
+SQLite keeps the latest catalog/book view per observed contract and all
+retained funding rows without a lifetime market/source ceiling. Every raw
+catalog/book/funding response is retained in the canonical miner-batch archive;
+SQLite does not duplicate that entire snapshot history. Polling quanta limit
+work per pass, not the universe.
+The status count `observed_catalog_dexes` counts DEX groups with active observed
+contracts. Empty/delisted-only catalog responses remain in the `catalogs`
+table and raw archive; that active count alone cannot prove every catalog was
+visited or that collection is complete.
 
 ## Cost scenarios, not manufactured trades
 

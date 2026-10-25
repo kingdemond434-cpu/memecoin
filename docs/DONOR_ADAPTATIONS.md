@@ -103,6 +103,17 @@ wallet-key loading and order methods. No `GMGN_API_KEY` is currently provisioned
 so registration reports that dependency and makes no request. The Helius key
 is never reused. Provider payloads remain unverified claims with observation
 time and pagination incompleteness; native safety facts are not overwritten.
+The owner subsequently reported a minimum “100 balance” condition during key
+creation. Its denomination and holding-versus-charge rules were not verified
+from the connected page; it is not described here as a proven fee. GMGN is an
+optional dependency and the other miners do not require funding that account.
+
+On Windows, provision any future GMGN key in a main-bot-specific private
+connection file. The older, independently pinned World paper release reads its
+own Helius connection file with a stricter field allowlist; adding an unknown
+GMGN field there would break its next startup. Keep the API-authentication
+Ed25519 pair separate from wallet signing keys. The native read adapter uses
+the API key only, not the generated private authentication key or a wallet key.
 
 SendAI's Pyth helper was inspected: it selects a feed by symbol and formats a
 price without carrying the confidence interval and publication freshness.
