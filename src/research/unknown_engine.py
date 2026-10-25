@@ -76,6 +76,9 @@ class UnknownOpportunityEngine:
         self.last_proposal_round = {"status": "NOT_RUN", "authority": "none"}
         self.last_pass = {"status": "NOT_RUN", "authority": "none"}
         self.workflows = None
+        self._frontier_report_cache = None
+        self._frontier_report_task = None
+        self._frontier_report_error = None
         # One-time migration before work resumes. Import commits before the
         # legacy map is retired, so interruption cannot lose retry identities.
         legacy = self.framework.get_research_component('research_conversion_receipts')
@@ -591,8 +594,36 @@ class UnknownOpportunityEngine:
             await asyncio.sleep(0)
         return self._pass_report(jobs, results)
 
-    def report(self) -> dict:
-        return {"status": "SHADOW_ONLY", "authority": "none", "frontier": self.frontier.report(),
+    async def frontier_snapshot(self, *, max_age_seconds=5) -> dict:
+        """A dated diagnostic snapshot; never used to lease or acknowledge work."""
+        import asyncio
+        if not math.isfinite(max_age_seconds) or max_age_seconds < 0:
+            raise ValueError('nonnegative diagnostic freshness interval required')
+        async def refresh():
+            try:
+                started = time.time()
+                value = await asyncio.to_thread(self.frontier.report)
+                self._frontier_report_cache = (value, started, time.monotonic())
+                self._frontier_report_error = None
+            except Exception as exc:
+                self._frontier_report_error = type(exc).__name__
+                raise
+            finally:
+                self._frontier_report_task = None
+        cached = self._frontier_report_cache
+        if (cached is None or time.monotonic()-cached[2] >= max_age_seconds) and self._frontier_report_task is None:
+            self._frontier_report_task = asyncio.create_task(refresh())
+            self._frontier_report_task.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+        if cached is None:
+            await asyncio.shield(self._frontier_report_task)
+            cached = self._frontier_report_cache
+        return {**cached[0], 'snapshot_observed_at': cached[1],
+                'snapshot_age_seconds': max(0, time.time()-cached[1]),
+                'refresh_in_progress': self._frontier_report_task is not None,
+                'refresh_error_type': self._frontier_report_error}
+
+    def report(self, *, frontier_snapshot=None) -> dict:
+        return {"status": "SHADOW_ONLY", "authority": "none", "frontier": self.frontier.report() if frontier_snapshot is None else frontier_snapshot,
                 "last_pass": self.last_pass, "canonical_evidence": self.evidence.report(),
                 "proposal_round": self.last_proposal_round,
                 "provider_configuration": (self.proposal_runner.configuration_report()
