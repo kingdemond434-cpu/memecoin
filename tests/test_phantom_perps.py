@@ -104,8 +104,10 @@ async def test_every_new_underlying_dex_rotates_and_ingestion_is_separate(monkey
     fetch = pool._callables["perps:catalog"]
     for _ in range(5):
         for row in await fetch():
-            # This is the real dispatch branch, with no spot/model attributes.
-            MinedRecordIngestion._ingest_mined_records(type("Desk",(),{"phantom_perps":state})(),"perps:catalog",[row])
+            # Product data is indexed after canonical retention on the worker;
+            # the hot-loop dispatch must have no dependency on perps SQLite.
+            state.ingest_batch([row], "fixture:"+str(len(observed)))
+            MinedRecordIngestion._ingest_mined_records(type("Desk",(),{})(),"perps:catalog",[row])
     assert {r["dex"] for r in observed if r["type"] == "metaAndAssetCtxs"} == {"","xyz","unknown-new"}
     assert state.report()["active_markets"] == 3
     state.close()

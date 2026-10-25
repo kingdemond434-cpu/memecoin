@@ -6,13 +6,16 @@ The provider universe is broader than Phantom's verified UI listing universe.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 import time
+from email.utils import parsedate_to_datetime
 from decimal import Decimal, ROUND_UP, InvalidOperation
 from pathlib import Path
 
 from src.research.data_miners import Enriches, MinerSpec, RateLimited, rotating_selector
+from src.research.perps_acquisition import PublicPerpsAcquisition
 
 INFO = "https://api.hyperliquid.xyz/info"
 PHANTOM_REFERENCE = "https://help.phantom.com/articles/42292249388307"
@@ -26,7 +29,16 @@ async def public_info(http, payload):
     session = await http.session()
     async with session.post(INFO, json=payload, allow_redirects=False) as response:
         if response.status == 429:
-            raise RateLimited("Hyperliquid public information rate limited")
+            error = RateLimited("Hyperliquid public information rate limited")
+            try:
+                delay = float(response.headers.get("Retry-After", 60))
+                error.retry_after_seconds = delay if math.isfinite(delay) and delay >= 0 else 60
+            except (TypeError, ValueError):
+                try:
+                    error.retry_after_seconds = max(0, parsedate_to_datetime(response.headers["Retry-After"]).timestamp()-time.time())
+                except (ValueError, TypeError, KeyError, OverflowError):
+                    error.retry_after_seconds = 60
+            raise error
         if response.status != 200:
             raise RuntimeError("Hyperliquid public information HTTP " + str(response.status))
         return await response.json()
@@ -109,7 +121,11 @@ class PhantomPerpsResearch:
           CREATE TABLE IF NOT EXISTS books(coin TEXT PRIMARY KEY,body TEXT NOT NULL,observed REAL NOT NULL,scenario TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS funding(coin TEXT NOT NULL,time INTEGER NOT NULL,body TEXT NOT NULL,observed REAL NOT NULL,PRIMARY KEY(coin,time));
           CREATE TABLE IF NOT EXISTS cursors(coin TEXT PRIMARY KEY,next_time INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS retained_batches(ref TEXT PRIMARY KEY,observed REAL NOT NULL);
+          CREATE TABLE IF NOT EXISTS ingestion_errors(ref TEXT NOT NULL,record_index INTEGER NOT NULL,
+            error TEXT NOT NULL,PRIMARY KEY(ref,record_index));
         """)
+        self.acquisition = PublicPerpsAcquisition(self, lambda http, payload: public_info(http, payload))
 
     def dex_names(self):
         with self.lock:
@@ -124,62 +140,110 @@ class PhantomPerpsResearch:
             row = self.db.execute("SELECT next_time FROM cursors WHERE coin=?", (coin,)).fetchone()
             return row[0] if row else 0
 
-    def ingest(self, record):
-        role, at = record["perps_role"], float(record["observed_at"])
+    def ingest_batch(self, records, source_ref):
+        """Worker-side derived transaction AFTER canonical archive acknowledgement."""
+        if not isinstance(source_ref, str) or not source_ref:
+            raise ValueError("canonical perps source reference required")
         with self.lock, self.db:
-            if role == "dex_inventory":
-                self.db.executemany("INSERT INTO dexes VALUES(?,?) ON CONFLICT(name) DO UPDATE SET observed=excluded.observed",
-                                    ((name, at) for name in record["dexes"]))
-            elif role == "collateral_inventory":
-                tokens = record["tokens"]
-                if any(type(token.get("index")) is not int for token in tokens):
-                    raise ValueError("invalid collateral token index")
-                self.db.executemany("INSERT INTO collateral_tokens VALUES(?,?,?) ON CONFLICT(token_index) DO UPDATE SET metadata=excluded.metadata,observed=excluded.observed",
-                                    ((token["index"], json.dumps(token, allow_nan=False), at) for token in tokens))
-            elif role == "catalog":
-                dex, meta, contexts = record["dex"], record["meta"], record["contexts"]
-                universe = meta["universe"]
-                if len(universe) != len(contexts) or len({m["name"] for m in universe}) != len(universe):
-                    raise ValueError("perps metadata/context alignment failed")
-                self.db.execute("INSERT INTO catalogs VALUES(?,?,?) ON CONFLICT(dex) DO UPDATE SET metadata=excluded.metadata,observed=excluded.observed",
-                                (dex, json.dumps({key:value for key,value in meta.items() if key != "universe"}, allow_nan=False), at))
-                self.db.execute("UPDATE markets SET active=0 WHERE dex=?", (dex,))
-                self.db.executemany("""INSERT INTO markets VALUES(?,?,?,?,?,?) ON CONFLICT(dex,coin) DO UPDATE SET
-                    active=excluded.active,spec=excluded.spec,context=excluded.context,observed=excluded.observed""",
-                    ((dex, market["name"], int(not market.get("isDelisted", False)),
-                      json.dumps({"asset": market, "collateral_token":meta.get("collateralToken")}, allow_nan=False),
-                      json.dumps(context, allow_nan=False), at) for market, context in zip(universe, contexts)))
-            elif role == "book":
-                coin, book = record["coin"], record["book"]
-                if book.get("coin") != coin:
-                    raise ValueError("perps book identity mismatch")
-                row = self.db.execute("SELECT spec FROM markets WHERE coin=? AND active=1", (coin,)).fetchone()
-                if row is None:
-                    raise ValueError("perps book has no observed contract")
-                spec = json.loads(row[0])
-                token = self.db.execute("SELECT metadata FROM collateral_tokens WHERE token_index=?", (spec["collateral_token"],)).fetchone()
-                token_meta = json.loads(token[0]) if token else {}
-                # Native canonical USDC is index zero; retain all other token
-                # identities without manufacturing USD-to-collateral parity.
-                verified = (type(spec["collateral_token"]) is int and spec["collateral_token"] == 0
-                            and token_meta.get("name") == "USDC" and token_meta.get("isCanonical") is True)
-                scenario = book_cost_scenario(book, spec["asset"]["szDecimals"], observed_at=at, collateral_verified=verified)
-                scenario["collateral_token_index"] = spec["collateral_token"]
-                self.db.execute("INSERT INTO books VALUES(?,?,?,?) ON CONFLICT(coin) DO UPDATE SET body=excluded.body,observed=excluded.observed,scenario=excluded.scenario",
-                                (coin, json.dumps(book, allow_nan=False), at, json.dumps(scenario, allow_nan=False)))
-            elif role == "funding":
-                coin, start, rows = record["coin"], record["start_time"], record["rows"]
-                for row in rows:
-                    if row.get("coin") != coin or type(row.get("time")) is not int or row["time"] < start:
-                        raise ValueError("perps funding identity/time mismatch")
-                self.db.executemany("INSERT OR IGNORE INTO funding VALUES(?,?,?,?)",
-                                    ((coin, row["time"], json.dumps(row, allow_nan=False), at) for row in rows))
-                if rows:
-                    next_time = max(row["time"] for row in rows) + 1
-                    self.db.execute("INSERT INTO cursors VALUES(?,?) ON CONFLICT(coin) DO UPDATE SET next_time=MAX(next_time,excluded.next_time)",
-                                    (coin, next_time))
-            else:
-                raise ValueError("unknown perps observation")
+            if self.db.execute("SELECT 1 FROM retained_batches WHERE ref=?", (source_ref,)).fetchone():
+                return
+            for index, record in enumerate(records):
+                if record.get("provider") != "hyperliquid" or record.get("product") != "perpetual":
+                    raise ValueError("foreign record in perps batch")
+                self.db.execute("SAVEPOINT perps_record")
+                try:
+                    self._ingest(record)
+                except (ValueError, TypeError, KeyError, ArithmeticError) as exc:
+                    self.db.execute("ROLLBACK TO perps_record")
+                    # Retain the canonical reference and explicit parse error;
+                    # one malformed book must not discard the successful ones.
+                    self.db.execute("INSERT INTO ingestion_errors VALUES(?,?,?)",
+                                    (source_ref, index, type(exc).__name__))
+                finally:
+                    self.db.execute("RELEASE perps_record")
+            self.db.execute("INSERT INTO retained_batches VALUES(?,?)", (source_ref, time.time()))
+
+    def ingest(self, record):
+        with self.lock, self.db:
+            self._ingest(record)
+
+    def _ingest(self, record):
+        role, at = record["perps_role"], float(record["observed_at"])
+        if not _decimal(at).is_finite() or at <= 0:
+            raise ValueError("positive finite perps observation clock required")
+        # The caller owns the single SQLite transaction, including batch ACK.
+        if role == "dex_inventory":
+            self.db.executemany("INSERT INTO dexes VALUES(?,?) ON CONFLICT(name) DO UPDATE SET observed=MAX(observed,excluded.observed)",
+                                ((name, at) for name in record["dexes"]))
+        elif role == "collateral_inventory":
+            tokens = record["tokens"]
+            if any(type(token.get("index")) is not int for token in tokens):
+                raise ValueError("invalid collateral token index")
+            self.db.executemany("INSERT INTO collateral_tokens VALUES(?,?,?) ON CONFLICT(token_index) DO UPDATE SET metadata=excluded.metadata,observed=excluded.observed WHERE excluded.observed>collateral_tokens.observed",
+                                ((token["index"], json.dumps(token, allow_nan=False), at) for token in tokens))
+        elif role == "catalog":
+            dex, meta, contexts = record["dex"], record["meta"], record["contexts"]
+            previous = self.db.execute("SELECT observed FROM catalogs WHERE dex=?", (dex,)).fetchone()
+            if previous and previous[0] >= at:
+                return
+            universe = meta["universe"]
+            if len(universe) != len(contexts) or len({m["name"] for m in universe}) != len(universe):
+                raise ValueError("perps metadata/context alignment failed")
+            self.db.execute("INSERT INTO catalogs VALUES(?,?,?) ON CONFLICT(dex) DO UPDATE SET metadata=excluded.metadata,observed=excluded.observed",
+                            (dex, json.dumps({key:value for key,value in meta.items() if key != "universe"}, allow_nan=False), at))
+            self.db.execute("UPDATE markets SET active=0 WHERE dex=?", (dex,))
+            self.db.executemany("""INSERT INTO markets VALUES(?,?,?,?,?,?) ON CONFLICT(dex,coin) DO UPDATE SET
+                active=excluded.active,spec=excluded.spec,context=excluded.context,observed=excluded.observed""",
+                ((dex, market["name"], int(not market.get("isDelisted", False)),
+                  json.dumps({"asset": market, "collateral_token":meta.get("collateralToken")}, allow_nan=False),
+                  json.dumps(context, allow_nan=False), at) for market, context in zip(universe, contexts)))
+        elif role == "book":
+            coin, book = record["coin"], record["book"]
+            if book.get("coin") != coin:
+                raise ValueError("perps book identity mismatch")
+            if type(book.get("time")) is not int or book["time"] < 0:
+                raise ValueError("perps provider book clock required")
+            if book["time"] > int(at*1000)+1000:
+                raise ValueError("future provider book cannot replace the current perps snapshot")
+            previous = self.db.execute("SELECT body,observed FROM books WHERE coin=?", (coin,)).fetchone()
+            if previous and (previous[1] >= at or json.loads(previous[0]).get("time", -1) >= book.get("time", -1)):
+                return
+            row = self.db.execute("SELECT spec FROM markets WHERE coin=? AND active=1", (coin,)).fetchone()
+            if row is None:
+                raise ValueError("perps book has no observed contract")
+            spec = json.loads(row[0])
+            token = self.db.execute("SELECT metadata FROM collateral_tokens WHERE token_index=?", (spec["collateral_token"],)).fetchone()
+            token_meta = json.loads(token[0]) if token else {}
+            # Native canonical USDC is index zero; retain all other token
+            # identities without manufacturing USD-to-collateral parity.
+            verified = (type(spec["collateral_token"]) is int and spec["collateral_token"] == 0
+                        and token_meta.get("name") == "USDC" and token_meta.get("isCanonical") is True)
+            scenario = book_cost_scenario(book, spec["asset"]["szDecimals"], observed_at=at, collateral_verified=verified)
+            scenario["collateral_token_index"] = spec["collateral_token"]
+            self.db.execute("INSERT INTO books VALUES(?,?,?,?) ON CONFLICT(coin) DO UPDATE SET body=excluded.body,observed=excluded.observed,scenario=excluded.scenario",
+                            (coin, json.dumps(book, allow_nan=False), at, json.dumps(scenario, allow_nan=False)))
+        elif role == "funding":
+            coin, start, rows = record["coin"], record["start_time"], record["rows"]
+            if type(start) is not int or start < 0:
+                raise ValueError("invalid funding history cursor")
+            for row in rows:
+                if row.get("coin") != coin or type(row.get("time")) is not int or not start <= row["time"] <= at*1000:
+                    raise ValueError("perps funding identity/time mismatch")
+                previous = self.db.execute("SELECT body FROM funding WHERE coin=? AND time=?", (coin, row["time"])).fetchone()
+                if previous and json.loads(previous[0]) != row:
+                    raise ValueError("conflicting immutable perps funding observation")
+            self.db.executemany("INSERT OR IGNORE INTO funding VALUES(?,?,?,?)",
+                                ((coin, row["time"], json.dumps(row, allow_nan=False), at) for row in rows))
+            if rows:
+                next_time = max(row["time"] for row in rows) + 1
+                self.db.execute("INSERT INTO cursors VALUES(?,?) ON CONFLICT(coin) DO UPDATE SET next_time=MAX(next_time,excluded.next_time)",
+                                (coin, next_time))
+        elif role == "request_error":
+            # An explicit retained HTTP failure is not a book or zero value.
+            if record.get("request_role") != "book" or not record.get("error"):
+                raise ValueError("invalid perps acquisition failure")
+        else:
+            raise ValueError("unknown perps observation")
 
     def report(self):
         with self.lock:
@@ -189,12 +253,22 @@ class PhantomPerpsResearch:
             funding = self.db.execute("SELECT count(*) FROM funding").fetchone()[0]
             examples = [{"coin":row[0], "observed_at":row[2], **json.loads(row[1])} for row in self.db.execute(
                 "SELECT coin,scenario,observed FROM books ORDER BY observed DESC LIMIT 5")]
+            now = time.time()
+            fresh = self.db.execute("SELECT count(*) FROM books b WHERE b.observed>=? AND "
+                "json_extract(b.body,'$.time') BETWEEN ? AND ? AND EXISTS "
+                "(SELECT 1 FROM markets m WHERE m.coin=b.coin AND m.active=1)",
+                (now-10, int((now-10)*1000), int(now*1000))).fetchone()[0]
+            batches = self.db.execute("SELECT count(*) FROM retained_batches").fetchone()[0]
+            errors = self.db.execute("SELECT count(*) FROM ingestion_errors").fetchone()[0]
         return {"status": "PUBLIC_MARKET_RESEARCH" if markets[0] else "NOT_OBSERVED",
             "underlying_venue": "Hyperliquid", "phantom_reference": PHANTOM_REFERENCE,
             "discovered_dexes": dexes, "observed_catalog_dexes": markets[2], "active_markets": markets[0],
             "last_catalog_observed_at": markets[1], "books_recorded": books[0], "last_book_observed_at": books[1],
             "funding_records": funding, "funding_backfill_complete": False,
             "latest_cost_examples": examples,
+            "fresh_active_books": fresh, "book_freshness_window_seconds":10,
+            "canonical_batches_indexed":batches, "acquisition":self.acquisition.report(now),
+            "derived_record_errors":errors, "derived_error_archive":"ingestion_errors; original records in canonical batch",
             "phantom_listing_verified_by_market": False, "live_eligibility": "UNVERIFIED",
             "execution_authority": False, "real_fills": 0, "simulated_strategy_fills": 0,
             "paper_scope": "static displayed-book cost scenarios; no strategy positions or fills",
@@ -202,8 +276,6 @@ class PhantomPerpsResearch:
 
     def register(self, pool, http):
         select_dex = rotating_selector(self.dex_names, 1)
-        select_book = rotating_selector(self.market_names, 1)
-        select_funding = rotating_selector(self.market_names, 1)
         inventory_due = 0.0
         collateral_due = 0.0
         def observation(role, **fields):
@@ -212,34 +284,39 @@ class PhantomPerpsResearch:
         async def catalog():
             nonlocal inventory_due, collateral_due
             if time.monotonic() >= inventory_due:
-                raw = await public_info(http, {"type": "perpDexs"})
+                raw = await self.acquisition.fetch(http, {"type": "perpDexs"}, role="catalog", target="dex_inventory")
+                if raw is None: return []
                 if not isinstance(raw, list) or any(row is not None and
                         (not isinstance(row, dict) or not isinstance(row.get("name"), str)) for row in raw):
                     raise ValueError("invalid perpetual DEX inventory")
                 inventory_due = time.monotonic() + 900
                 return [observation("dex_inventory", dexes=["", *[r["name"] for r in raw if r is not None]])]
             if time.monotonic() >= collateral_due:
-                raw = await public_info(http, {"type":"spotMeta"})
+                raw = await self.acquisition.fetch(http, {"type":"spotMeta"}, role="catalog", target="collateral_inventory")
+                if raw is None: return []
                 if not isinstance(raw, dict) or not isinstance(raw.get("tokens"), list):
                     raise ValueError("invalid collateral inventory")
                 collateral_due = time.monotonic() + 900
                 return [observation("collateral_inventory", tokens=raw["tokens"])]
             dex_key = select_dex()[0]
             dex = "" if dex_key == "native" else dex_key[4:]
-            meta, contexts = await public_info(http, {"type": "metaAndAssetCtxs", "dex": dex})
+            raw = await self.acquisition.fetch(http, {"type": "metaAndAssetCtxs", "dex": dex}, role="catalog", target=dex_key)
+            if raw is None: return []
+            meta, contexts = raw
             return [observation("catalog", dex=dex, meta=meta, contexts=contexts)]
         async def book():
-            return [observation("book", coin=coin, book=await public_info(http, {"type": "l2Book", "coin": coin})) for coin in select_book()]
+            return await self.acquisition.books(http, observation)
         async def funding():
             rows = []
-            for coin in select_funding():
+            for coin in self.acquisition.targets("funding", 1):
                 start = self.next_funding(coin)
-                values = await public_info(http, {"type": "fundingHistory", "coin": coin, "startTime": start})
+                values = await self.acquisition.fetch(http, {"type": "fundingHistory", "coin": coin, "startTime": start}, role="funding", target=coin)
+                if values is None: continue
                 rows.append(observation("funding", coin=coin, start_time=start, rows=values))
             return rows
         return {spec.miner_id: pool.register(spec, fetch) for spec, fetch in (
             (MinerSpec("perps:catalog", Enriches.MARKET_CONTEXT, 15, endpoint=INFO, detail="underlying full perp DEX inventory and rotating catalogs"), catalog),
-            (MinerSpec("perps:books", Enriches.VENUE_LIQUIDITY, 5, endpoint=INFO, detail="all retained markets rotate; recorded depth and static cost scenarios"), book),
+            (MinerSpec("perps:books", Enriches.VENUE_LIQUIDITY, 5, endpoint=INFO, detail="fair adaptive public book batches; shared durable provider budget and cooldown"), book),
             (MinerSpec("perps:funding", Enriches.EXECUTION_CONDITIONS, 60, endpoint=INFO, detail="resumable provider-available funding history; no invented cashflows"), funding))}
 
     def close(self):

@@ -36,8 +36,10 @@ pointed at the same provider is a second thing to get rate limited.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
+from src.chains.rpc_manager import RPCError
 
 from src.research.data_miners import (
     CADENCE_FAST, CADENCE_MINUTE, CADENCE_QUARTER, CADENCE_REALTIME,
@@ -271,32 +273,46 @@ def account_balance_miner(rpc: Any, accounts: Callable[[], Sequence[str]],
     sharply is it having exited something.
     """
     select_accounts = rotating_selector(accounts, per_pass)
+    batch_limit, learned_at = 100, 0.0
     async def fetch() -> List[Dict[str, Any]]:
+        nonlocal batch_limit, learned_at
         watched = select_accounts()
         if not watched:
             return []
-        result = await rpc.request(
-            "getMultipleAccounts",
-            [watched, {"commitment": "confirmed", "encoding": "base64"}])
-        values = (result or {}).get("value") or []
+        if time.time()-learned_at >= 3600:
+            batch_limit = 100  # periodic larger proof can release a past provider bound
+        offset = 0
         records: List[Dict[str, Any]] = []
-        for address, value in zip(watched, values):
-            if value is None:
-                # The account does not exist on chain. That is a real reading
-                # -- a funder that has been emptied and closed -- and is not
-                # the same as a balance of zero on a live account.
-                records.append({"address": address, "exists": False,
-                                "data_status": "OK"})
+        while offset < len(watched):
+            chunk = watched[offset:offset+batch_limit]
+            try:
+                result = await rpc.request("getMultipleAccounts",
+                    [chunk, {"commitment":"confirmed", "encoding":"base64"}])
+            except RPCError as exc:
+                error = exc.error if isinstance(exc.error, dict) else {}
+                match = re.search(r'\bmaximum\s+of\s+(\d+)\s+accounts?\b', str(error.get('message','')), re.I)
+                limit = int(match[1]) if match and error.get('code') == -32602 else 0
+                if not 0 < limit < len(chunk):
+                    raise  # never split rate limits, auth failures or unknown RPC errors
+                batch_limit, learned_at = limit, time.time()
                 continue
-            records.append({
-                "address": address,
-                "exists": True,
-                "lamports": float(value.get("lamports", 0) or 0),
-                "sol": float(value.get("lamports", 0) or 0) / LAMPORTS_PER_SOL,
-                "owner": value.get("owner"),
-                "executable": bool(value.get("executable")),
-                "data_status": "OK",
-            })
+            values = (result or {}).get('value')
+            if not isinstance(values,list) or len(values) != len(chunk):
+                raise ValueError('native balance response/address alignment failed')
+            at = time.time()
+            slot = (result.get('context') or {}).get('slot')
+            for address, value in zip(chunk, values):
+                provenance = {'observed_at':at, 'rpc_context_slot':slot, 'data_status':'OK'}
+                if value is None:
+                    records.append({'address':address, 'exists':False, **provenance})
+                    continue
+                lamports = value.get('lamports') if isinstance(value,dict) else None
+                if type(lamports) is not int or lamports < 0:
+                    raise ValueError('native lamport balance is not an observed nonnegative integer')
+                records.append({'address':address, 'exists':True, 'lamports':lamports,
+                    'sol':lamports/LAMPORTS_PER_SOL, 'owner':value.get('owner'),
+                    'executable':bool(value.get('executable')), **provenance})
+            offset += len(chunk)
         return records
 
     return fetch
