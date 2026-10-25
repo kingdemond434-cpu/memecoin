@@ -66,7 +66,7 @@ contracts. Empty/delisted-only catalog responses remain in the `catalogs`
 table and raw archive; that active count alone cannot prove every catalog was
 visited or that collection is complete.
 
-## Cost scenarios, not manufactured trades
+## Static costs and causal forward controls
 
 Each valid recent book produces a Decimal-based depth walk for a minimum-size
 notional probe, with quantity rounded to the observed contract precision.
@@ -80,11 +80,22 @@ USDC cost scenarios require observed canonical USDC collateral metadata. Other
 collateral IDs remain explicit and blocked for that scenario rather than
 assigned an invented 1:1 USDC conversion.
 
-These observations do not open positions, manufacture strategy fills, transfer
-collateral, fit a directional model or certify P&L/edge. Both real and simulated
-strategy fill counts remain zero. Margin/liquidation execution, authorized
-account fees and a complete perpetuals paper position engine remain separate
-work. World native prediction-market records remain separate and unchanged.
+The [perps paper ledger](PERPS_PAPER_LEDGER.md) now opens explicitly synthetic
+long/short execution controls using only future observed books. It accounts for
+position cost, fees, partial IOC fills, margin, hourly funding liabilities and
+observed liquidation/backstop scenarios. `simulated_control_fills` is separate
+from real fills and validated strategy fills, which remain zero. These are
+independent test accounts, not a pooled portfolio or a demonstrated trading
+edge. Authorized account fees and exact billing oracles remain unverified.
+World native prediction-market records remain separate and unchanged.
+
+Public keyed WebSocket snapshots supplement REST books/catalogs. One bounded
+connection per pass samples `fastAssetCtxs` and a fair rotating group of
+`activeAssetCtx` contracts. Frames enter the canonical archive before paper
+state. Missing fields never refresh another value's clock, and mark-only
+frames never manufacture fresh oracle prices. Connection/subscription budgets
+survive restart. This is sampled receipt-time evidence, not continuous
+exchange event-time capture or an executable quotation.
 
 ## Primary protocol references
 
