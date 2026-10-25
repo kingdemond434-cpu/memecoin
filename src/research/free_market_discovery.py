@@ -146,7 +146,11 @@ class FreeMarketDiscovery:
             pacing = self.db.execute("SELECT next_at FROM pacing WHERE id=1").fetchone()
             if pacing and pacing[0] > now:
                 return []
-            job = self.db.execute("SELECT role,network,page FROM jobs WHERE due<=? ORDER BY CASE WHEN role='networks' THEN 0 ELSE 1 END,due,last_served,role,network LIMIT 1", (now,)).fetchone()
+            # Alternate source roles as well as networks. Hundreds of cold
+            # DEX-directory jobs must not precede every fresh-pool page just
+            # because their role sorts first. Preserve reviewed network-page
+            # traversal priority and canonical ACK before cursor advancement.
+            job = self.db.execute("SELECT j.role,j.network,j.page FROM jobs j JOIN (SELECT role,max(last_served) AS served FROM jobs GROUP BY role) r ON j.role=r.role WHERE j.due<=? ORDER BY CASE WHEN j.role='networks' THEN 0 ELSE 1 END,r.served,j.due,j.last_served,j.role,j.network LIMIT 1", (now,)).fetchone()
             if not job:
                 return []
             with self.db:

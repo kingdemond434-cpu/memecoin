@@ -50,3 +50,13 @@ request-shape feedback is used; 429/cooldowns never trigger split retries.
 This is an example of a protocol maximum differing from free-provider access.
 
 Protocol reference: https://solana.com/docs/rpc/http/getmultipleaccounts
+
+## Global index fairness
+
+The expanding provider index admitted every network, but equal-age job sorting
+put hundreds of DEX-directory requests ahead of fresh/trending pool requests.
+Selection now alternates the eligible roles by their last actual service, then
+serves the oldest eligible network within a role. Network enumeration still
+advances reviewed pages, with canonical acknowledgement before cursor updates.
+Source admission and provider pacing remain unchanged. A regression checks that
+all three market roles get service during a multi-region cold-directory backlog.
