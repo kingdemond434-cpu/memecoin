@@ -11,6 +11,7 @@ from src.research.phantom_predictions import PhantomResearchStore
 from src.research.world_native import (NativeWorldCensus, CASH_MINT, PROGRAM_CANDIDATE,
     MARKET_DISCRIMINATOR, TOKEN_2022_PROGRAM, decode_market_candidate, verify_market_relations)
 from src.runtime.market_gateway import make_app
+from src.chains.rpc_manager import RPCError
 
 
 def key(n):
@@ -79,6 +80,46 @@ class NativeLayoutTests(unittest.TestCase):
 
 
 class NativeCensusTests(unittest.IsolatedAsyncioTestCase):
+    async def test_explicit_small_provider_limit_keeps_complete_relationship_frames(self):
+        fixtures=[fixture(n) for n in range(1,12)]
+        accounts={k:v for _,group in fixtures for k,v in group.items()}
+        class RPC:
+            sizes=[]
+            async def request(self,method,params):
+                if method=='getProgramAccounts': return {'context':{'slot':123},'value':[row for row,_ in fixtures]}
+                self.sizes.append(len(params[0]))
+                if len(params[0])>10: raise RPCError({'code':-32602,'message':'maximum of 10 accounts'})
+                return {'context':{'slot':124},'value':[accounts.get(k) for k in params[0]]}
+        with tempfile.TemporaryDirectory() as temp:
+            store=PhantomResearchStore(Path(temp)/'native.sqlite')
+            try:
+                rpc=RPC();census=NativeWorldCensus(store)
+                await census.poll(rpc)
+                self.assertEqual(11,census.report()['by_relationship_status']['CONSISTENT_NATIVE_RELATIONSHIPS'])
+                self.assertEqual([34,10,10,10,7],rpc.sizes)
+                restored=NativeWorldCensus(store)
+                self.assertEqual(10,restored.state['account_batch_limit'])
+                self.assertEqual(1,store.db.execute("SELECT count(*) FROM events WHERE kind='world_rpc_account_capacity'").fetchone()[0])
+                self.assertFalse(restored.report()['firm_quotes_available'])
+            finally: store.close()
+
+    async def test_rate_limit_cannot_trigger_split_retry_or_remove_pending_candidates(self):
+        row,accounts=fixture()
+        class RPC:
+            calls=0
+            async def request(self,method,params):
+                if method=='getProgramAccounts': return {'context':{'slot':123},'value':[row]}
+                self.calls+=1
+                raise RPCError({'code':429,'message':'maximum of 10 accounts, rate limited'})
+        with tempfile.TemporaryDirectory() as temp:
+            store=PhantomResearchStore(Path(temp)/'native.sqlite')
+            try:
+                rpc=RPC();census=NativeWorldCensus(store);await census.poll(rpc)
+                self.assertEqual(1,rpc.calls)
+                self.assertEqual({'PENDING':1},census.report()['by_relationship_status'])
+                self.assertNotIn('account_batch_limit',census.state)
+            finally: store.close()
+
     async def test_all_batches_resume_after_failure_without_resetting_pending(self):
         fixtures=[fixture(n) for n in range(1,71)]
         accounts={k:v for _,group in fixtures for k,v in group.items()}
