@@ -7,5 +7,7 @@ Dockerfile text eol=lf
 deploy/tor/torrc text eol=lf
 dashboard/wallet/wallet.js -whitespace linguist-generated=true
 idl/raydium_launchlab.json -text
+idl/meteora_dbc.json -text
+idl/METEORA_SDK_LICENSE -text
 idl/licenses/CHAINSTACK-APACHE-2.0.txt -text
 tests/fixtures/launchlab_launches.json -text

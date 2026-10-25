@@ -392,6 +392,8 @@ class SolanaRpcProgramStream:
         self._ws = None
         self._ws_connected = False
         self._ws_reconnects = 0
+        self._pending_fetches = {}
+        self._fetch_coalesced = 0
         self.status = "NOT_STARTED"
         self.status_detail = ""
 
@@ -418,6 +420,11 @@ class SolanaRpcProgramStream:
                     await task
                 except asyncio.CancelledError:
                     pass
+        pending = tuple(self._pending_fetches.values())
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def _loop(self):
         while self._running:
@@ -496,7 +503,7 @@ class SolanaRpcProgramStream:
                             })
                         if program not in {PumpFunMonitor.PUMP_FUN_PROGRAM, PumpSwapMonitor.PUMP_AMM_PROGRAM}:
                             if self._looks_like_pool_creation(logs):
-                                asyncio.create_task(self._fetch_confirmed_transaction(signature))
+                                self._schedule_confirmed_transaction(signature)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -514,6 +521,21 @@ class SolanaRpcProgramStream:
             result = handler(data)
             if asyncio.iscoroutine(result):
                 await result
+
+    def _schedule_confirmed_transaction(self, signature):
+        if not signature or signature in self._seen:
+            return False
+        if signature in self._pending_fetches:
+            self._fetch_coalesced += 1
+            return False
+        task = asyncio.create_task(self._fetch_confirmed_transaction(signature))
+        self._pending_fetches[signature] = task
+        def completed(value):
+            self._pending_fetches.pop(signature, None)
+            if not value.cancelled() and value.exception() is not None:
+                logger.warning('confirmed launch fetch failed: %s', type(value.exception()).__name__)
+        task.add_done_callback(completed)
+        return True
 
     async def _fetch_confirmed_transaction(self, signature: str):
         if not signature or signature in self._seen:
@@ -545,6 +567,8 @@ class SolanaRpcProgramStream:
             "initializepermissionlessconstantproductpoolwithconfig",
             "initializepermissionlessconstantproductpoolwithconfig2",
             "initializecustomizablepermissionlessconstantproductpool",
+            "initializevirtualpoolwithspltoken", "initializevirtualpoolwithtoken2022",
+            "initializevirtualpoolwithtoken2022transferhook",
         }
         for line in logs:
             if not isinstance(line, str) or "Instruction:" not in line:
@@ -571,15 +595,16 @@ class SolanaRpcProgramStream:
                     continue
                 for item in reversed(signatures or []):
                     signature = item.get("signature")
-                    if not signature or signature in self._seen or item.get("err") is not None:
+                    if (not signature or signature in self._seen or signature in self._pending_fetches
+                            or item.get("err") is not None):
                         continue
-                    self._seen.add(signature)
                     transaction = await self.rpc.request(
                         "getTransaction",
                         [signature, {"encoding": "json", "commitment": "confirmed",
                                      "maxSupportedTransactionVersion": 1}],
                     )
                     if transaction:
+                        self._seen.add(signature)
                         for handler in self._handlers.get("transaction", []):
                             result = handler(transaction)
                             if asyncio.iscoroutine(result):
@@ -593,8 +618,10 @@ class SolanaRpcProgramStream:
             raise RuntimeError(f"all {len(self.programs)} program polls failed")
         return successes, failures
 
-    def get_status(self) -> Dict[str, str]:
-        return {"status": self.status, "detail": self.status_detail}
+    def get_status(self) -> Dict[str, Any]:
+        return {"status": self.status, "detail": self.status_detail,
+                "pending_confirmation_fetches": len(self._pending_fetches),
+                "duplicate_confirmation_fetches_avoided": self._fetch_coalesced}
 
 
 def _json_transaction_parts(tx_data: Dict[str, Any]) -> Tuple[List[str], List[Dict[str, Any]], str, int]:
@@ -1747,6 +1774,7 @@ class RaydiumMonitor:
 
 def create_combined_subscription() -> SubscribeRequest:
     from src.chains.launchlab import LAUNCHLAB_PROGRAM
+    from src.chains.meteora_dbc import DBC_PROGRAM
     programs = [
         PumpFunMonitor.PUMP_FUN_PROGRAM,
         PumpSwapMonitor.PUMP_AMM_PROGRAM,
@@ -1757,6 +1785,7 @@ def create_combined_subscription() -> SubscribeRequest:
         RaydiumMonitor.METEORA_DYNAMIC_AMM,
         RaydiumMonitor.ORCA_WHIRLPOOL,
         LAUNCHLAB_PROGRAM,
+        DBC_PROGRAM,
     ]
     return SubscribeRequest(
         transactions={

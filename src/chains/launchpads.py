@@ -347,6 +347,9 @@ def default_specs() -> List[LaunchpadSpec]:
     launchlab = load_idl("raydium_launchlab")
     launchlab_create = next(row for row in launchlab["instructions"] if row["name"] == "initialize_v2")
     launchlab_positions = {row["name"]: index for index, row in enumerate(launchlab_create["accounts"])}
+    dbc = load_idl("meteora_dbc")
+    dbc_create = next(row for row in dbc["instructions"] if row["name"] == "initialize_virtual_pool_with_spl_token")
+    dbc_positions = {row["name"]: index for index, row in enumerate(dbc_create["accounts"])}
     return [
         LaunchpadSpec(
             name="pump.fun", program_id=pump["address"],
@@ -372,9 +375,15 @@ def default_specs() -> List[LaunchpadSpec]:
         LaunchpadSpec(
             name="meteora_dbc", program_id="dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN",
             create_instructions=("initialize_virtual_pool_with_spl_token",
-                                 "initialize_virtual_pool_with_token2022"),
-            mint_account_index=None,
-            note="Dynamic Bonding Curve; native layout UNKNOWN until reviewed"),
+                                 "initialize_virtual_pool_with_token2022",
+                                 "initialize_virtual_pool_with_token2022_transfer_hook"),
+            mint_account_index=dbc_positions["base_mint"], creator_account_index=dbc_positions["creator"],
+            layout_verified=True, protocol_version="dynamic_bonding_curve-" + dbc["metadata"]["version"],
+            source_ref="https://github.com/MeteoraAg/dynamic-bonding-curve-sdk/tree/3a965ec0c0a527c2be3c48b8b479366705bf4926",
+            idl_ref="idl/meteora_dbc.json", verification_provenance="docs/METEORA_DBC_DISCOVERY.md",
+            fixture_refs=("tests/fixtures/meteora_dbc_launches.json",), decoder_parity=True,
+            execution_support="DATA_BLOCKED_NATIVE_CURVE_EXECUTION",
+            note="reviewed SDK IDL and public native SPL fixture; Token-2022/hook layouts additionally schema-tested"),
         LaunchpadSpec(
             name="moonshot", program_id="MoonCVVNZFSYkqNXP6bxHLPL6QQJiMagDL3qcqUQTrG",
             create_instructions=("tokenMint",), mint_account_index=None,
