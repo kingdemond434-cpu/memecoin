@@ -7,11 +7,13 @@ import asyncio
 import base64
 import hashlib
 import json
+import re
 import struct
 import time
 
 from solders.pubkey import Pubkey
 from src.detection.rug_detector import RugDetector, TOKEN_2022_PROGRAM
+from src.chains.rpc_manager import RPCError
 
 PROGRAM_CANDIDATE = 'prediCtPZCttYMvm2W3PtxmMxLmT1dtN7riU6Cxh6tM'
 PROGRAM_SOURCE = 'https://github.com/chainstacklabs/world-xyz-research'
@@ -173,16 +175,34 @@ class NativeWorldCensus:
                 self._save()
             slot = self.state.get('census_slot')
             if slot is None: return
+            account_limit = (100 if time.time()-self.state.get('account_limit_observed_at',0)>=3600
+                             else self.state.get('account_batch_limit',100))
             while True:
                 # 33 relationships fit the RPC protocol's 100-account batch;
                 # no total-market ceiling or fixed target prefix is imposed.
-                rows = self.store.db.execute("SELECT market,payload FROM native_world_markets WHERE census_slot=? AND proof_status='PENDING' ORDER BY market LIMIT 33", (slot,)).fetchall()
+                candidate_quantum = max(1,(account_limit-1)//3)
+                rows = self.store.db.execute("SELECT market,payload FROM native_world_markets WHERE census_slot=? AND proof_status='PENDING' ORDER BY market LIMIT ?", (slot,candidate_quantum)).fetchall()
                 if not rows: break
                 candidates = [json.loads(row['payload']) for row in rows]
                 keys = list(dict.fromkeys([CASH_MINT, *[c[key] for c in candidates for key in ('yes_mint','no_mint','cash_vault')]]))
-                response = await rpc.request('getMultipleAccounts', [keys, {'encoding':'base64','commitment':'finalized','minContextSlot':slot}])
+                try:
+                    response = await rpc.request('getMultipleAccounts', [keys, {'encoding':'base64','commitment':'finalized','minContextSlot':slot}])
+                except RPCError as exc:
+                    error = exc.error if isinstance(exc.error,dict) else {}
+                    match = re.search(r'\bmaximum\s+of\s+(\d+)\s+accounts?\b',str(error.get('message','')),re.I)
+                    limit = int(match[1]) if match and error.get('code') == -32602 else 0
+                    if not 4 <= limit < len(keys):
+                        raise  # rate/auth failures never become split retries
+                    account_limit = limit
+                    self.state.update(account_batch_limit=limit,account_limit_observed_at=time.time())
+                    self.store.event('world_rpc_account_capacity', {'account_limit':limit,'observed_at':time.time(),
+                        'error_code':-32602,'trade_authority':False})
+                    self._save()
+                    continue  # same pending markets, smaller complete frames
                 observed_slot, values = _frame(response, minimum_slot=slot)
                 if len(keys) != len(values): raise ValueError('native account response alignment mismatch')
+                if len(keys)>self.state.get('account_batch_limit',100):
+                    self.state.update(account_batch_limit=100,account_limit_observed_at=time.time())
                 accounts = dict(zip(keys, values))
                 self.store.event('world_native_relationship_frame', {'keys': keys, 'response': response,
                     'census_slot': slot, 'observed_at': time.time(), 'trade_authority': False})

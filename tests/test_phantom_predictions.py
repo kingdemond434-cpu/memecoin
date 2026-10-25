@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from aiohttp.test_utils import TestClient, TestServer
-from src.research.phantom_predictions import PhantomPredictions, PhantomResearchStore, CATALOG, LOADER, native_program_observation, documented_phantom_fee
+from src.research.phantom_predictions import PhantomPredictions, PhantomResearchStore, CATALOG, LOADER, native_program_observation, documented_phantom_fee, _configured_world_rpc
 from src.research.prediction_markets import PaperBroker
 from src.runtime.market_gateway import make_app
 
@@ -17,6 +17,25 @@ def program():
 
 
 class NativeEvidenceTests(unittest.TestCase):
+    def test_keyless_rpc_survives_absent_helius_and_demo_credentials_are_excluded(self):
+        from urllib.parse import urlsplit
+        with patch.dict('os.environ',{},clear=True):
+            rpc = _configured_world_rpc()
+        hosts = {urlsplit(ep.endpoint.url).hostname for ep in rpc.endpoints}
+        self.assertIn('solana-rpc.publicnode.com',hosts)
+        self.assertIn('api.mainnet-beta.solana.com',hosts)
+        self.assertNotIn('mainnet.helius-rpc.com',hosts)
+        self.assertNotIn('solana.leorpc.com',hosts)
+        self.assertTrue(all('${' not in ep.endpoint.url for ep in rpc.endpoints))
+
+    def test_owner_rpc_remains_in_same_pool_with_keyless_fallback(self):
+        from urllib.parse import urlsplit
+        with patch.dict('os.environ',{'HELIUS_API_KEY':'test-only-owner-value'},clear=True):
+            rpc = _configured_world_rpc()
+        hosts = {urlsplit(ep.endpoint.url).hostname for ep in rpc.endpoints}
+        self.assertIn('mainnet.helius-rpc.com',hosts)
+        self.assertIn('solana-rpc.publicnode.com',hosts)
+
     def test_program_presence_never_claims_verified_market_or_trade_authority(self):
         proof = native_program_observation(program())
         self.assertTrue(proof['executable_observed'])

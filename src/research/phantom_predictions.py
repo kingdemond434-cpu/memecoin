@@ -9,16 +9,15 @@ import asyncio
 import base64
 import hashlib
 import json
-import os
 import sqlite3
 import time
 from decimal import Decimal
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import parse_qsl, urlsplit
 
 import aiohttp
 
-from src.chains.rpc_manager import ChainConfig, ChainType, RPCEndpointConfig, RPCManager
+from src.chains.rpc_manager import ChainRegistry, RPCManager
 from src.research import world_native
 
 SUPPORT = 'https://help.phantom.com/articles/trade-predictions-in-phantom-47187740851731'
@@ -31,6 +30,22 @@ CATALOG = 'https://markets-api-proxy.world-xyz.workers.dev/api/v1/events'
 PROGRAM_CANDIDATE = world_native.PROGRAM_CANDIDATE
 PROGRAM_SOURCE = world_native.PROGRAM_SOURCE
 LOADER = 'BPFLoaderUpgradeab1e11111111111111111111111'
+
+
+def _configured_world_rpc(config_path=None):
+    """Reuse the reviewed Solana pool, including keyless repair endpoints."""
+    path = config_path or Path(__file__).resolve().parents[2]/'config/chains.yaml'
+    chain = ChainRegistry(str(path)).get_chain('solana')
+    if chain is None:
+        raise ValueError('Solana RPC configuration required for World research')
+    # Public/demo credentials are not owner authorization. Plain keyless
+    # endpoints and configured owner credentials still participate in failover.
+    chain.rpc_endpoints = [ep for ep in chain.rpc_endpoints if not any(
+        key.lower() in {'api_key','apikey','api-key','key'} and value.lower() in {'free','demo'}
+        for key,value in parse_qsl(urlsplit(ep.url).query))]
+    if not chain.rpc_endpoints:
+        raise ValueError('no configured owner-authorized or keyless Solana RPC endpoint')
+    return RPCManager(chain)
 
 
 class PhantomResearchStore:
@@ -144,13 +159,7 @@ class PhantomPredictions:
         self.cycles += 1
 
     async def run(self):
-        rpc = None
-        key = os.getenv('HELIUS_API_KEY', '').strip()
-        if key:
-            endpoint = RPCEndpointConfig('https://mainnet.helius-rpc.com/?api-key='+quote(key, safe=''))
-            rpc = RPCManager(ChainConfig(name='Solana World public research', chain_id='solana', chain_type=ChainType.SOLANA,
-                rpc_endpoints=[endpoint], explorer_api='', explorer_key='', native_token='SOL', decimals=9,
-                block_time=.4, factories={}, routers={}, base_tokens=[], min_liquidity_usd=0, max_tax=0, honeypot_check=False))
+        rpc = _configured_world_rpc()
         try:
             if rpc: await rpc.start()
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12), headers={'User-Agent': 'MemecoinPhantomResearch/1.0'}) as session:
