@@ -203,6 +203,8 @@ class PhantomPerpsResearch:
                 raise ValueError("perps book identity mismatch")
             if type(book.get("time")) is not int or book["time"] < 0:
                 raise ValueError("perps provider book clock required")
+            if book["time"] > int(at*1000)+1000:
+                raise ValueError("future provider book cannot replace the current perps snapshot")
             previous = self.db.execute("SELECT body,observed FROM books WHERE coin=?", (coin,)).fetchone()
             if previous and (previous[1] >= at or json.loads(previous[0]).get("time", -1) >= book.get("time", -1)):
                 return

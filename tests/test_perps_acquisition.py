@@ -173,6 +173,9 @@ def test_old_catalog_collateral_and_books_never_rewind_current_view(tmp_path):
     state.ingest(observation('book',coin='BTC',book=book(now)))
     state.ingest(observation('book',coin='BTC',book=book(now-1)))
     assert json.loads(state.db.execute('SELECT body FROM books').fetchone()[0])['time'] == int(now*1000)
+    with pytest.raises(ValueError):
+        state.ingest(observation('book',coin='BTC',book=book(now+86400)))
+    assert json.loads(state.db.execute('SELECT body FROM books').fetchone()[0])['time'] == int(now*1000)
     assert state.report()['fresh_active_books'] == 1
     state.close()
 
