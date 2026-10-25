@@ -83,6 +83,27 @@ def test_pagination_never_becomes_an_arbitrary_fetch_or_repeated_page(target):
         free.next_page({'data': [], 'links': {'next': target}}, free.page_url('networks', '', 1), 1)
 
 
+@pytest.mark.asyncio
+async def test_global_directory_backlog_cannot_starve_fresh_and_trending_pool_roles(tmp_path, monkeypatch):
+    now = [1_000_000.]
+    monkeypatch.setattr(free.time, 'time', lambda: now[0])
+    book = free.FreeMarketDiscovery(tmp_path/'fair.sqlite')
+    with book.db:
+        book.db.execute('DELETE FROM jobs')
+        for network in ('asia', 'africa', 'europe', 'americas'):
+            for role in ('dexes', 'new_pools', 'trending_pools'):
+                book.db.execute('INSERT INTO jobs(role,network,page,due) VALUES(?,?,1,0)', (role,network))
+    selected = []
+    for index in range(6):
+        rows = await book.fetch(client({'data': []}))
+        selected.append(rows[0]['role'])
+        book.acknowledge(rows, 'canonical:fair-'+str(index))
+        now[0] += 20
+    assert set(selected[:3]) == {'dexes', 'new_pools', 'trending_pools'}
+    assert set(selected[3:]) == {'dexes', 'new_pools', 'trending_pools'}
+    book.close()
+
+
 def test_cross_chain_tokens_keep_exact_prefix_semantics_and_unknown_values():
     page = {'role': 'new_pools', 'http_status': 200, 'network': 'new_chain',
         'observed_at': 50, 'source_url': 'fixture', 'digest': 'd', 'payload': {'data': [pool()]}}

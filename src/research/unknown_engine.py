@@ -299,6 +299,20 @@ class UnknownOpportunityEngine:
             self.last_proposal_round = {"status": "DATA_BLOCKED",
                 "reason": "no configured provider runner or public training facts", "authority": "none"}
             return self.last_proposal_round
+        configuration = getattr(self.proposal_runner, "configuration_report", None)
+        if callable(configuration):
+            providers = configuration().get("providers", [])
+            if not any(row.get("status") in {"CONFIGURED_NOT_AUTHENTICATED", "CUSTOM_ADAPTER_UNVERIFIED"}
+                       for row in providers):
+                # A disabled/unconfigured provider cannot propose. In particular,
+                # do not re-hash the entire canonical ledger on a worker thread
+                # merely to discover that no request can ever start. Real rounds
+                # still use the runner's full verification and sealed retries.
+                self.last_proposal_round = {"status": "DATA_BLOCKED", "authority": "none",
+                    "reason": "no locally configured proposal provider; round not started",
+                    "providers": providers, "proposals": [], "experiment_requests": [],
+                    "network_requests": 0, "evidence_scan_started": False}
+                return self.last_proposal_round
         facts = list(self.training_facts)
         # A new hourly round is a new attributable, budgeted experiment. The
         # runner itself reuses sealed retries with the same stable identity.

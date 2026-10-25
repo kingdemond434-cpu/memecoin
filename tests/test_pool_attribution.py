@@ -13,11 +13,11 @@ from src.research.pool_attribution import PoolAttribution, bind_trade, mint_deci
 POOL, BASE = str(Pubkey(bytes([7])*32)), str(Pubkey(bytes([8])*32))
 
 
-def account():
+def account(base=BASE):
     body = bytearray(POOL_DISCRIMINATOR)
     for name, width, kind in _POOL_LAYOUT:
         if kind == 'pubkey':
-            body.extend(bytes(Pubkey.from_string(BASE if name == 'base_mint' else WSOL_MINT if name == 'quote_mint' else str(Pubkey(bytes([9])*32)))))
+            body.extend(bytes(Pubkey.from_string(base if name == 'base_mint' else WSOL_MINT if name == 'quote_mint' else str(Pubkey(bytes([9])*32)))))
         else:
             body.extend(bytes(width))
     return {'owner': PUMPSWAP_PROGRAM, 'data': [base64.b64encode(body).decode(), 'base64']}
@@ -139,6 +139,107 @@ def test_mint_owner_layout_and_initialization_are_checked():
     bad = mint()
     bad['data'][0] = base64.b64encode(bytes(165)).decode()
     assert mint_decimals(bad) is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_uses_full_protocol_batch_without_dropping_the_next_pool(tmp_path):
+    book = PoolAttribution(tmp_path/'attribution.sqlite')
+    for index in range(1,102):
+        book._capture({**event(), 'pool': str(Pubkey(bytes([index])*32))})
+    calls = []
+    async def request(method, params):
+        assert method == 'getMultipleAccounts' and len(params[0]) <= 100
+        calls.append(len(params[0]))
+        values = [mint()] if params[0] == [BASE] else [account() for _ in params[0]]
+        return {'context': {'slot': 50}, 'value': values}
+    rows = await book.fetch(SimpleNamespace(request=request))
+    assert calls == [100,1]
+    assert sum(row['attribution_kind']=='identity' for row in rows) == 100
+    book.acknowledge(rows, 'canonical:full-protocol-batch')
+    assert book.report()['resolved_pools'] == 100
+    calls.clear()
+    rows = await book.fetch(SimpleNamespace(request=request))
+    assert calls == [1,1]
+    assert sum(row['attribution_kind']=='identity' for row in rows) == 1
+    assert book.report()['pending_events'] == 101  # no owner-loop delivery ACK yet
+    book.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_provider_batch_limit_is_learned_without_discarding_other_jobs(tmp_path):
+    from src.chains.rpc_manager import RPCError
+    path = tmp_path/'attribution.sqlite'
+    book = PoolAttribution(path)
+    for index in range(1,102):
+        book._capture({**event(), 'pool': str(Pubkey(bytes([index])*32))})
+    calls = []
+    async def request(method, params):
+        calls.append(len(params[0]))
+        if len(params[0]) > 10:
+            raise RPCError({'code': -32602, 'message': 'A maximum of 10 accounts is allowed.'})
+        values = [mint()] if params[0] == [BASE] else [account() for _ in params[0]]
+        return {'context': {'slot': 50}, 'value': values}
+    rows = await book.fetch(SimpleNamespace(request=request))
+    assert calls == [100,10,1]
+    assert sum(row['attribution_kind']=='identity' for row in rows) == 10
+    assert any(row.get('account_limit') == 10 for row in rows)
+    book.acknowledge(rows, 'canonical:provider-limit-and-first-batch')
+    assert book.db.execute('SELECT count(*) FROM jobs').fetchone()[0] == 91
+    book.close()
+    book = PoolAttribution(path)
+    calls.clear()
+    await book.fetch(SimpleNamespace(request=request))
+    assert calls == [10,1] and book.report()['pool_read_batch_limit'] == 10
+    book._batch_observed -= 3601
+    async def upgraded(method, params):
+        values = [mint()] if params[0] == [BASE] else [account() for _ in params[0]]
+        return {'context': {'slot': 60}, 'value': values}
+    rows = await book.fetch(SimpleNamespace(request=upgraded))
+    assert sum(row['attribution_kind']=='identity' for row in rows) == 91
+    assert book.report()['pool_read_batch_limit'] == 100
+    book.close()
+
+
+@pytest.mark.asyncio
+async def test_mint_batch_can_learn_a_different_endpoint_bound_without_shifting_proofs(tmp_path):
+    from src.chains.rpc_manager import RPCError
+    book = PoolAttribution(tmp_path/'attribution.sqlite')
+    other_pool, other_base = str(Pubkey(bytes([15])*32)), str(Pubkey(bytes([16])*32))
+    for pool in (POOL, other_pool):
+        book._capture({**event(), 'pool': pool})
+    async def request(method, params):
+        addresses = params[0]
+        if POOL in addresses:
+            values = [account(BASE if p == POOL else other_base) for p in addresses]
+        elif len(addresses) > 1:
+            raise RPCError({'code': -32602, 'message': 'A maximum of 1 accounts is allowed.'})
+        else:
+            values = [mint()]
+        return {'context': {'slot': 50}, 'value': values}
+    rows = await book.fetch(SimpleNamespace(request=request))
+    identities = [row for row in rows if row['attribution_kind']=='identity']
+    assert len(identities) == 2
+    assert sum(row['base_decimals'] is not None for row in identities) == 1
+    assert sum(row['base_mint_slot_context'] is not None for row in identities) == 1
+    book.acknowledge(rows, 'canonical:partial-mint-proof')
+    assert book.report()['mapping_gaps'] == 1 and book.report()['pool_read_batch_limit'] == 1
+    book.close()
+
+
+@pytest.mark.asyncio
+async def test_rate_refusal_does_not_become_split_retries(tmp_path):
+    from src.chains.rpc_manager import RPCError
+    book = PoolAttribution(tmp_path/'attribution.sqlite')
+    await book.capture(event())
+    calls = []
+    async def request(method,params):
+        calls.append(method)
+        raise RPCError({'code': 429, 'message': 'rate limit; maximum of 1 accounts'})
+    rows = await book.fetch(SimpleNamespace(request=request))
+    assert len(calls) == 1
+    assert not any(row['attribution_kind']=='provider_capacity' for row in rows)
+    assert book.report()['pool_read_batch_limit'] == 100
+    book.close()
 
 
 def test_log_mention_is_not_emitter_identity_and_failed_scope_is_not_a_trade():
