@@ -27,7 +27,7 @@ def test_nonempty_source_queue_yields_between_durable_records(monkeypatch):
         async def mesh_start(): return 1
         async def next_event(): return pending.popleft()
         value.source_mesh = SimpleNamespace(start=mesh_start, next_event=next_event)
-        def index(event):
+        def index(event, **kwargs):
             indexed.append(event)
             if not pending:
                 value._running = False

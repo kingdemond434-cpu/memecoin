@@ -7,6 +7,7 @@ not admission. No scripts, login, access-challenge bypass or direct DNS path.
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import os
 import re
@@ -49,16 +50,19 @@ class OnionFrontierTransport(Transport):
     def _enqueue(self, urls, source_ref, observed_at, parent="", depth=0):
         if not source_ref:
             raise ValueError("durable public source provenance required")
+        admitted = []
         for value in urls:
             try:
                 url = onion_url(value)
             except TransportError:
                 continue
             host = urlsplit(url).hostname
-            self.db.execute("INSERT OR IGNORE INTO hosts(host) VALUES(?)", (host,))
-            self.db.execute("INSERT OR IGNORE INTO urls(url,host,source_ref,discovered_at,depth) VALUES(?,?,?,?,?)",
-                            (url, host, source_ref, observed_at, depth))
-            self.db.execute("INSERT OR IGNORE INTO origins VALUES(?,?,?,?)", (url, source_ref, parent, observed_at))
+            admitted.append((url, host))
+        self.db.executemany("INSERT OR IGNORE INTO hosts(host) VALUES(?)", ((host,) for _, host in admitted))
+        self.db.executemany("INSERT OR IGNORE INTO urls(url,host,source_ref,discovered_at,depth) VALUES(?,?,?,?,?)",
+                            ((url, host, source_ref, observed_at, depth) for url, host in admitted))
+        self.db.executemany("INSERT OR IGNORE INTO origins VALUES(?,?,?,?)",
+                            ((url, source_ref, parent, observed_at) for url, _ in admitted))
 
     def enqueue(self, urls, source_ref, observed_at):
         with self.lock, self.db:
@@ -102,20 +106,33 @@ class OnionFrontierTransport(Transport):
                           record["observed_at"], record["url"], record["crawl_depth"] + 1)
             self.db.execute("DELETE FROM outbox WHERE id=?", (observation_id,))
 
-    async def fetch(self):
-        now = time.time()
+    def _lease(self, now):
         with self.lock, self.db:
             pending = self.db.execute("SELECT record FROM outbox ORDER BY rowid LIMIT 1").fetchone()
             if pending:
-                return [json.loads(pending[0])]
+                return [json.loads(pending[0])], None
             row = self.db.execute("""SELECT u.* FROM urls u JOIN hosts h ON h.host=u.host
               WHERE u.next_at<=? AND h.next_at<=?
               ORDER BY h.last_attempt,((u.observed_at IS NULL)=(h.turn % 2)) DESC,u.next_at,u.discovered_at,u.url LIMIT 1""", (now, now)).fetchone()
             if row is None:
-                return []
+                return [], None
             self.db.execute("UPDATE hosts SET last_attempt=?,next_at=?,turn=turn+1 WHERE host=?", (now, now + 2, row["host"]))
             # Lease survives cancellation/restart; timed-out pages are retried.
             self.db.execute("UPDATE urls SET next_at=? WHERE url=?", (now + 60, row["url"]))
+            return [], row
+
+    def _store_observation(self, row, observed, revision, record):
+        with self.lock, self.db:
+            self.db.execute("UPDATE urls SET observed_at=?,digest=?,failures=0,last_error='',next_at=? WHERE url=?",
+                            (observed, revision, observed + 120, row["url"]))
+            if revision != row["digest"]:
+                self.db.execute("INSERT INTO outbox VALUES(?,?)", (record["observation_id"], json.dumps(record, allow_nan=False)))
+
+    async def fetch(self):
+        now = time.time()
+        pending, row = await asyncio.to_thread(self._lease, now)
+        if row is None:
+            return pending
         client = self.client_factory(row["host"])
         try:
             status, body, headers = await client.get(row["url"])
@@ -126,14 +143,15 @@ class OnionFrontierTransport(Transport):
                     retry = 0
                 if not 0 <= retry < float('inf'):
                     retry = 0
-                self._defer(row, "HTTP_" + str(status), now, max(3600 if status in {401, 403, 429} else 120, retry))
+                await asyncio.to_thread(self._defer, row, "HTTP_" + str(status), now,
+                                        max(3600 if status in {401, 403, 429} else 120, retry))
                 return []
             document = _Document(link_limit=None)
             document.feed(body)
             content = " ".join(" ".join(document.text).split())
             if not content or re.search(r"(?:complete|solve|enter|verify).{0,40}captcha|proof.of.work required|"
                                        r"(?:enable|requires?) javascript|sign in to (?:continue|view)", content[:2000], re.I):
-                self._defer(row, "PUBLIC_CONTENT_OR_ACCESS_CHALLENGE", now, 3600)
+                await asyncio.to_thread(self._defer, row, "PUBLIC_CONTENT_OR_ACCESS_CHALLENGE", now, 3600)
                 return []
             from src.collectors.onion_discovery import PATTERN, candidate_url
             links = set()
@@ -158,14 +176,10 @@ class OnionFrontierTransport(Transport):
                 "observation_kind": "initial_snapshot" if row["observed_at"] is None else "content_change",
                 "discovered_onion_links": sorted(links), "crawl_depth": row["depth"],
                 "text_truncated": False, "transport": "tor_socks5_remote_dns"}
-            with self.lock, self.db:
-                self.db.execute("UPDATE urls SET observed_at=?,digest=?,failures=0,last_error='',next_at=? WHERE url=?",
-                                (observed, revision, observed + 120, row["url"]))
-                if revision != row["digest"]:
-                    self.db.execute("INSERT INTO outbox VALUES(?,?)", (record["observation_id"], json.dumps(record, allow_nan=False)))
+            await asyncio.to_thread(self._store_observation, row, observed, revision, record)
             return [record] if revision != row["digest"] else []
         except Exception as exc:
-            self._defer(row, type(exc).__name__, now, 120)
+            await asyncio.to_thread(self._defer, row, type(exc).__name__, now, 120)
             raise TransportError("public onion frontier fetch failed: " + type(exc).__name__) from None
         finally:
             await client.close()
@@ -193,5 +207,7 @@ class OnionFrontierTransport(Transport):
             "all_onion_coverage": False}
 
     async def stop(self):
-        with self.lock:
-            self.db.close()
+        def close():
+            with self.lock:
+                self.db.close()
+        await asyncio.to_thread(close)
