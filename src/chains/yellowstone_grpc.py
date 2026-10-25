@@ -494,7 +494,7 @@ class SolanaRpcProgramStream:
                 transaction = await self.rpc.request(
                     "getTransaction",
                     [signature, {"encoding": "json", "commitment": "confirmed",
-                                 "maxSupportedTransactionVersion": 0}],
+                                 "maxSupportedTransactionVersion": 1}],
                 )
                 if transaction:
                     self._seen.add(signature)
@@ -505,10 +505,11 @@ class SolanaRpcProgramStream:
 
     @staticmethod
     def _looks_like_pool_creation(logs: List[str]) -> bool:
-        if _native_looks_like_pool_creation is not None:
-            return bool(_native_looks_like_pool_creation(logs))
+        if _native_looks_like_pool_creation is not None and _native_looks_like_pool_creation(logs):
+            return True
         names = {
-            "initialize", "initialize2", "initializepool", "initializepoolv2", "createpool",
+            "initialize", "initialize2", "initializev2", "initializewithtoken2022",
+            "initializepool", "initializepoolv2", "createpool",
             "initializelbpair", "initializecustomizablepermissionlesslbpair",
             "initializepermissionlesspool", "initializepermissionlesspoolwithfeetier",
             "initializepermissionlessconstantproductpoolwithconfig",
@@ -546,7 +547,7 @@ class SolanaRpcProgramStream:
                     transaction = await self.rpc.request(
                         "getTransaction",
                         [signature, {"encoding": "json", "commitment": "confirmed",
-                                     "maxSupportedTransactionVersion": 0}],
+                                     "maxSupportedTransactionVersion": 1}],
                     )
                     if transaction:
                         for handler in self._handlers.get("transaction", []):
@@ -699,7 +700,7 @@ def instruction_fields(instruction: Any) -> Tuple[int, List[int], bytes]:
 SYSTEM_PROGRAM = "11111111111111111111111111111111"
 
 
-def extract_compute_budget(keys: List[str], instructions: Iterable[Any]):
+def extract_compute_budget(keys: List[str], instructions: Iterable[Any], *, tx_data: Any = None):
     """What priority this transaction declared, from its own instructions.
 
     Every transaction on the stream landed, and every one of them carries
@@ -708,7 +709,29 @@ def extract_compute_budget(keys: List[str], instructions: Iterable[Any]):
     about, at exactly the ages that matter -- and it was being walked past
     on every single transaction.
     """
-    from src.execution.observed_bids import decode_compute_budget
+    from src.execution.observed_bids import ComputeBudget, decode_compute_budget
+
+    if isinstance(tx_data, dict):
+        result = tx_data.get("result", tx_data)
+        if type(result.get("version")) is int and result["version"] == 1:
+            config = result.get("transaction", {}).get("message", {}).get("transactionConfig") or {}
+            priority, limit = config.get("priorityFee"), config.get("computeUnitLimit")
+            # No instruction-derived fallback: they are no-ops in V1.
+            return ComputeBudget(
+                unit_limit=limit if type(limit) is int and 0 <= limit <= 1_400_000 else None,
+                absolute_priority_lamports=priority if type(priority) is int and 0 <= priority < 2**64 else None)
+    elif tx_data is not None:
+        info = getattr(tx_data, "transaction", tx_data)
+        message = getattr(getattr(info, "transaction", info), "message", None)
+        if message is not None and hasattr(message, "HasField") and message.HasField("config"):
+            config = message.config
+            return ComputeBudget(
+                unit_limit=config.compute_unit_limit if config.HasField("compute_unit_limit") else None,
+                absolute_priority_lamports=config.priority_fee if config.HasField("priority_fee") else None)
+        # Older storage protobufs expose only `versioned: bool`. Without the
+        # message config/version there is no safe V0-versus-V1 fee inference.
+        if getattr(message, "versioned", False):
+            return ComputeBudget()
 
     pairs = []
     for instruction in instructions:
@@ -942,7 +965,7 @@ class PumpFunMonitor:
         # Decoded once per transaction, not once per instruction: the budget
         # belongs to the transaction, and re-walking the instruction list for
         # every matched instruction would pay for it several times over.
-        budget = extract_compute_budget(keys, instructions)
+        budget = extract_compute_budget(keys, instructions, tx_data=tx_data)
         # The richer event wins. Decided once per transaction so the outer
         # instruction can stand down for the inner event that supersedes it.
         defer_to_cpi_trade = self._carries_cpi_trade(keys, instructions)
@@ -968,6 +991,7 @@ class PumpFunMonitor:
                             event["compute_unit_price"] = (
                                 budget.unit_price_micro_lamports)
                             event["compute_unit_limit"] = budget.unit_limit
+                            event["absolute_priority_lamports"] = budget.absolute_priority_lamports
                         if kind == "token_created" and event.get("creator"):
                             transfers = extract_system_transfers(keys, instructions)
                             event["funding_transfers"] = transfers
@@ -1011,6 +1035,11 @@ class PumpFunMonitor:
                         self.matched.get("token_trade:superseded_by_cpi_event", 0) + 1)
                     continue
                 if event:
+                    if budget.stated:
+                        event.update(priority_lamports=budget.priority_lamports,
+                                     compute_unit_price=budget.unit_price_micro_lamports,
+                                     compute_unit_limit=budget.unit_limit,
+                                     absolute_priority_lamports=budget.absolute_priority_lamports)
                     if event.get("type") == "token_created" and event.get("creator"):
                         transfers = extract_system_transfers(keys, instructions)
                         event["funding_transfers"] = transfers
@@ -1681,6 +1710,7 @@ class RaydiumMonitor:
 
 
 def create_combined_subscription() -> SubscribeRequest:
+    from src.chains.launchlab import LAUNCHLAB_PROGRAM
     programs = [
         PumpFunMonitor.PUMP_FUN_PROGRAM,
         PumpSwapMonitor.PUMP_AMM_PROGRAM,
@@ -1690,6 +1720,7 @@ def create_combined_subscription() -> SubscribeRequest:
         RaydiumMonitor.METEORA_DLMM,
         RaydiumMonitor.METEORA_DYNAMIC_AMM,
         RaydiumMonitor.ORCA_WHIRLPOOL,
+        LAUNCHLAB_PROGRAM,
     ]
     return SubscribeRequest(
         transactions={

@@ -754,6 +754,9 @@ class ReportingSurface:
                              else {"status": "DATA_BLOCKED",
                                    "detail": "no Pump monitor is wired"}),
             "launch_census": self.launch_census.report(),
+            "launchlab_decoder": (self.launchlab_monitor.decoder_report()
+                if getattr(self, "launchlab_monitor", None) is not None
+                else {"status": "DATA_BLOCKED", "detail": "no LaunchLab monitor is wired"}),
             "screen_policy": self.screen_policy.report(),
             "memory": self.memory.report(),
             "signer": self.signer_report(),

@@ -1,7 +1,7 @@
 # Provenance
 
-Every file in this directory is a verbatim copy from Pump's public
-documentation repository. Nothing here is transcribed, summarised, or recalled.
+The Pump files listed below are verbatim copies from Pump's public
+documentation repository. Nothing in those files is transcribed or recalled.
 
     source:   https://github.com/pump-fun/pump-public-docs
     commit:   9c82f61cb711b044a17f770ab8ce9f9bdf78f333
@@ -18,6 +18,11 @@ Refreshing them is a deliberate act: replace the files, record the new commit
 above, and re-run the suite. The account-list tests read these files directly,
 so an upstream change that alters an instruction's shape fails loudly here
 instead of silently producing transactions against the old layout.
+
+The additional `raydium_launchlab.json` is a verbatim Apache-2.0 artifact
+from Chainstack, independently cross-checked against Raydium's official SDK.
+Its exact revision, hash, public fixtures and license are documented in
+[`docs/DONOR_ADAPTATIONS.md`](../docs/DONOR_ADAPTATIONS.md).
 
 ## Why the IDL and not the markdown tables
 

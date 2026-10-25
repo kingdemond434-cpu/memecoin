@@ -74,6 +74,8 @@ class ComputeBudget:
 
     unit_price_micro_lamports: Optional[int] = None
     unit_limit: Optional[int] = None
+    # V1 messages bid an absolute fee; ComputeBudget instructions are no-ops.
+    absolute_priority_lamports: Optional[int] = None
 
     @property
     def stated(self) -> bool:
@@ -84,7 +86,8 @@ class ComputeBudget:
         those into a bid distribution would drag every percentile toward a
         number nobody chose.
         """
-        return self.unit_price_micro_lamports is not None
+        return (self.absolute_priority_lamports is not None
+                or self.unit_price_micro_lamports is not None)
 
     @property
     def priority_lamports(self) -> Optional[int]:
@@ -95,6 +98,8 @@ class ComputeBudget:
         400,000-unit budget are ten times apart in what the leader
         receives. Scheduling also depends on transaction cost and contention.
         """
+        if self.absolute_priority_lamports is not None:
+            return self.absolute_priority_lamports
         if self.unit_price_micro_lamports is None:
             return None
         if self.unit_price_micro_lamports == 0:

@@ -227,6 +227,7 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
         self.pump_monitor: Optional[PumpFunMonitor] = None
         self.pump_swap_monitor: Optional[PumpSwapMonitor] = None
         self.raydium_monitor: Optional[RaydiumMonitor] = None
+        self.launchlab_monitor = None
         self.rpc_program_stream: Optional[SolanaRpcProgramStream] = None
         self.detection_engine: Optional[TokenDetectionEngine] = None
         self.rug_detector: Optional[RugDetector] = None
@@ -3714,7 +3715,8 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
             launched_at = getattr(record, "detected_at", 0.0) if record else 0.0
             corpus.observe(
                 ComputeBudget(event.get("compute_unit_price"),
-                              event.get("compute_unit_limit")),
+                              event.get("compute_unit_limit"),
+                              event.get("absolute_priority_lamports")),
                 (float(event.get("timestamp", time.time())) - launched_at)
                 if launched_at else None)
         # Which feed reached this box first. Every feed delivering the same

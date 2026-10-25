@@ -13,7 +13,7 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 import logging
-from src.detection.token_detector import TokenCandidate
+from src.detection.token_detector import DetectionSource, TokenCandidate
 from src.research.feature_engine import build_features
 from src.strategies.multihead_predictor import PredictionFeatures
 from src.runtime.serialisation import jsonable as _jsonable
@@ -36,6 +36,58 @@ class MinedRecordIngestion:
     WHICH tokens and wallets are worth a miner pass lives here too, because
     it answers the same question from the other end -- what is worth
     collecting, and where does what we collected go."""
+
+    async def _on_launchpad_event(self, event: Dict[str, Any]) -> None:
+        """Capture native launches without supplying Pump-specific prices/accounts."""
+        if event.get("type") != "token_launch" or not event.get("token"):
+            return
+        token = event["token"]
+        self._stream_events["token_launch"] = self._stream_events.get("token_launch", 0) + 1
+        race = getattr(self, "feed_race", None)
+        if race is not None and not race.observe(
+                event.get("feed") or "yellowstone", f"token_launch:{token}",
+                at=event.get("received_ns", time.time_ns()) / 1e9):
+            self._stream_events["token_launch:duplicate_feed"] = self._stream_events.get(
+                "token_launch:duplicate_feed", 0) + 1
+            return
+        observed_at = float(event.get("timestamp", time.time()))
+        creator = str(event.get("creator") or "")
+        if event.get("priority_lamports") is not None:
+            from src.execution.observed_bids import ComputeBudget
+            self.observed_bids.observe(ComputeBudget(
+                event.get("compute_unit_price"), event.get("compute_unit_limit"),
+                event.get("absolute_priority_lamports")), 0.0)
+        self._note_launch_venue(event)
+        spec = self.launchpads.specs.get(event.get("program"))
+        event = {**event, "provisional": not bool(spec and spec.trusted)}
+        # Archive before enrichment/admission; unknown executable prices cannot
+        # erase a launch from the collection denominator.
+        self.trade_evidence.record("native_launch", event)
+        self.launch_census.see(token, creator=creator, at=observed_at,
+                               regime=str(self.current_regime or "unknown"))
+        self.wallet_intel.record_token_lifecycle(token, launch_at=observed_at)
+        self._assess_identity(token, event)
+        self._record_prelaunch_launch(token, event)
+        from src.runtime.actor_intelligence import ingest_launch_edges
+        ingest_launch_edges(self, token, event)
+        self.dataset_builder.start_episode(
+            token, creator, event["program"], event["pool"], event["quote_mint"],
+            detected_at=observed_at,
+            prelaunch_context=self._prelaunch_context(creator, observed_at))
+        self.dataset_builder.record_market_observation(token, event)
+        self.genealogy.record_token_creation(token, creator, event)
+        from src.strategies.information_graph import LeadEventType
+        self.info_graph.record_event(token, LeadEventType.DEPLOYER_ACTIVITY, creator,
+                                     "deployer", observed_at, event)
+        if event["provisional"]:
+            return
+        # A generic quote route may become available. This callback never
+        # seeds Pump reserves, warms Pump accounts or invents SOL decimals.
+        await self.detection_engine._on_candidate(TokenCandidate(
+            address=token, chain="solana", source=DetectionSource.FACTORY,
+            block_number=event["slot"], tx_hash=event["signature"], deployer=creator,
+            factory=event["program"], pair=event["pool"], base_token=event["quote_mint"],
+            timestamp=observed_at, metadata=dict(event)))
 
     async def _build_prediction_features(self, candidate: TokenCandidate, risk: Any, liquidity: float) -> PredictionFeatures:
         as_of = time.time()
