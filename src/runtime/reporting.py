@@ -878,14 +878,40 @@ class ReportingSurface:
         }
 
     async def _readiness_snapshot(self):
-        engine = getattr(self, 'unknown_engine', None)
-        if engine is not None and callable(getattr(engine, 'frontier_snapshot', None)):
-            frontier = await engine.frontier_snapshot()
-            with diagnostic_reads():
-                report = engine.report(frontier_snapshot=frontier)
-                return _jsonable(self.readiness(unknown_engine_report=report))
+        async def refresh():
+            try:
+                engine = getattr(self, 'unknown_engine', None)
+                frontier = await engine.frontier_snapshot() if engine is not None and callable(
+                    getattr(engine, 'frontier_snapshot', None)) else None
+                observed_at = time.time()
+                # Reporting is a read-only projection. Keep its filesystem,
+                # statistics and serialization work away from market intake.
+                value = await asyncio.to_thread(self._build_readiness_projection, engine, frontier)
+                self._readiness_cache = (value, observed_at, time.monotonic())
+                self._readiness_refresh_error = None
+            except Exception as exc:
+                self._readiness_refresh_error = type(exc).__name__
+                raise
+            finally:
+                self._readiness_refresh_task = None
+        cached = getattr(self, '_readiness_cache', None)
+        if (cached is None or time.monotonic()-cached[2] >= 1) and getattr(self, '_readiness_refresh_task', None) is None:
+            self._readiness_refresh_task = asyncio.create_task(refresh())
+            self._readiness_refresh_task.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+        if cached is None:
+            await asyncio.shield(self._readiness_refresh_task)
+            cached = self._readiness_cache
+        return {**cached[0], 'diagnostic_snapshot': {'observed_at': cached[1],
+            'age_seconds': max(0, time.time()-cached[1]),
+            'refresh_in_progress': getattr(self, '_readiness_refresh_task', None) is not None,
+            'refresh_error_type': getattr(self, '_readiness_refresh_error', None)}}
+
+    def _build_readiness_projection(self, engine, frontier):
         with diagnostic_reads():
-            return _jsonable(self.readiness())
+            if frontier is None:
+                return _jsonable(self.readiness())
+            report = engine.report(frontier_snapshot=frontier)
+            return _jsonable(self.readiness(unknown_engine_report=report))
 
     async def _health_loop(self):
         while self._running:

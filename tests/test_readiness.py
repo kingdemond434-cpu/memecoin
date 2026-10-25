@@ -128,6 +128,9 @@ class TheDeskAnswersFromItsOwnFacts(unittest.IsolatedAsyncioTestCase):
                                  offline=True)
         await desk.initialize()
         self.assertIn("promotion_blocked_at", desk.readiness())
+        projected = await desk._readiness_snapshot()
+        self.assertIn('promotion_blocked_at', projected)
+        self.assertGreaterEqual(projected['diagnostic_snapshot']['age_seconds'], 0)
 
 
 if __name__ == "__main__":
