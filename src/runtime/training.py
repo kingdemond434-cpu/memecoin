@@ -235,6 +235,10 @@ class TrainingSupervisor:
         stalled corpus on a desk that was collecting perfectly well -- and
         the whole trigger is built on this number.
         """
+        from src.runtime.diagnostic_reads import diagnostic_value
+        return diagnostic_value((id(self), 'resolved_episodes'), self._resolved_episode_count)
+
+    def _resolved_episode_count(self) -> int:
         total = 0
         try:
             for pattern in ("*.json.gz", "*.json"):
