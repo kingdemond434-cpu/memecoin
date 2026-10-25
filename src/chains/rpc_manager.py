@@ -602,6 +602,17 @@ class ChainRegistry:
                 if ws_url and self._has_unresolved_placeholder(ws_url):
                     ws_url = None
                 endpoints.append(RPCEndpointConfig(url=url, ws_url=ws_url, weight=1))
+            if name == 'solana':
+                from src.chains.research_rpc import extra_solana_endpoints
+                indexed = {endpoint.url: endpoint for endpoint in endpoints}
+                for url, ws_url in extra_solana_endpoints():
+                    if url in indexed:
+                        if ws_url:
+                            indexed[url].ws_url = ws_url
+                    else:
+                        endpoint = RPCEndpointConfig(url=url, ws_url=ws_url, weight=1)
+                        endpoints.append(endpoint)
+                        indexed[url] = endpoint
             if not endpoints:
                 raise ValueError(f"No usable RPC endpoints configured for {name}")
             self.chains[name] = ChainConfig(

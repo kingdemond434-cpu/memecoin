@@ -12,6 +12,25 @@ implementation capabilities, not assertions that every token or mainnet program
 version has passed. The launch registry's global simulation evidence fields
 are deliberately not populated with a generic implementation filename.
 
+PumpSwap's Anchor IDL describes only the fixed account prefix. The current
+legacy buy/sell runtime also requires ordered remaining accounts: cashback
+quote ATA (plus the accumulator on sells), pool-v2 for nonzero coin creators,
+and the buyback recipient/quote ATA even when its fee is zero. The adapter
+follows the official `@pump-fun/pump-swap-sdk@2.2.0` source, `offlinePumpAmm.ts`
+and `pda.ts`. Its npm archive SHA-512 is
+`YGHDcLexyL6/N8lDcLMmFBX6o5l7X0Nxqf2kzjRJ96plLatFZ9LXNJZErdl9yySe3dpKpO+/nzQHL4dHtL7nmQ==`.
+Only the IDL prefix is compared with the Rust builder; runtime tails have
+separate conditional-order tests. Historical frames lacking those accounts
+remain historical failures; new bank snapshots must be acquired for new proof.
+
+Additional owner-provided Solana RPCs are read from private environment fields
+`SOLANA_RESEARCH_RPC_URL`, `SOLANA_RESEARCH_RPC_URL_1`, etc., with corresponding
+optional `SOLANA_RESEARCH_WS_URL` suffixes. These append without shifting YAML
+HTTP/WS pairs. Remote connections require HTTPS/WSS; explicit loopback local
+validators may use HTTP/WS. Values are literal data, never evaluated or printed.
+They share normal provider health, cooldown and accounting behavior; adding an
+endpoint neither evades quota nor proves uninterrupted coverage.
+
 The worker verifies mint owner/layout, route identities and token-account
 authorities, reads quote-mint and mode flags using Pump's documented trailing
 field defaults, and

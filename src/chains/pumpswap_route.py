@@ -5,11 +5,11 @@ docs do not publish PumpSwap's account lists. They do not -- but the IDL does,
 and it is published in the same repository. The block was never about the
 information being unavailable; it was about looking in the wrong file.
 
-So the same machinery that builds `buy_v2` builds these: the account list,
-every flag, every PDA seed and the program each PDA is derived under all come
-out of idl/pump_amm.json. `buy` takes 23 accounts, `sell` takes 21, and the
-difference is `global_volume_accumulator` and `user_volume_accumulator`, which
-only the buy carries.
+The IDL declares a 23-account buy prefix and a 21-account sell prefix. Current
+runtime remaining accounts are additionally required: cashback accounts,
+pool-v2 for nonzero coin creators, and the buyback recipient/quote ATA. Their
+order and flags follow the official @pump-fun/pump-swap-sdk@2.2.0. An IDL-only
+instruction can pass builder parity yet fail the actual program with 6062.
 
 Two things here are not shared with the bonding curve and are easy to get
 wrong by analogy.
@@ -29,6 +29,7 @@ somebody else.
 """
 
 import logging
+from functools import lru_cache
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -42,6 +43,7 @@ from src.chains.pump_route import (
     WSOL_MINT, PreparedInstruction, associated_token_address,
     select_fee_recipient,
 )
+from src.chains.pump_route import select_buyback_recipient
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +56,7 @@ except (ImportError, AttributeError):  # pragma: no cover - environment dependen
     native_pumpswap_build_buy = None
     native_pumpswap_build_sell = None
 
-PUMPSWAP_ROUTE_SCHEMA_VERSION = "v1"
+PUMPSWAP_ROUTE_SCHEMA_VERSION = "v2"
 PUMPSWAP_PROGRAM = program_id(PUMP_AMM_IDL) if IDL_STATUS == "OK" else ""
 
 # Anchor account discriminator for `Pool`, taken from the IDL rather than
@@ -186,6 +188,37 @@ def derive_pool(index: int, creator: str, base_mint: str, quote_mint: str) -> st
     return str(address)
 
 
+@lru_cache(maxsize=8192)
+def _auxiliary_pda(seed: str, key: str) -> str:
+    from solders.pubkey import Pubkey
+    return str(Pubkey.find_program_address([seed.encode(), bytes(Pubkey.from_string(key))],
+                                          Pubkey.from_string(PUMPSWAP_PROGRAM))[0])
+
+
+def _remaining_accounts(name, pool, user, quote_token_program):
+    """Runtime accounts omitted by Anchor IDLs, per official SDK 2.2.0.
+
+    Cashbacks first, optional pool-v2 next, buyback wallet/ATA last. Do not
+    add a pool-v2 placeholder for zero coin_creator: it shifts fee positions.
+    """
+    metas = []
+    if pool.is_cashback_coin:
+        accumulator = _auxiliary_pda('user_volume_accumulator', user)
+        metas.append(AccountMeta(associated_token_address(accumulator, pool.quote_mint,
+                                                         quote_token_program), False, True))
+        if name == 'sell':
+            metas.append(AccountMeta(accumulator, False, True))
+    if pool.coin_creator != SYSTEM_PROGRAM:
+        metas.append(AccountMeta(_auxiliary_pda('pool-v2', pool.base_mint), False, False))
+    recipient = select_buyback_recipient(pool.base_mint)
+    if not recipient:
+        raise IdlError('published buyback recipients unavailable')
+    metas.extend([AccountMeta(recipient, False, False),
+                  AccountMeta(associated_token_address(recipient, pool.quote_mint,
+                                                      quote_token_program), False, True)])
+    return metas
+
+
 @dataclass(frozen=True)
 class PumpSwapRouteConfig:
     base_token_program: str = TOKEN_2022_PROGRAM
@@ -277,7 +310,6 @@ class PumpSwapRoute:
                 data += b"\x00"
         except (IdlError, ValueError, TypeError) as exc:
             return PreparedInstruction(status="REJECTED", detail=f"unbuildable: {exc}")
-        expected = len(account_names(PUMP_AMM_IDL, name))
         native_builder = (native_pumpswap_build_buy if name == "buy"
                           else native_pumpswap_build_sell)
         if native_builder is not None:
@@ -306,9 +338,17 @@ class PumpSwapRoute:
                     detail="native/Python PumpSwap instruction parity mismatch")
             # Rust is authoritative once the exact bytes and metas agree.
             accounts, data = native_accounts, native_data
+        # Rust/Python parity above covers the declared IDL prefix. The
+        # current program additionally validates these ordered remaining
+        # accounts, even when the buyback fee is zero.
+        try:
+            accounts = [*accounts, *_remaining_accounts(name, pool, user, config.quote_token_program)]
+        except (IdlError, ValueError, TypeError) as exc:
+            return PreparedInstruction(status='DATA_BLOCKED', venue='pumpswap',
+                                       detail=f'current runtime accounts unavailable: {exc}')
         return PreparedInstruction(status="OK", program_id=self.program,
                                    accounts=accounts, data=data,
-                                   expected_accounts=expected, venue="pumpswap")
+                                   expected_accounts=len(accounts), venue="pumpswap")
 
     def report(self) -> Dict[str, Any]:
         blocked = self.config.blocked_reason()
@@ -319,6 +359,9 @@ class PumpSwapRoute:
             "program": self.program,
             "buy_accounts": len(account_names(PUMP_AMM_IDL, "buy")) if not blocked else 0,
             "sell_accounts": len(account_names(PUMP_AMM_IDL, "sell")) if not blocked else 0,
+            "account_counts_scope": "IDL_PREFIX_ONLY; runtime remaining accounts are additional",
+            "runtime_remaining_accounts": "cashback accounts; pool-v2 for nonzero creator; buyback wallet and quote ATA",
+            "runtime_account_source": "@pump-fun/pump-swap-sdk@2.2.0",
             "pool_size": POOL_SIZE,
             "native_builder": ("OK_WITH_CONTINUOUS_PARITY"
                                if native_pumpswap_build_buy is not None

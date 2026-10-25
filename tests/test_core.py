@@ -14013,8 +14013,8 @@ class TestPumpSwapConstruction(unittest.TestCase):
         sell = route.build_sell(self._pool(), self.OTHER, 1_000, 500)
         self.assertEqual(buy.status, "OK")
         self.assertEqual(sell.status, "OK")
-        self.assertEqual(len(buy.accounts), 23)
-        self.assertEqual(len(sell.accounts), 21)
+        self.assertEqual(len(buy.accounts), 26)  # IDL prefix + pool-v2 + buyback pair
+        self.assertEqual(len(sell.accounts), 24)
 
     def test_only_the_buy_tracks_volume(self):
         self.assertIn("global_volume_accumulator", account_names(PUMP_AMM_IDL, "buy"))
