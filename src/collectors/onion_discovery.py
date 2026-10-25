@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import logging
 from pathlib import Path
 
 from src.collectors.onion import PROXY_ENV, onion_url
@@ -74,3 +75,30 @@ def discover(desk, event, canonical_job_id):
         # transport, retaining the exact parent URL and crawl depth.
         return
     frontier.enqueue(candidate_urls(event), "frontier_job:" + canonical_job_id, event.observed_at)
+
+
+def deliver(desk, event, canonical_job_id, *, frontier=None, prepared=False):
+    """Durably admit children before acknowledging their canonical parent.
+
+    Live callers prepare the frontier/source on the event loop, then run only
+    the SQLite delivery in a worker. A failed delivery leaves the outbox intact.
+    """
+    if not canonical_job_id:
+        return False
+    transport = getattr(desk, "transports", {}).get(event.source_id)
+    kind = getattr(transport, "kind", None)
+    urls = candidate_urls(event)
+    try:
+        if urls:
+            if not prepared:
+                frontier = _frontier(desk)
+            if frontier is not None and event.source_id != frontier.source_id:
+                frontier.enqueue(urls, "frontier_job:" + canonical_job_id, event.observed_at)
+        if kind in {"onion", "onion_directory"}:
+            metadata = event.metadata or {}
+            transport.acknowledge(metadata.get("onion_observation_id") or
+                                  metadata.get("onion_directory_observation_id"), canonical_job_id)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("onion canonical delivery deferred: %s", type(exc).__name__)
+        return False
+    return True

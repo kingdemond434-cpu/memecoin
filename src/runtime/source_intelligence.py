@@ -159,7 +159,7 @@ class SourceIntelligence:
             logger.error("population sampling frame DATA_BLOCKED: %s", exc)
             return None
 
-    def _record_population_narrative(self, event: Any) -> Optional[str]:
+    def _record_population_narrative(self, event: Any, *, defer_onion_io: bool = False) -> Optional[str]:
         metadata = dict(getattr(event, "metadata", None) or {})
         transport = (getattr(self, "transports", {}) or {}).get(event.source_id)
         tokens = list(getattr(event, "token_addresses", ()) or ())
@@ -194,20 +194,9 @@ class SourceIntelligence:
                 "address_role_status", "text_truncated", "onion_observation_id")}
         job_id = self._enqueue_population_work("NARRATIVE_OBSERVATION", payload,
             evidence_refs=metadata.get("evidence_refs") or (), now=event.observed_at)
-        discovery_stored = True
-        if job_id and (discovered_onions or getattr(self, "global_config", {}).get("onion_auto_discovery", False)):
-            from src.collectors.onion_discovery import discover
-            try:
-                discover(self, event, job_id)
-            except Exception as exc:
-                discovery_stored = False
-                logger.warning("onion source discovery deferred: %s", type(exc).__name__)
-        if job_id and discovery_stored and getattr(transport, "kind", None) in {"onion", "onion_directory"}:
-            try:
-                transport.acknowledge(metadata.get("onion_observation_id") or
-                                      metadata.get("onion_directory_observation_id"), job_id)
-            except Exception as exc:
-                logger.warning("onion canonical acknowledgement deferred: %s", type(exc).__name__)
+        if job_id and not defer_onion_io:
+            from src.collectors.onion_discovery import deliver
+            deliver(self, event, job_id)
         if job_id:
             try:
                 from src.research.public_claim_links import PublicClaimLinks
@@ -493,7 +482,15 @@ class SourceIntelligence:
                 await asyncio.sleep(0.01)
                 continue
             try:
-                self._index_source_event(event)
+                job_id = self._index_source_event(event, defer_onion_io=True)
+                if job_id:
+                    from src.collectors.onion_discovery import _frontier, deliver
+                    # SourceMesh.add may start an asyncio task, so preparation
+                    # stays on the owner loop. Bulk SQLite admission/ack waits
+                    # in the worker and cannot freeze health or market events.
+                    frontier = _frontier(self)
+                    await asyncio.to_thread(deliver, self, event, job_id,
+                                            frontier=frontier, prepared=True)
             except Exception as exc:
                 logger.warning("source event indexing failed: %s", exc)
             # Queue.get() completes synchronously while producers keep the
@@ -501,11 +498,12 @@ class SourceIntelligence:
             # burst cannot monopolize health, market and shutdown callbacks.
             await asyncio.sleep(0)
 
-    def _index_source_event(self, event: Any) -> None:
+    def _index_source_event(self, event: Any, *, defer_onion_io: bool = False) -> Optional[str]:
         """One event into the per-token index and the lead-lag graph."""
         population_recorder = getattr(self, "_record_population_narrative", None)
+        job_id = None
         if callable(population_recorder):
-            population_recorder(event)
+            job_id = population_recorder(event, defer_onion_io=defer_onion_io)
         # A post from an account this launch NAMED in its own metadata is the
         # only verifiable social link available: the account controls what it
         # publishes and the desk observed the publication. It says the account
@@ -537,6 +535,8 @@ class SourceIntelligence:
                     token, float(event.source_at) - launched_at)
             # A source naming a token we hold is new evidence about it.
             self.request_redecision(token)
+
+        return job_id
 
     async def _poll_sources(self) -> int:
         """Collect from every declared source and index events by token.
