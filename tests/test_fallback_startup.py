@@ -23,7 +23,7 @@ async def test_missing_grpc_starts_rpc_fallback_after_real_decoders_register(mon
             self.started = True
     monkeypatch.setattr(wiring, "SolanaRpcProgramStream", Stream)
     desk = SimpleNamespace(offline=False, solana_rpc=object(), global_config={},
-        _on_pump_event=AsyncMock(), _on_raydium_event=AsyncMock())
+        _on_pump_event=AsyncMock(), _on_raydium_event=AsyncMock(), _on_launchpad_event=AsyncMock())
     await wiring.SubsystemWiring._setup_yellowstone(desk)
     assert len(created) == 1 and created[0].started
     assert desk.rpc_program_stream is created[0]
