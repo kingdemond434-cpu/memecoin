@@ -10646,14 +10646,14 @@ class TestGraduationKeepsNativeExecution(unittest.IsolatedAsyncioTestCase):
         prepared = engine.prepare_native_route(self.MINT, self.OTHER, 1_000_000_000, 100)
         self.assertEqual(prepared.status, "OK")
         self.assertEqual(prepared.venue, "pumpswap")
-        self.assertEqual(len(prepared.accounts), 23)
+        self.assertEqual(len(prepared.accounts), 26)
 
     def test_the_sell_side_is_native_too(self):
         engine = self._engine(reserves=self._reserves(), account=self._pool_account())
         prepared = engine.prepare_native_route(self.OTHER, self.MINT, 1_000_000, 200)
         self.assertEqual(prepared.status, "OK")
         self.assertEqual(prepared.venue, "pumpswap")
-        self.assertEqual(len(prepared.accounts), 21)
+        self.assertEqual(len(prepared.accounts), 24)
 
     def test_non_sol_or_mismatched_pool_assets_do_not_price_a_sol_trade(self):
         from src.execution.jupiter_jito import USDC_MINT
@@ -14013,8 +14013,8 @@ class TestPumpSwapConstruction(unittest.TestCase):
         sell = route.build_sell(self._pool(), self.OTHER, 1_000, 500)
         self.assertEqual(buy.status, "OK")
         self.assertEqual(sell.status, "OK")
-        self.assertEqual(len(buy.accounts), 23)
-        self.assertEqual(len(sell.accounts), 21)
+        self.assertEqual(len(buy.accounts), 26)  # IDL prefix + pool-v2 + buyback pair
+        self.assertEqual(len(sell.accounts), 24)
 
     def test_only_the_buy_tracks_volume(self):
         self.assertIn("global_volume_accumulator", account_names(PUMP_AMM_IDL, "buy"))
