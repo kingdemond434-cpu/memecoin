@@ -1232,6 +1232,7 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
             should_trade = contested
             decision.update({"should_trade": should_trade, "trade_info": trade_info,
                              "contested_for_capital": True})
+        measurement_decision_at = time.time()
         decision_id = self.counterfactual_lab.record_decision(token, _jsonable(prediction), decision)
         # Frozen BEFORE the action, with every alternative the policy priced.
         # A row amended afterwards leaks the future into its own features, and
@@ -1297,6 +1298,8 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
         # the result is inspected so a rejected submission is timed the same
         # as an accepted one: a failed entry is a slot spent.
         self.latency.mark(token, "sign_to_submit")
+        if getattr(result, "measurement_context", None):
+            result.measurement_context["decision_at"] = measurement_decision_at
         tail_fill = getattr(self, "_tail_shadow_fill", None)
         if tail_fill is not None:
             try:
@@ -2036,42 +2039,6 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
         self.state_sequencer.bump(token)
         self.request_redecision(token)
 
-    async def _fetch_pool_account(self, token: str, pool: str) -> bool:
-        """Decode the Pool account once, off the hot path.
-
-        The vaults, the coin_creator and the mayhem flag are not in any event
-        and cannot be inferred: the mayhem flag alone selects which published
-        fee-recipient set the instruction must name, and choosing from the
-        wrong one builds a transaction that is well formed and fails. So this
-        is fetched at migration, when nothing is waiting on it, and the route
-        stays DATA_BLOCKED until it lands.
-        """
-        if not pool or not self.solana_rpc or pool in self._pool_account_pending:
-            return False
-        self._pool_account_pending.add(pool)
-        try:
-            result = await self.solana_rpc.request(
-                "getAccountInfo", [pool, {"encoding": "base64", "commitment": "confirmed"}])
-            value = (result or {}).get("value") or {}
-            encoded = (value.get("data") or [None])[0]
-            if not encoded:
-                return False
-            decoded = parse_pool(base64.b64decode(encoded), pool)
-            if not decoded.ok:
-                logger.warning("pool %s did not decode: %s", pool, decoded.detail)
-                return False
-            self._pool_accounts[token] = decoded
-            state = self._latest_pool_state.get(token)
-            if state is not None and not state.coin_creator:
-                state.coin_creator = decoded.coin_creator
-            return True
-        except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError) as exc:
-            logger.warning("pool account fetch failed for %s: %s", pool, exc)
-            return False
-        finally:
-            self._pool_account_pending.discard(pool)
-
-
     def _follow_quote(self, token: str, lamports: int):
         """What a buy of ``lamports`` would get us right now, on either venue.
 
@@ -2793,6 +2760,7 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
 
         if lamports <= 0 or self.sol_price_usd <= 0:
             return
+        measurement_decision_at = time.time()
         result = await self.execution_engine.execute_swap(
             candidate.base_token or WSOL_MINT, token, lamports,
             slippage_bps=slippage_bps,
@@ -2813,6 +2781,8 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
         )
         attempt = {**_jsonable(result), "scale_in": True, "marginal_elogw": gain,
                    "added_fraction": fraction, "at_multiple": multiple}
+        if getattr(result, "measurement_context", None):
+            attempt["measurement_context"] = {**result.measurement_context, "decision_at": measurement_decision_at}
         self.dataset_builder.record_execution_attempt(token, attempt)
         if not result.success:
             return
@@ -3309,6 +3279,7 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
 
     async def _execute_exit(self, token: str, position: Dict[str, Any], exit_pct: float,
                             reason: str, expected_edge_usd: Optional[float] = None):
+        measurement_decision_at = time.time()
         current_tokens = int(position["size_tokens"])
         sold_tokens = min(current_tokens, max(1, int(current_tokens * min(max(exit_pct, 0), 1))))
         # Whether the ladder had this exit prepared. Recorded on the attempt
@@ -3349,6 +3320,8 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
                    "exit_pct": sold_tokens / max(current_tokens, 1),
                    "staged_exit": staged_status,
                    "staged_rung": (rung.fraction if rung is not None else None)}
+        if getattr(result, "measurement_context", None):
+            attempt["measurement_context"] = {**result.measurement_context, "decision_at": measurement_decision_at}
         self._record_ops_event("execution_attempts", {
             "token": token, "side": "sell", "success": bool(result.success),
             "status": getattr(result.status, "value", str(result.status)),
@@ -3932,6 +3905,14 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
                            # reserves keeps the derivation point-in-time.
                            "virtual_sol_reserves": virtual_sol or None,
                            "virtual_token_reserves": virtual_token or None}
+            reference_receipt_at, reference_source_at = time.time(), event.get("timestamp")
+            if (virtual_sol > 0 and virtual_token > 0 and event.get("signature")
+                    and type(reference_source_at) in (float, int) and math.isfinite(reference_source_at)
+                    and 0 < reference_source_at <= reference_receipt_at):
+                from src.research.execution_measurement import reserve_reference
+                observation["execution_reference"] = reserve_reference(
+                    token, virtual_sol, virtual_token, observed_at=reference_receipt_at, source_at=reference_source_at,
+                    source_ref="solana:" + str(event["signature"]) + "#slot=" + str(event.get("slot")))
             # Reconstruct the holder set from fills we watched: free, exact
             # for a launch this young, and available at stream latency
             # rather than behind an RPC method nothing will serve.
