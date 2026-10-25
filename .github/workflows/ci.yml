@@ -13,6 +13,55 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  windows-native:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build locked Windows stable-ABI wheel
+        run: |
+          python -m pip install "maturin>=1.7,<2"
+          python -m maturin build --release --locked --manifest-path native/solana_fastpath/Cargo.toml --out native-wheels
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - name: Verify wheel on VPS Python version
+        env:
+          ALLOW_LIVE_TRADING: ""
+          SOLANA_PRIVATE_KEY: ""
+        run: |
+          python -m pip install -r requirements-dev.txt
+          $wheel = Get-ChildItem native-wheels/*.whl
+          if ($wheel.Count -ne 1) { throw 'Expected one native wheel' }
+          python -m pip install --no-deps $wheel.FullName
+          python -c "import solana_fastpath; print(solana_fastpath.IMPLEMENTATION)"
+          python -m pytest tests -q --durations=15 -o faulthandler_timeout=60
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/bench_hotpath.py --json native-wheels/benchmark.json
+      - name: Retain wheel provenance
+        env:
+          SOURCE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          $wheel = Get-ChildItem native-wheels/*.whl
+          @{commit=$env:GITHUB_SHA; source_head=$env:SOURCE_HEAD; tree=(git rev-parse 'HEAD^{tree}'); sha256=(Get-FileHash $wheel.FullName -Algorithm SHA256).Hash; wheel=$wheel.Name; tested_python='3.14'; live_submission='LOCKED'} | ConvertTo-Json | Set-Content native-wheels/build-receipt.json -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-${{ github.sha }}
+          path: native-wheels/
+          if-no-files-found: error
+
   python:
     runs-on: ubuntu-latest
     timeout-minutes: 15

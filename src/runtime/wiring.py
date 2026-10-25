@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from solders.keypair import Keypair
 from src.chains.rpc_manager import ChainRegistry, RPCManager
 from src.chains.launchlab import LAUNCHLAB_PROGRAM, LaunchLabMonitor
+from src.chains.meteora_dbc import DBC_PROGRAM, MeteoraDBCMonitor
 from src.chains.yellowstone_grpc import (
     NATIVE_FASTPATH_STATUS, PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
     create_combined_subscription,
@@ -306,6 +307,7 @@ class SubsystemWiring:
             self.pump_swap_monitor = PumpSwapMonitor(self.yellowstone, self._on_pump_event)
             self.raydium_monitor = RaydiumMonitor(self.yellowstone, self._on_raydium_event)
             self.launchlab_monitor = LaunchLabMonitor(self.yellowstone, self._on_launchpad_event)
+            self.dbc_monitor = MeteoraDBCMonitor(self.yellowstone, self._on_launchpad_event)
             # The native receiver comes up ALONGSIDE, not instead, and BEFORE
             # the reference stream: a gRPC subscription takes a moment to be
             # served, and if the reference starts first every event in that
@@ -341,12 +343,14 @@ class SubsystemWiring:
                                   RaydiumMonitor.RAYDIUM_AMM_V4, RaydiumMonitor.RAYDIUM_CPMM,
                                   RaydiumMonitor.RAYDIUM_CLMM, RaydiumMonitor.METEORA_DLMM,
                                   RaydiumMonitor.METEORA_DYNAMIC_AMM, RaydiumMonitor.ORCA_WHIRLPOOL,
-                                  LAUNCHLAB_PROGRAM]
+                                  LAUNCHLAB_PROGRAM, DBC_PROGRAM]
             )
             self.pump_monitor = PumpFunMonitor(self.rpc_program_stream, self._on_pump_event)
             self.pump_swap_monitor = PumpSwapMonitor(self.rpc_program_stream, self._on_pump_event)
             self.raydium_monitor = RaydiumMonitor(self.rpc_program_stream, self._on_raydium_event)
             self.launchlab_monitor = LaunchLabMonitor(
+                self.rpc_program_stream, _tagged_feed(self._on_launchpad_event, "rpc_ws"))
+            self.dbc_monitor = MeteoraDBCMonitor(
                 self.rpc_program_stream, _tagged_feed(self._on_launchpad_event, "rpc_ws"))
             # initialize() creates this stream after research setup. Start
             # it here, after its handlers exist, rather than in the earlier
@@ -367,7 +371,7 @@ class SubsystemWiring:
                  RaydiumMonitor.RAYDIUM_AMM_V4, RaydiumMonitor.RAYDIUM_CPMM,
                  RaydiumMonitor.RAYDIUM_CLMM, RaydiumMonitor.METEORA_DLMM,
                  RaydiumMonitor.METEORA_DYNAMIC_AMM, RaydiumMonitor.ORCA_WHIRLPOOL,
-                 LAUNCHLAB_PROGRAM])
+                 LAUNCHLAB_PROGRAM, DBC_PROGRAM])
             self.secondary_pump_monitor = PumpFunMonitor(
                 stream, _tagged_feed(self._on_pump_event, "rpc_ws"))
             self.secondary_pump_swap_monitor = PumpSwapMonitor(
@@ -375,6 +379,8 @@ class SubsystemWiring:
             self.secondary_raydium_monitor = RaydiumMonitor(
                 stream, _tagged_feed(self._on_raydium_event, "rpc_ws"))
             self.secondary_launchlab_monitor = LaunchLabMonitor(
+                stream, _tagged_feed(self._on_launchpad_event, "rpc_ws"))
+            self.secondary_dbc_monitor = MeteoraDBCMonitor(
                 stream, _tagged_feed(self._on_launchpad_event, "rpc_ws"))
             await stream.start()
         except Exception as exc:

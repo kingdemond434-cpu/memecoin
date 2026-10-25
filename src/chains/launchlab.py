@@ -60,6 +60,8 @@ class _Arguments:
 
 
 class LaunchLabMonitor:
+    program_id = LAUNCHLAB_PROGRAM
+
     def __init__(self, stream: Any, callback: Callable):
         self.callback = callback
         idl = load_idl("raydium_launchlab")
@@ -138,7 +140,7 @@ class LaunchLabMonitor:
         for index, instruction in enumerate(instructions):
             try:
                 program_index, accounts, data = instruction_fields(instruction)
-                if not 0 <= program_index < len(keys) or keys[program_index] != LAUNCHLAB_PROGRAM:
+                if not 0 <= program_index < len(keys) or keys[program_index] != self.program_id:
                     continue
                 event = self.decode(keys, accounts, data)
                 if event is None or event["token"] in emitted:

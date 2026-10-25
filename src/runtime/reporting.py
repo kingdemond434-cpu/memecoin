@@ -598,6 +598,8 @@ class ReportingSurface:
             # never returned a record reads differently from one that is
             # failing, and the two need different fixes.
             "data_miners": self.data_miners.report(),
+            "meteora_dbc_decoder": (self.dbc_monitor.decoder_report()
+                if getattr(self, "dbc_monitor", None) is not None else {"status": "NOT_OBSERVED"}),
             "pool_attribution": (self.pool_attribution.report()
                 if getattr(self, "pool_attribution", None) is not None else {"status": "NOT_OBSERVED"}),
             "free_market_discovery": (self.free_discovery.report()
