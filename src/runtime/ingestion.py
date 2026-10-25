@@ -9,12 +9,14 @@ is sized, and the two stop sharing a merge surface.
 from __future__ import annotations
 
 import asyncio
+import base64
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 import logging
 from src.detection.token_detector import DetectionSource, TokenCandidate
 from src.research.feature_engine import build_features
+from src.chains.pumpswap_route import parse_pool
 from src.strategies.multihead_predictor import PredictionFeatures
 from src.runtime.serialisation import jsonable as _jsonable
 
@@ -36,6 +38,33 @@ class MinedRecordIngestion:
     WHICH tokens and wallets are worth a miner pass lives here too, because
     it answers the same question from the other end -- what is worth
     collecting, and where does what we collected go."""
+
+    async def _fetch_pool_account(self, token: str, pool: str) -> bool:
+        """Decode the pool's actual vaults/creator before native route use."""
+        if not pool or not self.solana_rpc or pool in self._pool_account_pending:
+            return False
+        self._pool_account_pending.add(pool)
+        try:
+            result = await self.solana_rpc.request(
+                "getAccountInfo", [pool, {"encoding": "base64", "commitment": "confirmed"}])
+            value = (result or {}).get("value") or {}
+            encoded = (value.get("data") or [None])[0]
+            if not encoded:
+                return False
+            decoded = parse_pool(base64.b64decode(encoded), pool)
+            if not decoded.ok:
+                logger.warning("pool %s did not decode: %s", pool, decoded.detail)
+                return False
+            self._pool_accounts[token] = decoded
+            state = self._latest_pool_state.get(token)
+            if state is not None and not state.coin_creator:
+                state.coin_creator = decoded.coin_creator
+            return True
+        except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError) as exc:
+            logger.warning("pool account fetch failed for %s: %s", pool, exc)
+            return False
+        finally:
+            self._pool_account_pending.discard(pool)
 
     async def _on_launchpad_event(self, event: Dict[str, Any]) -> None:
         """Capture native launches without supplying Pump-specific prices/accounts."""

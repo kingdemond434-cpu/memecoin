@@ -2039,42 +2039,6 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
         self.state_sequencer.bump(token)
         self.request_redecision(token)
 
-    async def _fetch_pool_account(self, token: str, pool: str) -> bool:
-        """Decode the Pool account once, off the hot path.
-
-        The vaults, the coin_creator and the mayhem flag are not in any event
-        and cannot be inferred: the mayhem flag alone selects which published
-        fee-recipient set the instruction must name, and choosing from the
-        wrong one builds a transaction that is well formed and fails. So this
-        is fetched at migration, when nothing is waiting on it, and the route
-        stays DATA_BLOCKED until it lands.
-        """
-        if not pool or not self.solana_rpc or pool in self._pool_account_pending:
-            return False
-        self._pool_account_pending.add(pool)
-        try:
-            result = await self.solana_rpc.request(
-                "getAccountInfo", [pool, {"encoding": "base64", "commitment": "confirmed"}])
-            value = (result or {}).get("value") or {}
-            encoded = (value.get("data") or [None])[0]
-            if not encoded:
-                return False
-            decoded = parse_pool(base64.b64decode(encoded), pool)
-            if not decoded.ok:
-                logger.warning("pool %s did not decode: %s", pool, decoded.detail)
-                return False
-            self._pool_accounts[token] = decoded
-            state = self._latest_pool_state.get(token)
-            if state is not None and not state.coin_creator:
-                state.coin_creator = decoded.coin_creator
-            return True
-        except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError) as exc:
-            logger.warning("pool account fetch failed for %s: %s", pool, exc)
-            return False
-        finally:
-            self._pool_account_pending.discard(pool)
-
-
     def _follow_quote(self, token: str, lamports: int):
         """What a buy of ``lamports`` would get us right now, on either venue.
 
