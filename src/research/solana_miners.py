@@ -99,6 +99,7 @@ def holder_structure_miner(rpc: Any, tokens: Callable[[], Sequence[str]],
     async def fetch() -> List[Dict[str, Any]]:
         watched = select()
         records: List[Dict[str, Any]] = []
+        failures = 0
         for mint in watched:
             try:
                 largest = await rpc.request(
@@ -106,6 +107,7 @@ def holder_structure_miner(rpc: Any, tokens: Callable[[], Sequence[str]],
                 supply = await rpc.request(
                     "getTokenSupply", [mint, {"commitment": "confirmed"}])
             except Exception as exc:
+                failures += 1
                 logger.debug("holder mine failed for %s: %s", mint, exc)
                 continue
             holders = ((largest or {}).get("value") or [])
@@ -129,6 +131,8 @@ def holder_structure_miner(rpc: Any, tokens: Callable[[], Sequence[str]],
                 "concentration_hhi": sum((value / total) ** 2 for value in amounts),
                 "data_status": "OK",
             })
+        if watched and failures == len(watched):
+            raise RuntimeError("all native holder reads failed; concentration remains DATA_BLOCKED")
         return records
 
     return fetch

@@ -396,7 +396,8 @@ class MinedRecordIngestion:
         seen = set()
         for group in (self.elogw_engine.open_positions,
                       self._latest_curve_state,
-                      self._latest_pool_state):
+                      self._latest_pool_state,
+                      getattr(self, "_discovered_pools", {})):
             for token in group:
                 if token and token not in seen:
                     seen.add(token)
@@ -449,8 +450,10 @@ class MinedRecordIngestion:
         for token in self._mineable_tokens():
             curve = self._latest_curve_state.get(token)
             pool = self._latest_pool_state.get(token)
+            episode = getattr(getattr(self, "dataset_builder", None), "active_episodes", {}).get(token)
             for address in (getattr(curve, "creator", ""),
-                            getattr(pool, "coin_creator", "")):
+                            getattr(pool, "coin_creator", ""),
+                            getattr(episode, "deployer", "")):
                 if address and address not in seen:
                     seen.add(address)
                     addresses.append(address)
@@ -468,6 +471,14 @@ class MinedRecordIngestion:
         for source in (getattr(self.wallet_intel, "elite_wallets", None) or {},
                        getattr(self, "_recent_funders", None) or {}):
             for address in source:
+                if address and address not in seen:
+                    seen.add(address)
+                    wallets.append(address)
+        # Observed opening buyers are candidates, not certified smart money.
+        # Waiting for an elite label left a cold desk with no wallet targets.
+        for entries in getattr(self, "_actor_entries", {}).values():
+            for entry in entries:
+                address = str(entry.wallet or "")
                 if address and address not in seen:
                     seen.add(address)
                     wallets.append(address)
@@ -504,6 +515,20 @@ class MinedRecordIngestion:
         if getattr(self, "channel_book", None) is not None:
             self._harvest_channels(miner_id, records)
         for record in records:
+            if record.get("provider") == "geckoterminal" and record.get("discovery_kind"):
+                if record["discovery_kind"] == "pool_observation" and record.get("network_id") == "solana":
+                    # Explicit provider namespace and indicative prices stay
+                    # separate from verified native routes/curve state.
+                    from solders.pubkey import Pubkey
+                    try:
+                        Pubkey.from_string(record["token"])
+                        Pubkey.from_string(record["quote_token"])
+                        Pubkey.from_string(record["pool"])
+                    except ValueError:
+                        continue
+                    self._ingest_discovered_pools([{**record, "mint": record["token"],
+                        "venue": "geckoterminal", "_source": "geckoterminal:public-api"}])
+                continue  # network/DEX/page envelopes are never spot regime values
             if record.get("provider") == "hyperliquid" and record.get("product") == "perpetual":
                 self.phantom_perps.ingest(record)
                 continue  # separate contracts, funding and collateral from spot/World

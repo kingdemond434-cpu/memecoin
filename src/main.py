@@ -734,6 +734,8 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
         await self._close_health_server()
         if getattr(self, "phantom_perps", None) is not None:
             await asyncio.to_thread(self.phantom_perps.close)
+        if getattr(self, "free_discovery", None) is not None:
+            await asyncio.to_thread(self.free_discovery.close)
         if getattr(self, "public_claim_links", None) is not None:
             self.public_claim_links.close()
         for component in (self.global_research, self.dataset_builder, self.execution_engine, self.rug_hazard,

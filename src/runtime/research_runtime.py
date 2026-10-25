@@ -98,6 +98,13 @@ class ResearchRuntime:
             self.research_frontier.enqueue("MINER_BATCH_REPLAY", ref,
                 evidence_refs=[ref], auction=workflows.auction("MINER_BATCH_REPLAY"),
                 exploration_tags=["new_source_classes"], now=now)
+        if miner_id == "free:geckoterminal_pages":
+            # This callback runs on the existing miner worker. Raw pages are
+            # canonical before discovery indexing and durable cursor ACKs.
+            page = next(row for row in records if row.get("discovery_kind") == "source_page")
+            for observation in self.free_discovery.discovery_records(page, ref):
+                self._retain_chain_scout_record(observation)
+            self.free_discovery.acknowledge(records, ref)
         return ref
 
     def _retain_mined_disposition(self, ref: str, status: str, detail: str, now: float) -> None:
