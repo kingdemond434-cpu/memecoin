@@ -130,19 +130,27 @@ def _route(target, accounts):
             raise ForkUnavailable('curve owner mismatch')
         raw = account_data(curve)
         state = parse_bonding_curve(raw)
-        # The extended IDL flags must be observed, never silently defaulted.
+        # Pump defines absent trailing extension fields as zero/default. Its
+        # on-chain default quote mint means native SOL; the v2 instruction
+        # still receives WSOL as its interface mint, but transfers lamports.
         from solders.pubkey import Pubkey
-        if (len(raw) < 115 or raw[81] not in (0, 1) or raw[82] not in (0, 1)
-                or raw[83:115] != bytes(Pubkey.from_string(WSOL_MINT))
-                or not state.tradeable or not state.creator):
+        mayhem = raw[81] if len(raw) > 81 else 0
+        cashback = raw[82] if len(raw) > 82 else 0
+        if mayhem not in (0, 1) or cashback not in (0, 1) or not state.tradeable:
             raise ForkUnavailable('curve flags/creator/tradeability unavailable')
+        creator = state.creator or SYSTEM  # documented default for pre-creator-field curves
+        if 83 < len(raw) < 115 and any(raw[83:]):
+            raise ForkUnavailable('partial non-default curve quote mint')
+        quote_mint = str(Pubkey.from_bytes(raw[83:115])) if len(raw) >= 115 else SYSTEM
+        if quote_mint not in {SYSTEM, WSOL_MINT}:
+            raise ForkUnavailable('curve quote asset is not native SOL')
         if state.real_token_reserves <= 0:
             raise ForkUnavailable('curve real inventory unavailable')
-        route = NativePumpRoute(PumpRouteConfig(base_token_program=mint_value['owner'], mayhem=bool(raw[81])))
+        route = NativePumpRoute(PumpRouteConfig(base_token_program=mint_value['owner'], mayhem=bool(mayhem)))
         requested = min(state.real_token_reserves,
             target['quote_budget'] * state.virtual_token_reserves // (state.virtual_sol_reserves + target['quote_budget'])) * 9 // 10
-        buy = route.build_buy(mint, state.creator, owner, requested, target['quote_budget'])
-        sell = lambda amount: route.build_sell(mint, state.creator, owner, amount, 1)
+        buy = route.build_buy(mint, creator, owner, requested, target['quote_budget'])
+        sell = lambda amount: route.build_sell(mint, creator, owner, amount, 1)
     elif venue == 'pumpswap':
         pool_value = accounts.get(target['pool'])
         if not pool_value or pool_value['owner'] != PUMPSWAP_PROGRAM:
@@ -351,9 +359,10 @@ def execute_frame(frame):
     vm.airdrop(owner, virtual_funding)
     setup = [_ata_instruction(target['token'], token_program), _ata_instruction(WSOL_MINT, TOKEN_PROGRAM)]
     quote_address = Pubkey.from_string(associated_token_address(str(owner), WSOL_MINT, TOKEN_PROGRAM))
-    # Both reviewed adapters use a WSOL quote mint (including Pump buy_v2).
-    setup += [transfer({'from_pubkey': owner, 'to_pubkey': quote_address, 'lamports': target['quote_budget']}),
-              Instruction(Pubkey.from_string(TOKEN_PROGRAM), b'\x11', [AccountMeta(quote_address, False, True)])]
+    native_sol = target['venue'] == 'pump_curve'
+    if not native_sol:
+        setup += [transfer({'from_pubkey': owner, 'to_pubkey': quote_address, 'lamports': target['quote_budget']}),
+                  Instruction(Pubkey.from_string(TOKEN_PROGRAM), b'\x11', [AccountMeta(quote_address, False, True)])]
     setup_receipt = _receipt(_transact(vm, setup))
     from importlib.metadata import version
     from pathlib import Path
@@ -364,28 +373,34 @@ def execute_frame(frame):
         'program_hashes': {key: hashlib.sha256(raw).hexdigest() for key, _, raw in images},
         'scope': 'LOCAL_SVM_AT_SAMPLED_BANK_NOT_FUTURE_SELL_GUARANTEE',
         'runtime_parity': 'bundled mainnet feature set and reconstructed loaders; exact validator parity unverified',
+        'quote_balance_measurement': ('native payer lamport change plus VM transaction fee; may include rent refunds'
+                                      if native_sol else 'WSOL token-account amount change'),
         'synthetic_funding_lamports': virtual_funding, 'quote_budget_lamports': target['quote_budget'],
         'real_transaction_submitted': False, 'sell_simulation_pass': None, 'setup': setup_receipt}
     if not setup_receipt['succeeded']:
         return {**result, 'status': 'FORK_SETUP_FAILED_UNKNOWN'}
     initial = _tokens(vm, target['token'], token_program)
+    quote_before_buy = vm.get_balance(owner) if native_sol else _tokens(vm, WSOL_MINT, TOKEN_PROGRAM)
     buy_receipt = _receipt(_transact(vm, [_instruction(buy)]))
     result['buy'] = buy_receipt
     if not buy_receipt['succeeded']:
         return {**result, 'status': 'FORK_BUY_FAILED_UNKNOWN'}
     received = _tokens(vm, target['token'], token_program) - initial
+    quote_after_buy = vm.get_balance(owner) if native_sol else _tokens(vm, WSOL_MINT, TOKEN_PROGRAM)
+    result.update(quote_balance_after_setup_units=quote_before_buy, quote_balance_after_buy_units=quote_after_buy)
     if received <= 0:
         return {**result, 'status': 'NO_RECEIVED_TOKEN_BALANCE_UNKNOWN'}
     # Critical: sell ACTUAL received units in this same modified VM.
-    before_quote = _tokens(vm, WSOL_MINT, TOKEN_PROGRAM)
+    before_quote = vm.get_balance(owner) if native_sol else _tokens(vm, WSOL_MINT, TOKEN_PROGRAM)
     sell_receipt = _receipt(_transact(vm, [_instruction(sell(received))]))
     result.update(sell=sell_receipt, bought_token_units=received, sell_input_token_units=received)
     if not sell_receipt['succeeded']:
         # A failing sampled VM is NOT proof that the real token is a honeypot.
         return {**result, 'status': 'FORK_SELL_FAILED', 'sell_simulation_pass': False}
     remaining = _tokens(vm, target['token'], token_program)
-    after_quote = _tokens(vm, WSOL_MINT, TOKEN_PROGRAM)
-    returned = after_quote - before_quote
+    after_quote = vm.get_balance(owner) if native_sol else _tokens(vm, WSOL_MINT, TOKEN_PROGRAM)
+    returned = after_quote - before_quote + (sell_receipt['vm_fee_lamports'] if native_sol else 0)
+    result['quote_balance_after_sell_units'] = after_quote
     if remaining != initial or returned <= 0:
         return {**result, 'status': 'SELL_BALANCE_CHANGE_INCOMPLETE_UNKNOWN',
                 'remaining_token_units': remaining, 'returned_quote_units': returned}
