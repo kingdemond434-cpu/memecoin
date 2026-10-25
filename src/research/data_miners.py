@@ -278,11 +278,7 @@ class DataMinerPool:
                             logger.warning("data miner task failed: %s", name)
                         del self._inflight[name]
                 now = time.time()
-                due = sorted((name for name, at in self._next_due.items()
-                    if at <= now and name in self._callables and name not in self._inflight
-                    and self._health[name].backoff_until <= now), key=self._next_due.get)
-                for name in due:
-                    self._inflight[name] = asyncio.create_task(self._run_one(name, now))
+                await self.run_due(now, wait=False)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pragma: no cover - defensive
@@ -291,14 +287,18 @@ class DataMinerPool:
             # often a miner runs is its own declaration, not this sleep.
             await asyncio.sleep(1.0)
 
-    async def run_due(self, now: Optional[float] = None) -> List[MinerResult]:
-        """Run every miner whose cadence has come round. Concurrent, bounded."""
+    async def run_due(self, now: Optional[float] = None, *, wait: bool = True) -> List[MinerResult]:
+        """Run due sources; the live scheduler owns tasks without a group barrier."""
         now = time.time() if now is None else now
-        due = [miner_id for miner_id, at in self._next_due.items()
+        due = sorted((miner_id for miner_id, at in self._next_due.items()
                if at <= now and miner_id in self._callables
                and miner_id not in self._active and miner_id not in self._inflight
-               and self._health[miner_id].backoff_until <= now]
+               and self._health[miner_id].backoff_until <= now), key=self._next_due.get)
         if not due:
+            return []
+        if not wait:
+            for name in due:
+                self._inflight[name] = asyncio.create_task(self._run_one(name, now))
             return []
         results = await asyncio.gather(
             *(self._run_one(miner_id, now) for miner_id in due),
