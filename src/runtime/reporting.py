@@ -24,6 +24,7 @@ from aiohttp import web
 from src.research.funnel_invariant import check_desk
 from src.runtime.research_reads import research_report
 from src.research.global_research_miner import GlobalResearchMiner
+from src.runtime.diagnostic_reads import diagnostic_reads
 from src.chains.yellowstone_grpc import (
     NATIVE_FASTPATH_STATUS, PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
     create_combined_subscription,
@@ -880,9 +881,11 @@ class ReportingSurface:
         engine = getattr(self, 'unknown_engine', None)
         if engine is not None and callable(getattr(engine, 'frontier_snapshot', None)):
             frontier = await engine.frontier_snapshot()
-            report = engine.report(frontier_snapshot=frontier)
-            return _jsonable(self.readiness(unknown_engine_report=report))
-        return _jsonable(self.readiness())
+            with diagnostic_reads():
+                report = engine.report(frontier_snapshot=frontier)
+                return _jsonable(self.readiness(unknown_engine_report=report))
+        with diagnostic_reads():
+            return _jsonable(self.readiness())
 
     async def _health_loop(self):
         while self._running:

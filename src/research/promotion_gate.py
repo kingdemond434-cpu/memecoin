@@ -321,16 +321,21 @@ class PromotionLedger:
             handle.write(json.dumps(row, default=str) + "\n")
 
     def history(self) -> List[Dict[str, Any]]:
+        from src.runtime.diagnostic_reads import diagnostic_value
+        return diagnostic_value((id(self), 'promotion_history'), self._history_rows)
+
+    def _history_rows(self) -> List[Dict[str, Any]]:
         if not self.path.exists():
             return []
         rows = []
-        for line in self.path.read_text().splitlines():
-            line = line.strip()
-            if line:
-                try:
-                    rows.append(json.loads(line))
-                except ValueError:
-                    continue
+        with self.path.open() as handle:
+            for line in handle:
+                line = line.strip()
+                if line:
+                    try:
+                        rows.append(json.loads(line))
+                    except ValueError:
+                        continue
         return rows
 
     def fingerprints_for(self, stage: Stage) -> List[str]:

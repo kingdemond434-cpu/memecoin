@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+from collections import Counter, defaultdict
 import json
 import math
 import re
@@ -483,8 +484,9 @@ class PopulationHunter:
         return {"source_id": row["source_id"], "evaluated_observation_id": observation_id}, []
 
     @staticmethod
-    def _narrative_report(state: dict, narrative_id: str, as_of: float) -> dict:
-        rows = [r for r in state["narratives"].values() if r["narrative_id"] == narrative_id and r["observed_at"] <= as_of]
+    def _narrative_report(state: dict, narrative_id: str, as_of: float, *, observations=None) -> dict:
+        candidates = state['narratives'].values() if observations is None else observations
+        rows = [r for r in candidates if r["narrative_id"] == narrative_id and r["observed_at"] <= as_of]
         rows.sort(key=lambda r: (r["observed_at"], r["id"]))
         unique, hashes = [], set()
         for row in rows:
@@ -516,9 +518,16 @@ class PopulationHunter:
         actors = [r for r in self.state["actors"].values() if r["observed_at"] <= cutoff]
         narratives = [r for r in self.state["narratives"].values() if r["observed_at"] <= cutoff]
         source_ids = sorted({r["source_id"] for r in narratives})
+        source_counts = Counter(row['source_id'] for row in narratives)
+        source_rows, narrative_rows = defaultdict(list), defaultdict(list)
+        for row in self.state['source_outcomes'].values():
+            if row['observed_at'] <= cutoff:
+                source_rows[row['source_id']].append(row)
+        for row in narratives:
+            narrative_rows[row['narrative_id']].append(row)
         sources = {}
         for source in source_ids:
-            rows = [r for r in self.state["source_outcomes"].values() if r["source_id"] == source and r["observed_at"] <= cutoff]
+            rows = source_rows[source]
             metrics = {}
             for metric in QUALITY:
                 evaluated = {r["observation_id"]: r["evaluations"][metric] for r in rows if metric in r["evaluations"]}
@@ -526,7 +535,7 @@ class PopulationHunter:
                 metrics[metric] = {"numerator": sum(values), "denominator": len(values),
                                    "rate": sum(values) / len(values) if values else None}
             returns = list({r["observation_id"]: r["executable_net_return"] for r in rows if "executable_net_return" in r}.values())
-            sources[source] = {"observations": sum(r["source_id"] == source for r in narratives),
+            sources[source] = {"observations": source_counts[source],
                 "evaluated_observations": len({r["observation_id"] for r in rows}), "metrics": metrics,
                 "mean_executable_net_return": sum(returns) / len(returns) if returns else None,
                 "executable_return_denominator": len(returns), "lead_time_seconds": None,
@@ -546,7 +555,8 @@ class PopulationHunter:
             for actor_id, row in list(recent.items())[:16]]
         narrative_ids = list(dict.fromkeys(row["narrative_id"] for row in
             sorted(narratives, key=lambda r: (r["observed_at"], r["id"]), reverse=True)))
-        narrative_reports = [{"narrative_id": name, **self.narrative(name, as_of=value_cutoff)}
+        narrative_reports = [{"narrative_id": name, **self._narrative_report(self.state, name, value_cutoff,
+                              observations=narrative_rows[name])}
                              for name in narrative_ids[:16]]
         return {"status": "OBSERVATION_ONLY" if actors or narratives else "NO_OBSERVED_INPUTS", "authority": "none",
             "actor_observations": len(actors), "native_actor_count": len({r["actor_id"] for r in actors}),
