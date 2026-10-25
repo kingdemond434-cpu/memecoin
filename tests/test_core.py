@@ -10646,14 +10646,14 @@ class TestGraduationKeepsNativeExecution(unittest.IsolatedAsyncioTestCase):
         prepared = engine.prepare_native_route(self.MINT, self.OTHER, 1_000_000_000, 100)
         self.assertEqual(prepared.status, "OK")
         self.assertEqual(prepared.venue, "pumpswap")
-        self.assertEqual(len(prepared.accounts), 23)
+        self.assertEqual(len(prepared.accounts), 26)
 
     def test_the_sell_side_is_native_too(self):
         engine = self._engine(reserves=self._reserves(), account=self._pool_account())
         prepared = engine.prepare_native_route(self.OTHER, self.MINT, 1_000_000, 200)
         self.assertEqual(prepared.status, "OK")
         self.assertEqual(prepared.venue, "pumpswap")
-        self.assertEqual(len(prepared.accounts), 21)
+        self.assertEqual(len(prepared.accounts), 24)
 
     def test_non_sol_or_mismatched_pool_assets_do_not_price_a_sol_trade(self):
         from src.execution.jupiter_jito import USDC_MINT
