@@ -51,6 +51,7 @@ from src.runtime.offload import OffloadedPool, install_fast_event_loop
 from src.research.data_miners import DataMinerPool
 from src.research.solana_miners import register_solana_miners
 from src.research.gmgn_observations import register_gmgn_miners
+from src.research.phantom_perps import PhantomPerpsResearch
 from src.research.source_catalogue import default_registry
 from src.research.regional_miners import register_regional_miners
 from src.research.telegram_miners import (
@@ -1288,6 +1289,9 @@ class SubsystemWiring:
         self.miner_registration.update(register_gmgn_miners(
             self.data_miners, http=self.http_client, watched_tokens=self._mineable_tokens,
             watched_wallets=self._tracked_wallets, deployers=self._known_deployers))
+        self.phantom_perps = PhantomPerpsResearch(
+            Path(self.global_config.get("ops_state_dir", "data/state")) / "phantom_perps.sqlite")
+        self.miner_registration.update(self.phantom_perps.register(self.data_miners, self.http_client))
         # Chain facts the program stream does not carry: what landing costs
         # right now, whether the chain is keeping up, whether the supply is
         # still under someone's control, and what the deployer did before.

@@ -504,6 +504,9 @@ class MinedRecordIngestion:
         if getattr(self, "channel_book", None) is not None:
             self._harvest_channels(miner_id, records)
         for record in records:
+            if record.get("provider") == "hyperliquid" and record.get("product") == "perpetual":
+                self.phantom_perps.ingest(record)
+                continue  # separate contracts, funding and collateral from spot/World
             # Chain-wide execution conditions belong to no episode: they are
             # the state of the world every decision in this moment is made in.
             if record.get("slot_time_ratio") is not None:
