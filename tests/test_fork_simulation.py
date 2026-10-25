@@ -1,0 +1,270 @@
+"""VM machinery fixtures are SYNTHETIC; they do not certify a mainnet DEX."""
+import base64
+import copy
+import json
+import struct
+from types import SimpleNamespace
+
+import pytest
+from solders.litesvm import LiteSVM
+from solders.pubkey import Pubkey
+
+from src.chains.idl import AccountMeta
+from src.chains.pump_route import PreparedInstruction, TOKEN_PROGRAM, WSOL_MINT, ASSOCIATED_TOKEN_PROGRAM, associated_token_address
+from src.chains.rpc_manager import RPCError
+from src.research import fork_simulation as f
+from src.research.fork_probe import ForkProbe
+
+
+def wire(raw=b'', owner=TOKEN_PROGRAM, lamports=3_000_000, executable=False):
+    return {'data': [base64.b64encode(raw).decode(), 'base64'], 'owner': owner,
+            'lamports': lamports, 'executable': executable, 'rentEpoch': 2**64 - 1}
+
+
+@pytest.mark.asyncio
+async def test_account_limit_split_is_explicit_and_bank_must_match():
+    keys = [str(Pubkey.new_unique()) for _ in range(5)]
+    calls = []
+    async def request(method, params):
+        assert method == 'getMultipleAccounts' and params[1]['commitment'] == 'finalized'
+        calls.append(params[0])
+        if len(params[0]) > 2:
+            raise RPCError({'code': -32602, 'message': 'maximum of 2 accounts'})
+        return {'context': {'slot': 77}, 'value': [None] * len(params[0])}
+    frame = await f.read_frame(SimpleNamespace(request=request), keys)
+    assert set(frame['accounts']) == set(keys) and frame['slot'] == 77
+    assert list(map(len, calls)) == [5, 2, 2, 1]
+    async def inconsistent(method, params):
+        return {'context': {'slot': 77 if params[0][0] == sorted(keys)[0] else 78},
+                'value': [None] * len(params[0])}
+    with pytest.raises(f.ForkUnavailable, match='different banks'):
+        await f.read_frame(SimpleNamespace(request=inconsistent), keys, batch=2)
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_is_not_fanned_out():
+    calls = []
+    async def request(method, params):
+        calls.append(params)
+        raise RPCError({'code': 429, 'message': 'maximum of 2 accounts'})
+    with pytest.raises(RPCError):
+        await f.read_frame(SimpleNamespace(request=request), [str(Pubkey.new_unique()) for _ in range(5)])
+    assert len(calls) == 1
+
+
+def synthetic_frame():
+    """Copy actual bundled SPL/ATA SBF; create explicitly synthetic balances."""
+    vm = LiteSVM()
+    user = f.virtual_owner().pubkey()
+    mint, treasury, quote_treasury = [str(Pubkey.new_unique()) for _ in range(3)]
+    accounts = {str(user): None}
+    for program in (TOKEN_PROGRAM, ASSOCIATED_TOKEN_PROGRAM):
+        account = vm.get_account(Pubkey.from_string(program))
+        accounts[program] = wire(bytes(account.data), str(account.owner), account.lamports, True)
+        if str(account.owner) == f.UPGRADEABLE:
+            backing_key = str(Pubkey.from_bytes(bytes(account.data)[4:36]))
+            backing = vm.get_account(Pubkey.from_string(backing_key))
+            accounts[backing_key] = wire(bytes(backing.data), str(backing.owner), backing.lamports)
+    for key, decimals in ((mint, 6), (WSOL_MINT, 9)):
+        raw = bytearray(82)
+        raw[36:44] = (10**12).to_bytes(8, 'little')
+        raw[44:46] = bytes([decimals, 1])
+        accounts[key] = wire(raw)
+        accounts[associated_token_address(str(user), key, TOKEN_PROGRAM)] = None
+    def token(mint_key, amount, native=False):
+        raw = bytearray(165)
+        raw[:32], raw[32:64] = bytes(Pubkey.from_string(mint_key)), bytes(user)
+        raw[64:72], raw[108] = amount.to_bytes(8, 'little'), 1
+        if native:
+            raw[109:113], raw[113:121] = (1).to_bytes(4, 'little'), (3_000_000).to_bytes(8, 'little')
+        return wire(raw, lamports=3_000_000 + (amount if native else 0))
+    accounts[treasury] = token(mint, 10**9)
+    accounts[quote_treasury] = token(WSOL_MINT, 10**9, True)
+    accounts[f.CLOCK] = wire(struct.pack('<QqQQq', 500_000_000, 1000, 0, 0, 1000),
+                             owner='Sysvar1111111111111111111111111111111111111')
+    frame = {'schema': f.SCHEMA, 'slot': 500_000_000, 'observed_at': 1000., 'accounts': accounts,
+             'target': {'token': mint, 'venue': 'pump_curve', 'quote_budget': 1_000_000}}
+    return frame, treasury, quote_treasury
+
+
+def transfer(source, destination, amount):
+    return PreparedInstruction('OK', TOKEN_PROGRAM,
+        [AccountMeta(source, False, True), AccountMeta(destination, False, True),
+         AccountMeta(str(f.virtual_owner().pubkey()), True, False)],
+        bytes([3]) + int(amount).to_bytes(8, 'little'))
+
+
+@pytest.mark.parametrize('broken_sell', [False, True])
+def test_real_spl_vm_sells_actual_post_buy_balance(monkeypatch, broken_sell):
+    frame, treasury, quote_treasury = synthetic_frame()
+    mint = frame['target']['token']
+    user = str(f.virtual_owner().pubkey())
+    ata = associated_token_address(user, mint, TOKEN_PROGRAM)
+    requested = []
+    def route(target, accounts):
+        def sell(amount):
+            requested.append(amount)
+            return transfer(ata, treasury, amount + (1 if broken_sell else 0))
+        return transfer(treasury, ata, 123), sell, TOKEN_PROGRAM
+    monkeypatch.setattr(f, '_route', route)
+    original = f._transact
+    stages = []
+    def transact(vm, instructions):
+        stages.append(len(instructions))
+        if len(stages) == 3:
+            # Synthetic exchange repays quote in the same atomic transaction.
+            quote_ata = associated_token_address(user, WSOL_MINT, TOKEN_PROGRAM)
+            instructions = [*instructions, f._instruction(transfer(quote_treasury, quote_ata, 50_000))]
+        return original(vm, instructions)
+    monkeypatch.setattr(f, '_transact', transact)
+    result = f.execute_frame(frame)
+    assert result['buy']['succeeded']
+    assert result['bought_token_units'] == result['sell_input_token_units'] == 123
+    assert requested == [123]  # no assumed quote amount or prefunded base balance
+    assert result['sell_simulation_pass'] is (not broken_sell)
+    assert result['real_transaction_submitted'] is False
+    if broken_sell:
+        assert result['status'] == 'FORK_SELL_FAILED'
+    else:
+        assert result['status'] == 'ROUNDTRIP_SUCCEEDED_IN_FORK'
+        assert result['remaining_token_units'] == 0 and result['returned_quote_units'] == 50_000
+
+
+def test_program_loader_binding_and_future_upgrade_rejected():
+    frame, _, _ = synthetic_frame()
+    assert len(f._program_images(frame)) == 2
+    program = frame['accounts'][TOKEN_PROGRAM]
+    pointer = str(Pubkey.from_bytes(f.account_data(program)[4:36]))
+    backing = frame['accounts'][pointer]
+    raw = bytearray(f.account_data(backing))
+    raw[4:12] = (500_000_001).to_bytes(8, 'little')
+    backing['data'][0] = base64.b64encode(raw).decode()
+    with pytest.raises(f.ForkUnavailable, match='future'):
+        f._program_images(frame)
+
+
+@pytest.mark.asyncio
+async def test_archival_retry_canonical_ack_and_pit(monkeypatch, tmp_path):
+    from src.research import fork_probe as p
+    frame, _, _ = synthetic_frame()
+    async def acquire(rpc, target):
+        return frame
+    async def run(snapshot):
+        assert snapshot == frame
+        return {'status': 'ROUNDTRIP_SUCCEEDED_IN_FORK', 'sell_simulation_pass': True,
+                'observed_at': frame['observed_at']}
+    monkeypatch.setattr(p, 'acquire', acquire)
+    monkeypatch.setattr(p, 'run_isolated', run)
+    probe = ForkProbe(tmp_path/'fork.sqlite')
+    target = frame['target']
+    rows = await probe.fetch(None, lambda: [target])
+    assert probe.latest(target['token'], as_of=10**12) is None
+    assert probe._read_frame(rows[0]['input_sha256']) == frame
+    assert probe.db.execute('SELECT count(*) FROM blobs').fetchone()[0] >= 1
+    probe.close()
+    probe = ForkProbe(tmp_path/'fork.sqlite')
+    assert await probe.fetch(None, lambda: []) == rows
+    altered = copy.deepcopy(rows)
+    altered[0]['sell_simulation_pass'] = False
+    with pytest.raises(ValueError):
+        probe.acknowledge(altered, 'canonical:x')
+    before_ack = p.time.time() - 1
+    probe.acknowledge(rows, 'canonical:x')
+    assert probe.latest(target['token'], as_of=before_ack) is None
+    assert probe.latest(target['token'], as_of=10**12)['source_ref'] == 'canonical:x'
+    probe.db.execute("UPDATE frames SET body=? WHERE id=?", (b'corrupt', rows[0]['input_sha256']))
+    with pytest.raises(Exception):
+        probe._read_frame(rows[0]['input_sha256'])
+    probe.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_environment_failure_is_unknown():
+    result = await f.run_isolated({'schema': f.SCHEMA, 'slot': 1})
+    assert result['status'] == 'FORK_ENVIRONMENT_UNKNOWN'
+    assert result['sell_simulation_pass'] is None and result['real_transaction_submitted'] is False
+
+
+def test_curve_adapter_uses_observed_quote_mint_flags_and_owner():
+    from src.chains.pump_curve import BONDING_CURVE_DISCRIMINATOR
+    mint, creator = str(Pubkey.new_unique()), str(Pubkey.new_unique())
+    raw_mint = bytearray(82)
+    raw_mint[44:46] = b'\x06\x01'
+    curve = (BONDING_CURVE_DISCRIMINATOR + struct.pack('<QQQQQ', 10**15, 30*10**9, 8*10**14, 10**9, 10**15)
+             + b'\x00' + bytes(Pubkey.from_string(creator)) + b'\x00\x00' + bytes(Pubkey.from_string(WSOL_MINT)))
+    key = f._curve_address(mint)
+    accounts = {mint: wire(raw_mint), key: wire(curve, f.PUMP_PROGRAM)}
+    target = {'token': mint, 'venue': 'pump_curve', 'quote_budget': 1_000_000}
+    buy, sell, program = f._route(target, accounts)
+    assert buy.ok and program == TOKEN_PROGRAM and sell(123).ok
+    assert int.from_bytes(sell(123).data[8:16], 'little') == 123
+    for altered in (curve[:82], curve[:83] + bytes(Pubkey.new_unique()), curve[:81] + b'\x02' + curve[82:]):
+        accounts[key] = wire(altered, f.PUMP_PROGRAM)
+        with pytest.raises(f.ForkUnavailable):
+            f._route(target, accounts)
+    accounts[key] = wire(curve, TOKEN_PROGRAM)
+    with pytest.raises(f.ForkUnavailable, match='owner'):
+        f._route(target, accounts)
+
+
+def test_pumpswap_adapter_binds_reserve_mints_and_authorities():
+    from src.chains.pumpswap_route import _POOL_LAYOUT, POOL_DISCRIMINATOR, PUMPSWAP_PROGRAM, derive_pool
+    mint, creator, base_reserve, quote_reserve = [str(Pubkey.new_unique()) for _ in range(4)]
+    pool = derive_pool(1, creator, mint, WSOL_MINT)
+    values = {'index': 1, 'creator': creator, 'base_mint': mint, 'quote_mint': WSOL_MINT,
+              'pool_base_token_account': base_reserve, 'pool_quote_token_account': quote_reserve,
+              'coin_creator': creator}
+    raw_pool = bytearray(POOL_DISCRIMINATOR)
+    for name, width, kind in _POOL_LAYOUT:
+        raw_pool.extend(bytes(Pubkey.from_string(values.get(name, creator))) if kind == 'pubkey'
+                        else int(values.get(name, 0)).to_bytes(width, 'little'))
+    raw_mint = bytearray(82)
+    raw_mint[44:46] = b'\x06\x01'
+    def reserve(token, amount):
+        raw = bytearray(165)
+        raw[:32], raw[32:64] = bytes(Pubkey.from_string(token)), bytes(Pubkey.from_string(pool))
+        raw[64:72], raw[108] = amount.to_bytes(8, 'little'), 1
+        return wire(raw)
+    accounts = {mint: wire(raw_mint), WSOL_MINT: wire(raw_mint), pool: wire(raw_pool, PUMPSWAP_PROGRAM),
+                base_reserve: reserve(mint, 10**12), quote_reserve: reserve(WSOL_MINT, 30*10**9)}
+    target = {'token': mint, 'venue': 'pumpswap', 'pool': pool, 'quote_budget': 1_000_000}
+    buy, sell, _ = f._route(target, accounts)
+    assert buy.ok and sell(123).ok
+    raw = bytearray(f.account_data(accounts[base_reserve]))
+    raw[32:64] = bytes(Pubkey.new_unique())
+    accounts[base_reserve] = wire(raw)
+    with pytest.raises(f.ForkUnavailable, match='authority'):
+        f._route(target, accounts)
+
+
+@pytest.mark.asyncio
+async def test_queue_is_not_a_top_n_and_old_targets_precede_new_ones(monkeypatch, tmp_path):
+    from src.research import fork_probe as p
+    async def unavailable(rpc, target):
+        raise f.ForkUnavailable('synthetic unavailable fixture')
+    monkeypatch.setattr(p, 'acquire', unavailable)
+    probe = ForkProbe(tmp_path/'fork.sqlite')
+    targets = [{'token': str(Pubkey.new_unique()), 'venue': 'pump_curve', 'quote_budget': 1_000_000} for _ in range(1100)]
+    rows = await probe.fetch(None, lambda: targets)
+    probe.acknowledge(rows, 'canonical:first')
+    assert probe.report()['targets'] == 1100
+    new = {'token': str(Pubkey.new_unique()), 'venue': 'pump_curve', 'quote_budget': 1_000_000}
+    rows2 = await probe.fetch(None, lambda: [new])
+    assert rows2[0]['token'] != new['token']
+    assert rows2[0]['sell_simulation_pass'] is None
+    probe.close()
+
+
+def test_runtime_retains_result_before_acknowledging():
+    from src.runtime.research_runtime import ResearchRuntime
+    called = []
+    def record(kind, payload, now):
+        called.append('retain')
+        return 'canonical:fork'
+    def ack(records, ref):
+        assert called == ['retain'] and ref == 'canonical:fork'
+        called.append('ack')
+    bot = SimpleNamespace(unknown_engine=SimpleNamespace(_record=record),
+                          fork_probe=SimpleNamespace(acknowledge=ack))
+    ref = ResearchRuntime._retain_mined_batch(bot, 'chain:local_fork_roundtrip', [{'token': 'synthetic'}], 1000)
+    assert ref == 'canonical:fork' and called == ['retain', 'ack']

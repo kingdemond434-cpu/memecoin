@@ -457,6 +457,19 @@ class MinedRecordIngestion:
             # spend the latency it exists to win.
             await asyncio.sleep(0.0 if len(events) >= budget else interval)
 
+    def _native_fork_targets(self) -> List[Dict[str, Any]]:
+        targets = []
+        # Copies cross the miner worker boundary; the live maps are never
+        # modified by the VM, and no real payer is read.
+        for token, state in list(getattr(self, "_latest_curve_state", {}).items()):
+            if state is not None and state.tradeable:
+                targets.append({"token": token, "venue": "pump_curve", "quote_budget": 1_000_000})
+        for token, state in list(getattr(self, "_latest_pool_state", {}).items()):
+            if state is not None and state.tradeable and state.pool:
+                targets.append({"token": token, "venue": "pumpswap", "pool": state.pool,
+                                "quote_budget": 1_000_000})
+        return targets
+
     def _mineable_tokens(self) -> List[str]:
         """Which mints are worth spending a miner pass on, most urgent first.
 
@@ -590,6 +603,15 @@ class MinedRecordIngestion:
             self._harvest_channels(miner_id, records)
         attribution_delivered = []
         for record in records:
+            if miner_id == "chain:local_fork_roundtrip" and record.get("provider") == "local_svm":
+                # Raw result and bank archive are already canonical. This is a
+                # research observation; it never triggers an order or labels
+                # a VM/environment failure as a proven on-chain honeypot.
+                proof = self.fork_probe.latest(record["token"], as_of=time.time())
+                if proof and proof.get("probe_id") == record.get("probe_id"):
+                    self.dataset_builder.record_market_observation(record["token"],
+                        {**proof, "type": "native_fork_roundtrip", "timestamp": proof["available_at"]})
+                continue
             if record.get("provider") == "native_pool_attribution":
                 if record.get("attribution_kind") == "recovered_trade":
                     event = record["event"]

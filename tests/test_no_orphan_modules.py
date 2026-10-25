@@ -21,6 +21,9 @@ ROOT = Path(__file__).resolve().parents[1]
 #: capability -> the call that proves the runtime consults it, and where a
 #: reader should look to see the wiring for themselves.
 REQUIRED_CALLS = {
+    "fork probe scheduled": ("self.fork_probe.register(", "src/runtime/wiring.py"),
+    "fork probe canonically acknowledged": ("self.fork_probe.acknowledge(", "src/runtime/research_runtime.py"),
+    "fork probe observations consumed": ("self.fork_probe.latest(", "src/runtime/ingestion.py"),
     "post-sniper absorption": ("evaluate_cohorts(", "src/main.py"),
     "exchange-hidden coordination": ("_apply_temporal_clusters(",
                                      "src/runtime/source_intelligence.py"),

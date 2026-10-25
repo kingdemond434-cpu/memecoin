@@ -55,6 +55,7 @@ from src.research.gmgn_observations import register_gmgn_miners
 from src.research.free_market_discovery import FreeMarketDiscovery
 from src.research.pool_attribution import PoolAttribution
 from src.research.phantom_perps import PhantomPerpsResearch
+from src.research.fork_probe import ForkProbe
 from src.research.source_catalogue import default_registry
 from src.research.regional_miners import register_regional_miners
 from src.research.telegram_miners import (
@@ -1302,6 +1303,10 @@ class SubsystemWiring:
         self.phantom_perps = PhantomPerpsResearch(
             Path(self.global_config.get("ops_state_dir", "data/state")) / "phantom_perps.sqlite")
         self.miner_registration.update(self.phantom_perps.register(self.data_miners, self.http_client))
+        self.fork_probe = ForkProbe(
+            Path(self.global_config.get("ops_state_dir", "data/state")) / "native_fork_probe.sqlite")
+        self.miner_registration.update(self.fork_probe.register(
+            self.data_miners, self.solana_rpc, self._native_fork_targets))
         # Chain facts the program stream does not carry: what landing costs
         # right now, whether the chain is keeping up, whether the supply is
         # still under someone's control, and what the deployer did before.
