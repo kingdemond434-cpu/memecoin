@@ -42,4 +42,11 @@ The next queued pool is retained; this is batching rather than dropping work
 or asserting unlimited provider capacity. A regression checks 101 pending
 pools across two batches and canonical/delivery acknowledgement separation.
 
+A live public-provider probe then returned JSON-RPC -32602 with an explicit
+maximum of 10 accounts. Recovery now learns and persists that stricter bound,
+retries only the permitted prefix and leaves the rest queued. Capability is
+re-probed hourly so a later endpoint upgrade can expand it. Only explicit
+request-shape feedback is used; 429/cooldowns never trigger split retries.
+This is an example of a protocol maximum differing from free-provider access.
+
 Protocol reference: https://solana.com/docs/rpc/http/getmultipleaccounts

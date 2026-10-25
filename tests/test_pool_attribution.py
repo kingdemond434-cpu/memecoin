@@ -165,6 +165,50 @@ async def test_recovery_uses_full_protocol_batch_without_dropping_the_next_pool(
     book.close()
 
 
+@pytest.mark.asyncio
+async def test_explicit_provider_batch_limit_is_learned_without_discarding_other_jobs(tmp_path):
+    from src.chains.rpc_manager import RPCError
+    path = tmp_path/'attribution.sqlite'
+    book = PoolAttribution(path)
+    for index in range(1,102):
+        book._capture({**event(), 'pool': str(Pubkey(bytes([index])*32))})
+    calls = []
+    async def request(method, params):
+        calls.append(len(params[0]))
+        if len(params[0]) > 10:
+            raise RPCError({'code': -32602, 'message': 'A maximum of 10 accounts is allowed.'})
+        values = [mint()] if params[0] == [BASE] else [account() for _ in params[0]]
+        return {'context': {'slot': 50}, 'value': values}
+    rows = await book.fetch(SimpleNamespace(request=request))
+    assert calls == [100,10,1]
+    assert sum(row['attribution_kind']=='identity' for row in rows) == 10
+    assert any(row.get('account_limit') == 10 for row in rows)
+    book.acknowledge(rows, 'canonical:provider-limit-and-first-batch')
+    assert book.db.execute('SELECT count(*) FROM jobs').fetchone()[0] == 91
+    book.close()
+    book = PoolAttribution(path)
+    calls.clear()
+    await book.fetch(SimpleNamespace(request=request))
+    assert calls == [10,1] and book.report()['pool_read_batch_limit'] == 10
+    book.close()
+
+
+@pytest.mark.asyncio
+async def test_rate_refusal_does_not_become_split_retries(tmp_path):
+    from src.chains.rpc_manager import RPCError
+    book = PoolAttribution(tmp_path/'attribution.sqlite')
+    await book.capture(event())
+    calls = []
+    async def request(method,params):
+        calls.append(method)
+        raise RPCError({'code': 429, 'message': 'rate limit; maximum of 1 accounts'})
+    rows = await book.fetch(SimpleNamespace(request=request))
+    assert len(calls) == 1
+    assert not any(row['attribution_kind']=='provider_capacity' for row in rows)
+    assert book.report()['pool_read_batch_limit'] == 100
+    book.close()
+
+
 def test_log_mention_is_not_emitter_identity_and_failed_scope_is_not_a_trade():
     expected, other = PUMPSWAP_PROGRAM, TOKEN_PROGRAM
     encoded = 'Program data: ' + base64.b64encode(b'trade').decode()

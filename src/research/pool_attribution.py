@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 from pathlib import Path
 import sqlite3
 import threading
@@ -19,6 +20,7 @@ import time
 
 from src.chains.pumpswap_route import PUMPSWAP_PROGRAM, parse_pool
 from src.chains.pump_route import TOKEN_PROGRAM, TOKEN_2022_PROGRAM, WSOL_MINT
+from src.chains.rpc_manager import RPCError
 from src.research.data_miners import Enriches, MinerSpec
 
 MINER = 'chain:pool_attribution'
@@ -77,12 +79,15 @@ class PoolAttribution:
           CREATE TABLE IF NOT EXISTS identities(pool TEXT PRIMARY KEY,body TEXT NOT NULL,ref TEXT);
           CREATE TABLE IF NOT EXISTS jobs(pool TEXT PRIMARY KEY,due REAL,last_error TEXT,attempts INTEGER);
           CREATE TABLE IF NOT EXISTS counters(name TEXT PRIMARY KEY,value INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS capabilities(name TEXT PRIMARY KEY,value INTEGER NOT NULL,observed REAL NOT NULL);
         ''')
         self._identities = {pool: {**json.loads(body), 'source_ref': ref}
                             for pool, body, ref in self.db.execute('SELECT pool,body,ref FROM identities')}
         self._delivery_tasks = set()
         self.delivery_failures = 0
         self.capture_failures = 0
+        row = self.db.execute("SELECT value,observed FROM capabilities WHERE name='account_batch'").fetchone()
+        self._batch_limit, self._batch_observed = (int(row[0]), float(row[1])) if row else (RPC_ACCOUNT_BATCH, 0.)
 
     def lookup(self, pool):
         with self.lock:
@@ -115,7 +120,10 @@ class PoolAttribution:
         with self.lock:
             pending = list(self.db.execute('SELECT id,body,first_seen FROM events WHERE ref IS NULL ORDER BY first_seen LIMIT 250'))
             recovered = list(self.db.execute("SELECT e.id,e.body,e.first_seen,e.ref FROM events e JOIN identities i ON e.pool=i.pool WHERE e.ref IS NOT NULL AND json_extract(i.body,'$.base_decimals') IS NOT NULL ORDER BY e.first_seen LIMIT 250"))
-            pools = [row[0] for row in self.db.execute("SELECT j.pool FROM jobs j LEFT JOIN identities i ON j.pool=i.pool WHERE (i.pool IS NULL OR json_extract(i.body,'$.base_decimals') IS NULL) AND j.due<=? ORDER BY j.due,j.pool LIMIT ?", (now, RPC_ACCOUNT_BATCH))]
+            # Re-probe capacity periodically so a learned free-provider bound
+            # does not permanently cap a later, more capable endpoint.
+            batch_limit = RPC_ACCOUNT_BATCH if now - self._batch_observed >= 3600 else self._batch_limit
+            pools = [row[0] for row in self.db.execute("SELECT j.pool FROM jobs j LEFT JOIN identities i ON j.pool=i.pool WHERE (i.pool IS NULL OR json_extract(i.body,'$.base_decimals') IS NULL) AND j.due<=? ORDER BY j.due,j.pool LIMIT ?", (now, batch_limit))]
         rows = [{'provider': 'native_pool_attribution', 'attribution_kind': 'raw_orphan',
                  'event_id': key, 'original_event': json.loads(body), 'first_seen': at,
                  'available_at': now, 'execution_eligible': False} for key, body, at in pending]
@@ -129,7 +137,28 @@ class PoolAttribution:
         if not pools:
             return rows
         try:
-            result = await rpc.request('getMultipleAccounts', [pools, {'encoding': 'base64', 'commitment': 'confirmed'}])
+            while True:
+                try:
+                    result = await rpc.request('getMultipleAccounts', [pools, {'encoding': 'base64', 'commitment': 'confirmed'}])
+                    break
+                except RPCError as exc:
+                    error = exc.error if isinstance(exc.error, dict) else {}
+                    message = str(error.get('message', ''))
+                    match = re.search(r'\bmaximum\s+of\s+(\d+)\s+accounts?\b', message, re.IGNORECASE)
+                    limit = int(match[1]) if match and error.get('code') == -32602 else 0
+                    if not 0 < limit < len(pools):
+                        raise
+                    # Explicit request-shape feedback only. HTTP/JSON-RPC rate
+                    # limits and ordinary failures never trigger split retries.
+                    observed = time.time()
+                    with self.lock, self.db:
+                        self.db.execute("INSERT OR REPLACE INTO capabilities VALUES('account_batch',?,?)", (limit, observed))
+                        self._batch_limit, self._batch_observed = limit, observed
+                    rows.append({'provider': 'native_pool_attribution', 'attribution_kind': 'provider_capacity',
+                        'method': 'getMultipleAccounts', 'account_limit': limit, 'observed_at': observed,
+                        'error_code': -32602, 'error_message_sha256': hashlib.sha256(message.encode()).hexdigest(),
+                        'execution_eligible': False})
+                    pools = pools[:limit]  # the remainder stays due in the durable job queue
             values = result.get('value') if isinstance(result, dict) else None
             if not isinstance(values, list) or len(values) != len(pools):
                 raise ValueError('pool response alignment unavailable')
@@ -238,7 +267,7 @@ class PoolAttribution:
                 'mapping_gaps': gaps, 'recovered_events': recovered[0] if recovered else 0,
                 'capture_failures': self.capture_failures, 'delivery_ack_failures': self.delivery_failures,
                 'pending_delivery_acks': len(self._delivery_tasks),
-                'pool_read_batch_limit': RPC_ACCOUNT_BATCH,
+                'pool_read_batch_limit': self._batch_limit, 'protocol_account_limit': RPC_ACCOUNT_BATCH,
                 'historical_loss_before_capture': 'UNRECOVERED; NO_BACKDATED_COVERAGE', 'execution_eligible': False}
 
     def close(self):
