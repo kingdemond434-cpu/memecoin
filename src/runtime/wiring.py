@@ -56,6 +56,7 @@ from src.research.free_market_discovery import FreeMarketDiscovery
 from src.research.pool_attribution import PoolAttribution
 from src.research.phantom_perps import PhantomPerpsResearch
 from src.research.fork_probe import ForkProbe
+from src.research.neural_sentiment import SentimentResearch
 from src.research.source_catalogue import default_registry
 from src.research.regional_miners import register_regional_miners
 from src.research.telegram_miners import (
@@ -1307,6 +1308,12 @@ class SubsystemWiring:
             Path(self.global_config.get("ops_state_dir", "data/state")) / "native_fork_probe.sqlite")
         self.miner_registration.update(self.fork_probe.register(
             self.data_miners, self.solana_rpc, self._native_fork_targets))
+        sentiment_config = self.global_config.get('neural_sentiment', {})
+        self.neural_sentiment = SentimentResearch(
+            Path(self.global_config.get('ops_state_dir', 'data/state')) / 'neural_sentiment.sqlite',
+            python=sentiment_config.get('python'), model_root=sentiment_config.get('model_root'),
+            ledger_path=self.trade_evidence.path)
+        self.miner_registration.update(self.neural_sentiment.register(self.data_miners))
         # Chain facts the program stream does not carry: what landing costs
         # right now, whether the chain is keeping up, whether the supply is
         # still under someone's control, and what the deployer did before.

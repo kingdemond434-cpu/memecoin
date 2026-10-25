@@ -736,6 +736,8 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
             await asyncio.to_thread(self.phantom_perps.close)
         if getattr(self, "fork_probe", None) is not None:
             await asyncio.to_thread(self.fork_probe.close)
+        if getattr(self, 'neural_sentiment', None) is not None:
+            await asyncio.to_thread(self.neural_sentiment.close)
         if getattr(self, "free_discovery", None) is not None:
             await asyncio.to_thread(self.free_discovery.close)
         if getattr(self, "public_claim_links", None) is not None:

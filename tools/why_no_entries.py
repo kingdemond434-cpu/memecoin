@@ -22,6 +22,7 @@ Reads two state files and writes nothing.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import sys
 from pathlib import Path
@@ -44,10 +45,12 @@ _UNANSWERED = ("data_blocked", "no_prediction", "not_trained", "untrained",
 #: is the difference between that and an answer.
 _REMEDY = (
     ("data_blocked_prediction_model",
-     "the multi-head predictor is not trained, so EVERY launch is refused "
-     "before liquidity is even resolved. Nothing downstream can run.\n"
-     "    .venv/bin/python -m src.runtime.train_once "
-     "--storage data/launch_episodes --model-dir models"),
+     "prediction was unavailable for these decisions. This reason alone "
+     "does not distinguish an absent artifact, rejected after-cost training, "
+     "missing inputs or enrichment still running. Inspect prediction readiness "
+     "on /status and the original blocked-decision evidence. "
+     "Use src.runtime.train_once when corpus/artifact diagnosis warrants it; "
+     "a rejected candidate must remain rejected."),
     ("champion_not_promoted",
      "a model exists but the champion/challenger framework has not promoted "
      "it to live authority. Shadow mode does not need this; a live desk "
@@ -150,7 +153,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # What the desk could not answer, versus what it answered no to. Only the
     # first is fixed by making something run.
-    combined = {**reasons, **rejected}
+    combined = dict(Counter(reasons) + Counter(rejected))
+    active_blocks = Counter(record.get('disposition_reason') or record.get('screen_reason') or 'unattributed'
+        for record in census.get('records', []) if record.get('disposition') == 'data_blocked')
+    if active_blocks:
+        print('\ncurrent data blocks in retained detail (not lifetime totals):')
+        for reason, count in active_blocks.most_common(args.top):
+            print(f'  {reason:44s} {count:>10d}')
     unanswered = sum(count for name, count in combined.items()
                      if any(mark in name.lower() for mark in _UNANSWERED))
     if combined:
