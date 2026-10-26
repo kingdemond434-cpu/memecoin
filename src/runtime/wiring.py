@@ -1336,7 +1336,8 @@ class SubsystemWiring:
             Path(self.global_config.get("ops_state_dir", "data/state")) / "phantom_perps.sqlite")
         self.miner_registration.update(self.phantom_perps.register(self.data_miners, self.http_client))
         self.fork_probe = ForkProbe(
-            Path(self.global_config.get("ops_state_dir", "data/state")) / "native_fork_probe.sqlite")
+            Path(self.global_config.get("ops_state_dir", "data/state")) / "native_fork_probe.sqlite",
+            paper_enabled=bool(self.dry_run))
         self.miner_registration.update(self.fork_probe.register(
             self.data_miners, self.solana_rpc, self._native_fork_targets))
         sentiment_config = self.global_config.get('neural_sentiment', {})
