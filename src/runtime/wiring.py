@@ -507,6 +507,14 @@ class SubsystemWiring:
                 else:
                     await component.start()
 
+    async def _setup_trade_evidence(self):
+        # Certified recovery hashes the entire retained prefix. Keep that
+        # blocking disk/CPU work off the loop that serves startup health.
+        self.trade_evidence = await asyncio.to_thread(
+            TradeEvidenceLedger,
+            Path(self.global_config.get("ops_state_dir", "data/state")) / "trade_evidence.jsonl",
+            recovery_certificate=self.global_config.get('evidence_recovery_certificate') or None)
+
     async def _setup_prediction(self):
         # One brain per launch age. A pooled model trained across every horizon
         # learns the average launch and there is no such thing: at 100ms the
@@ -585,10 +593,7 @@ class SubsystemWiring:
             small_account_negligible_share=float(setting("small_account_negligible_share", 0.002)),
         )
         # The entry thesis, frozen before the action it justifies.
-        self.trade_evidence = TradeEvidenceLedger(
-            Path(self.global_config.get("ops_state_dir", "data/state"))
-            / "trade_evidence.jsonl",
-            recovery_certificate=self.global_config.get('evidence_recovery_certificate') or None)
+        await self._setup_trade_evidence()
         self.monster_machine = MonsterStateMachine(
             monster_probability_threshold=float(
                 self.global_config.get("monster_probability_threshold", 0.15)),
