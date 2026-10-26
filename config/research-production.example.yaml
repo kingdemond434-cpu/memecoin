@@ -8,6 +8,7 @@ global:
   # Persistent expanding frontier: no source/page/depth admission ceiling.
   # Workers and request pacing bound active work; all pending URLs stay on disk.
   onion_frontier_path: data/state/public_onion_frontier.sqlite
+  onion_workers: 4
   research_replay:
     enabled: false
     episode_path: data/research/sealed-corpus

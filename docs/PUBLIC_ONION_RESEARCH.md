@@ -18,9 +18,21 @@ The continuous `onion:continuous-frontier` transport persists discovered hosts,
 pages and parent provenance in SQLite. It has no source-count, page-count or
 crawl-depth admission ceiling. It follows valid v3 onion links, revisits pages
 for content/link changes and retains inaccessible work with retry deadlines.
-One paced worker services the queue; a growing inventory does not establish
-that all pages have been visited or that the queue can keep up with arrivals.
+The runtime defaults to four active workers (`global.onion_workers`). Each
+batch leases distinct hosts, never concurrent pages from one host. A durable
+60-second host lease survives cancellation/restart; each HTTP operation has a
+25-second deadline. Success retains a two-second host delay; refusals, access
+challenges and `Retry-After` retain their longer backoff. This concurrency is
+an active resource setting, not a limit on admitted hosts or pages. A growing
+inventory does not establish that all pages have been visited or that service
+can keep up with arrivals.
 `all_onion_coverage` remains false.
+
+Each successful page commits independently to the canonical outbox while other
+hosts may still be waiting. One failed host does not discard another host's
+observation. Pending outbox records are redelivered before new network work;
+children still require their parent's canonical acknowledgement. Multiple
+transport instances sharing the database reserve host leases transactionally.
 
 The separately configured `onion` transport is a bounded single-source crawler.
 Its `max_pages` (up to 256), `max_depth` (up to eight) and `pages_per_poll` (up to

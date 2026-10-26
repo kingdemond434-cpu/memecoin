@@ -40,7 +40,8 @@ def _frontier(desk):
     if current is None:
         from src.collectors.onion_frontier import OnionFrontierTransport
         current = OnionFrontierTransport(config.get("onion_frontier_path") or
-            Path(config.get("ops_state_dir", "data/state")) / "public_onion_frontier.sqlite")
+            Path(config.get("ops_state_dir", "data/state")) / "public_onion_frontier.sqlite",
+            workers=config.get('onion_workers', 4))
         current.migrate(desk.unknown_engine.framework.get_research_component(COMPONENT) or {},
                         config.get('onion_legacy_state_dir', 'data/research/onion'))
         desk.onion_frontier = current

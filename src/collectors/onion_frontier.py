@@ -1,7 +1,7 @@
 """Continuously expanding public-onion frontier with durable canonical outbox.
 
-Discovery is not limited by a source/page count or crawl depth. A single paced
-worker walks a disk-backed queue; host fairness and retries constrain *work*,
+Discovery is not limited by a source/page count or crawl depth. Paced workers
+walk distinct hosts in a disk-backed queue; fairness and retries constrain work,
 not admission. No scripts, login, access-challenge bypass or direct DNS path.
 """
 from __future__ import annotations
@@ -26,8 +26,11 @@ SOURCE_ID = "onion:continuous-frontier"
 class OnionFrontierTransport(Transport):
     kind = "onion"
 
-    def __init__(self, path, *, client_factory=None):
+    def __init__(self, path, *, client_factory=None, workers=1):
         super().__init__(SOURCE_ID)
+        if type(workers) is not int or workers < 1:
+            raise ValueError('positive integer active onion concurrency required')
+        self.workers = workers
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path, timeout=3, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -108,34 +111,52 @@ class OnionFrontierTransport(Transport):
 
     def _lease(self, now):
         with self.lock, self.db:
-            pending = self.db.execute("SELECT record FROM outbox ORDER BY rowid LIMIT 1").fetchone()
+            # Reserve before reading so two transport instances sharing this
+            # database cannot both select the same host before either writes.
+            self.db.execute('BEGIN IMMEDIATE')
+            pending = self.db.execute("SELECT record FROM outbox ORDER BY rowid LIMIT ?", (self.workers,)).fetchall()
             if pending:
-                return [json.loads(pending[0])], None
-            row = self.db.execute("""SELECT u.* FROM urls u JOIN hosts h ON h.host=u.host
-              WHERE u.next_at<=? AND h.next_at<=?
-              ORDER BY h.last_attempt,((u.observed_at IS NULL)=(h.turn % 2)) DESC,u.next_at,u.discovered_at,u.url LIMIT 1""", (now, now)).fetchone()
-            if row is None:
-                return [], None
-            self.db.execute("UPDATE hosts SET last_attempt=?,next_at=?,turn=turn+1 WHERE host=?", (now, now + 2, row["host"]))
-            # Lease survives cancellation/restart; timed-out pages are retried.
-            self.db.execute("UPDATE urls SET next_at=? WHERE url=?", (now + 60, row["url"]))
-            return [], row
+                return [json.loads(row[0]) for row in pending], []
+            rows = []
+            for _ in range(self.workers):
+                row = self.db.execute("""SELECT u.* FROM urls u JOIN hosts h ON h.host=u.host
+                  WHERE u.next_at<=? AND h.next_at<=?
+                  ORDER BY h.last_attempt,((u.observed_at IS NULL)=(h.turn % 2)) DESC,u.next_at,u.discovered_at,u.url LIMIT 1""", (now, now)).fetchone()
+                if row is None:
+                    break
+                # A 60-second host/page lease outlives the 20-second Tor HTTP
+                # timeout. Concurrent polls and restarts cannot fan out one host.
+                self.db.execute("UPDATE hosts SET last_attempt=?,next_at=?,turn=turn+1 WHERE host=?", (now, now + 60, row["host"]))
+                self.db.execute("UPDATE urls SET next_at=? WHERE url=?", (now + 60, row["url"]))
+                rows.append(row)
+            return [], rows
 
     def _store_observation(self, row, observed, revision, record):
         with self.lock, self.db:
             self.db.execute("UPDATE urls SET observed_at=?,digest=?,failures=0,last_error='',next_at=? WHERE url=?",
                             (observed, revision, observed + 120, row["url"]))
+            self.db.execute("UPDATE hosts SET next_at=? WHERE host=?", (observed + 2, row["host"]))
             if revision != row["digest"]:
                 self.db.execute("INSERT INTO outbox VALUES(?,?)", (record["observation_id"], json.dumps(record, allow_nan=False)))
 
     async def fetch(self):
         now = time.time()
-        pending, row = await asyncio.to_thread(self._lease, now)
-        if row is None:
+        pending, rows = await asyncio.to_thread(self._lease, now)
+        if not rows:
             return pending
-        client = self.client_factory(row["host"])
+        results = await asyncio.gather(*(self._fetch_one(row) for row in rows), return_exceptions=True)
+        records = [record for result in results if isinstance(result, list) for record in result]
+        failures = [result for result in results if isinstance(result, Exception)]
+        if failures and len(failures) == len(rows):
+            raise TransportError('public onion frontier batch failed: ' + str(len(failures)) + ' hosts')
+        return records
+
+    async def _fetch_one(self, row):
+        client = None
         try:
-            status, body, headers = await client.get(row["url"])
+            client = self.client_factory(row["host"])
+            async with asyncio.timeout(25):
+                status, body, headers = await client.get(row["url"])
             if status != 200:
                 try:
                     retry = float(headers.get("Retry-After", 0))
@@ -143,7 +164,7 @@ class OnionFrontierTransport(Transport):
                     retry = 0
                 if not 0 <= retry < float('inf'):
                     retry = 0
-                await asyncio.to_thread(self._defer, row, "HTTP_" + str(status), now,
+                await asyncio.to_thread(self._defer, row, "HTTP_" + str(status), time.time(),
                                         max(3600 if status in {401, 403, 429} else 120, retry))
                 return []
             document = _Document(link_limit=None)
@@ -151,7 +172,7 @@ class OnionFrontierTransport(Transport):
             content = " ".join(" ".join(document.text).split())
             if not content or re.search(r"(?:complete|solve|enter|verify).{0,40}captcha|proof.of.work required|"
                                        r"(?:enable|requires?) javascript|sign in to (?:continue|view)", content[:2000], re.I):
-                await asyncio.to_thread(self._defer, row, "PUBLIC_CONTENT_OR_ACCESS_CHALLENGE", now, 3600)
+                await asyncio.to_thread(self._defer, row, "PUBLIC_CONTENT_OR_ACCESS_CHALLENGE", time.time(), 3600)
                 return []
             from src.collectors.onion_discovery import PATTERN, candidate_url
             links = set()
@@ -179,10 +200,11 @@ class OnionFrontierTransport(Transport):
             await asyncio.to_thread(self._store_observation, row, observed, revision, record)
             return [record] if revision != row["digest"] else []
         except Exception as exc:
-            await asyncio.to_thread(self._defer, row, type(exc).__name__, now, 120)
+            await asyncio.to_thread(self._defer, row, type(exc).__name__, time.time(), 120)
             raise TransportError("public onion frontier fetch failed: " + type(exc).__name__) from None
         finally:
-            await client.close()
+            if client is not None:
+                await client.close()
 
     def _defer(self, row, reason, now, delay):
         with self.lock, self.db:
@@ -203,7 +225,7 @@ class OnionFrontierTransport(Transport):
             "pending_pages": counts[0] - counts[1], "pending_canonical_delivery": pending,
             "oldest_unobserved_at": oldest, "legacy_candidate_capacity_debt": int(legacy[0]) if legacy else 0,
             "source_count_limit": None, "page_count_limit": None, "crawl_depth_limit": None,
-            "workers": 1, "status": "OBSERVED" if counts[1] else "NOT_OBSERVED",
+            "workers": self.workers, "status": "OBSERVED" if counts[1] else "NOT_OBSERVED",
             "all_onion_coverage": False}
 
     async def stop(self):
