@@ -16,6 +16,10 @@ INSTRUCTIONS_SYSVAR='Sysvar1nstructions1111111111111111111111111'
 SIZES={'VirtualPool':424,'PoolConfig':1048}
 
 
+class DBCSubsetUnavailable(ValueError):
+    reason_code = 'DBC_POOL_MIGRATED'
+
+
 def pda(*seeds):
     return str(Pubkey.find_program_address(list(seeds),Pubkey.from_string(DBC_PROGRAM))[0])
 
@@ -72,8 +76,10 @@ def validate_frame(state,accounts,decode):
     if not config_value or config_value['owner']!=DBC_PROGRAM:
         raise ValueError('DBC config owner mismatch')
     config=decode_account(decode(config_value),'PoolConfig')
+    if state['is_migrated'] != 0:
+        raise DBCSubsetUnavailable('DBC pool migrated; original curve is not the active trading venue')
     if (config['quote_mint']!=WSOL_MINT or config['quote_token_flag']!=0
-            or config['token_type']!=state['pool_type'] or state['is_migrated']!=0):
+            or config['token_type']!=state['pool_type']):
         raise ValueError('DBC unmigrated base/WSOL subset unavailable')
     if pool_address(state['base_mint'],state['config'])!=state['pool']:
         raise ValueError('DBC pool derivation mismatch')

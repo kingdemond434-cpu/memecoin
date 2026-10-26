@@ -16,6 +16,46 @@ from src.research import fork_simulation as f
 from src.research.fork_probe import ForkProbe
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('error,expected,extra', [
+    (__import__('src.chains.rpc_manager',fromlist=['RPCUnavailable']).RPCUnavailable(
+        'RPC_PROVIDER_REFUSAL',http_status=429),'RPC_PROVIDER_REFUSAL',{'rpc_http_status':429}),
+    (RPCError({'code':-32029,'message':'https://private.invalid/?key=DO_NOT_EXPORT'}),
+        'RPC_RESPONSE_ERROR',{'rpc_error_code':-32029}),
+    (TimeoutError('https://private.invalid/?key=DO_NOT_EXPORT'),'FORK_OPERATION_TIMEOUT',{}),
+])
+async def test_probe_failure_metadata_is_safe_and_only_canonical_ack_publishes(monkeypatch,tmp_path,error,expected,extra):
+    from src.research import fork_probe as p
+    async def fail(rpc,target):raise error
+    monkeypatch.setattr(p,'acquire',fail)
+    probe=ForkProbe(tmp_path/'probe.sqlite');event=native_launch_fixture()
+    target={key:event[key] for key in ('token','pool','venue')};target['quote_budget']=1_000_000
+    rows=await probe.fetch(None,lambda:[target]);row=rows[0]
+    assert row['reason_code']==expected and row['failure_phase']=='ACCOUNT_SNAPSHOT'
+    assert all(row[key]==value for key,value in extra.items())
+    assert row['sell_simulation_pass'] is None and 'DO_NOT_EXPORT' not in json.dumps(row)
+    assert probe.report()['canonical_unknown_reason_codes']=={}
+    probe.acknowledge(rows,'canonical:safe-diagnostic')
+    assert probe.report()['canonical_unknown_reason_codes']=={expected:1}
+    probe.close()
+
+
+@pytest.mark.asyncio
+async def test_migrated_curve_retains_target_and_canonical_unknown_with_slower_recheck(monkeypatch,tmp_path):
+    from src.research import fork_probe as p
+    monkeypatch.setattr(p.time,'time',lambda:100.)
+    async def fail(rpc,target):raise f.ForkUnavailable('observed migrated curve',reason_code='DBC_POOL_MIGRATED')
+    monkeypatch.setattr(p,'acquire',fail)
+    probe=ForkProbe(tmp_path/'probe.sqlite')
+    target={'token':str(Pubkey.new_unique()),'pool':str(Pubkey.new_unique()),'venue':'meteora_dbc','quote_budget':1000}
+    rows=await probe.fetch(None,lambda:[target]);probe.acknowledge(rows,'canonical:migrated')
+    assert probe.db.execute('SELECT due,attempts FROM jobs').fetchone()==(3700.,1)
+    assert rows[0]['retry_after_seconds']==3600 and rows[0]['sell_simulation_pass'] is None
+    assert probe.report()['targets']==1
+    assert await probe.fetch(None,lambda:[])==[]
+    probe.close()
+
+
 def native_launch_fixture():
     from src.chains.launchlab import LAUNCHLAB_PROGRAM
     return {'type':'token_launch','venue':'raydium_launchlab','program':LAUNCHLAB_PROGRAM,

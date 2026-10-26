@@ -72,6 +72,17 @@ class RPCHealth(Enum):
     DOWN = "down"
 
 
+class RPCUnavailable(RuntimeError):
+    """Structured exhaustion metadata; never carries a URL or response body."""
+    def __init__(self, reason_code, *, http_status=None):
+        if reason_code not in {'RPC_NO_ELIGIBLE_ENDPOINT', 'RPC_PROVIDER_REFUSAL',
+                               'RPC_ALLOCATION_EXHAUSTED', 'RPC_ATTEMPTS_EXHAUSTED'}:
+            raise ValueError('unreviewed RPC availability code')
+        self.reason_code = reason_code
+        self.http_status = http_status if type(http_status) is int and 100 <= http_status <= 599 else None
+        super().__init__('No healthy RPC endpoint available; ' + reason_code)
+
+
 @dataclass
 class EndpointHealth:
     endpoint: RPCEndpointConfig
@@ -398,11 +409,11 @@ class RPCManager:
     async def request(self, method: str, params: List[Any]) -> Any:
         async with self._request_semaphore:
             last_refusal = ""
+            failure_code, failure_status = 'RPC_NO_ELIGIBLE_ENDPOINT', None
             for attempt in range(3):
                 ep = self._select_endpoint(method=method)
                 if not ep:
-                    raise RuntimeError(
-                        f"No healthy RPC endpoint serves {method}" + (f"; last: {last_refusal}" if last_refusal else ""))
+                    raise RPCUnavailable(failure_code, http_status=failure_status)
                 try:
                     await self._allocate(ep, [method])
                     async with self.session.post(
@@ -446,6 +457,7 @@ class RPCManager:
                         elif resp.status >= 500:
                             cooldown = self._retry_after_seconds(resp, 5.0)
                         self._penalise(ep, resp.status, cooldown)
+                        failure_code, failure_status = 'RPC_PROVIDER_REFUSAL', resp.status
                         last_refusal = (f"{_host_of(ep.endpoint.url)} HTTP "
                                         f"{resp.status}")
                         logger.warning(
@@ -462,6 +474,9 @@ class RPCManager:
                     ep.cooldown_until = exc.retry_at
                     last_refusal = ('RPC provider cooling after refusal' if isinstance(exc,RPCProviderCooling)
                                     else 'configured RPC allocation exhausted')
+                    failure_code = ('RPC_PROVIDER_REFUSAL' if isinstance(exc, RPCProviderCooling)
+                                    else 'RPC_ALLOCATION_EXHAUSTED')
+                    failure_status = None
                     continue
                 except Exception as e:
                     self._penalise(ep, 0)
@@ -469,9 +484,7 @@ class RPCManager:
                     if attempt == 2:
                         raise RPCError(last_refusal) from None
                     await asyncio.sleep(0.1 * (attempt + 1))
-            raise RuntimeError(
-                f"All RPC endpoints failed for {method}"
-                + (f"; last: {last_refusal}" if last_refusal else ""))
+            raise RPCUnavailable(failure_code, http_status=failure_status)
 
     async def batch_request(self, requests: List[Dict[str, Any]]) -> List[Any]:
         """Results aligned to ``requests`` by JSON-RPC id, not by arrival order.

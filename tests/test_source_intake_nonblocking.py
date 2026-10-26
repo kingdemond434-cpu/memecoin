@@ -90,3 +90,72 @@ def test_cancel_waits_for_started_persistence_without_acknowledging_source(tmp_p
         assert getattr(value, "public_claim_links", None) is None
         value.unknown_engine.frontier.close()
     asyncio.run(scenario())
+
+
+def test_neural_queue_commit_yields_and_keeps_exactly_one_canonical_source(tmp_path):
+    async def scenario():
+        from src.research.neural_sentiment import SentimentResearch
+        value=desk(tmp_path);value.global_config={'ops_state_dir':str(tmp_path)}
+        neural=SentimentResearch(tmp_path/'neural.sqlite');value.neural_sentiment=neural
+        entered,released=threading.Event(),threading.Event();owner=threading.get_ident();calls=[]
+        original=neural.enqueue
+        def blocked(payload,**kwargs):
+            assert threading.get_ident()!=owner
+            assert value.unknown_engine.frontier.job(kwargs['source_job'])['payload_ref']==kwargs['source_ref']
+            calls.append(kwargs);entered.set();assert released.wait(5)
+            return original(payload,**kwargs)
+        neural.enqueue=blocked
+        task=asyncio.create_task(value._record_population_narrative_async(event()))
+        try:
+            assert await asyncio.to_thread(entered.wait,3)
+            # A real socket request must complete while the durable queue is gated.
+            from aiohttp import web
+            from aiohttp.test_utils import TestClient,TestServer
+            async def health(request):return web.json_response({'responsive':True})
+            app=web.Application();app.router.add_get('/health',health)
+            async with TestClient(TestServer(app)) as client:
+                response=await asyncio.wait_for(client.get('/health'),1)
+                assert (await response.json())['responsive'] and not released.is_set()
+        finally:released.set()
+        job=await task
+        assert len(calls)==1 and calls[0]['source_job']==job
+        assert neural.report()['inputs']==1 and neural.report()['canonical_windows']==0
+        assert TradeEvidenceLedger.verify(value.unknown_engine.evidence.path)[0]
+        neural.close();value.public_claim_links.close();value.unknown_engine.frontier.close()
+    asyncio.run(scenario())
+
+
+def test_cancellation_drains_started_neural_commit_before_owner_can_close(tmp_path):
+    async def scenario():
+        from src.research.neural_sentiment import SentimentResearch
+        value=desk(tmp_path);neural=SentimentResearch(tmp_path/'neural.sqlite');value.neural_sentiment=neural
+        entered,released=threading.Event(),threading.Event();original=neural.enqueue
+        def blocked(*args,**kwargs):
+            entered.set();assert released.wait(5);return original(*args,**kwargs)
+        neural.enqueue=blocked
+        task=asyncio.create_task(value._record_population_narrative_async(event()))
+        assert await asyncio.to_thread(entered.wait,3)
+        task.cancel();await asyncio.sleep(0);assert not task.done()
+        released.set()
+        try:await task
+        except asyncio.CancelledError:pass
+        else:raise AssertionError('cancellation swallowed')
+        assert neural.report()['inputs']==1 and getattr(value,'public_claim_links',None) is None
+        assert TradeEvidenceLedger.verify(value.unknown_engine.evidence.path)[0]
+        neural.close();value.unknown_engine.frontier.close()
+    asyncio.run(scenario())
+
+
+def test_neural_failure_retains_canonical_work_and_reports_one_retryable_failure(tmp_path):
+    async def scenario():
+        from src.research.neural_sentiment import SentimentResearch
+        value=desk(tmp_path);value.global_config={'ops_state_dir':str(tmp_path)}
+        neural=SentimentResearch(tmp_path/'neural.sqlite');value.neural_sentiment=neural
+        neural.enqueue=Mock(side_effect=OSError('sensitive fixture must not be copied to failure type'))
+        job=await value._record_population_narrative_async(event())
+        assert job and value.unknown_engine.frontier.job(job)['payload_ref']
+        assert neural.enqueue.call_count==neural.intake_failures==1
+        assert neural.last_intake_error=='OSError' and neural.report()['inputs']==0
+        assert value.public_claim_links.page()['items'][0]['source_job']==job
+        neural.close();value.public_claim_links.close();value.unknown_engine.frontier.close()
+    asyncio.run(scenario())

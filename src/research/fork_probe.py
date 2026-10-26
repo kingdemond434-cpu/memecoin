@@ -13,6 +13,7 @@ import zlib
 
 from src.research.data_miners import Enriches, MinerSpec
 from src.research.fork_simulation import SCHEMA, ForkUnavailable, acquire, digest, run_isolated
+from src.chains.rpc_manager import RPCError, RPCUnavailable
 
 MINER = 'chain:local_fork_roundtrip'
 TRANSPORT_FIELDS = frozenset({'_miner', '_enriches', '_endpoint', '_fetched_at',
@@ -189,18 +190,33 @@ class ForkProbe:
             return []
         identity, target = job[0], json.loads(job[1])
         frame_id = None
+        phase = 'ACCOUNT_SNAPSHOT'
         try:
             frame = await asyncio.wait_for(acquire(rpc, target), timeout=50)
+            phase = 'INPUT_ARCHIVE'
             frame_id = await asyncio.to_thread(self._store_frame, frame)
             # Execute the archived, hash-checked input, not a mutable live object.
             frame = await asyncio.to_thread(self._read_frame, frame_id)
+            phase = 'LOCAL_VM'
             result = await run_isolated(frame)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             # Provider exception strings may contain credential-bearing URLs.
             result = {'status': 'FORK_ENVIRONMENT_UNKNOWN', 'sell_simulation_pass': None,
-                      'reason': str(exc)[:300] if isinstance(exc, ForkUnavailable) else type(exc).__name__}
+                      'reason': str(exc)[:300] if isinstance(exc, ForkUnavailable) else type(exc).__name__,
+                      'failure_phase': phase, 'reason_code': 'FORK_OPERATION_FAILED'}
+            if isinstance(exc, (ForkUnavailable, RPCUnavailable)):
+                result['reason_code'] = exc.reason_code
+            elif isinstance(exc, TimeoutError):
+                result['reason_code'] = 'FORK_OPERATION_TIMEOUT'
+            if isinstance(exc, RPCUnavailable):
+                result['rpc_http_status'] = exc.http_status
+            elif isinstance(exc, RPCError):
+                result['reason_code'] = 'RPC_RESPONSE_ERROR'
+                code = exc.error.get('code') if isinstance(exc.error, dict) else None
+                result['rpc_error_code'] = code if type(code) is int else None
+        retry_seconds = 3600 if result.get('reason_code') == 'DBC_POOL_MIGRATED' else 300
         row = {**result, 'provider': 'local_svm', 'fork_kind': 'native_roundtrip',
             'schema': SCHEMA, 'token': target['token'], 'target': target,
             'dispatch_lane': job[4], 'dispatch_venue': job[3], 'target_first_queued_at': job[2],
@@ -208,11 +224,14 @@ class ForkProbe:
             'queue_age_at_attempt_seconds': max(0., now-job[2]) if job[2] is not None else None,
             'queue_clock_regressed': now < job[2] if job[2] is not None else None,
             'input_sha256': frame_id, 'created_at': time.time(),
+            'retry_after_seconds': retry_seconds,
             'input_archive': 'native_fork_probe.sqlite:frames',
             'real_transaction_submitted': False, 'execution_authority': False,
             'scope': 'sampled local model; no future sell or profitability guarantee'}
         row['probe_id'] = digest(row)
         with self.lock, self.db:
+            if retry_seconds != 300:
+                self.db.execute('UPDATE jobs SET due=? WHERE id=?', (row['created_at']+retry_seconds, identity))
             self.db.execute('INSERT INTO results VALUES(?,?,?,?,NULL,NULL)',
                 (row['probe_id'], identity, json.dumps(row, allow_nan=False), row['created_at']))
         return [row]
@@ -246,6 +265,8 @@ class ForkProbe:
             jobs = self.db.execute('SELECT count(*),sum(attempts) FROM jobs').fetchone()
             statuses = dict(self.db.execute("SELECT json_extract(body,'$.status'),count(*) FROM results WHERE ref IS NOT NULL GROUP BY 1"))
             pending = self.db.execute('SELECT count(*) FROM results WHERE ref IS NULL').fetchone()[0]
+            reasons = dict(self.db.execute("SELECT COALESCE(json_extract(body,'$.reason_code'),'LEGACY_UNCLASSIFIED'),"
+                "count(*) FROM results WHERE ref IS NOT NULL AND json_extract(body,'$.status')='FORK_ENVIRONMENT_UNKNOWN' GROUP BY 1"))
             venues = {}
             for venue, count, attempts, untried in self.db.execute(
                     "SELECT json_extract(body,'$.venue'),count(*),sum(attempts),sum(attempts=0) FROM jobs GROUP BY 1"):
@@ -268,9 +289,11 @@ class ForkProbe:
                 'SELECT count(*),count(DISTINCT job) FROM native_target_sources').fetchone()
         return {'status': 'LOCAL_FORK_RESEARCH', 'targets': jobs[0], 'attempts': jobs[1] or 0,
                 'canonical_dispositions': statuses, 'awaiting_canonical_ack': pending,
+                'canonical_unknown_reason_codes': reasons,
                 'by_venue': venues,
                 'scheduling': '2 fresh untried : 1 oldest untried : 1 due retry; empty lanes share capacity',
                 'venue_scheduling': 'least recently serviced eligible venue within each lane; persistent monotone tickets',
+                'retry_policy': '300 seconds normally; observed migrated DBC curves retained with 3600-second recheck; no target deletion',
                 'venue_service_tickets': venue_service,
                 'canonical_native_source_links': source_links, 'canonical_native_linked_targets': source_targets,
                 'supported_adapters': ['pump_curve', 'pumpswap', 'raydium_launchlab','meteora_dbc'],

@@ -108,6 +108,7 @@ def analyze_fill(fill, tape, *, as_of, horizons=HORIZONS, max_reference_age=2.0)
               "real_fill": fill.get("real_fill"), "market": fill["market"], "quote_mint": fill["quote_mint"],
               "unit": fill["unit"], "clock_basis": fill.get("clock_basis"),
               "fill_price": str(price), "quantity": str(qty), "source_ref": fill["source_ref"],
+              "reference_at": at, "available_at": available,
               "horizons": {}, "unidentified_components": ["spread versus impact; not inferred from forecast"],
               "external_costs_complete": False, "external_cost_quote_raw": None}
     if available > now or at > now:

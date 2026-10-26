@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 import gzip
 import json
 from pathlib import Path
@@ -10,9 +10,10 @@ from types import SimpleNamespace
 import time
 
 from src.research.execution_measurement import clock, episode_measurements
+from src.research.sample_measurement import markout_diagnostics
 
 
-def audit(episodes, output, *, as_of):
+def audit(episodes, output, *, as_of, selection=None):
     source, target = Path(episodes).resolve(), Path(output).resolve()
     clock(as_of)
     if not source.is_dir():
@@ -20,6 +21,7 @@ def audit(episodes, output, *, as_of):
     if source == target or source in target.parents:
         raise ValueError('measurement output must be outside the source corpus')
     counts = Counter()
+    samples = defaultdict(list)
     target.parent.mkdir(parents=True, exist_ok=True)
     # Refuse overwrites; this is a dated measurement receipt, not corpus repair.
     with target.open('x', encoding='utf-8') as sink:
@@ -41,13 +43,24 @@ def audit(episodes, output, *, as_of):
                         counts['verified_real_fill_attempts'] += 1
                     for horizon, result in row.get('horizons', {}).items():
                         counts['horizon_' + horizon + ':' + result['status']] += 1
+                        if result['status'] == 'MEASURED':
+                            from decimal import Decimal
+                            notional = Decimal(row['quantity'])*Decimal(row['fill_price'])
+                            # quote identity, reference kind and horizon stay separate.
+                            group = json.dumps([row['quote_mint'],row['unit'],row['reference_kind'],horizon])
+                            samples[group].append({'fill_id':row['fill_id'],'market':row['market'],
+                                'interval':[row['available_at'],row['available_at']+int(horizon)],
+                                'net_return':float(Decimal(result['net_markout_quote'])/notional)})
                 sink.write(json.dumps({'source_file': str(path), 'token': episode.token, **report}, allow_nan=False)+'\n')
             except (OSError, ValueError, TypeError, KeyError) as exc:
                 counts['blocked_episode_files'] += 1
                 sink.write(json.dumps({'source_file': str(path), 'status': 'DATA_BLOCKED_EPISODE_SCHEMA',
                                        'error_type': type(exc).__name__})+'\n')
         summary = {'kind': 'summary', 'as_of': as_of, 'counts': dict(counts),
-                   'authority': 'MEASUREMENT_ONLY', 'economic_edge': 'UNMEASURED'}
+                   'authority': 'MEASUREMENT_ONLY', 'economic_edge': 'UNMEASURED',
+                   'cost_complete_markout_samples':{key:markout_diagnostics(rows,**(selection or {}))
+                       for key,rows in sorted(samples.items())},
+                   'selection_scope':'DSR is conditional on supplied trial universe; never a promotion or profit verdict'}
         sink.write(json.dumps(summary)+'\n')
     return summary
 
@@ -57,8 +70,15 @@ def main():
     parser.add_argument('--episodes', required=True)
     parser.add_argument('--output', required=True)
     parser.add_argument('--as-of', type=float, default=None)
+    parser.add_argument('--trial-count',type=int)
+    parser.add_argument('--trial-sharpe-variance',type=float)
+    parser.add_argument('--selection-evidence-ref')
     args = parser.parse_args()
-    print(json.dumps(audit(args.episodes, args.output, as_of=args.as_of or time.time())))
+    selection={'trial_count':args.trial_count,'trial_sharpe_variance':args.trial_sharpe_variance,
+               'selection_evidence_ref':args.selection_evidence_ref}
+    # Validate even when the corpus contains no eligible observations.
+    markout_diagnostics([],**selection)
+    print(json.dumps(audit(args.episodes, args.output, as_of=args.as_of or time.time(),selection=selection)))
 
 
 if __name__ == '__main__':

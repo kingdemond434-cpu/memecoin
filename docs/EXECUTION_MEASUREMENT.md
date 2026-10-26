@@ -57,3 +57,26 @@ The output must be fresh and outside the corpus. The tool streams episodes,
 retains blocked-file reasons and writes a summary. It creates no fills,
 positions, promotion receipts or profitability evidence. Horizon coverage
 still depends on actual tape continuing long enough after each execution.
+
+The audit also groups cost-complete markout returns by quote mint, raw unit,
+reference kind and horizon. It normalizes each net markout by its actual
+observed fill notional and deduplicates identical fill observations. Conflicting
+duplicates fail the audit. These are marginal reference markouts, not realized
+strategy returns or independently executable exits.
+
+`sample_measurement.py` adapts the owner's quant DSR and sample-geometry
+methods. Raw rows, distinct launches and maximum disjoint observation windows
+are reported separately. Their minimum is an independence **upper bound**;
+serial, common-factor, entity and regime dependence remain unmeasured, so an
+effective sample size is not invented. No regime discount constants are copied.
+
+Per-observation Sharpe and an IID moment approximation to PSR require finite,
+nonconstant returns and enough observations to estimate sample kurtosis. DSR
+additionally requires the complete selection trial count, observed cross-trial
+Sharpe variance and a provenance reference, supplied together with
+`--trial-count`, `--trial-sharpe-variance` and `--selection-evidence-ref`.
+These inputs must describe the selection universe, not just the winning
+candidate. Missing selection history produces an unavailable DSR, not one
+assumed trial. The tool does not verify a supplied external register or certify
+independence. It reports conditional statistics and never grants execution
+authority, sets a calendar waiting period or declares profitability.
