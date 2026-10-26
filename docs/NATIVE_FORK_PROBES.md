@@ -60,6 +60,11 @@ ACK compares the archived body after removing only the six declared miner
 transport stamp fields; additional or modified body fields remain refused.
 Availability is the ACK time, never backdated to the sampled slot. Restart
 retries unacknowledged results. New targets cannot leapfrog an older backlog.
+New results bind a manifest of the worker, both route builders, curve decoder,
+IDL resolver, vendored IDLs and recipient table, plus its digest and Python
+version. The older worker-only hash does not identify a changed dependency.
+Historical results keep their original metadata; this manifest is local
+reproducibility evidence rather than external software attestation.
 There is no top-N or lifetime token ceiling; cadence, provider quota and VM
 time impose real throughput limits. A backlog is not complete launch coverage.
 
