@@ -1933,11 +1933,9 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
     def ingest_curve_account(self, token: str, data: bytes) -> bool:
         """Adopt a full bonding-curve account when the raw bytes are available.
 
-        A trade event carries virtual reserves only, so a state built from one
-        is complete enough to price and to build a transaction, but its real
-        reserves are unknown -- which is what makes every frontier derived
-        from it an upper bound rather than a measurement. An account update
-        carries all of it, so when one arrives it replaces the reconstruction
+        A legacy trade prefix can carry virtual reserves only; current decoded
+        events also supply the real reserve pair. An account update carries
+        its complete account layout, so when one arrives it replaces that state
         rather than being merged into it: mixing a measured field into a
         reconstructed record produces a row that is neither, and nothing
         downstream can tell which parts to trust.
@@ -3871,13 +3869,9 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
                 # is stale. Bumping here rather than on a timer is what makes
                 # staleness mean "the market changed" instead of "time passed".
                 self.state_sequencer.bump(token)
-                # Static facts about the curve -- who created it, how large
-                # the supply is -- do not arrive on trade events and do not
-                # change. Carrying them forward from the creation event is
-                # what lets a trade event produce a state complete enough to
-                # build a transaction from. Without it the native route
-                # refused every trade for want of a creator it had already
-                # been told once.
+                # Preserve creation supply and the fallback creator for older
+                # trade prefixes. Current events can also provide the creator;
+                # no missing field is replaced with a purported observation.
                 static = self._curve_static.get(token, {})
                 real_sol, real_token = event.get('real_sol_reserves'), event.get('real_token_reserves')
                 measured_real = (event.get('real_reserve_data_status') == 'OBSERVED_OFFICIAL_PUMP_TRADE'
