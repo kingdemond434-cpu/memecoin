@@ -1,7 +1,7 @@
 # Public onion research
 
-The source mesh supports a real `onion` transport. This is separate from public
-Telegram previews. Every request uses a dedicated Tor SOCKS5 connector with
+The source mesh supports public onion collection and continuous discovery.
+This is separate from public Telegram previews. Every onion request uses a dedicated Tor SOCKS5 connector with
 remote hostname resolution; the ordinary HTTP client rejects onion requests
 and redirects. The connector never falls back to a direct TCP request.
 
@@ -14,29 +14,41 @@ verified token mint.
 
 ## What is collected
 
-Declared forum pages and same-host discussion links are polled at a bounded
-cadence. A source can explore up to 256 pages and eight link levels, with at
-most two requests per poll. Other onion links are retained as source candidates
-for the automatic discovery frontier. Dread can use this same transport; a
-discovered link remains an unverified source identity rather than proof that
-its service is the genuine forum.
+The continuous `onion:continuous-frontier` transport persists discovered hosts,
+pages and parent provenance in SQLite. It has no source-count, page-count or
+crawl-depth admission ceiling. It follows valid v3 onion links, revisits pages
+for content/link changes and retains inaccessible work with retry deadlines.
+One paced worker services the queue; a growing inventory does not establish
+that all pages have been visited or that the queue can keep up with arrivals.
+`all_onion_coverage` remains false.
+
+The separately configured `onion` transport is a bounded single-source crawler.
+Its `max_pages` (up to 256), `max_depth` (up to eight) and `pages_per_poll` (up to
+two) options still apply to that adapter. They do not limit the continuous
+frontier's inventory. Dread can use the public-page transport, but a discovered
+address does not establish that a service is the genuine forum.
 
 Set `global.onion_auto_discovery: true` and append
 `config/sources.onion-discovery.yaml` to the source registry to discover public
 links from the selected announcement page. Links found in other collected
 public messages, Telegram content and onion pages enter the same discovery
 path. Their original canonical research work item is retained as provenance.
-At most two new hosts are admitted per event, up to
-`global.onion_max_sources` (default 16, hard maximum 32); up to 512 additional
-hosts stay pending with explicit capacity debt. Sources resume after restart.
-Each added source starts polling immediately even when the mesh is already
-running. No source gains authenticity from its domain spelling or discovery
-origin. Current Dread identity still needs independent verification.
+Those discoveries join the same disk-backed frontier rather than creating a
+new polling task for each host. Historical admitted/pending source state,
+unacknowledged snapshots and legacy capacity debt remain readable for migration;
+the old `onion_max_sources`/512-candidate admission limits do not govern the
+continuous frontier. New hosts and old pages share its paced service. No source
+gains authenticity from its domain spelling or discovery origin. Current Dread
+identity still needs independent verification.
 
 Records retain their source URL, provenance, content hash, original observation
 time, launch/wallet/claimed-insider/claimed-coordination topics and address
-mentions. Script/style content is discarded; documents are capped at 512 KiB,
-and emitted text at 16,000 characters with an explicit truncation flag.
+mentions. Script/style content is discarded. The HTTP document envelope is
+512 KiB, and oversized or unsupported responses fail explicitly. The continuous
+frontier retains the extracted text and links within that envelope without the
+bounded adapter's 16,000-character/128-link truncation. The bounded adapter
+retains its text-truncation flag. Document and request envelopes are resource
+controls, not proof of unlimited content coverage.
 Publication time is unknown unless separately established; an initial snapshot
 does not establish when its claims were first published.
 
@@ -51,8 +63,9 @@ consumer writes the original claim provenance to the canonical narrative work
 item. It does not grant actor independence, authenticity, a profitable strategy
 or execution authority.
 
-The page frontier, hashes and delivery outbox are atomically checkpointed with
-flush/fsync. A pending snapshot is replayed with its original ID and timestamp
+The continuous page frontier, hashes and delivery outbox use SQLite WAL and
+FULL synchronous transactions. The bounded adapter uses its own atomic JSON
+checkpoint with flush/fsync. A pending snapshot is replayed with its original ID and timestamp
 after restart until the existing research engine durably accepts it. Intake is
 idempotent; a checkpoint acknowledgement failure can cause redelivery, not
 manufacture a later observation. The transport does not claim exactly-once
@@ -62,6 +75,34 @@ HTTP failures, unsupported documents, access challenges, missing proxy and
 invalid checkpoints are explicit failures. A name in a configuration file does
 not count as an observed source. `/status` includes `wallet_follow.research.onion_research`
 and per-transport coverage, candidate links and pending delivery counts.
+
+## Verify the deployed collector
+
+`config/research-production.example.yaml` keeps automatic discovery disabled as
+an explicit opt-in default. It does not describe a running deployment's actual
+configuration. Check that deployment's `global.onion_auto_discovery`, configured
+proxy and attached frontier; a Tor process alone is insufficient evidence.
+
+Inspect `wallet_follow.research.onion_research` in `/status`, especially
+`automatic_discovery_enabled` and `continuous_frontier.observed_pages`,
+`last_observed_at`, `pending_pages`, `deferred_pages` and
+`pending_canonical_delivery`. Distinguish recent successful reads, old successful
+reads, discovered-but-unvisited URLs and pending research delivery. Unchanged
+pages may advance the successful-read clock without producing another content
+change. Refusals, inaccessible hosts and access challenges remain deferred;
+they are not silently counted as successful coverage.
+
+For delivery evidence, resolve an `origins.source_ref` of `frontier_job:<id>`
+from the frontier database to its actual `NARRATIVE_OBSERVATION` job in the
+research frontier. Verify the referenced canonical row hash and the parent's
+URL/observation identity internally. The corresponding neural input can be
+checked by its canonical source reference. Do not print raw documents, addresses
+or proxy/credential values merely to prove counters. Deduplicate sampled job
+references: multiple discovered child links can share one parent observation.
+
+Successful collection and canonical delivery establish a working research
+path. They do not establish authenticated insiders, complete coverage, NLP
+completion, a predictive advantage or profitable trading.
 
 ## Configuration
 
