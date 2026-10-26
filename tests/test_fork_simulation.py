@@ -401,6 +401,51 @@ async def test_empty_untried_lanes_share_capacity_with_due_retries(monkeypatch,t
     probe.close()
 
 
+@pytest.mark.asyncio
+async def test_bursty_launchpad_cannot_starve_rare_eligible_venues(monkeypatch,tmp_path):
+    from src.research import fork_probe as p
+    async def unavailable(rpc,target):raise f.ForkUnavailable('synthetic unavailable fixture')
+    monkeypatch.setattr(p,'acquire',unavailable)
+    probe=ForkProbe(tmp_path/'fork.sqlite')
+    def target(venue):
+        return {'token':str(Pubkey.new_unique()),'venue':venue,'quote_budget':1_000_000}
+    initial=[target('raydium_launchlab'),target('pumpswap')]+[target('pump_curve') for _ in range(1100)]
+    serviced=[]
+    for turn in range(3):
+        rows=await probe.fetch(None,lambda:initial if turn==0 else [target('pump_curve') for _ in range(20)])
+        serviced.append(rows[0]['dispatch_venue'])
+        assert rows[0]['dispatch_venue']==rows[0]['target']['venue']
+        probe.acknowledge(rows,f'canonical:fair-venue:{turn}')
+    assert serviced==['pump_curve','pumpswap','raydium_launchlab']
+    assert probe.report()['targets']==1142
+    assert len(probe.report()['venue_service_tickets'])==3
+    probe.close()
+
+
+@pytest.mark.asyncio
+async def test_venue_service_survives_restart_and_pending_ack_does_not_spend_another_turn(monkeypatch,tmp_path):
+    from src.research import fork_probe as p
+    async def unavailable(rpc,target):raise f.ForkUnavailable('synthetic unavailable fixture')
+    monkeypatch.setattr(p,'acquire',unavailable)
+    path=tmp_path/'fork.sqlite'
+    targets=[{'token':str(Pubkey.new_unique()),'venue':venue,'quote_budget':1_000_000}
+             for venue in ('raydium_launchlab','pump_curve')]
+    probe=ForkProbe(path)
+    rows=await probe.fetch(None,lambda:targets)
+    assert rows[0]['dispatch_venue']=='pump_curve'
+    before=probe.report()['venue_service_tickets']
+    probe.close()
+    probe=ForkProbe(path)
+    assert await probe.fetch(None,lambda:targets)==rows
+    assert probe.report()['venue_service_tickets']==before
+    probe.acknowledge(rows,'canonical:before-restart')
+    burst=[{'token':str(Pubkey.new_unique()),'venue':'pump_curve','quote_budget':1_000_000} for _ in range(50)]
+    rare=await probe.fetch(None,lambda:burst)
+    assert rare[0]['dispatch_venue']=='raydium_launchlab'
+    assert probe.report()['venue_service_tickets']['raydium_launchlab']>before['pump_curve']
+    probe.close()
+
+
 def test_runtime_retains_result_before_acknowledging():
     from src.runtime.research_runtime import ResearchRuntime
     called = []

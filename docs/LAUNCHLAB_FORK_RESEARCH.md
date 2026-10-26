@@ -58,3 +58,10 @@ dispositions. A supported adapter with no observed targets is explicitly
 `NO_TARGETS_OBSERVED`; support is not an executed round trip. Cadence, provider
 refusals and backlog can still delay sampling, so the queue has no guaranteed
 launch-to-probe deadline or whole-market coverage denominator.
+
+Within each dispatch lane, the least recently serviced eligible venue gets
+the next turn. Durable monotone service tickets keep a high-volume launchpad
+from monopolizing fresh or historical work. Ties follow that lane's original
+arrival/deadline ordering. Empty or not-yet-due venues do not reserve idle
+capacity. This is fair service among retained candidates, not a claim that all
+venues are decoded or that a provider can supply every requested bank.

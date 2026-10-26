@@ -32,6 +32,7 @@ class ForkProbe:
           CREATE INDEX IF NOT EXISTS pending ON results(ref,created);
           CREATE INDEX IF NOT EXISTS queue ON jobs(due,id);
           CREATE INDEX IF NOT EXISTS by_token ON results(json_extract(body,'$.token'),available DESC) WHERE ref IS NOT NULL;
+          CREATE TABLE IF NOT EXISTS fork_venue_service(venue TEXT PRIMARY KEY,last_ticket INTEGER NOT NULL);
         ''')
         columns = {row[1] for row in self.db.execute('PRAGMA table_info(jobs)')}
         if 'arrived' not in columns:
@@ -56,11 +57,16 @@ class ForkProbe:
                  'DUE_RETRY': ('attempts>0', 'due,id')}
         for lane in dict.fromkeys((preferred, 'OLDEST_UNTRIED', 'DUE_RETRY')):
             predicate, order = plans[lane]
-            job = self.db.execute('SELECT id,body,first_seen FROM jobs WHERE due<=? AND '+predicate+
-                                  ' ORDER BY '+order+' LIMIT 1', (now,)).fetchone()
+            venue = "COALESCE(NULLIF(json_extract(j.body,'$.venue'),''),'UNKNOWN')"
+            job = self.db.execute('SELECT j.id,j.body,j.first_seen,'+venue+' FROM jobs j '
+                'LEFT JOIN fork_venue_service v ON v.venue='+venue+' WHERE due<=? AND '+predicate+
+                ' ORDER BY COALESCE(v.last_ticket,0),'+order+' LIMIT 1', (now,)).fetchone()
             if job:
                 self.db.execute('UPDATE jobs SET due=?,attempts=attempts+1 WHERE id=?', (now+300, job[0]))
                 self.db.execute('UPDATE fork_dispatch SET cursor=? WHERE id=1', ((cursor+1) % 4,))
+                self.db.execute('INSERT INTO fork_venue_service VALUES(?, '
+                    '(SELECT COALESCE(MAX(last_ticket),0)+1 FROM fork_venue_service)) '
+                    'ON CONFLICT(venue) DO UPDATE SET last_ticket=excluded.last_ticket', (job[3],))
                 return (*job, lane)
         return None
 
@@ -146,7 +152,7 @@ class ForkProbe:
                       'reason': str(exc)[:300] if isinstance(exc, ForkUnavailable) else type(exc).__name__}
         row = {**result, 'provider': 'local_svm', 'fork_kind': 'native_roundtrip',
             'schema': SCHEMA, 'token': target['token'], 'target': target,
-            'dispatch_lane': job[3], 'target_first_queued_at': job[2],
+            'dispatch_lane': job[4], 'dispatch_venue': job[3], 'target_first_queued_at': job[2],
             'queue_age_at_attempt_seconds': max(0., now-job[2]) if job[2] is not None else None,
             'queue_clock_regressed': now < job[2] if job[2] is not None else None,
             'input_sha256': frame_id, 'created_at': time.time(),
@@ -201,10 +207,13 @@ class ForkProbe:
                 row['coverage_state'] = ('OBSERVED_LOCAL_ROUNDTRIPS' if row['canonical_dispositions'].get(
                     'ROUNDTRIP_SUCCEEDED_IN_FORK', 0) else 'CANONICAL_DISPOSITIONS_ONLY' if row[
                     'canonical_dispositions'] else 'TARGETS_PENDING' if row['targets'] else 'NO_TARGETS_OBSERVED')
+            venue_service = dict(self.db.execute('SELECT venue,last_ticket FROM fork_venue_service'))
         return {'status': 'LOCAL_FORK_RESEARCH', 'targets': jobs[0], 'attempts': jobs[1] or 0,
                 'canonical_dispositions': statuses, 'awaiting_canonical_ack': pending,
                 'by_venue': venues,
                 'scheduling': '2 fresh untried : 1 oldest untried : 1 due retry; empty lanes share capacity',
+                'venue_scheduling': 'least recently serviced eligible venue within each lane; persistent monotone tickets',
+                'venue_service_tickets': venue_service,
                 'supported_adapters': ['pump_curve', 'pumpswap', 'raydium_launchlab'],
                 'adapter_subsets': {'raydium_launchlab': 'funding status, SPL/Token-2022 base, WSOL quote; transfer hooks/other layouts unknown'},
                 'other_venues': 'UNSUPPORTED_UNKNOWN', 'live_authority': False,
