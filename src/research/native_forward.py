@@ -112,7 +112,13 @@ class NativeForwardPaper:
         return compile_candidate(spec.exact_candidate)
 
     def _blocked(self, variable, reason, candidate_id=None):
-        return self.validation._blocked("native_forward_" + variable, reason, {"candidate_id": candidate_id})
+        result = self.validation._blocked("native_forward_" + variable, reason, {"candidate_id": candidate_id})
+        counts = self.state.setdefault('input_refusals', {})
+        counts[variable] = counts.get(variable, 0) + 1
+        self.state['last_tick_status'] = 'BLOCKED'
+        self.state['last_input_wait'] = variable
+        self._save()
+        return result
 
     def _record(self, event_type, payload, now):
         ref = self.ledger.record_reference(event_type, payload, timestamp=now)
@@ -195,6 +201,8 @@ class NativeForwardPaper:
 
     def tick(self, token, episode, native_state, *, state_observed_at, source_ref,
              equity_usd, native_to_usd, now, fee_bps=None, execution_costs=None):
+        self.state['observed_ticks'] = self.state.get('observed_ticks', 0) + 1
+        self.state['last_observed_at'] = now
         if self.ledger is None:
             return self._blocked("ledger", "canonical evidence ledger unavailable")
         if not isinstance(episode, dict) or episode.get("token") != token:
@@ -202,6 +210,8 @@ class NativeForwardPaper:
         eligible = [(eid, experiment) for eid, experiment in self.validation.state["experiments"].items()
                     if experiment["registered_at"] <= episode.get("created_at", 0)]
         if not eligible:
+            self.state['last_tick_status'] = 'NO_REGISTERED_FRESH_COHORT'
+            self._save()
             return {"disposition": "DEEPENING_TASK", "detail": {"status": "NO_REGISTERED_FRESH_COHORT"}, "children": []}
         if (not _number(now, positive=True) or not _number(state_observed_at, positive=True)
                 or not now - self.max_state_age <= state_observed_at <= now or not source_ref):
@@ -341,6 +351,7 @@ class NativeForwardPaper:
                 self.state["blocked"][key] = blocked["detail"]
                 children.extend(blocked["children"])
                 results.append(blocked["detail"])
+        self.state['last_tick_status'] = 'BLOCKED' if children else 'NATIVE_PAPER_PASS'
         self._save()
         return {"disposition": "BLOCKED" if children else "DEEPENING_TASK",
                 "detail": {"status": "NATIVE_PAPER_PASS", "results": results,
@@ -358,4 +369,9 @@ class NativeForwardPaper:
 
     def report(self):
         return {"open_positions": len(self.state["positions"]), "completed": len(self.state["completed"]),
-                "blocked": len(self.state["blocked"]), "scope": "NATIVE_QUOTE_PAPER_ONLY", "real_fill": False}
+                "blocked": len(self.state["blocked"]), "scope": "NATIVE_QUOTE_PAPER_ONLY", "real_fill": False,
+                'observed_ticks':self.state.get('observed_ticks',0),
+                'last_observed_at':self.state.get('last_observed_at'),
+                'last_tick_status':self.state.get('last_tick_status','NOT_OBSERVED'),
+                'last_input_wait':self.state.get('last_input_wait'),
+                'input_refusals':dict(self.state.get('input_refusals',{}))}

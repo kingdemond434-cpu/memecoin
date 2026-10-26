@@ -48,3 +48,16 @@ open and completed model positions, blocked inputs and paper-only outcomes.
 The historical registry's zero experiments may remain correct while this
 independent prospective control collects. Phantom World and underlying perps
 remain separate products; no alternative-venue fill is substituted here.
+
+Fresh post-declaration native controls receive part of the existing market
+observation work budget even while the stable outcome cohort remains full of
+older launches. Open model positions receive priority for subsequent marks.
+This paper-only lane does not evict the stable outcome cohort, expand the RPC
+concurrency budget, or request extra aggregator quotes. It remains a sampled
+observer, not a census. Tick counts and named input-refusal counts persist
+even when missing native state prevents any position from opening.
+
+RPC simulation uses real on-chain accounts. It does not persist the virtual
+token inventory from a simulated entry, so it cannot by itself establish a
+wallet-free later sell. A retained local-bank entry/future-exit inventory
+bridge is still required for that model; unavailable simulations stay blocked.
