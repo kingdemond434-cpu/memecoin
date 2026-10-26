@@ -696,7 +696,7 @@ class ChainRegistry:
     async def start_all(self, enabled_chains: Optional[Iterable[str]] = None):
         selected = set(self.chains if enabled_chains is None else enabled_chains)
         # This bounds concurrent connections, not the number of configured chains.
-        slots = asyncio.Semaphore(4)
+        slots = loop_local_semaphore(4, "chain.startup")
 
         async def start(name):
             async with slots:
