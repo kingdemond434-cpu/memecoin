@@ -692,6 +692,17 @@ class FrontierIndex:
         result["priority_status"] = "UNMEASURED" if result["priority"] is None else "MEASURED"
         return result
 
+    def job_payload_ref(self, job_id: str) -> Optional[str]:
+        """Read the immutable canonical payload binding without hydrating a job.
+
+        Source intake needs only this binding, twice per delivery. Avoid reading
+        axes, auction, evidence lists and tags while retaining a fresh committed
+        SQLite lookup (no stale in-memory reference cache).
+        """
+        with self._db() as db:
+            row = db.execute("SELECT payload_ref FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            return row[0] if row else None
+
     def job(self, job_id: str) -> Optional[Dict[str, Any]]:
         with self._db() as db:
             row = db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
