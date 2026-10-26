@@ -621,6 +621,7 @@ class ChainRegistry:
             raw = yaml.safe_load(f)
         self.chains: Dict[str, ChainConfig] = {}
         self.rpc_managers: Dict[str, RPCManager] = {}
+        self._start_locks = {}
         self._parse_config(raw)
 
     def _parse_config(self, raw: Dict):
@@ -677,17 +678,40 @@ class ChainRegistry:
     def _has_unresolved_placeholder(value: str) -> bool:
         return "${" in value
 
+    async def start_chain(self, name: str) -> RPCManager:
+        """Publish one manager only after startup; clean up failed/cancelled probes."""
+        lock = self._start_locks.setdefault(name, loop_local_lock("chain.start"))
+        async with lock:
+            if name in self.rpc_managers:
+                return self.rpc_managers[name]
+            manager = RPCManager(self.chains[name])
+            try:
+                await manager.start()
+            except BaseException:
+                await manager.stop()
+                raise
+            self.rpc_managers[name] = manager
+            return manager
+
     async def start_all(self, enabled_chains: Optional[Iterable[str]] = None):
-        selected = set(enabled_chains or self.chains.keys())
-        for name, chain in self.chains.items():
-            if name not in selected:
-                continue
-            self.rpc_managers[name] = RPCManager(chain)
-            await self.rpc_managers[name].start()
+        selected = set(self.chains if enabled_chains is None else enabled_chains)
+        # This bounds concurrent connections, not the number of configured chains.
+        slots = loop_local_semaphore(4, "chain.startup")
+
+        async def start(name):
+            async with slots:
+                await self.start_chain(name)
+
+        async with asyncio.TaskGroup() as tasks:
+            for name in self.chains:
+                if name in selected:
+                    tasks.create_task(start(name))
 
     async def stop_all(self):
-        for mgr in self.rpc_managers.values():
+        for name, mgr in list(self.rpc_managers.items()):
             await mgr.stop()
+            if self.rpc_managers.get(name) is mgr:
+                del self.rpc_managers[name]
 
     async def stop(self):
         """Lifecycle alias used by the desk's uniform component shutdown."""

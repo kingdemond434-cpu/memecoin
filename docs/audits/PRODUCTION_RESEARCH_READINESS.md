@@ -47,7 +47,11 @@ not enable providers or replay implicitly.
 
 ## Native EVM probes
 
-`global.evm_native_probes` accepts at most four explicit Uniswap V2 routes.
+`global.evm_native_probes` accepts explicit Uniswap V2 routes without a fixed
+route-count limit. Independent chain clients start concurrently in batches of
+four; this is an in-flight connection budget, not a coverage limit. Duplicate
+routes reuse the registry-owned client. A failed optional chain is reported
+independently, and a failed or cancelled startup closes its unpublished client.
 Each declaration supplies the registry chain, factory/router, input/output
 token addresses, exact raw input amount and official deployment provenance.
 The existing collection loop rotates through at most two probes per pass;
