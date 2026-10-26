@@ -924,6 +924,23 @@ class PumpFunMonitor:
         if asyncio.iscoroutine(result):
             await result
 
+    @staticmethod
+    def _trade_quote_mint(data):
+        # Current IDL: volume fields end at 258, then ix_name, mayhem,
+        # four fee u64s, Vec<Shareholder(pubkey,u16)>, then quote_mint.
+        if len(data) < 262:
+            return None
+        size = struct.unpack_from('<I', data, 258)[0]
+        offset = 262 + size + 1 + 32
+        if size > 4096 or offset + 4 > len(data):
+            return None
+        count = struct.unpack_from('<I', data, offset)[0]
+        offset += 4 + count * 34
+        if offset + 32 > len(data):
+            return None
+        raw = data[offset:offset+32]
+        return 'So11111111111111111111111111111111111111112' if raw == bytes(32) else b58encode(raw)
+
     def _decode_program_event(self, data: bytes, signature: str, slot: int) -> Optional[Dict[str, Any]]:
         base = {
             "chain": "solana", "program": self.PUMP_FUN_PROGRAM, "signature": signature,
@@ -943,6 +960,7 @@ class PumpFunMonitor:
                 **base, "type": "token_created", "token": mint, "bonding_curve": curve,
                 "wallet": user, "creator": creator, "name": name, "symbol": symbol, "uri": uri,
                 "timestamp": float(timestamp), "data_status": "OK",
+                "token_total_supply": struct.unpack_from("<Q", data, offset + 160)[0] if len(data) >= offset + 168 else None,
             }
         if data.startswith(self.TRADE_EVENT):
             if len(data) < 97:
@@ -954,20 +972,23 @@ class PumpFunMonitor:
             timestamp = struct.unpack_from("<q", data, 89)[0]
             virtual_sol = struct.unpack_from("<Q", data, 97)[0] if len(data) >= 105 else 0
             virtual_token = struct.unpack_from("<Q", data, 105)[0] if len(data) >= 113 else 0
+            real_sol = struct.unpack_from("<Q", data, 113)[0] if len(data) >= 129 else None
+            real_token = struct.unpack_from("<Q", data, 121)[0] if len(data) >= 129 else None
             return {
                 **base, "type": "token_trade", "token": mint, "wallet": user,
                 "side": "buy" if is_buy else "sell", "token_amount": token_amount,
                 "actual_token_delta_raw": token_amount if is_buy else -token_amount,
                 "notional_sol": sol_amount / 1_000_000_000, "timestamp": float(timestamp),
                 "curve_price_raw": virtual_sol / virtual_token if virtual_token else None,
-                # The reserves were already decoded to derive the price above;
-                # carrying them forward lets capacity be computed locally from
-                # the curve rather than round-tripping an RPC for depth that
-                # this event already contains. Real reserves are NOT in the
-                # TradeEvent, so anything derived from these alone is an upper
-                # bound on executable size, and is labelled as one downstream.
+                # The vendored official TradeEvent prefix includes real SOL
+                # and token reserves immediately after the virtual pair. A
+                # legacy/truncated prefix remains unknown, never measured zero.
                 "virtual_sol_reserves": virtual_sol or None,
                 "virtual_token_reserves": virtual_token or None,
+                "real_sol_reserves": real_sol, "real_token_reserves": real_token,
+                "real_reserve_data_status": "OBSERVED_OFFICIAL_PUMP_TRADE" if len(data) >= 129 else "UNMEASURED",
+                "creator": b58encode(data[177:209]) if len(data) >= 209 else None,
+                "quote_mint": self._trade_quote_mint(data),
                 "fill_data_status": "OBSERVED_PROGRAM_EVENT", "data_status": "OK",
             }
         if data.startswith(self.COMPLETE_EVENT):

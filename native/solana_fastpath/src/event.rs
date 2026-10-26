@@ -21,16 +21,15 @@
 //! ```text
 //! TradeEvent     8 discriminator | 32 mint | 8 sol | 8 token | 1 is_buy
 //!                32 user | 8 timestamp | [8 virtual_sol] [8 virtual_token]
+//!                [8 real_sol | 8 real_token] ... [creator at byte 177]
 //! CreateEvent    8 discriminator | borsh name, symbol, uri
 //!                32 mint | 32 curve | 32 user | 32 creator | 8 timestamp
 //! CompleteEvent  8 discriminator | 32 user | 32 mint | 32 curve | 8 timestamp
 //! ```
 //!
-//! The two trailing TradeEvent fields are optional in the wire format and
-//! are the ones that matter most: they carry the curve reserves, which is
-//! what lets liquidity be priced at T0 without an RPC call. Absent, they
-//! are None rather than zero -- an unknown reserve and an empty curve are
-//! different facts.
+//! Older retained prefixes can lack current tail fields. Missing reserves
+//! remain None, whereas an observed zero is preserved. The current vendored
+//! IDL supplies real reserves, creator and a variable-length quote-mint tail.
 
 use crate::helpers::b58encode;
 
@@ -56,6 +55,10 @@ pub enum PumpEvent {
         /// zero: an unknown reserve is not an empty curve.
         virtual_sol_reserves: Option<u64>,
         virtual_token_reserves: Option<u64>,
+        real_sol_reserves: Option<u64>,
+        real_token_reserves: Option<u64>,
+        creator: Option<String>,
+        quote_mint: Option<String>,
     },
     Create {
         mint: String,
@@ -66,6 +69,7 @@ pub enum PumpEvent {
         symbol: String,
         uri: String,
         timestamp: i64,
+        token_total_supply: Option<u64>,
     },
     Complete {
         mint: String,
@@ -98,6 +102,18 @@ fn i64_at(data: &[u8], offset: usize) -> i64 {
 
 fn pubkey_at(data: &[u8], offset: usize) -> String {
     b58encode(&data[offset..offset + 32])
+}
+
+fn trade_quote_mint(data: &[u8]) -> Option<String> {
+    if data.len() < 262 { return None; }
+    let size = u32::from_le_bytes(data[258..262].try_into().ok()?) as usize;
+    if size > MAX_STRING { return None; }
+    let offset = 262usize.checked_add(size)?.checked_add(33)?;
+    let count = u32::from_le_bytes(data.get(offset..offset.checked_add(4)?)?.try_into().ok()?) as usize;
+    let key_offset = offset.checked_add(4)?.checked_add(count.checked_mul(34)?)?;
+    let raw = data.get(key_offset..key_offset.checked_add(32)?)?;
+    Some(if raw == [0u8;32] { "So11111111111111111111111111111111111111112".to_string() }
+         else { b58encode(raw) })
 }
 
 /// Three borsh strings back to back, returning them and the offset after.
@@ -154,6 +170,10 @@ pub fn decode(data: &[u8]) -> Result<PumpEvent, DecodeError> {
             // priceable without an RPC round trip.
             virtual_sol_reserves: (data.len() >= 105).then(|| u64_at(data, 97)),
             virtual_token_reserves: (data.len() >= 113).then(|| u64_at(data, 105)),
+            real_sol_reserves: (data.len() >= 129).then(|| u64_at(data, 113)),
+            real_token_reserves: (data.len() >= 129).then(|| u64_at(data, 121)),
+            creator: (data.len() >= 209).then(|| pubkey_at(data, 177)),
+            quote_mint: trade_quote_mint(data),
         });
     }
 
@@ -176,6 +196,7 @@ pub fn decode(data: &[u8]) -> Result<PumpEvent, DecodeError> {
             symbol,
             uri,
             timestamp: i64_at(data, offset + 128),
+            token_total_supply: (data.len() >= offset + 168).then(|| u64_at(data, offset + 160)),
         });
     }
 
@@ -245,6 +266,19 @@ mod tests {
             }
             other => panic!("expected a trade, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn real_pair_is_preserved_and_partial_pair_stays_unknown() {
+        let mut data = trade_payload(true);
+        data.extend_from_slice(&0u64.to_le_bytes());
+        if let PumpEvent::Trade {real_sol_reserves,real_token_reserves,..} = decode(&data).unwrap() {
+            assert_eq!((real_sol_reserves,real_token_reserves),(None,None));
+        } else { panic!("expected trade"); }
+        data.extend_from_slice(&700_000u64.to_le_bytes());
+        if let PumpEvent::Trade {real_sol_reserves,real_token_reserves,..} = decode(&data).unwrap() {
+            assert_eq!((real_sol_reserves,real_token_reserves),(Some(0),Some(700_000)));
+        } else { panic!("expected trade"); }
     }
 
     #[test]

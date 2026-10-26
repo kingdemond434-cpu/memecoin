@@ -3879,12 +3879,20 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
                 # refused every trade for want of a creator it had already
                 # been told once.
                 static = self._curve_static.get(token, {})
+                real_sol, real_token = event.get('real_sol_reserves'), event.get('real_token_reserves')
+                measured_real = (event.get('real_reserve_data_status') == 'OBSERVED_OFFICIAL_PUMP_TRADE'
+                    and event.get('program') == PumpFunMonitor.PUMP_FUN_PROGRAM
+                    and type(real_sol) is int and type(real_token) is int
+                    and 0 <= real_sol <= virtual_sol and 0 <= real_token <= virtual_token)
+                if event.get('creator'):
+                    static = self._curve_static.setdefault(token,{})
+                    static['creator'] = event['creator']
                 self._latest_curve_state[token] = BondingCurveState(
                     virtual_token_reserves=virtual_token, virtual_sol_reserves=virtual_sol,
-                    # The TradeEvent carries no real reserves. Leaving these at
-                    # zero is what marks every frontier derived from this state
-                    # as an upper bound rather than a measurement.
-                    real_token_reserves=0, real_sol_reserves=0,
+                    # Current official events carry both real reserves. Only
+                    # a decoded, complete and sane pair can replace unknowns.
+                    real_token_reserves=real_token if measured_real else 0,
+                    real_sol_reserves=real_sol if measured_real else 0,
                     token_total_supply=int(static.get("token_total_supply", 0) or 0),
                     complete=False, creator=str(static.get("creator", "") or ""),
                 )
@@ -3929,7 +3937,10 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
                            # pre-migration launch cannot have. Storing the
                            # reserves keeps the derivation point-in-time.
                            "virtual_sol_reserves": virtual_sol or None,
-                           "virtual_token_reserves": virtual_token or None}
+                           "virtual_token_reserves": virtual_token or None,
+                           "real_sol_reserves": event.get('real_sol_reserves'),
+                           "real_token_reserves": event.get('real_token_reserves'),
+                           "real_reserve_data_status": event.get('real_reserve_data_status','UNMEASURED')}
             reference_receipt_at, reference_source_at = time.time(), event.get("timestamp")
             if (virtual_sol > 0 and virtual_token > 0 and event.get("signature")
                     and type(reference_source_at) in (float, int) and math.isfinite(reference_source_at)

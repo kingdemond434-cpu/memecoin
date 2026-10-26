@@ -56,7 +56,8 @@ fn decode_pump_event(py: Python<'_>, data: &[u8]) -> PyResult<Option<PyObject>> 
     let out = PyDict::new(py);
     match decode(data) {
         Ok(PumpEvent::Trade { mint, user, is_buy, sol_amount, token_amount,
-                              timestamp, virtual_sol_reserves, virtual_token_reserves }) => {
+                              timestamp, virtual_sol_reserves, virtual_token_reserves,
+                              real_sol_reserves, real_token_reserves, creator, quote_mint }) => {
             out.set_item("type", "token_trade")?;
             out.set_item("token", mint)?;
             out.set_item("wallet", user)?;
@@ -66,8 +67,13 @@ fn decode_pump_event(py: Python<'_>, data: &[u8]) -> PyResult<Option<PyObject>> 
             out.set_item("timestamp", timestamp)?;
             out.set_item("virtual_sol_reserves", virtual_sol_reserves)?;
             out.set_item("virtual_token_reserves", virtual_token_reserves)?;
+            out.set_item("real_sol_reserves", real_sol_reserves)?;
+            out.set_item("real_token_reserves", real_token_reserves)?;
+            out.set_item("real_reserve_data_status", if real_sol_reserves.is_some() && real_token_reserves.is_some() { "OBSERVED_OFFICIAL_PUMP_TRADE" } else { "UNMEASURED" })?;
+            out.set_item("creator", creator)?;
+            out.set_item("quote_mint", quote_mint)?;
         }
-        Ok(PumpEvent::Create { mint, bonding_curve, user, creator, name, symbol, uri, timestamp }) => {
+        Ok(PumpEvent::Create { mint, bonding_curve, user, creator, name, symbol, uri, timestamp, token_total_supply }) => {
             out.set_item("type", "token_created")?;
             out.set_item("token", mint)?;
             out.set_item("bonding_curve", bonding_curve)?;
@@ -77,6 +83,7 @@ fn decode_pump_event(py: Python<'_>, data: &[u8]) -> PyResult<Option<PyObject>> 
             out.set_item("symbol", symbol)?;
             out.set_item("uri", uri)?;
             out.set_item("timestamp", timestamp)?;
+            out.set_item("token_total_supply", token_total_supply)?;
         }
         Ok(PumpEvent::Complete { mint, user, bonding_curve, timestamp }) => {
             out.set_item("type", "token_migrated")?;
@@ -889,6 +896,10 @@ mod ingress_binding {
                 timestamp,
                 virtual_sol_reserves,
                 virtual_token_reserves,
+                real_sol_reserves,
+                real_token_reserves,
+                creator,
+                quote_mint,
             }) => {
                 dict.set_item("type", "token_trade").ok()?;
                 dict.set_item("token", mint).ok()?;
@@ -900,6 +911,11 @@ mod ingress_binding {
                 // None, not zero. An unknown reserve is not an empty curve.
                 dict.set_item("virtual_sol_reserves", virtual_sol_reserves).ok()?;
                 dict.set_item("virtual_token_reserves", virtual_token_reserves).ok()?;
+                dict.set_item("real_sol_reserves", real_sol_reserves).ok()?;
+                dict.set_item("real_token_reserves", real_token_reserves).ok()?;
+                dict.set_item("real_reserve_data_status", if real_sol_reserves.is_some() && real_token_reserves.is_some() { "OBSERVED_OFFICIAL_PUMP_TRADE" } else { "UNMEASURED" }).ok()?;
+                dict.set_item("creator", creator).ok()?;
+                dict.set_item("quote_mint", quote_mint).ok()?;
             }
             Ok(PumpEvent::Create {
                 mint,
@@ -910,6 +926,7 @@ mod ingress_binding {
                 symbol,
                 uri,
                 timestamp,
+                token_total_supply,
             }) => {
                 dict.set_item("type", "token_created").ok()?;
                 dict.set_item("token", mint).ok()?;
@@ -920,6 +937,7 @@ mod ingress_binding {
                 dict.set_item("symbol", symbol).ok()?;
                 dict.set_item("uri", uri).ok()?;
                 dict.set_item("timestamp", timestamp).ok()?;
+                dict.set_item("token_total_supply", token_total_supply).ok()?;
             }
             Ok(PumpEvent::Complete {
                 mint,
