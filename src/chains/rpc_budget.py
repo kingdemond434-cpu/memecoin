@@ -6,6 +6,7 @@ No credential or credential-bearing URL is stored in this database.
 """
 import asyncio
 import hashlib
+import json
 import math
 import sqlite3
 import threading
@@ -18,6 +19,50 @@ class RPCBudgetExhausted(RuntimeError):
     def __init__(self, retry_at):
         super().__init__("configured RPC allocation exhausted")
         self.retry_at = retry_at
+
+
+class RPCProviderCooling(RPCBudgetExhausted):
+    def __init__(self, retry_at):
+        RuntimeError.__init__(self, 'RPC provider cooling after refusal')
+        self.retry_at = retry_at
+
+
+class SharedRPCCooldowns:
+    """Owner-local refusal windows shared by managers, loops and processes.
+
+    Only endpoint/header digests and deadlines are stored, never credentials.
+    This does not discover a plan's limits or measure external application use.
+    """
+    def __init__(self, path):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.db=sqlite3.connect(path, timeout=3, check_same_thread=False)
+        self.db.execute('PRAGMA journal_mode=WAL')
+        self.db.execute('CREATE TABLE IF NOT EXISTS rpc_transport_cooldown(identity TEXT PRIMARY KEY,until REAL NOT NULL)')
+        self.db.commit()
+        self.lock=threading.RLock()
+
+    @staticmethod
+    def identity(endpoint):
+        body=json.dumps([endpoint.url,sorted((key.lower(),value) for key,value in endpoint.headers.items())],separators=(',',':'))
+        return hashlib.sha256(body.encode()).hexdigest()
+
+    def until(self, endpoint):
+        with self.lock:
+            row=self.db.execute('SELECT until FROM rpc_transport_cooldown WHERE identity=?',
+                (self.identity(endpoint),)).fetchone()
+        return row[0] if row else 0.
+
+    def defer(self, endpoint, until):
+        if not math.isfinite(until) or until < 0:
+            raise ValueError('finite RPC refusal deadline required')
+        with self.lock, self.db:
+            self.db.execute('INSERT INTO rpc_transport_cooldown VALUES(?,?) '
+                'ON CONFLICT(identity) DO UPDATE SET until=MAX(until,excluded.until)',
+                (self.identity(endpoint),until))
+
+    def close(self):
+        with self.lock:
+            self.db.close()
 
 
 class RPCBudget:
