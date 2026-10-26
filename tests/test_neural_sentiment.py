@@ -274,6 +274,66 @@ def test_hash_verified_replay_repairs_intake_and_resumes_partial_lines(tmp_path)
     queue.close()
 
 
+def replay_fixture(tmp_path,count=40):
+    from src.research.trade_evidence import TradeEvidenceLedger
+    path=tmp_path/'canonical.jsonl'
+    ledger=TradeEvidenceLedger(path)
+    for index in range(count):
+        ledger.record('research_typed_work',{'work_kind':'NARRATIVE_OBSERVATION',
+            'point_payload':{'text':f'public post {index}','source_id':'fixture','observed_at':100}},timestamp=100)
+    return path,SentimentResearch(tmp_path/'nlp.sqlite',worker=Worker(),ledger_path=path)
+
+
+def test_replay_inputs_and_checkpoint_use_one_durable_commit(tmp_path):
+    path,queue=replay_fixture(tmp_path)
+    commits=[]
+    queue.db.set_trace_callback(lambda statement: commits.append(1) if statement=='COMMIT' else None)
+    queue.reconcile(byte_quantum=10**7)
+    assert queue.report()['inputs']==40
+    assert queue.report()['replayed_canonical_bytes']==path.stat().st_size
+    assert len(commits)==1 and queue.report()['inference_metrics']['replay_commits']==1
+    queue.reconcile()
+    assert len(commits)==1  # EOF does not fsync another identical checkpoint.
+    queue.close()
+
+
+def test_replay_intake_failure_rolls_back_whole_batch_and_source_cursor(tmp_path,monkeypatch):
+    path,queue=replay_fixture(tmp_path)
+    original=queue._enqueue_locked
+    calls=[]
+    def fail_third(*args,**kwargs):
+        calls.append(1)
+        if len(calls)==3: raise OSError('fixture write failure')
+        return original(*args,**kwargs)
+    monkeypatch.setattr(queue,'_enqueue_locked',fail_third)
+    with pytest.raises(OSError): queue.reconcile(byte_quantum=10**7)
+    assert queue.report()['inputs']==0 and queue.report()['replayed_canonical_bytes']==0
+    monkeypatch.setattr(queue,'_enqueue_locked',original)
+    queue.reconcile(byte_quantum=10**7)
+    assert queue.report()['inputs']==40 and queue.report()['source_ledger_backlog_bytes']==0
+    queue.close()
+
+
+def test_concurrent_replay_cursor_is_never_rewound(tmp_path,monkeypatch):
+    path,queue=replay_fixture(tmp_path,count=2)
+    import src.research.trade_evidence as evidence
+    original=evidence._verified_row
+    moved=[]
+    def concurrent(*args):
+        row,previous=original(*args)
+        if not moved:
+            moved.append(1)
+            # Simulate a separately committed newer replay pass while this
+            # pass is reading its prefix outside the queue's writer lock.
+            with queue.db:
+                queue.db.execute('UPDATE replay SET offset=12345 WHERE id=1')
+        return row,previous
+    monkeypatch.setattr(evidence,'_verified_row',concurrent)
+    queue.reconcile(byte_quantum=10**7)
+    assert queue.report()['replayed_canonical_bytes']==12345 and queue.report()['inputs']==0
+    queue.close()
+
+
 @pytest.mark.asyncio
 async def test_worker_environment_excludes_credentials_and_failed_child_is_reaped(monkeypatch):
     from src.research.neural_sentiment import OfflineWorker

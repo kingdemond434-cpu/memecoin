@@ -118,6 +118,7 @@ class SentimentResearch:
         self.last_intake_error = None
         self.intake_failures = 0
         self.replay_error = None
+        self.last_replay_seconds = None
         self.inference_code_sha256 = hashlib.sha256(inspect.getsource(worker_main).encode()).hexdigest()
 
     def _next_ticket(self):
@@ -126,6 +127,12 @@ class SentimentResearch:
         return self.db.execute('UPDATE scheduler SET ticket=ticket+1 WHERE id=1 RETURNING ticket').fetchone()[0]
 
     def enqueue(self, payload, *, source_job, source_ref, tokens=(), origin=None):
+        with self.lock, self.db:
+            return self._enqueue_locked(payload, source_job=source_job, source_ref=source_ref,
+                                        tokens=tokens, origin=origin)
+
+    def _enqueue_locked(self, payload, *, source_job, source_ref, tokens=(), origin=None):
+        """Insert inside the caller's locked transaction, never commit a batch."""
         origin = origin or ('LIVE' if source_job else 'REPLAY')
         if origin not in {'LIVE', 'REPLAY'}:
             raise ValueError('invalid observation intake origin')
@@ -144,18 +151,17 @@ class SentimentResearch:
             'text_sha256': hashlib.sha256(text.encode()).hexdigest(),
             'tokens': sorted(set(tokens)), 'model_revision': REVISION}
         identity = digest([source_ref, REVISION])
-        with self.lock, self.db:
-            previous = self.db.execute('SELECT body FROM inputs WHERE id=?', (identity,)).fetchone()
-            if previous and json.loads(previous[0])['text_sha256'] != body['text_sha256']:
-                raise ValueError('canonical source text changed')
-            if previous:
-                if origin == 'LIVE':
-                    self.db.execute("UPDATE inputs SET origin='LIVE' WHERE id=?", (identity,))
-                return identity
-            queued_at = time.time()
-            ticket = self._next_ticket()
-            self.db.execute('INSERT OR IGNORE INTO inputs(id,body,created,served,origin,arrived) VALUES(?,?,?,?,?,?)',
-                            (identity, canonical(body), queued_at, ticket, origin, ticket))
+        previous = self.db.execute('SELECT body FROM inputs WHERE id=?', (identity,)).fetchone()
+        if previous and json.loads(previous[0])['text_sha256'] != body['text_sha256']:
+            raise ValueError('canonical source text changed')
+        if previous:
+            if origin == 'LIVE':
+                self.db.execute("UPDATE inputs SET origin='LIVE' WHERE id=?", (identity,))
+            return identity
+        queued_at = time.time()
+        ticket = self._next_ticket()
+        self.db.execute('INSERT OR IGNORE INTO inputs(id,body,created,served,origin,arrived) VALUES(?,?,?,?,?,?)',
+                        (identity, canonical(body), queued_at, ticket, origin, ticket))
         return identity
 
     def _metric(self, name):
@@ -189,6 +195,8 @@ class SentimentResearch:
         from src.research.trade_evidence import _verified_row
         with self.lock:
             offset, previous, sequence = self.db.execute('SELECT offset,previous,sequence FROM replay').fetchone()
+        checkpoint = (offset, previous, sequence)
+        inputs = []
         if self.ledger_path.stat().st_size < offset:
             raise ValueError('canonical source ledger was truncated')
         boundary = offset+byte_quantum
@@ -206,22 +214,38 @@ class SentimentResearch:
                     if row['event_type'] == 'research_typed_work' and work.get('work_kind') == 'NARRATIVE_OBSERVATION':
                         payload = work['point_payload']
                         tokens = payload.get('token_addresses') or ([payload['token_id']] if payload.get('token_id') else [])
-                        self.enqueue(payload, source_job=None,
-                            source_ref=f"evidence:{row['hash']}:{start}", tokens=tokens)
+                        inputs.append((payload, f"evidence:{row['hash']}:{start}", tokens))
                 offset = handle.tell()
-        # Inputs are idempotent if a crash precedes this single checkpoint.
+        if offset == checkpoint[0]:
+            self.replay_error = None
+            return
+        # Verified inputs and their source cursor commit together. A replay
+        # pass must not fsync once per historical post or rewind a concurrent
+        # pass that has already advanced the cursor.
         with self.lock, self.db:
+            if not self.db.in_transaction:
+                self.db.execute('BEGIN IMMEDIATE')
+            current = self.db.execute('SELECT offset,previous,sequence FROM replay').fetchone()
+            if current != checkpoint:
+                return
+            for payload, ref, tokens in inputs:
+                self._enqueue_locked(payload, source_job=None, source_ref=ref, tokens=tokens)
             self.db.execute('UPDATE replay SET offset=?,previous=?,sequence=? WHERE id=1',
                             (offset, previous, sequence))
+            if offset != checkpoint[0]:
+                self._metric('replay_commits')
         self.replay_error = None
 
     async def fetch(self):
         if self.worker is None:
             return []
+        replay_started = time.perf_counter()
         try:
             await asyncio.to_thread(self.reconcile)
         except Exception as exc:
             self.replay_error = type(exc).__name__
+        finally:
+            self.last_replay_seconds = time.perf_counter()-replay_started
         with self.lock:
             pending = self.db.execute('SELECT body FROM results WHERE ref IS NULL ORDER BY rowid LIMIT 256').fetchall()
         if pending:
@@ -352,6 +376,7 @@ class SentimentResearch:
             'awaiting_canonical_ack': retained-acked, 'last_error_type': self.last_error,
             'last_intake_error_type': self.last_intake_error, 'intake_failures_this_run': self.intake_failures,
             'replay_error_type': self.replay_error, 'replayed_canonical_bytes': replay_offset,
+            'last_replay_seconds': self.last_replay_seconds,
             'queue_lanes': lanes, 'scheduling': '2 fresh live : 1 age-fair live : 1 replay; unused capacity shared; no input expiration',
             'inference_cache_entries': cache_entries, 'inference_metrics': metrics,
             'source_ledger_backlog_bytes': max(0, self.ledger_path.stat().st_size-replay_offset)
