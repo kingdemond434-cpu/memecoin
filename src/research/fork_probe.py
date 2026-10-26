@@ -23,13 +23,15 @@ def reviewed_native_target(event):
     """Candidate identity only; actual bank/owner/route checks still follow."""
     from solders.pubkey import Pubkey
     from src.chains.launchlab import LAUNCHLAB_PROGRAM
+    from src.chains.meteora_dbc import DBC_PROGRAM
     from src.chains.pump_route import WSOL_MINT
-    if (event.get('type') != 'token_launch' or event.get('venue') != 'raydium_launchlab'
-            or event.get('program') != LAUNCHLAB_PROGRAM or event.get('quote_mint') != WSOL_MINT):
+    venues={'raydium_launchlab':LAUNCHLAB_PROGRAM,'meteora_dbc':DBC_PROGRAM}
+    if (event.get('type') != 'token_launch' or event.get('venue') not in venues
+            or event.get('program') != venues[event['venue']] or event.get('quote_mint') != WSOL_MINT):
         return None
     for key in ('token', 'pool'):
         Pubkey.from_string(event[key])
-    return {'token': event['token'], 'venue': 'raydium_launchlab', 'pool': event['pool'],
+    return {'token': event['token'], 'venue': event['venue'], 'pool': event['pool'],
             'quote_budget': 1_000_000}
 
 
@@ -254,7 +256,7 @@ class ForkProbe:
                 row = venues.setdefault(venue or 'UNKNOWN', {'targets': 0, 'attempts': 0,
                     'untried_targets': 0, 'canonical_dispositions': {}})
                 row['canonical_dispositions'][status] = count
-            for venue in ('pump_curve', 'pumpswap', 'raydium_launchlab'):
+            for venue in ('pump_curve', 'pumpswap', 'raydium_launchlab','meteora_dbc'):
                 venues.setdefault(venue, {'targets': 0, 'attempts': 0,
                     'untried_targets': 0, 'canonical_dispositions': {}})
             for row in venues.values():
@@ -271,8 +273,9 @@ class ForkProbe:
                 'venue_scheduling': 'least recently serviced eligible venue within each lane; persistent monotone tickets',
                 'venue_service_tickets': venue_service,
                 'canonical_native_source_links': source_links, 'canonical_native_linked_targets': source_targets,
-                'supported_adapters': ['pump_curve', 'pumpswap', 'raydium_launchlab'],
-                'adapter_subsets': {'raydium_launchlab': 'funding status, SPL/Token-2022 base, WSOL quote; transfer hooks/other layouts unknown'},
+                'supported_adapters': ['pump_curve', 'pumpswap', 'raydium_launchlab','meteora_dbc'],
+                'adapter_subsets': {'raydium_launchlab': 'funding status, SPL/Token-2022 base, WSOL quote; transfer hooks/other layouts unknown',
+                    'meteora_dbc':'ordinary unmigrated VirtualPool/PoolConfig, SPL/Token-2022 base, WSOL quote; hooks/other quotes/layouts unknown'},
                 'other_venues': 'UNSUPPORTED_UNKNOWN', 'live_authority': False,
                 'input_archive': 'native_fork_probe.sqlite:frames',
                 'runtime_parity': 'exact validator parity unverified',

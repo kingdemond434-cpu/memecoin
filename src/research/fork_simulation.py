@@ -21,7 +21,7 @@ from src.chains.pump_route import (ASSOCIATED_TOKEN_PROGRAM, NativePumpRoute,
 from src.chains.pumpswap_route import (PUMPSWAP_PROGRAM, PumpSwapRoute,
     PumpSwapRouteConfig, parse_pool)
 from src.chains.rpc_manager import RPCError
-from src.chains import launchlab_route
+from src.chains import launchlab_route, meteora_dbc_route
 
 SCHEMA = 'native-fork-roundtrip-v1'
 CLOCK = 'SysvarC1ock11111111111111111111111111111111'
@@ -54,7 +54,8 @@ def implementation_manifest():
         'src/chains/pumpswap_route.py', 'src/chains/pump_curve.py', 'src/chains/idl.py',
         'idl/pump.json', 'idl/pump_amm.json', 'idl/pump_fees.json', 'idl/FEE_RECIPIENTS.md',
         'src/chains/launchlab_route.py', 'src/chains/launchlab.py', 'idl/raydium_launchlab.json',
-        'src/detection/rug_detector.py')
+        'src/detection/rug_detector.py','src/chains/meteora_dbc_route.py',
+        'src/chains/meteora_dbc.py','idl/meteora_dbc.json')
     return {'schema': 'local-fork-source-manifest-v1',
         'python_version': '.'.join(map(str, sys.version_info[:3])),
         'source_sha256': {name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in paths}}
@@ -209,6 +210,18 @@ def _route(target, accounts):
             sell = lambda amount: launchlab_route.build_swap(state, owner, amount, 1, buy=False)
         except ValueError as exc:
             raise ForkUnavailable(str(exc)) from exc
+    elif venue == 'meteora_dbc':
+        value=accounts.get(target['pool'])
+        if not value or value['owner']!=meteora_dbc_route.DBC_PROGRAM:
+            raise ForkUnavailable('DBC pool owner mismatch')
+        try:
+            state=meteora_dbc_route.parse_pool(account_data(value),target['pool'])
+            if state['base_mint']!=mint:raise ValueError('DBC target mint mismatch')
+            meteora_dbc_route.validate_frame(state,accounts,account_data)
+            buy=meteora_dbc_route.build_swap(state,owner,target['quote_budget'],1,buy=True)
+            sell=lambda amount:meteora_dbc_route.build_swap(state,owner,amount,1,buy=False)
+        except ValueError as exc:
+            raise ForkUnavailable(str(exc)) from exc
     else:
         raise ForkUnavailable('no reviewed native round-trip adapter for this venue')
     if not buy.ok or not sell(1).ok:
@@ -221,7 +234,7 @@ async def acquire(rpc, target):
     mint = target['token']
     if type(target.get('quote_budget')) is not int or not 0 < target['quote_budget'] < 2**63:
         raise ForkUnavailable('invalid local probe budget')
-    if target['venue'] not in {'pump_curve', 'pumpswap', 'raydium_launchlab'}:
+    if target['venue'] not in {'pump_curve', 'pumpswap', 'raydium_launchlab','meteora_dbc'}:
         raise ForkUnavailable('no reviewed native round-trip adapter for this venue')
     bootstrap_keys = [mint, WSOL_MINT, CLOCK]
     bootstrap_keys.append(_curve_address(mint) if target['venue'] == 'pump_curve' else target['pool'])
@@ -242,6 +255,14 @@ async def acquire(rpc, target):
             raise ForkUnavailable(str(exc)) from exc
         bootstrap_keys.extend(state[key] for key in ('base_vault', 'quote_vault', 'global_config', 'platform_config'))
         bootstrap = await read_frame(rpc, bootstrap_keys)
+    elif target['venue']=='meteora_dbc':
+        value=bootstrap['accounts'].get(target['pool'])
+        if not value or value['owner']!=meteora_dbc_route.DBC_PROGRAM:
+            raise ForkUnavailable('DBC pool owner mismatch')
+        try:state=meteora_dbc_route.parse_pool(account_data(value),target['pool'])
+        except ValueError as exc:raise ForkUnavailable(str(exc)) from exc
+        bootstrap_keys.extend(state[key] for key in ('base_vault','quote_vault','config'))
+        bootstrap=await read_frame(rpc,bootstrap_keys)
     buy, sell, token_program = _route(target, bootstrap['accounts'])
     keys = set(bootstrap_keys) | {str(virtual_owner().pubkey())}
     for instruction in (buy, sell(1)):

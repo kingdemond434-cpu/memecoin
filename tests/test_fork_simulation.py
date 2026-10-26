@@ -423,7 +423,8 @@ async def test_venue_report_counts_only_acknowledged_dispositions(monkeypatch,tm
              for venue in ('pump_curve','pumpswap','raydium_launchlab')]
     rows=await probe.fetch(None,lambda:targets)
     before=probe.report()['by_venue']
-    assert len(before)==3 and not any(row['canonical_dispositions'] for row in before.values())
+    assert len(before)==4 and not any(row['canonical_dispositions'] for row in before.values())
+    assert before['meteora_dbc']['coverage_state']=='NO_TARGETS_OBSERVED'
     assert before['raydium_launchlab']['attempts']==1 and before['pump_curve']['untried_targets']==1
     probe.acknowledge(rows,'canonical:venue-unknown')
     assert probe.report()['by_venue']['raydium_launchlab']['canonical_dispositions']=={'FORK_ENVIRONMENT_UNKNOWN':1}

@@ -486,12 +486,14 @@ class MinedRecordIngestion:
         # Other native launches do not have Pump reserves. Use their observed
         # episode identities; ForkProbe persists each target beyond this view.
         from src.chains.launchlab import LAUNCHLAB_PROGRAM
+        from src.chains.meteora_dbc import DBC_PROGRAM
         from src.chains.pump_route import WSOL_MINT
         builder = getattr(self, 'dataset_builder', None)
         episodes = getattr(builder, 'active_episodes', {})
+        native_venues={LAUNCHLAB_PROGRAM:'raydium_launchlab',DBC_PROGRAM:'meteora_dbc'}
         for token, episode in list(episodes.items()):
-            if episode.factory == LAUNCHLAB_PROGRAM and episode.base_token == WSOL_MINT and episode.pair:
-                targets.append({'token': token, 'venue': 'raydium_launchlab', 'pool': episode.pair,
+            if episode.factory in native_venues and episode.base_token == WSOL_MINT and episode.pair:
+                targets.append({'token': token, 'venue': native_venues[episode.factory], 'pool': episode.pair,
                                 'quote_budget': 1_000_000})
         return targets
 
