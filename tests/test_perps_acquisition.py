@@ -93,11 +93,13 @@ async def test_partial_http_failure_keeps_other_books_and_continues_universe_aft
     assert len(rows) == 3 and sum(r['perps_role']=='book' for r in rows) == 2
     def remaining_targets(stage):
         targets=state.acquisition.targets('book',3)
-        assert targets==['COIN0003','COIN0004','COIN0005'], {
+        diagnostic={
             'stage':stage,'targets':targets,
             'service':state.db.execute('SELECT * FROM acquisition_service ORDER BY target').fetchall(),
             'active':state.market_names(),
             'sqlite':__import__('sqlite3').sqlite_version}
+        if targets!=['COIN0003','COIN0004','COIN0005']:print(json.dumps(diagnostic))
+        assert targets==['COIN0003','COIN0004','COIN0005'], diagnostic
     remaining_targets('after_fetch')
     state.ingest_batch(rows, 'canonical:first')
     remaining_targets('after_ingest')
@@ -110,6 +112,22 @@ async def test_partial_http_failure_keeps_other_books_and_continues_universe_aft
     remaining_targets('after_reopen')
     await state.acquisition.books(None, observation)
     assert seen == [f'COIN{i:04d}' for i in range(6)]
+    state.close()
+
+
+def test_unserved_market_ties_across_catalogs_are_not_skipped_or_duplicated(tmp_path):
+    path=tmp_path/'selection.sqlite'
+    state=PhantomPerpsResearch(path)
+    setup_markets(state,12)
+    state.ingest(catalog(dex='second',coin='COIN0003'))
+    with state.db:
+        state.db.executemany('INSERT INTO acquisition_service VALUES(?,?,?,?)',
+            [('book',f'COIN{i:04d}',1000.,'') for i in range(3)])
+    assert state.acquisition.targets('book',3)==['COIN0003','COIN0004','COIN0005']
+    assert state.acquisition.targets('funding',3)==['COIN0000','COIN0001','COIN0002']
+    state.close();state=PhantomPerpsResearch(path)
+    assert state.acquisition.targets('book',3)==['COIN0003','COIN0004','COIN0005']
+    assert len(state.acquisition.targets('book',100))==12
     state.close()
 
 
