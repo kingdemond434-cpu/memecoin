@@ -130,6 +130,7 @@ class SentimentResearch:
         self.intake_failures = 0
         self.replay_error = None
         self.last_replay_seconds = None
+        self.last_fetch_profile = None
         self.inference_code_sha256 = hashlib.sha256(
             (inspect.getsource(worker_main)+inspect.getsource(inference_profile)).encode()).hexdigest()
 
@@ -248,18 +249,74 @@ class SentimentResearch:
                 self._metric('replay_commits')
         self.replay_error = None
 
+    async def _disk(self, operation, *args, **kwargs):
+        """Drain an initiated SQLite operation before cancellation can close its owner."""
+        task=asyncio.create_task(asyncio.to_thread(operation,*args,**kwargs))
+        try:return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await asyncio.gather(task,return_exceptions=True)
+            raise
+
+    def _pending_results(self):
+        with self.lock:
+            return self.db.execute('SELECT body FROM results WHERE ref IS NULL ORDER BY rowid LIMIT 256').fetchall()
+
+    def _cached_window(self, cache_id, offset):
+        with self.lock:
+            cached=self.db.execute('SELECT body,sha256 FROM inference_cache WHERE id=?',(cache_id,)).fetchone()
+        if not cached:return None
+        try:
+            cache=json.loads(cached[0])
+            if digest(cache)!=cached[1]:raise ValueError('cached inference changed')
+            self._validate_window(cache['result'],offset)
+            return cache
+        except (ValueError,KeyError,TypeError):
+            with self.lock,self.db:self._metric('cache_corruptions')
+            return None
+
+    def _commit_window(self, cache_id, cache, cache_hit, metric, row, identity, cursor):
+        with self.lock,self.db:
+            if not cache_hit:
+                self.db.execute('INSERT OR REPLACE INTO inference_cache VALUES(?,?,?)',
+                    (cache_id,canonical(cache),digest(cache)))
+            self._metric(metric)
+            self.db.execute('INSERT INTO results VALUES(?,?,?,NULL,NULL)',
+                (row['annotation_id'],identity,canonical(row)))
+            self.db.execute('UPDATE inputs SET served=? WHERE id=?',(self._next_ticket(),identity))
+            self.db.execute('UPDATE dispatch SET cursor=? WHERE id=1',(cursor,))
+
+    def _failed_window(self, identity, metric, cursor):
+        with self.lock,self.db:
+            if metric is not None:self._metric(metric)
+            self.db.execute('UPDATE inputs SET served=? WHERE id=?',(self._next_ticket(),identity))
+            self.db.execute('UPDATE dispatch SET cursor=? WHERE id=1',(cursor,))
+
     async def fetch(self):
+        began=time.perf_counter()
+        profile={'disk_wait_seconds':0.,'inference_wait_seconds':0.,'returned_windows':0}
+        try:
+            rows=await self._fetch_windows(profile)
+            profile['returned_windows']=len(rows)
+            return rows
+        finally:
+            profile['elapsed_seconds']=max(0.,time.perf_counter()-began)
+            self.last_fetch_profile=profile
+
+    async def _fetch_windows(self, profile):
         if self.worker is None:
             return []
+        async def disk(operation,*args):
+            started=time.perf_counter()
+            try:return await self._disk(operation,*args)
+            finally:profile['disk_wait_seconds']+=max(0.,time.perf_counter()-started)
         replay_started = time.perf_counter()
         try:
-            await asyncio.to_thread(self.reconcile)
+            await disk(self.reconcile)
         except Exception as exc:
             self.replay_error = type(exc).__name__
         finally:
             self.last_replay_seconds = time.perf_counter()-replay_started
-        with self.lock:
-            pending = self.db.execute('SELECT body FROM results WHERE ref IS NULL ORDER BY rowid LIMIT 256').fetchall()
+        pending = await disk(self._pending_results)
         if pending:
             return [json.loads(row[0]) for row in pending]
         rows, seen = [], []
@@ -270,7 +327,7 @@ class SentimentResearch:
         for _ in range(256):
             if seen and time.perf_counter() >= deadline:
                 break
-            job = self._job(seen)
+            job = await disk(self._job, seen)
             if job is None:
                 break
             identity, raw, offset, origin, cursor = job
@@ -281,22 +338,12 @@ class SentimentResearch:
                 started = time.perf_counter()
                 cache_id = digest([REVISION, FILES, self.inference_code_sha256, self.inference_profile,
                                    body['text_sha256'], offset])
-                with self.lock:
-                    cached = self.db.execute('SELECT body,sha256 FROM inference_cache WHERE id=?', (cache_id,)).fetchone()
-                cache = None
-                if cached:
-                    try:
-                        cache = json.loads(cached[0])
-                        if digest(cache) != cached[1]:
-                            raise ValueError('cached inference changed')
-                        self._validate_window(cache['result'], offset)
-                    except (ValueError, KeyError, TypeError):
-                        cache = None
-                        with self.lock, self.db:
-                            self._metric('cache_corruptions')
+                cache = await disk(self._cached_window,cache_id,offset)
                 cache_hit = cache is not None
                 if cache is None:
-                    result = await self.worker.infer(body['text'], offset)
+                    inferred=time.perf_counter()
+                    try:result = await self.worker.infer(body['text'], offset)
+                    finally:profile['inference_wait_seconds']+=max(0.,time.perf_counter()-inferred)
                     self._validate_window(result, offset)
                     cache = {'result': result, 'inferred_at': time.time(),
                         'inference_worker_sha256': worker_sha, 'inference_code_sha256': self.inference_code_sha256}
@@ -319,15 +366,7 @@ class SentimentResearch:
                     language_training_scope=body['language'].split('-')[0].lower() in LANGUAGES,
                     scope='document sentiment; not factual credibility, insider identity or token-return probability')
                 row['annotation_id'] = digest(row)
-                with self.lock, self.db:
-                    if not cache_hit:
-                        self.db.execute('INSERT OR REPLACE INTO inference_cache VALUES(?,?,?)',
-                                        (cache_id, canonical(cache), digest(cache)))
-                    self._metric(inference_metric)
-                    self.db.execute('INSERT INTO results VALUES(?,?,?,NULL,NULL)',
-                                    (row['annotation_id'], identity, canonical(row)))
-                    self.db.execute('UPDATE inputs SET served=? WHERE id=?', (self._next_ticket(), identity))
-                    self.db.execute('UPDATE dispatch SET cursor=? WHERE id=1', (cursor,))
+                await disk(self._commit_window,cache_id,cache,cache_hit,inference_metric,row,identity,cursor)
                 rows.append(row)
                 self.last_error = None
             except asyncio.CancelledError:
@@ -335,13 +374,9 @@ class SentimentResearch:
             except Exception as exc:
                 # Worker failures never erase raw input or print text/credentials.
                 self.last_error = type(exc).__name__
-                with self.lock, self.db:
-                    # Count completed work even if its result transaction rolled
-                    # back; the raw input remains pending for actual retry.
-                    if inference_metric is not None:
-                        self._metric(inference_metric)
-                    self.db.execute('UPDATE inputs SET served=? WHERE id=?', (self._next_ticket(), identity))
-                    self.db.execute('UPDATE dispatch SET cursor=? WHERE id=1', (cursor,))
+                # Count completed work even if its result transaction rolled
+                # back; the raw input remains pending for actual retry.
+                await disk(self._failed_window,identity,inference_metric,cursor)
         return rows
 
     @staticmethod
@@ -393,6 +428,7 @@ class SentimentResearch:
             'last_intake_error_type': self.last_intake_error, 'intake_failures_this_run': self.intake_failures,
             'replay_error_type': self.replay_error, 'replayed_canonical_bytes': replay_offset,
             'last_replay_seconds': self.last_replay_seconds,
+            'last_fetch_profile': self.last_fetch_profile,
             'queue_lanes': lanes, 'scheduling': '2 fresh live : 1 age-fair live : 1 replay; unused capacity shared; no input expiration',
             'inference_cache_entries': cache_entries, 'inference_metrics': metrics,
             'source_ledger_backlog_bytes': max(0, self.ledger_path.stat().st_size-replay_offset)

@@ -203,9 +203,13 @@ class SourceIntelligence:
     async def _record_population_narrative_async(self, event: Any) -> Optional[str]:
         payload = SourceIntelligence._population_narrative_payload(self, event)
         metadata = dict(getattr(event, "metadata", None) or {})
-        pending = asyncio.create_task(asyncio.to_thread(
-            self._enqueue_population_work, "NARRATIVE_OBSERVATION", payload,
-            evidence_refs=metadata.get("evidence_refs") or (), now=event.observed_at))
+        tokens = list(getattr(event, 'token_addresses', ()) or ())
+        def persist():
+            job_id = self._enqueue_population_work('NARRATIVE_OBSERVATION', payload,
+                evidence_refs=metadata.get('evidence_refs') or (), now=event.observed_at)
+            SourceIntelligence._enqueue_neural_narrative(self, payload, job_id, tokens)
+            return job_id
+        pending = asyncio.create_task(asyncio.to_thread(persist))
         try:
             job_id = await asyncio.shield(pending)
         except asyncio.CancelledError:
@@ -216,10 +220,26 @@ class SourceIntelligence:
         # PublicClaimLinks owns a thread-bound SQLite connection. Finish its
         # indexing, and all source/lead-graph mutations, on the owner loop.
         return self._record_population_narrative(event, defer_onion_io=True,
-            prepared_payload=payload, canonical_job_result=job_id)
+            prepared_payload=payload, canonical_job_result=job_id, neural_intake_done=True)
+
+    def _enqueue_neural_narrative(self, payload, job_id, tokens):
+        neural = getattr(self, 'neural_sentiment', None)
+        if not job_id or neural is None:
+            return
+        try:
+            source_job = self.unknown_engine.frontier.job(job_id)
+            if not source_job or not source_job.get('payload_ref'):
+                raise ValueError('canonical narrative source reference unavailable')
+            neural.enqueue(payload, source_job=job_id, source_ref=source_job['payload_ref'], tokens=tokens)
+        except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+            with self.__dict__.setdefault('_neural_intake_error_lock', threading.RLock()):
+                neural.last_intake_error = type(exc).__name__
+                neural.intake_failures += 1
+            logger.warning('neural sentiment intake deferred: %s', type(exc).__name__)
 
     def _record_population_narrative(self, event: Any, *, defer_onion_io: bool = False,
-                                     prepared_payload=None, canonical_job_result=_NOT_ENQUEUED) -> Optional[str]:
+                                     prepared_payload=None, canonical_job_result=_NOT_ENQUEUED,
+                                     neural_intake_done=False) -> Optional[str]:
         payload = (prepared_payload if prepared_payload is not None
                    else SourceIntelligence._population_narrative_payload(self, event))
         metadata = dict(getattr(event, "metadata", None) or {})
@@ -231,17 +251,8 @@ class SourceIntelligence:
             from src.collectors.onion_discovery import deliver
             deliver(self, event, job_id)
         if job_id:
-            neural = getattr(self, 'neural_sentiment', None)
-            if neural is not None:
-                try:
-                    source_job = self.unknown_engine.frontier.job(job_id)
-                    if not source_job or not source_job.get('payload_ref'):
-                        raise ValueError('canonical narrative source reference unavailable')
-                    neural.enqueue(payload, source_job=job_id, source_ref=source_job['payload_ref'], tokens=tokens)
-                except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
-                    neural.last_intake_error = type(exc).__name__
-                    neural.intake_failures += 1
-                    logger.warning('neural sentiment intake deferred: %s', type(exc).__name__)
+            if not neural_intake_done:
+                SourceIntelligence._enqueue_neural_narrative(self, payload, job_id, tokens)
             try:
                 from src.research.public_claim_links import PublicClaimLinks
                 if getattr(self, "public_claim_links", None) is None:

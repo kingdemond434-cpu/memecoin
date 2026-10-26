@@ -33,7 +33,11 @@ MAX_FRAME_BYTES = 24 * 1024 * 1024  # parser/process envelope, not a token unive
 
 
 class ForkUnavailable(ValueError):
-    pass
+    def __init__(self, message, *, reason_code='FORK_ENVIRONMENT_UNVERIFIED'):
+        if reason_code not in {'FORK_ENVIRONMENT_UNVERIFIED', 'DBC_POOL_MIGRATED'}:
+            raise ValueError('unreviewed fork availability code')
+        self.reason_code = reason_code
+        super().__init__(message)
 
 
 def digest(value):
@@ -220,6 +224,8 @@ def _route(target, accounts):
             meteora_dbc_route.validate_frame(state,accounts,account_data)
             buy=meteora_dbc_route.build_swap(state,owner,target['quote_budget'],1,buy=True)
             sell=lambda amount:meteora_dbc_route.build_swap(state,owner,amount,1,buy=False)
+        except meteora_dbc_route.DBCSubsetUnavailable as exc:
+            raise ForkUnavailable(str(exc), reason_code=exc.reason_code) from exc
         except ValueError as exc:
             raise ForkUnavailable(str(exc)) from exc
     else:

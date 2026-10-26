@@ -31,6 +31,70 @@ class CountingWorker(Worker):
         return await super().infer(text,offset)
 
 
+@pytest.mark.asyncio
+async def test_pending_queue_lock_cannot_hold_event_loop_and_cancel_drains_query(tmp_path):
+    import asyncio,threading
+    queue=SentimentResearch(tmp_path/'nlp.sqlite',worker=CountingWorker());enqueue(queue)
+    entered,released=threading.Event(),threading.Event()
+    original=queue._pending_results
+    def blocked():
+        entered.set();assert released.wait(5);return original()
+    queue._pending_results=blocked
+    task=asyncio.create_task(queue.fetch())
+    assert await asyncio.to_thread(entered.wait,3)
+    # The owner loop still handles real network requests during the gated SQL operation.
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient,TestServer
+    async def health(request):return web.json_response({'responsive':True})
+    app=web.Application();app.router.add_get('/health',health)
+    try:
+        async with TestClient(TestServer(app)) as client:
+            response=await asyncio.wait_for(client.get('/health'),1)
+            assert (await response.json())['responsive']
+        task.cancel();await asyncio.sleep(0);assert not task.done()
+    finally:released.set()
+    with pytest.raises(asyncio.CancelledError):await task
+    assert queue.report()['inputs']==1 and queue.report()['canonical_windows']==0
+    assert queue.last_fetch_profile['disk_wait_seconds']>=0
+    queue.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_result_commit_is_drained_and_replayed_without_duplicate_inference(tmp_path):
+    import asyncio,threading
+    worker=CountingWorker();queue=SentimentResearch(tmp_path/'nlp.sqlite',worker=worker);enqueue(queue)
+    entered,released=threading.Event(),threading.Event();owner=threading.get_ident();original=queue._commit_window
+    def blocked(*args):
+        assert threading.get_ident()!=owner
+        entered.set();assert released.wait(5);return original(*args)
+    queue._commit_window=blocked
+    task=asyncio.create_task(queue.fetch());assert await asyncio.to_thread(entered.wait,3)
+    task.cancel();await asyncio.sleep(0);assert not task.done();released.set()
+    with pytest.raises(asyncio.CancelledError):await task
+    assert queue.report()['awaiting_canonical_ack']==1 and queue.report()['canonical_windows']==0
+    rows=await queue.fetch()
+    assert len(rows)==worker.calls==1 and queue.observation(rows[0]['annotation_id'],as_of=10**12) is None
+    queue.acknowledge(rows,'canonical:after-cancellation')
+    assert queue.report()['completed_inputs']==1 and queue.report()['canonical_windows']==1
+    queue.close()
+
+
+@pytest.mark.asyncio
+async def test_result_transaction_failure_does_not_publish_cache_annotation_or_cursor(tmp_path):
+    worker=CountingWorker();queue=SentimentResearch(tmp_path/'nlp.sqlite',worker=worker);identity=enqueue(queue)
+    before=queue.db.execute('SELECT cursor FROM dispatch').fetchone()[0]
+    # Abort after the transaction has written its cache and annotation. All must roll back.
+    queue.db.execute("CREATE TRIGGER reject_result BEFORE UPDATE ON inputs WHEN NEW.served<>OLD.served BEGIN SELECT RAISE(ABORT,'synthetic commit refusal'); END")
+    import sqlite3
+    with pytest.raises(sqlite3.IntegrityError):await queue.fetch()
+    assert queue.db.execute('SELECT count(*) FROM inference_cache').fetchone()[0]==0
+    assert queue.db.execute('SELECT count(*) FROM results').fetchone()[0]==0
+    assert queue.db.execute('SELECT offset,complete FROM inputs WHERE id=?',(identity,)).fetchone()==(0,0)
+    assert queue.db.execute('SELECT cursor FROM dispatch').fetchone()[0]==before
+    queue.db.execute('DROP TRIGGER reject_result')
+    queue.close()
+
+
 def paced_worker(monkeypatch):
     """Deterministic four-window time quantum, independent of host disk speed."""
     tick = [0.]

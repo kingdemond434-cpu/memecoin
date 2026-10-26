@@ -148,6 +148,15 @@ def test_native_intake_and_episode_views_preserve_dbc_identity_and_source_bindin
     probe.close()
 
 
+def test_observed_migration_reason_survives_adapter_without_claiming_honeypot():
+    state,accounts=fixture()
+    raw=bytearray(f.account_data(accounts[state['pool']]));raw[305]=1
+    accounts[state['pool']]=wire(raw,r.DBC_PROGRAM)
+    target={'token':state['base_mint'],'pool':state['pool'],'venue':'meteora_dbc','quote_budget':1000}
+    with pytest.raises(f.ForkUnavailable) as caught:f._route(target,accounts)
+    assert caught.value.reason_code=='DBC_POOL_MIGRATED'
+
+
 @pytest.mark.asyncio
 async def test_acquire_rereads_config_vaults_and_instruction_dependencies_in_final_frame():
     state,accounts=fixture();calls=[]
