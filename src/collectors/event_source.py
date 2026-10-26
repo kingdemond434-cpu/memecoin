@@ -21,6 +21,7 @@ from when it last produced an event.
 
 import asyncio
 import hashlib
+import heapq
 import logging
 import threading
 import time
@@ -282,6 +283,7 @@ class SourceMesh:
         # content_hash -> (first_seen_at, [source_ids in arrival order]).
         # Kept rather than discarded, because who saw it FIRST is the signal.
         self._seen: Dict[str, Any] = {}
+        self._seen_expiry = []
         # One total memory budget, with no fixed source admission quota.
         # Each nonempty source gets one delivery before its next turn.
         self._pending_sources = OrderedDict()
@@ -308,10 +310,15 @@ class SourceMesh:
             self._owner_loop.call_soon_threadsafe(start_added_source)
 
     def _expire(self, now: float) -> None:
-        stale = [key for key, (first_at, _) in self._seen.items()
-                 if now - first_at > self.dedupe_window]
-        for key in stale:
-            self._seen.pop(key, None)
+        # The live path must expire too. A heap visits only expired entries,
+        # not every cached message on every incoming observation. Timestamps
+        # may arrive out of order (batch/live clocks), so a FIFO is insufficient.
+        with self._queue_lock:
+            while self._seen_expiry and now-self._seen_expiry[0][0] > self.dedupe_window:
+                first_at, key = heapq.heappop(self._seen_expiry)
+                current = self._seen.get(key)
+                if current is not None and current[0] == first_at:
+                    del self._seen[key]
 
     async def _collect_one(self, source: "EventSource", now: float) -> List[Event]:
         """Poll one source under a timeout, never propagating its failure.
@@ -341,6 +348,7 @@ class SourceMesh:
         source is appended to the original's list and only the event itself
         is suppressed.
         """
+        self._expire(now)
         metadata = getattr(event, "metadata", None) or {}
         if metadata.get("onion_observation_id") or metadata.get("onion_directory_observation_id"):
             # This source has a durable outbox and a canonical queue ACK.
@@ -352,6 +360,7 @@ class SourceMesh:
             self._seen[key][1].append(event.source_id)
             return False
         self._seen[key] = (now, [event.source_id])
+        heapq.heappush(self._seen_expiry, (now, key))
         return True
 
     async def _producer(self, source: "EventSource") -> None:
@@ -478,7 +487,10 @@ class SourceMesh:
         # Diagnostic projections run in a worker while the owner loop mutates
         # queues. Copy only scalar counters under this short, I/O-free lock.
         with self._queue_lock:
+            self._expire(now)
             return {
+                'dedupe_cached_contents': len(self._seen),
+                'dedupe_window_seconds': self.dedupe_window,
                 'pending_events': self._pending_count,
                 'delivery_policy': 'ROUND_ROBIN_NONEMPTY_SOURCES',
                 'pending_by_source': {key: len(rows) for key, rows in self._pending_sources.items()},
@@ -508,20 +520,22 @@ class SourceMesh:
             *(self._collect_one(source, now) for source in self.sources))
 
         fresh: List[Event] = []
-        for batch in batches:
-            for event in batch:
-                if not self._admit(event, now):
-                    continue
-                if len(fresh) >= self.max_queue:
-                    fresh.pop(0)
-                    self.dropped += 1
-                fresh.append(event)
+        with self._queue_lock:
+            for batch in batches:
+                for event in batch:
+                    if not self._admit(event, now):
+                        continue
+                    if len(fresh) >= self.max_queue:
+                        fresh.pop(0)
+                        self.dropped += 1
+                    fresh.append(event)
         return fresh
 
     def repeaters_of(self, content_hash: str) -> List[str]:
         """Sources that carried this content, in the order they were observed."""
-        entry = self._seen.get(content_hash)
-        return list(entry[1]) if entry else []
+        with self._queue_lock:
+            entry = self._seen.get(content_hash)
+            return list(entry[1]) if entry else []
 
     def health(self, now: Optional[float] = None) -> Dict[str, Any]:
         now = time.time() if now is None else now

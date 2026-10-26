@@ -37,7 +37,7 @@ def reviewed_native_target(event):
 
 
 class ForkProbe:
-    def __init__(self, path):
+    def __init__(self, path, *, paper_enabled=False):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.db = sqlite3.connect(path, check_same_thread=False, timeout=3)
@@ -69,6 +69,10 @@ class ForkProbe:
         self.db.execute('CREATE INDEX IF NOT EXISTS untried_arrival ON jobs(arrived DESC,id) WHERE attempts=0')
         self.db.execute('CREATE INDEX IF NOT EXISTS retry_deadline ON jobs(due,id) WHERE attempts>0')
         self.db.commit()
+        self.paper_controls = None
+        if paper_enabled:
+            from src.research.fork_paper import ForkPaperControls
+            self.paper_controls = ForkPaperControls(self)
 
     def _enqueue_targets_locked(self, targets, now):
         admitted = []
@@ -113,9 +117,13 @@ class ForkProbe:
         for lane in dict.fromkeys((preferred, 'OLDEST_UNTRIED', 'DUE_RETRY')):
             predicate, order = plans[lane]
             venue = "COALESCE(NULLIF(json_extract(j.body,'$.venue'),''),'UNKNOWN')"
+            # Keep the 2:1:1 lane cadence. Within retries, retained paper
+            # inventory gets first service; it never displaces fresh lanes.
+            paper_priority = ("CASE WHEN EXISTS(SELECT 1 FROM paper_bank_inventory p WHERE p.job=j.id "
+                "AND p.status='OPEN') THEN 0 ELSE 1 END," if self.paper_controls and lane=='DUE_RETRY' else '')
             job = self.db.execute('SELECT j.id,j.body,j.first_seen,'+venue+' FROM jobs j '
                 'LEFT JOIN fork_venue_service v ON v.venue='+venue+' WHERE due<=? AND '+predicate+
-                ' ORDER BY COALESCE(v.last_ticket,0),'+order+' LIMIT 1', (now,)).fetchone()
+                ' ORDER BY '+paper_priority+'COALESCE(v.last_ticket,0),'+order+' LIMIT 1', (now,)).fetchone()
             if job:
                 self.db.execute('UPDATE jobs SET due=?,attempts=attempts+1 WHERE id=?', (now+300, job[0]))
                 self.db.execute('UPDATE fork_dispatch SET cursor=? WHERE id=1', ((cursor+1) % 4,))
@@ -190,6 +198,7 @@ class ForkProbe:
             return []
         identity, target = job[0], json.loads(job[1])
         frame_id = None
+        paper_result = None
         phase = 'ACCOUNT_SNAPSHOT'
         try:
             frame = await asyncio.wait_for(acquire(rpc, target), timeout=50)
@@ -199,6 +208,16 @@ class ForkProbe:
             frame = await asyncio.to_thread(self._read_frame, frame_id)
             phase = 'LOCAL_VM'
             result = await run_isolated(frame)
+            if self.paper_controls is not None:
+                try:
+                    paper_result = await self.paper_controls.prepare(frame, job)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # Preserve the independent honeypot observation on paper
+                    # infrastructure failure; never publish credentials/errors.
+                    paper_result = {'status':'PAPER_CONTROL_UNAVAILABLE','error_type':type(exc).__name__,
+                                    'real_fill':False,'promotion_eligible':False}
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -228,12 +247,16 @@ class ForkProbe:
             'input_archive': 'native_fork_probe.sqlite:frames',
             'real_transaction_submitted': False, 'execution_authority': False,
             'scope': 'sampled local model; no future sell or profitability guarantee'}
+        if paper_result is not None:
+            row['paper_control'] = paper_result
         row['probe_id'] = digest(row)
         with self.lock, self.db:
             if retry_seconds != 300:
                 self.db.execute('UPDATE jobs SET due=? WHERE id=?', (row['created_at']+retry_seconds, identity))
             self.db.execute('INSERT INTO results VALUES(?,?,?,?,NULL,NULL)',
                 (row['probe_id'], identity, json.dumps(row, allow_nan=False), row['created_at']))
+            if self.paper_controls is not None:
+                self.paper_controls.commit_locked(identity, row['probe_id'], paper_result)
         return [row]
 
     def acknowledge(self, records, ref):
@@ -288,6 +311,7 @@ class ForkProbe:
             source_links, source_targets = self.db.execute(
                 'SELECT count(*),count(DISTINCT job) FROM native_target_sources').fetchone()
         return {'status': 'LOCAL_FORK_RESEARCH', 'targets': jobs[0], 'attempts': jobs[1] or 0,
+                'prospective_local_bank': self.paper_controls.report() if self.paper_controls else {'status':'DISABLED'},
                 'canonical_dispositions': statuses, 'awaiting_canonical_ack': pending,
                 'canonical_unknown_reason_codes': reasons,
                 'by_venue': venues,

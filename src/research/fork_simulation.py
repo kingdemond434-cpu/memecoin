@@ -54,7 +54,7 @@ def implementation_manifest():
     """
     from pathlib import Path
     root = Path(__file__).resolve().parents[2]
-    paths = ('src/research/fork_simulation.py', 'src/chains/pump_route.py',
+    paths = ('src/research/fork_simulation.py', 'src/research/paper_bank.py', 'src/chains/pump_route.py',
         'src/chains/pumpswap_route.py', 'src/chains/pump_curve.py', 'src/chains/idl.py',
         'idl/pump.json', 'idl/pump_amm.json', 'idl/pump_fees.json', 'idl/FEE_RECIPIENTS.md',
         'src/chains/launchlab_route.py', 'src/chains/launchlab.py', 'idl/raydium_launchlab.json',
@@ -394,6 +394,9 @@ def execute_frame(frame):
     if len(json.dumps(frame)) > MAX_FRAME_BYTES * 2:
         raise ForkUnavailable('worker input exceeds envelope')
     target, accounts = frame['target'], frame['accounts']
+    paper = frame.get('_paper_request')
+    if paper is not None and (not isinstance(paper, dict) or paper.get('phase') not in {'entry', 'exit'}):
+        raise ForkUnavailable('unrecognized paper operation')
     buy, sell, token_program = _route(target, accounts)
     owner = virtual_owner().pubkey()
     if accounts.get(str(owner)) is not None:
@@ -423,6 +426,9 @@ def execute_frame(frame):
                 Pubkey.from_string(value['owner']), False, value.get('rentEpoch', 2**64 - 1)))
     for key, loader, raw in images:
         vm.add_program_with_loader(Pubkey.from_string(key), raw, Pubkey.from_string(loader))
+    if paper is not None and paper['phase'] == 'exit':
+        from src.research.paper_bank import execute_exit
+        return execute_exit(vm, frame, paper['inventory'], sell, token_program)
     # Sole synthetic state change: virtual payer SOL. Pool, mints and holders
     # are copied, never topped up or patched to make a failed sell pass.
     virtual_funding = max(2_000_000_000, target['quote_budget'] + 100_000_000)
@@ -450,18 +456,30 @@ def execute_frame(frame):
         'synthetic_funding_lamports': virtual_funding, 'quote_budget_lamports': target['quote_budget'],
         'real_transaction_submitted': False, 'sell_simulation_pass': None, 'setup': setup_receipt}
     if not setup_receipt['succeeded']:
+        if paper is not None:
+            from src.research.paper_bank import capture_entry
+            return capture_entry(vm, frame, result, token_program)
         return {**result, 'status': 'FORK_SETUP_FAILED_UNKNOWN'}
     initial = _tokens(vm, target['token'], token_program)
     quote_before_buy = vm.get_balance(owner) if native_sol else _tokens(vm, WSOL_MINT, TOKEN_PROGRAM)
     buy_receipt = _receipt(_transact(vm, [_instruction(buy)]))
     result['buy'] = buy_receipt
     if not buy_receipt['succeeded']:
+        if paper is not None:
+            from src.research.paper_bank import capture_entry
+            return capture_entry(vm, frame, result, token_program)
         return {**result, 'status': 'FORK_BUY_FAILED_UNKNOWN'}
     received = _tokens(vm, target['token'], token_program) - initial
     quote_after_buy = vm.get_balance(owner) if native_sol else _tokens(vm, WSOL_MINT, TOKEN_PROGRAM)
     result.update(quote_balance_after_setup_units=quote_before_buy, quote_balance_after_buy_units=quote_after_buy)
     if received <= 0:
+        if paper is not None:
+            from src.research.paper_bank import capture_entry
+            return capture_entry(vm, frame, result, token_program)
         return {**result, 'status': 'NO_RECEIVED_TOKEN_BALANCE_UNKNOWN'}
+    if paper is not None:
+        from src.research.paper_bank import capture_entry
+        return capture_entry(vm, frame, result, token_program)
     # Critical: sell ACTUAL received units in this same modified VM.
     before_quote = vm.get_balance(owner) if native_sol else _tokens(vm, WSOL_MINT, TOKEN_PROGRAM)
     sell_receipt = _receipt(_transact(vm, [_instruction(sell(received))]))
@@ -481,7 +499,9 @@ def execute_frame(frame):
             'cost_adjusted_profit': None, 'real_fill': False}
 
 
-async def run_isolated(frame, *, timeout=15):
+async def run_isolated(frame, *, timeout=15, paper_request=None):
+    if paper_request is not None:
+        frame = {**frame, '_paper_request': paper_request}
     # No API keys, wallet environment or network transport enters the VM worker.
     env = {key: os.environ[key] for key in ('SYSTEMROOT', 'WINDIR') if key in os.environ}
     env['PYTHONIOENCODING'] = 'utf-8'

@@ -43,6 +43,13 @@ or eviction. This is scheduling fairness, not a canonical acknowledgement or a
 zero-loss guarantee. `source_mesh` reports per-source pending counts, oldest
 queue age, deliveries and drops so overload remains visible.
 
+Ordinary live content deduplication expires after its configured window, with
+within-window source arrival order retained. `source_mesh` exposes
+`dedupe_cached_contents` and `dedupe_window_seconds`; idle health reads clean
+expired content without discarding queued events. Durable onion observations
+continue to use their outbox identity and canonical acknowledgement, rather
+than this time-limited content suppression.
+
 The separately configured `onion` transport is a bounded single-source crawler.
 Its `max_pages` (up to 256), `max_depth` (up to eight) and `pages_per_poll` (up to
 two) options still apply to that adapter. They do not limit the continuous
