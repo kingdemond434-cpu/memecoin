@@ -184,6 +184,13 @@ class SourceIntelligence:
                 event.content_hash, event.source_at], sort_keys=True).encode()).hexdigest()}
         from src.research.local_decisions import annotate_public_text
         payload["local_decision_shadow"] = annotate_public_text(event.text)
+        receipt_reader = getattr(getattr(self, 'source_mesh', None), 'delivery_receipt', None)
+        receipt = receipt_reader(event) if callable(receipt_reader) else None
+        if receipt is not None:
+            payload['source_intake_receipt'] = receipt
+            # A disk backlog cannot appear in research before first delivery.
+            # Preserve source/observation clocks and stable retry identity.
+            payload['research_available_at'] = max(event.observed_at, receipt['first_delivered_at'])
         # Only explicit reviewed provenance can assert operator independence
         # or original/clone/promotion labels. Author handles are not operators.
         for key in ("operator_id", "operator_verified", "operator_evidence_refs", "label", "label_provenance"):
@@ -206,7 +213,8 @@ class SourceIntelligence:
         tokens = list(getattr(event, 'token_addresses', ()) or ())
         def persist():
             job_id = self._enqueue_population_work('NARRATIVE_OBSERVATION', payload,
-                evidence_refs=metadata.get('evidence_refs') or (), now=event.observed_at)
+                evidence_refs=metadata.get('evidence_refs') or (),
+                now=payload.get('research_available_at', event.observed_at))
             SourceIntelligence._enqueue_neural_narrative(self, payload, job_id, tokens)
             return job_id
         pending = asyncio.create_task(asyncio.to_thread(persist))
@@ -541,17 +549,33 @@ class SourceIntelligence:
                 continue
             try:
                 job_id = await self._record_population_narrative_async(event)
-                self._index_source_event(event, defer_onion_io=True, record_population=False)
+                durable = getattr(self.source_mesh, 'journal', None) is not None
+                if durable and not job_id:
+                    await self.source_mesh.retry_event(event)
+                    continue
                 if job_id:
                     from src.collectors.onion_discovery import _frontier, deliver
                     # SourceMesh.add may start an asyncio task, so preparation
                     # stays on the owner loop. Bulk SQLite admission/ack waits
                     # in the worker and cannot freeze health or market events.
                     frontier = _frontier(self)
-                    await asyncio.to_thread(deliver, self, event, job_id,
-                                            frontier=frontier, prepared=True)
+                    delivered = await asyncio.to_thread(deliver, self, event, job_id,
+                                                        frontier=frontier, prepared=True)
+                    if durable:
+                        if not delivered:
+                            await self.source_mesh.retry_event(event)
+                            continue
+                        canonical = await self.source_mesh._disk_call(self.unknown_engine.frontier.job, job_id)
+                        await self.source_mesh.acknowledge_event(event, job_id, canonical['payload_ref'])
+                self._index_source_event(event, defer_onion_io=True, record_population=False)
             except Exception as exc:
-                logger.warning("source event indexing failed: %s", exc)
+                logger.warning("source event indexing failed: %s", type(exc).__name__)
+                if (getattr(self.source_mesh, 'journal', None) is not None and
+                        self.source_mesh.delivery_receipt(event) is not None):
+                    try:
+                        await self.source_mesh.retry_event(event)
+                    except Exception as retry_exc:
+                        logger.warning('source lease retry deferred: %s', type(retry_exc).__name__)
             # Queue.get() completes synchronously while producers keep the
             # queue nonempty. Yield between durable records so a replay/feed
             # burst cannot monopolize health, market and shutdown callbacks.
