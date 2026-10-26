@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -91,7 +92,15 @@ class SentimentResearch:
             CREATE TABLE IF NOT EXISTS scheduler(id INTEGER PRIMARY KEY CHECK(id=1),ticket INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS inputs_pending ON inputs(complete,served,created,id);
             CREATE INDEX IF NOT EXISTS results_pending ON results(ref);
+            CREATE TABLE IF NOT EXISTS dispatch(id INTEGER PRIMARY KEY CHECK(id=1),cursor INTEGER NOT NULL);
+            INSERT OR IGNORE INTO dispatch VALUES(1,0);
+            CREATE TABLE IF NOT EXISTS inference_cache(id TEXT PRIMARY KEY,body TEXT NOT NULL,sha256 TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS metrics(name TEXT PRIMARY KEY,value INTEGER NOT NULL);
         ''')
+        if 'origin' not in {row[1] for row in self.db.execute('PRAGMA table_info(inputs)')}:
+            self.db.execute("ALTER TABLE inputs ADD COLUMN origin TEXT NOT NULL DEFAULT 'LIVE'")
+            self.db.execute("UPDATE inputs SET origin='REPLAY' WHERE json_extract(body,'$.source_job') IS NULL")
+        self.db.execute('CREATE INDEX IF NOT EXISTS inputs_lanes ON inputs(complete,origin,served,created,id)')
         self.db.execute('INSERT OR IGNORE INTO replay VALUES(1,0,?,0)', ('0'*64,))
         # Old unserved rows used zero, which lets an endless stream of new
         # inputs leapfrog the remaining windows of an already-started post.
@@ -105,13 +114,17 @@ class SentimentResearch:
         self.last_intake_error = None
         self.intake_failures = 0
         self.replay_error = None
+        self.inference_code_sha256 = hashlib.sha256(inspect.getsource(worker_main).encode()).hexdigest()
 
     def _next_ticket(self):
         # Called inside the queue transaction. It survives process restarts
         # and cannot move backwards when the host wall clock is corrected.
         return self.db.execute('UPDATE scheduler SET ticket=ticket+1 WHERE id=1 RETURNING ticket').fetchone()[0]
 
-    def enqueue(self, payload, *, source_job, source_ref, tokens=()):
+    def enqueue(self, payload, *, source_job, source_ref, tokens=(), origin=None):
+        origin = origin or ('LIVE' if source_job else 'REPLAY')
+        if origin not in {'LIVE', 'REPLAY'}:
+            raise ValueError('invalid observation intake origin')
         if not source_ref:
             raise ValueError('canonical source reference required')
         text = payload['text']
@@ -132,11 +145,29 @@ class SentimentResearch:
             if previous and json.loads(previous[0])['text_sha256'] != body['text_sha256']:
                 raise ValueError('canonical source text changed')
             if previous:
+                if origin == 'LIVE':
+                    self.db.execute("UPDATE inputs SET origin='LIVE' WHERE id=?", (identity,))
                 return identity
             queued_at = time.time()
-            self.db.execute('INSERT OR IGNORE INTO inputs(id,body,created,served) VALUES(?,?,?,?)',
-                            (identity, canonical(body), queued_at, self._next_ticket()))
+            self.db.execute('INSERT OR IGNORE INTO inputs(id,body,created,served,origin) VALUES(?,?,?,?,?)',
+                            (identity, canonical(body), queued_at, self._next_ticket(), origin))
         return identity
+
+    def _metric(self, name):
+        self.db.execute('INSERT INTO metrics VALUES(?,1) ON CONFLICT(name) DO UPDATE SET value=value+1', (name,))
+
+    def _job(self, seen):
+        with self.lock:
+            cursor = self.db.execute('SELECT cursor FROM dispatch WHERE id=1').fetchone()[0]
+            preferred = 'LIVE' if cursor % 4 < 3 else 'REPLAY'
+            exclusion = ' AND id NOT IN ('+','.join('?' for _ in seen)+')' if seen else ''
+            for origin in (preferred, 'REPLAY' if preferred == 'LIVE' else 'LIVE'):
+                row = self.db.execute('SELECT id,body,offset,origin FROM inputs WHERE complete=0 AND origin=? '
+                    'AND id NOT IN (SELECT input_id FROM results WHERE ref IS NULL)'+exclusion+
+                    ' ORDER BY served,created,id LIMIT 1', (origin, *seen)).fetchone()
+                if row:
+                    return (*row, (cursor+1) % 4)
+        return None
 
     def reconcile(self, byte_quantum=1024*1024):
         """Verify/replay the append-only canonical prefix, resuming across restarts.
@@ -184,18 +215,56 @@ class SentimentResearch:
         except Exception as exc:
             self.replay_error = type(exc).__name__
         with self.lock:
-            pending = self.db.execute('SELECT body FROM results WHERE ref IS NULL ORDER BY rowid LIMIT 4').fetchall()
-            jobs = self.db.execute('SELECT id,body,offset FROM inputs WHERE complete=0 '
-                'AND id NOT IN (SELECT input_id FROM results WHERE ref IS NULL) '
-                'ORDER BY served,created,id LIMIT 4').fetchall()
+            pending = self.db.execute('SELECT body FROM results WHERE ref IS NULL ORDER BY rowid LIMIT 256').fetchall()
         if pending:
             return [json.loads(row[0]) for row in pending]
-        rows = []
-        for identity, raw, offset in jobs:
+        rows, seen, model_calls = [], [], 0
+        deadline = time.perf_counter()+2
+        worker_sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        # These are active-work quanta, never source/history admission limits.
+        # Cache hits can drain quickly; expensive new inference is bounded.
+        for _ in range(256):
+            if rows and time.perf_counter() >= deadline:
+                break
+            job = self._job(seen)
+            if job is None:
+                break
+            identity, raw, offset, origin, cursor = job
+            seen.append(identity)
             body = json.loads(raw)
             try:
                 started = time.perf_counter()
-                result = await self.worker.infer(body['text'], offset)
+                cache_id = digest([REVISION, FILES, self.inference_code_sha256, body['text_sha256'], offset])
+                with self.lock:
+                    cached = self.db.execute('SELECT body,sha256 FROM inference_cache WHERE id=?', (cache_id,)).fetchone()
+                cache = None
+                if cached:
+                    try:
+                        cache = json.loads(cached[0])
+                        if digest(cache) != cached[1]:
+                            raise ValueError('cached inference changed')
+                        self._validate_window(cache['result'], offset)
+                    except (ValueError, KeyError, TypeError):
+                        cache = None
+                        with self.lock, self.db:
+                            self._metric('cache_corruptions')
+                cache_hit = cache is not None
+                if cache is None:
+                    if model_calls >= 4:
+                        break  # leave dispatch cursor unchanged for this job
+                    model_calls += 1
+                    result = await self.worker.infer(body['text'], offset)
+                    self._validate_window(result, offset)
+                    cache = {'result': result, 'inferred_at': time.time(),
+                        'inference_worker_sha256': worker_sha, 'inference_code_sha256': self.inference_code_sha256}
+                    with self.lock, self.db:
+                        self.db.execute('INSERT OR REPLACE INTO inference_cache VALUES(?,?,?)',
+                                        (cache_id, canonical(cache), digest(cache)))
+                        self._metric('worker_inferences')
+                else:
+                    result = cache['result']
+                    with self.lock, self.db:
+                        self._metric('cache_hits')
                 inference_seconds = time.perf_counter()-started
                 self._validate_window(result, offset)
                 row = {key: value for key, value in body.items() if key != 'text'}
@@ -203,7 +272,10 @@ class SentimentResearch:
                     annotation_kind='document_sentiment_window', input_id=identity,
                     **result, created_at=time.time(), weights_sha256=FILES['onnx/model_quantized.onnx'],
                     worker_request_seconds=inference_seconds,
-                    worker_source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                    worker_source_sha256=worker_sha, input_origin=origin,
+                    inference_cache_hit=cache_hit, inference_cache_key=cache_id,
+                    actual_inference_at=cache['inferred_at'], actual_inference_worker_sha256=cache['inference_worker_sha256'],
+                    inference_code_sha256=self.inference_code_sha256,
                     calibrated=False, trading_skill='UNMEASURED', execution_authority=False,
                     language_training_scope=body['language'].split('-')[0].lower() in LANGUAGES,
                     scope='document sentiment; not factual credibility, insider identity or token-return probability')
@@ -212,6 +284,7 @@ class SentimentResearch:
                     self.db.execute('INSERT INTO results VALUES(?,?,?,NULL,NULL)',
                                     (row['annotation_id'], identity, canonical(row)))
                     self.db.execute('UPDATE inputs SET served=? WHERE id=?', (self._next_ticket(), identity))
+                    self.db.execute('UPDATE dispatch SET cursor=? WHERE id=1', (cursor,))
                 rows.append(row)
                 self.last_error = None
             except asyncio.CancelledError:
@@ -221,6 +294,7 @@ class SentimentResearch:
                 self.last_error = type(exc).__name__
                 with self.lock, self.db:
                     self.db.execute('UPDATE inputs SET served=? WHERE id=?', (self._next_ticket(), identity))
+                    self.db.execute('UPDATE dispatch SET cursor=? WHERE id=1', (cursor,))
         return rows
 
     @staticmethod
@@ -259,6 +333,10 @@ class SentimentResearch:
             retained, acked = self.db.execute('SELECT count(*),count(ref) FROM results').fetchone()
             oldest = self.db.execute('SELECT min(created) FROM inputs WHERE complete=0').fetchone()[0]
             replay_offset = self.db.execute('SELECT offset FROM replay').fetchone()[0]
+            lanes = {origin: {'pending': count, 'oldest_pending_seconds': max(0, time.time()-oldest)}
+                for origin, count, oldest in self.db.execute('SELECT origin,count(*),min(created) FROM inputs WHERE complete=0 GROUP BY origin')}
+            metrics = dict(self.db.execute('SELECT name,value FROM metrics'))
+            cache_entries = self.db.execute('SELECT count(*) FROM inference_cache').fetchone()[0]
         return {'status': 'OFFLINE_RESEARCH' if self.worker else 'NOT_CONFIGURED',
             'model_revision': REVISION, 'inputs': total, 'completed_inputs': complete or 0,
             'pending_inputs': total-(complete or 0), 'oldest_pending_seconds': max(0, time.time()-oldest) if oldest else None,
@@ -266,6 +344,8 @@ class SentimentResearch:
             'awaiting_canonical_ack': retained-acked, 'last_error_type': self.last_error,
             'last_intake_error_type': self.last_intake_error, 'intake_failures_this_run': self.intake_failures,
             'replay_error_type': self.replay_error, 'replayed_canonical_bytes': replay_offset,
+            'queue_lanes': lanes, 'scheduling': '3 live : 1 replay slots; unused capacity shared; durable age order within each lane',
+            'inference_cache_entries': cache_entries, 'inference_metrics': metrics,
             'source_ledger_backlog_bytes': max(0, self.ledger_path.stat().st_size-replay_offset)
                 if self.ledger_path and self.ledger_path.exists() else None,
             'language_training_scope': LANGUAGES, 'trading_skill': 'UNMEASURED',

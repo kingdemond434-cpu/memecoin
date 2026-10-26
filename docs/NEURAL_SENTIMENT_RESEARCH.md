@@ -58,6 +58,22 @@ remaining windows of an older long document. Each result records measured
 worker-request wall time (including startup/tokenization when applicable),
 which is an observation of processing latency, not a billed inference cost.
 
+Live intake and canonical historical replay have separate durable scheduling
+lanes. A three-to-one slot ratio favors live observations while guaranteeing
+historical progress when both lanes have work; empty lanes share their unused
+capacity. Existing rows migrate by their original canonical intake provenance.
+Lane backlog and oldest age are reported separately. This bounds competition
+from a large backfill; it does not guarantee processing deadlines under overload.
+
+Identical text windows reuse actual inference keyed by full-text hash, offset,
+model/tokenizer/configuration hashes and the inference-function source hash.
+Each source observation still has its own retained input, source reference,
+annotation and canonical ACK time. Reuse is labeled with the original inference
+time/worker hash and never counts as an independent opinion or a new model run.
+Cache corruption triggers real recomputation. Worker calls, cache hits and
+corruption are measured separately. A time-bounded pass can drain cached work
+faster while keeping expensive new model calls bounded; no input is discarded.
+
 The documented training languages are en/ar/de/es/fr/ja/zh/id/hi/it/ms/pt.
 Other languages remain outside that stated training scope. Raw softmax outputs
 are explicitly **uncalibrated**, with trading skill **UNMEASURED**. They do not

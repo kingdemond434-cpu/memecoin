@@ -22,6 +22,78 @@ def enqueue(queue, text='public fixture', source='source:one', job='job:one'):
         source_job=job, source_ref='canonical:'+job, tokens=['token:one'])
 
 
+class CountingWorker(Worker):
+    def __init__(self):
+        self.calls=0
+
+    async def infer(self,text,offset):
+        self.calls+=1
+        return await super().infer(text,offset)
+
+
+@pytest.mark.asyncio
+async def test_live_intake_progresses_ahead_of_large_history_without_starving_history(tmp_path):
+    path=tmp_path/'nlp.sqlite'
+    queue=SentimentResearch(path,worker=Worker())
+    for index in range(100):
+        queue.enqueue({'text':f'old document {index}', 'source_id':'historical', 'observed_at':10},
+            source_job=None,source_ref=f'canonical:replay:{index}')
+    enqueue(queue,'current live observation',job='live:first')
+    queue.close()
+    queue=SentimentResearch(path,worker=Worker())
+    rows=await queue.fetch()
+    assert any(row['source_job']=='live:first' and row['input_origin']=='LIVE' for row in rows)
+    assert any(row['input_origin']=='REPLAY' for row in rows)
+    queue.acknowledge(rows,'canonical:mixed')
+    enqueue(queue,'another current live observation',job='live:second')
+    rows=await queue.fetch()
+    assert any(row['source_job']=='live:second' for row in rows)
+    assert any(row['input_origin']=='REPLAY' for row in rows)
+    assert queue.report()['queue_lanes']['REPLAY']['pending'] > 90
+    queue.close()
+
+
+@pytest.mark.asyncio
+async def test_identical_text_reuses_inference_but_preserves_each_source_and_ack(tmp_path):
+    worker=CountingWorker()
+    queue=SentimentResearch(tmp_path/'nlp.sqlite',worker=worker)
+    for index in range(3):
+        enqueue(queue, 'same exact text',source=f'source:{index}',job=f'job:{index}')
+    rows=await queue.fetch()
+    assert len(rows)==3 and worker.calls==1
+    assert sum(row['inference_cache_hit'] for row in rows)==2
+    assert len({row['source_ref'] for row in rows})==3
+    assert len({row['annotation_id'] for row in rows})==3
+    assert len({row['inference_cache_key'] for row in rows})==1
+    for row in rows:
+        assert queue.observation(row['annotation_id'],as_of=10**12) is None
+    queue.acknowledge(rows,'canonical:independent-observations')
+    assert queue.report()['inference_metrics']=={'worker_inferences':1,'cache_hits':2}
+    assert queue.report()['canonical_windows']==3
+    queue.close()
+
+
+@pytest.mark.asyncio
+async def test_corrupt_cache_is_recomputed_and_model_code_changes_invalidate_cache(tmp_path):
+    worker=CountingWorker()
+    queue=SentimentResearch(tmp_path/'nlp.sqlite',worker=worker)
+    enqueue(queue,'shared text',job='first')
+    first=await queue.fetch()
+    queue.acknowledge(first,'canonical:first')
+    with queue.db:
+        queue.db.execute('UPDATE inference_cache SET body=?', ('{"broken":true}',))
+    enqueue(queue,'shared text',job='second')
+    second=await queue.fetch()
+    assert worker.calls==2 and not second[0]['inference_cache_hit']
+    assert queue.report()['inference_metrics']['cache_corruptions']==1
+    queue.acknowledge(second,'canonical:second')
+    queue.inference_code_sha256='fixture-new-inference-contract'
+    enqueue(queue,'shared text',job='third')
+    third=await queue.fetch()
+    assert worker.calls==3 and third[0]['inference_cache_key']!=first[0]['inference_cache_key']
+    queue.close()
+
+
 @pytest.mark.asyncio
 async def test_full_document_survives_restart_windows_and_canonical_boundary(tmp_path):
     path = tmp_path/'nlp.sqlite'
