@@ -96,12 +96,14 @@ async def test_failure_retains_raw_input_and_old_sources_are_not_starved(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_new_inputs_cannot_starve_remaining_windows_of_a_long_post(tmp_path):
+async def test_new_inputs_cannot_starve_remaining_windows_of_a_long_post(tmp_path, monkeypatch):
     queue = SentimentResearch(tmp_path/'nlp.sqlite', worker=Worker())
     enqueue(queue, ' '.join(['word']*1200), job='long:original')
     first = await queue.fetch()
     queue.acknowledge(first, 'canonical:first')
     assert first[0]['token_stop'] == 510
+    # A backwards wall-clock correction must not give new work priority.
+    monkeypatch.setattr('src.research.neural_sentiment.time.time', lambda: 50.)
     for turn in range(3):
         for index in range(4):
             enqueue(queue, job=f'new:{turn}:{index}')

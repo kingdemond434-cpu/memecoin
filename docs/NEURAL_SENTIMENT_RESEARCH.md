@@ -51,8 +51,9 @@ install alone is insufficient: run the offline actual-model smoke in the
 clean worker environment. Record installer restart-pending status separately;
 do not reboot an unattended trading host as part of this setup.
 
-Unserved inputs begin at their enqueue time; each served input moves to the
-back of that age order. New arrivals cannot repeatedly jump ahead of the
+Inputs receive durable scheduling tickets; each served input moves to the
+back of that order. Tickets survive restarts and wall-clock corrections.
+New arrivals cannot repeatedly jump ahead of the
 remaining windows of an older long document. Each result records measured
 worker-request wall time (including startup/tokenization when applicable),
 which is an observation of processing latency, not a billed inference cost.

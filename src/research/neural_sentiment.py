@@ -88,11 +88,15 @@ class SentimentResearch:
               body TEXT NOT NULL,ref TEXT,available REAL);
             CREATE TABLE IF NOT EXISTS replay(id INTEGER PRIMARY KEY CHECK(id=1),
               offset INTEGER NOT NULL,previous TEXT NOT NULL,sequence INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS scheduler(id INTEGER PRIMARY KEY CHECK(id=1),ticket INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS inputs_pending ON inputs(complete,served,created,id);
+            CREATE INDEX IF NOT EXISTS results_pending ON results(ref);
         ''')
         self.db.execute('INSERT OR IGNORE INTO replay VALUES(1,0,?,0)', ('0'*64,))
         # Old unserved rows used zero, which lets an endless stream of new
         # inputs leapfrog the remaining windows of an already-started post.
         self.db.execute('UPDATE inputs SET served=created WHERE served=0')
+        self.db.execute('INSERT OR IGNORE INTO scheduler SELECT 1,CAST(COALESCE(MAX(served),0) AS INTEGER) FROM inputs')
         self.db.commit()
         self.ledger_path = Path(ledger_path) if ledger_path else None
         self.lock = threading.RLock()
@@ -101,6 +105,11 @@ class SentimentResearch:
         self.last_intake_error = None
         self.intake_failures = 0
         self.replay_error = None
+
+    def _next_ticket(self):
+        # Called inside the queue transaction. It survives process restarts
+        # and cannot move backwards when the host wall clock is corrected.
+        return self.db.execute('UPDATE scheduler SET ticket=ticket+1 WHERE id=1 RETURNING ticket').fetchone()[0]
 
     def enqueue(self, payload, *, source_job, source_ref, tokens=()):
         if not source_ref:
@@ -122,9 +131,11 @@ class SentimentResearch:
             previous = self.db.execute('SELECT body FROM inputs WHERE id=?', (identity,)).fetchone()
             if previous and json.loads(previous[0])['text_sha256'] != body['text_sha256']:
                 raise ValueError('canonical source text changed')
+            if previous:
+                return identity
             queued_at = time.time()
             self.db.execute('INSERT OR IGNORE INTO inputs(id,body,created,served) VALUES(?,?,?,?)',
-                            (identity, canonical(body), queued_at, queued_at))
+                            (identity, canonical(body), queued_at, self._next_ticket()))
         return identity
 
     def reconcile(self, byte_quantum=1024*1024):
@@ -200,7 +211,7 @@ class SentimentResearch:
                 with self.lock, self.db:
                     self.db.execute('INSERT INTO results VALUES(?,?,?,NULL,NULL)',
                                     (row['annotation_id'], identity, canonical(row)))
-                    self.db.execute('UPDATE inputs SET served=? WHERE id=?', (time.time(), identity))
+                    self.db.execute('UPDATE inputs SET served=? WHERE id=?', (self._next_ticket(), identity))
                 rows.append(row)
                 self.last_error = None
             except asyncio.CancelledError:
@@ -209,7 +220,7 @@ class SentimentResearch:
                 # Worker failures never erase raw input or print text/credentials.
                 self.last_error = type(exc).__name__
                 with self.lock, self.db:
-                    self.db.execute('UPDATE inputs SET served=? WHERE id=?', (time.time(), identity))
+                    self.db.execute('UPDATE inputs SET served=? WHERE id=?', (self._next_ticket(), identity))
         return rows
 
     @staticmethod
