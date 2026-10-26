@@ -91,13 +91,23 @@ async def test_partial_http_failure_keeps_other_books_and_continues_universe_aft
     state.acquisition.request = request
     rows = await state.acquisition.books(None, observation)
     assert len(rows) == 3 and sum(r['perps_role']=='book' for r in rows) == 2
+    def remaining_targets(stage):
+        targets=state.acquisition.targets('book',3)
+        assert targets==['COIN0003','COIN0004','COIN0005'], {
+            'stage':stage,'targets':targets,
+            'service':state.db.execute('SELECT * FROM acquisition_service ORDER BY target').fetchall(),
+            'active':state.market_names(),
+            'sqlite':__import__('sqlite3').sqlite_version}
+    remaining_targets('after_fetch')
     state.ingest_batch(rows, 'canonical:first')
+    remaining_targets('after_ingest')
     assert state.report()['books_recorded'] == 2
     assert state.report()['acquisition']['recent_request_errors'][0]['error'] == 'TimeoutError'
     assert peak <= 4
     state.close()
     state = PhantomPerpsResearch(path)
     state.acquisition.request = request
+    remaining_targets('after_reopen')
     await state.acquisition.books(None, observation)
     assert seen == [f'COIN{i:04d}' for i in range(6)]
     state.close()
