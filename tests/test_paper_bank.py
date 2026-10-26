@@ -10,6 +10,7 @@ from solders.system_program import transfer as sol_transfer
 from src.chains.pump_route import TOKEN_PROGRAM, WSOL_MINT, associated_token_address
 from src.research import fork_simulation as f, fork_probe as probe_module, fork_paper
 from test_fork_simulation import synthetic_frame, transfer, wire
+from isolated_vm import isolated_vm
 
 
 def market(monkeypatch):
@@ -47,6 +48,7 @@ def operation(frame,phase,inventory=None):
     return f.execute_frame({**frame,'_paper_request':{'phase':phase,**({'inventory':inventory} if inventory else {})}})
 
 
+@isolated_vm
 def test_later_bank_uses_retained_actual_units_and_changes_public_market_proceeds(monkeypatch):
     frame,price=market(monkeypatch)
     entry=operation(frame,'entry')
@@ -66,6 +68,7 @@ def test_later_bank_uses_retained_actual_units_and_changes_public_market_proceed
     assert held==entry['inventory']  # exit never mutates the archived entry state
 
 
+@isolated_vm
 def test_failed_exit_retains_inventory_and_actual_fee_debit_for_later_retry(monkeypatch):
     frame,price=market(monkeypatch)
     entry=operation(frame,'entry');price['broken']=True
@@ -83,6 +86,7 @@ def test_failed_exit_retains_inventory_and_actual_fee_debit_for_later_retry(monk
 
 
 @pytest.mark.parametrize('mutation', ['same_bank','same_clock','altered_seal','market_overlay','wrong_token','public_collision'])
+@isolated_vm
 def test_untrusted_or_nonprospective_inventory_cannot_execute(monkeypatch,mutation):
     frame,_=market(monkeypatch);entry=operation(frame,'entry')['inventory'];fresh=later(frame)
     if mutation=='same_bank':fresh['slot']=frame['slot'];fresh['accounts'][f.CLOCK]=frame['accounts'][f.CLOCK]
@@ -97,6 +101,7 @@ def test_untrusted_or_nonprospective_inventory_cannot_execute(monkeypatch,mutati
 
 
 @pytest.mark.asyncio
+@isolated_vm
 async def test_pipeline_atomically_retains_inventory_restarts_and_requires_canonical_ack(monkeypatch,tmp_path):
     frame,_=market(monkeypatch);clock=[1000.]
     monkeypatch.setattr(probe_module.time,'time',lambda:clock[0])
@@ -128,6 +133,7 @@ async def test_pipeline_atomically_retains_inventory_restarts_and_requires_canon
 
 
 @pytest.mark.asyncio
+@isolated_vm
 async def test_preexisting_targets_not_retroactively_enrolled(monkeypatch,tmp_path):
     frame,_=market(monkeypatch);clock=[900.]
     monkeypatch.setattr(probe_module.time,'time',lambda:clock[0])
@@ -140,6 +146,7 @@ async def test_preexisting_targets_not_retroactively_enrolled(monkeypatch,tmp_pa
     probe.close()
 
 
+@isolated_vm
 def test_failed_entry_is_a_terminal_costed_trial_not_a_free_replenished_retry(monkeypatch):
     frame,_=market(monkeypatch)
     original=f._route
@@ -155,6 +162,7 @@ def test_failed_entry_is_a_terminal_costed_trial_not_a_free_replenished_retry(mo
 
 
 @pytest.mark.asyncio
+@isolated_vm
 async def test_inventory_and_outbox_rollback_together_and_corruption_cannot_resume(monkeypatch,tmp_path):
     import sqlite3
     frame,_=market(monkeypatch);clock=[1000.]

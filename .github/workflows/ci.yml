@@ -111,13 +111,7 @@ jobs:
         env:
           ALLOW_LIVE_TRADING: ""
           SOLANA_PRIVATE_KEY: ""
-        run: |
-          python -m pytest tests/test_perps_acquisition.py -q
-          python -m pytest tests -q --durations=20 -o faulthandler_timeout=60
-
-      - name: Diagnose perps test-order contamination
-        if: failure()
-        run: python tools/diagnose_perps_order.py
+        run: python -m pytest tests -q --durations=20 -o faulthandler_timeout=60
 
       - name: Latency regression check
         # A correctness regression fails the build and a latency regression

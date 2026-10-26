@@ -93,18 +93,7 @@ async def test_partial_http_failure_keeps_other_books_and_continues_universe_aft
     assert len(rows) == 3 and sum(r['perps_role']=='book' for r in rows) == 2
     def remaining_targets(stage):
         targets=state.acquisition.targets('book',3)
-        diagnostic={
-            'stage':stage,'targets':targets,
-            'service':state.db.execute('SELECT * FROM acquisition_service ORDER BY target').fetchall(),
-            'active':state.market_names(),
-            'sqlite':__import__('sqlite3').sqlite_version}
-        if targets!=['COIN0003','COIN0004','COIN0005']:
-            diagnostic['joined']=state.db.execute("SELECT m.coin,s.target,s.attempted FROM markets m LEFT JOIN acquisition_service s ON s.target=m.coin AND s.role='book' WHERE m.active=1 ORDER BY m.coin LIMIT 8").fetchall()
-            diagnostic['literal']=state.db.execute("SELECT m.coin,COALESCE(MAX(s.attempted),0) AS serviced FROM markets m LEFT JOIN acquisition_service s ON s.target=m.coin AND s.role='book' WHERE m.active=1 GROUP BY m.coin ORDER BY serviced,m.coin LIMIT 3").fetchall()
-            diagnostic['repeat']=state.acquisition.targets('book',3)
-            diagnostic['plan']=state.db.execute("EXPLAIN QUERY PLAN SELECT m.coin,COALESCE(MAX(s.attempted),0) AS serviced FROM markets m LEFT JOIN acquisition_service s ON s.target=m.coin AND s.role=? WHERE m.active=1 GROUP BY m.coin ORDER BY serviced,m.coin LIMIT ?",('book',3)).fetchall()
-            print(json.dumps(diagnostic))
-        assert targets==['COIN0003','COIN0004','COIN0005'], diagnostic
+        assert targets==['COIN0003','COIN0004','COIN0005'], stage
     remaining_targets('after_fetch')
     state.ingest_batch(rows, 'canonical:first')
     remaining_targets('after_ingest')

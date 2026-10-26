@@ -29,16 +29,11 @@ class PublicPerpsAcquisition:
 
     def targets(self, role, quantum):
         with self.state.lock:
-            cursor = self.state.db.execute("""
+            return [r[0] for r in self.state.db.execute("""
               SELECT DISTINCT m.coin,COALESCE(s.attempted,0) AS serviced
               FROM markets m LEFT JOIN acquisition_service s ON s.target=m.coin AND s.role=?
               WHERE m.active=1 ORDER BY serviced,m.coin LIMIT ?
-            """, (role, quantum))
-            try:
-                rows = cursor.fetchall()
-            finally:
-                cursor.close()
-            return [row[0] for row in rows]
+            """, (role, quantum))]
 
     async def fetch(self, http, payload, *, role, target):
         async with self.inflight:
