@@ -144,13 +144,16 @@ class RateLimitedEndpointsAreDemotedAndParked(unittest.TestCase):
         with patch('src.chains.rpc_manager.time.time', return_value=ready_at + 1):
             self.assertIsNotNone(manager._select_endpoint())
 
-    def test_retry_after_is_honoured_but_bounded(self):
+    def test_retry_after_honours_long_provider_resets_and_rejects_bad_headers(self):
         class Response:
             def __init__(self, value):
                 self.headers = {"Retry-After": value}
         self.assertEqual(RPCManager._retry_after_seconds(Response("12"), 30.0), 12.0)
-        # A hostile or broken header cannot park an endpoint for hours.
-        self.assertEqual(RPCManager._retry_after_seconds(Response("99999"), 30.0), 300.0)
+        # A finite long reset can represent a genuine daily quota. Clipping
+        # it to five minutes retries into an explicit provider refusal.
+        self.assertEqual(RPCManager._retry_after_seconds(Response("99999"), 30.0), 99999.0)
+        self.assertEqual(RPCManager._retry_after_seconds(Response("NaN"), 30.0), 30.0)
+        self.assertEqual(RPCManager._retry_after_seconds(Response("inf"), 30.0), 30.0)
         self.assertEqual(RPCManager._retry_after_seconds(Response("soon"), 30.0), 30.0)
 
     def test_api_keys_never_reach_a_log_line(self):
