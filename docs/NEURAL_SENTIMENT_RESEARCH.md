@@ -43,6 +43,20 @@ neural_sentiment:
   model_root: /absolute/path/to/pinned/model/cache
 ```
 
+Windows also needs the supported Microsoft C++ runtime, as specified by the
+[ONNX Runtime prerequisites](https://onnxruntime.ai/docs/install/#requirements).
+Use the [official Microsoft redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist).
+Validate its Microsoft publisher signature before installation. A package
+install alone is insufficient: run the offline actual-model smoke in the
+clean worker environment. Record installer restart-pending status separately;
+do not reboot an unattended trading host as part of this setup.
+
+Unserved inputs begin at their enqueue time; each served input moves to the
+back of that age order. New arrivals cannot repeatedly jump ahead of the
+remaining windows of an older long document. Each result records measured
+worker-request wall time (including startup/tokenization when applicable),
+which is an observation of processing latency, not a billed inference cost.
+
 The documented training languages are en/ar/de/es/fr/ja/zh/id/hi/it/ms/pt.
 Other languages remain outside that stated training scope. Raw softmax outputs
 are explicitly **uncalibrated**, with trading skill **UNMEASURED**. They do not

@@ -90,6 +90,9 @@ class SentimentResearch:
               offset INTEGER NOT NULL,previous TEXT NOT NULL,sequence INTEGER NOT NULL);
         ''')
         self.db.execute('INSERT OR IGNORE INTO replay VALUES(1,0,?,0)', ('0'*64,))
+        # Old unserved rows used zero, which lets an endless stream of new
+        # inputs leapfrog the remaining windows of an already-started post.
+        self.db.execute('UPDATE inputs SET served=created WHERE served=0')
         self.db.commit()
         self.ledger_path = Path(ledger_path) if ledger_path else None
         self.lock = threading.RLock()
@@ -119,8 +122,9 @@ class SentimentResearch:
             previous = self.db.execute('SELECT body FROM inputs WHERE id=?', (identity,)).fetchone()
             if previous and json.loads(previous[0])['text_sha256'] != body['text_sha256']:
                 raise ValueError('canonical source text changed')
-            self.db.execute('INSERT OR IGNORE INTO inputs(id,body,created) VALUES(?,?,?)',
-                            (identity, canonical(body), time.time()))
+            queued_at = time.time()
+            self.db.execute('INSERT OR IGNORE INTO inputs(id,body,created,served) VALUES(?,?,?,?)',
+                            (identity, canonical(body), queued_at, queued_at))
         return identity
 
     def reconcile(self, byte_quantum=1024*1024):
@@ -179,12 +183,15 @@ class SentimentResearch:
         for identity, raw, offset in jobs:
             body = json.loads(raw)
             try:
+                started = time.perf_counter()
                 result = await self.worker.infer(body['text'], offset)
+                inference_seconds = time.perf_counter()-started
                 self._validate_window(result, offset)
                 row = {key: value for key, value in body.items() if key != 'text'}
                 row.update(schema=SCHEMA, provider='offline_neural_sentiment',
                     annotation_kind='document_sentiment_window', input_id=identity,
                     **result, created_at=time.time(), weights_sha256=FILES['onnx/model_quantized.onnx'],
+                    worker_request_seconds=inference_seconds,
                     worker_source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                     calibrated=False, trading_skill='UNMEASURED', execution_authority=False,
                     language_training_scope=body['language'].split('-')[0].lower() in LANGUAGES,

@@ -16,6 +16,16 @@ from src.research import fork_simulation as f
 from src.research.fork_probe import ForkProbe
 
 
+def test_manifest_binds_route_builders_decoder_and_vendored_contracts():
+    from pathlib import Path
+    import hashlib
+    manifest = f.implementation_manifest()
+    root = Path(f.__file__).resolve().parents[2]
+    for name in ('src/chains/pumpswap_route.py', 'src/chains/pump_route.py',
+                 'src/chains/pump_curve.py', 'src/chains/idl.py', 'idl/pump_amm.json', 'idl/FEE_RECIPIENTS.md'):
+        assert manifest['source_sha256'][name] == hashlib.sha256((root/name).read_bytes()).hexdigest()
+
+
 def wire(raw=b'', owner=TOKEN_PROGRAM, lamports=3_000_000, executable=False):
     return {'data': [base64.b64encode(raw).decode(), 'base64'], 'owner': owner,
             'lamports': lamports, 'executable': executable, 'rentEpoch': 2**64 - 1}

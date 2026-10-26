@@ -40,6 +40,23 @@ def digest(value):
                                      allow_nan=False).encode()).hexdigest()
 
 
+def implementation_manifest():
+    """Bind route/decoder/IDL inputs as well as this worker's own source.
+
+    An unchanged worker file can load a corrected route builder. Its single
+    file hash alone cannot identify the implementation that produced a probe.
+    This is local reproducibility metadata, not external software attestation.
+    """
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    paths = ('src/research/fork_simulation.py', 'src/chains/pump_route.py',
+        'src/chains/pumpswap_route.py', 'src/chains/pump_curve.py', 'src/chains/idl.py',
+        'idl/pump.json', 'idl/pump_amm.json', 'idl/pump_fees.json', 'idl/FEE_RECIPIENTS.md')
+    return {'schema': 'local-fork-source-manifest-v1',
+        'python_version': '.'.join(map(str, sys.version_info[:3])),
+        'source_sha256': {name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in paths}}
+
+
 def virtual_owner():
     # A PUBLIC, deterministic test seed. Never fund this address on chain.
     from solders.keypair import Keypair
@@ -366,9 +383,11 @@ def execute_frame(frame):
     setup_receipt = _receipt(_transact(vm, setup))
     from importlib.metadata import version
     from pathlib import Path
+    implementation = implementation_manifest()
     result = {'schema': SCHEMA, 'target': target, 'slot': frame['slot'], 'input_sha256': digest(frame),
         'solders_version': version('solders'),
         'worker_source_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        'implementation': implementation, 'implementation_sha256': digest(implementation),
         'observed_at': frame['observed_at'], 'virtual_owner': str(owner),
         'program_hashes': {key: hashlib.sha256(raw).hexdigest() for key, _, raw in images},
         'scope': 'LOCAL_SVM_AT_SAMPLED_BANK_NOT_FUTURE_SELL_GUARANTEE',
