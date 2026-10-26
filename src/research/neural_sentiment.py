@@ -120,6 +120,20 @@ class SentimentResearch:
         self.db.execute('UPDATE inputs SET served=created WHERE served=0')
         self.db.execute('INSERT OR IGNORE INTO scheduler SELECT 1,CAST(COALESCE(MAX(served),0) AS INTEGER) FROM inputs')
         self.db.commit()
+        # Hot-path delivery is a point lookup of already ACKed output. It must
+        # not wait behind the writer connection's replay/report/fsync lock.
+        # WAL gives this separate read-only connection committed snapshots;
+        # uncommitted annotations and ACKs remain invisible.
+        self.observation_db = sqlite3.connect(path.resolve().as_uri()+'?mode=ro',
+            uri=True, check_same_thread=False, timeout=3)
+        self.observation_db.execute('PRAGMA query_only=ON')
+        self.observation_lock = threading.RLock()
+        # Full queue counts are intentionally separate from both the writer
+        # and the latency-sensitive primary-key observation lookup.
+        self.report_db = sqlite3.connect(path.resolve().as_uri()+'?mode=ro',
+            uri=True, check_same_thread=False, timeout=3)
+        self.report_db.execute('PRAGMA query_only=ON')
+        self.report_lock = threading.RLock()
         self.ledger_path = Path(ledger_path) if ledger_path else None
         self.lock = threading.RLock()
         self.worker = worker or (OfflineWorker(python, model_root, intra_op_threads=intra_op_threads)
@@ -410,15 +424,26 @@ class SentimentResearch:
                     (record['token_stop'], int(record['token_stop'] == record['token_count']), found[1]))
 
     def report(self):
-        with self.lock:
-            total, complete = self.db.execute('SELECT count(*),sum(complete) FROM inputs').fetchone()
-            retained, acked = self.db.execute('SELECT count(*),count(ref) FROM results').fetchone()
-            oldest = self.db.execute('SELECT min(created) FROM inputs WHERE complete=0').fetchone()[0]
-            replay_offset = self.db.execute('SELECT offset FROM replay').fetchone()[0]
-            lanes = {origin: {'pending': count, 'oldest_pending_seconds': max(0, time.time()-oldest)}
-                for origin, count, oldest in self.db.execute('SELECT origin,count(*),min(created) FROM inputs WHERE complete=0 GROUP BY origin')}
-            metrics = dict(self.db.execute('SELECT name,value FROM metrics'))
-            cache_entries = self.db.execute('SELECT count(*) FROM inference_cache').fetchone()[0]
+        read_started=time.time()
+        began=time.perf_counter()
+        with self.report_lock,self.report_db:
+            # One committed snapshot across all counters, even if intake/ACK
+            # commits while this potentially long read is in progress.
+            self.report_db.execute('BEGIN')
+            groups=self.report_db.execute('SELECT complete,origin,count(*),min(created) '
+                'FROM inputs GROUP BY complete,origin').fetchall()
+            if any(flag not in (0,1) for flag,_,_,_ in groups):
+                raise ValueError('invalid queue completion flag')
+            total=sum(row[2] for row in groups)
+            complete=sum(row[2] for row in groups if row[0]==1)
+            pending=[row for row in groups if row[0]==0]
+            oldest=min((row[3] for row in pending),default=None)
+            lanes={origin:{'pending':count,'oldest_pending_seconds':max(0,time.time()-at)}
+                for _,origin,count,at in pending}
+            retained,acked=self.report_db.execute('SELECT count(*),count(ref) FROM results').fetchone()
+            replay_offset=self.report_db.execute('SELECT offset FROM replay').fetchone()[0]
+            metrics=dict(self.report_db.execute('SELECT name,value FROM metrics'))
+            cache_entries=self.report_db.execute('SELECT count(*) FROM inference_cache').fetchone()[0]
         return {'status': 'OFFLINE_RESEARCH' if self.worker else 'NOT_CONFIGURED',
             'model_revision': REVISION, 'inference_profile': self.inference_profile,
             'inputs': total, 'completed_inputs': complete or 0,
@@ -429,6 +454,8 @@ class SentimentResearch:
             'replay_error_type': self.replay_error, 'replayed_canonical_bytes': replay_offset,
             'last_replay_seconds': self.last_replay_seconds,
             'last_fetch_profile': self.last_fetch_profile,
+            'database_read_started_at':read_started,
+            'database_read_elapsed_seconds':max(0,time.perf_counter()-began),
             'queue_lanes': lanes, 'scheduling': '2 fresh live : 1 age-fair live : 1 replay; unused capacity shared; no input expiration',
             'inference_cache_entries': cache_entries, 'inference_metrics': metrics,
             'source_ledger_backlog_bytes': max(0, self.ledger_path.stat().st_size-replay_offset)
@@ -438,8 +465,8 @@ class SentimentResearch:
             'scope': 'full token windows of retained source inputs; intake failures and resource backlog remain coverage debt'}
 
     def observation(self, annotation_id, *, as_of):
-        with self.lock:
-            row = self.db.execute('SELECT body,ref,available FROM results WHERE id=? AND '
+        with self.observation_lock:
+            row = self.observation_db.execute('SELECT body,ref,available FROM results WHERE id=? AND '
                 'ref IS NOT NULL AND available<=?', (annotation_id, as_of)).fetchone()
         return {**json.loads(row[0]), 'source_ref_annotation': row[1], 'available_at': row[2]} if row else None
 
@@ -456,7 +483,10 @@ class SentimentResearch:
 
     def close(self):
         with self.lock:
-            self.db.close()
+            with self.report_lock,self.observation_lock:
+                self.report_db.close()
+                self.observation_db.close()
+                self.db.close()
 
 
 def worker_main(root, *, intra_op_threads=1):

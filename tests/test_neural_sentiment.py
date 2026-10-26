@@ -32,6 +32,89 @@ class CountingWorker(Worker):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('acknowledged',[False,True])
+async def test_owner_loop_observation_uses_committed_snapshot_without_waiting_for_writer(tmp_path,acknowledged):
+    import asyncio,threading
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient,TestServer
+    queue=SentimentResearch(tmp_path/'nlp.sqlite',worker=CountingWorker());enqueue(queue)
+    rows=await queue.fetch();identity=rows[0]['annotation_id']
+    if acknowledged:queue.acknowledge(rows,'canonical:before-write')
+    entered,released=threading.Event(),threading.Event()
+    def slow_write():
+        with queue.lock,queue.db:
+            if not acknowledged:
+                queue.db.execute('UPDATE results SET ref=?,available=? WHERE id=?',
+                    ('canonical:uncommitted-fixture',200.,identity))
+            else:
+                queue.db.execute('UPDATE inputs SET served=served+1')
+            entered.set();assert released.wait(5)
+    writer=asyncio.create_task(asyncio.to_thread(slow_write))
+    assert await asyncio.to_thread(entered.wait,3)
+    async def health(request):
+        proof=queue.observation(identity,as_of=10**12)
+        return web.json_response({'observed':proof is not None})
+    app=web.Application();app.router.add_get('/health',health)
+    try:
+        async with TestClient(TestServer(app)) as client:
+            response=await asyncio.wait_for(client.get('/health'),1)
+            assert (await response.json())['observed']==acknowledged
+        assert not released.is_set() and not writer.done()
+    finally:
+        released.set();await writer
+    assert queue.observation(identity,as_of=10**12) is not None
+    if not acknowledged:assert queue.observation(identity,as_of=199.) is None
+    queue.close()
+
+
+def test_observation_connection_is_read_only_and_closed_with_its_owner(tmp_path):
+    import sqlite3
+    queue=SentimentResearch(tmp_path/'nlp.sqlite');reader=queue.observation_db
+    with pytest.raises(sqlite3.OperationalError):reader.execute('DELETE FROM results')
+    queue.close()
+    with pytest.raises(sqlite3.ProgrammingError):reader.execute('SELECT count(*) FROM results')
+
+
+@pytest.mark.asyncio
+async def test_slow_report_does_not_lock_intake_or_canonical_delivery(tmp_path):
+    import asyncio,threading
+    queue=SentimentResearch(tmp_path/'nlp.sqlite',worker=CountingWorker());enqueue(queue)
+    rows=await queue.fetch();queue.acknowledge(rows,'canonical:before-report')
+    entered,released=threading.Event(),threading.Event()
+    def gate():
+        if not entered.is_set():entered.set();assert released.wait(5)
+        return 0
+    queue.report_db.set_progress_handler(gate,1)
+    pending=asyncio.create_task(asyncio.to_thread(queue.report))
+    assert await asyncio.to_thread(entered.wait,3)
+    try:
+        # These are the synchronous methods called by actual collection and
+        # owner-loop delivery. Neither shares the long-report reader's lock.
+        assert enqueue(queue,'second public post',job='second')
+        assert queue.observation(rows[0]['annotation_id'],as_of=10**12)
+        assert not pending.done()
+    finally:released.set();await pending
+    queue.report_db.set_progress_handler(None,0)
+    assert queue.report()['inputs']==2
+    queue.close()
+
+
+@pytest.mark.asyncio
+async def test_report_counter_groups_share_one_committed_database_snapshot(tmp_path):
+    queue=SentimentResearch(tmp_path/'nlp.sqlite',worker=CountingWorker());enqueue(queue)
+    rows=await queue.fetch();committed=[]
+    def race(sql):
+        if sql.startswith('SELECT count(*),count(ref)') and not committed:
+            queue.acknowledge(rows,'canonical:during-report');committed.append(True)
+    queue.report_db.set_trace_callback(race)
+    first=queue.report();queue.report_db.set_trace_callback(None)
+    assert committed and first['completed_inputs']==first['canonical_windows']==0
+    second=queue.report()
+    assert second['completed_inputs']==second['canonical_windows']==1
+    queue.close()
+
+
+@pytest.mark.asyncio
 async def test_pending_queue_lock_cannot_hold_event_loop_and_cancel_drains_query(tmp_path):
     import asyncio,threading
     queue=SentimentResearch(tmp_path/'nlp.sqlite',worker=CountingWorker());enqueue(queue)
