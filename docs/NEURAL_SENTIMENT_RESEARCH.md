@@ -51,19 +51,26 @@ install alone is insufficient: run the offline actual-model smoke in the
 clean worker environment. Record installer restart-pending status separately;
 do not reboot an unattended trading host as part of this setup.
 
-Inputs receive durable scheduling tickets; each served input moves to the
-back of that order. Tickets survive restarts and wall-clock corrections.
-New arrivals cannot repeatedly jump ahead of the
-remaining windows of an older long document. Each result records measured
+Inputs receive durable arrival and service tickets, independent of wall-clock
+corrections. Each served input moves to the back of the age-fair order. Each result records measured
 worker-request wall time (including startup/tokenization when applicable),
 which is an observation of processing latency, not a billed inference cost.
 
 Live intake and canonical historical replay have separate durable scheduling
-lanes. A three-to-one slot ratio favors live observations while guaranteeing
-historical progress when both lanes have work; empty lanes share their unused
-capacity. Existing rows migrate by their original canonical intake provenance.
+lanes. Of every four available slots, two favor the newest live arrivals, one
+serves the oldest live service ticket and one serves historical replay. Fresh
+posts therefore bypass old live backlog; long-document tails and older live
+posts retain their own service share. Empty lanes share their unused capacity.
+Existing rows migrate by original intake provenance and durable insertion order.
 Lane backlog and oldest age are reported separately. This bounds competition
 from a large backfill; it does not guarantee processing deadlines under overload.
+
+The miner declares `LOCAL_CPU` resource use and has a separate serial execution
+lane. Slow sockets can occupy all network slots without occupying this offline
+slot. ONNX still uses one CPU thread, each inference pass has bounded work, and
+neither lane bypasses canonical retention or delivery acknowledgements. The
+resource declaration is scheduling metadata for trusted callables, not a network
+sandbox. Per-miner queue-wait and fetch wall times expose actual contention.
 
 Identical text windows reuse actual inference keyed by full-text hash, offset,
 model/tokenizer/configuration hashes and the inference-function source hash.

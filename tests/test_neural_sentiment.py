@@ -32,6 +32,33 @@ class CountingWorker(Worker):
 
 
 @pytest.mark.asyncio
+async def test_newest_post_bypasses_live_backlog_without_starving_old_live_or_replay(tmp_path,monkeypatch):
+    path=tmp_path/'nlp.sqlite'
+    queue=SentimentResearch(path,worker=Worker())
+    for index in range(100):
+        enqueue(queue,f'old live text {index}',job=f'old:{index}')
+    queue.enqueue({'text':'historical text','source_id':'historical','observed_at':1},
+        source_job=None,source_ref='canonical:history')
+    # Use the persistent arrival ticket, not the corrected host wall clock.
+    monkeypatch.setattr('src.research.neural_sentiment.time.time',lambda:50.)
+    enqueue(queue,'newest live text',job='fresh:arrival')
+    queue.close()
+    queue=SentimentResearch(path,worker=Worker())
+    rows=await queue.fetch()
+    assert rows[0]['source_job']=='fresh:arrival'
+    assert any(row['source_job']=='old:0' for row in rows)
+    assert any(row['input_origin']=='REPLAY' for row in rows)
+    queue.acknowledge(rows,'canonical:all-lanes')
+    for turn in range(3):
+        enqueue(queue,f'fresh turn {turn}',job=f'fresh:{turn}')
+        rows=await queue.fetch()
+        assert any(row['source_job']==f'fresh:{turn}' for row in rows)
+        assert any(str(row['source_job']).startswith('old:') for row in rows)
+        queue.acknowledge(rows,f'canonical:turn:{turn}')
+    queue.close()
+
+
+@pytest.mark.asyncio
 async def test_live_intake_progresses_ahead_of_large_history_without_starving_history(tmp_path):
     path=tmp_path/'nlp.sqlite'
     queue=SentimentResearch(path,worker=Worker())

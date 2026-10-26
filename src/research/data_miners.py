@@ -129,6 +129,9 @@ class MinerSpec:
     # Per-consumer-call work quantum. All retained records are delivered in
     # successive chunks, yielding between them; this is not a discovery cap.
     max_records: int = 500
+    # Offline inference should not queue behind external socket timeouts.
+    # This is a trusted callable's resource declaration, not a network sandbox.
+    resource_class: str = 'NETWORK'
 
     def missing_credentials(self) -> List[str]:
         """Which required variables are absent. Presence only; never a value."""
@@ -169,6 +172,8 @@ class MinerHealth:
     # to the base every time and a source that rate limited us repeatedly was
     # retried at a constant interval for ever.
     backoff_seconds: float = 0.0
+    last_queue_wait_ms: Optional[float] = None
+    last_fetch_ms: Optional[float] = None
 
     def to_dict(self, now: Optional[float] = None) -> Dict[str, Any]:
         now = time.time() if now is None else now
@@ -182,6 +187,8 @@ class MinerHealth:
                                 if self.backoff_until > now else None),
             "backoff_seconds": self.backoff_seconds or None,
             "last_error": self.last_error,
+            "last_queue_wait_ms": self.last_queue_wait_ms,
+            "last_fetch_ms": self.last_fetch_ms,
         }
 
 
@@ -214,6 +221,7 @@ class DataMinerPool:
         # the offload thread's loop, which is precisely the split that made
         # a plain semaphore leak a waiter per call until the box died.
         self._semaphore = loop_local_semaphore(self.concurrency, "miners")
+        self._local_semaphore = loop_local_semaphore(1, "miners.local_cpu")
         self._task: Optional[asyncio.Task] = None
         self._inflight: Dict[str, asyncio.Task] = {}
         self._active: set[str] = set()
@@ -225,6 +233,8 @@ class DataMinerPool:
     def register(self, spec: MinerSpec,
                  fetch: Callable[[], Awaitable[List[Dict[str, Any]]]]) -> bool:
         """Add a miner. Refuses one whose credentials are absent, by name."""
+        if spec.resource_class not in {'NETWORK', 'LOCAL_CPU'}:
+            raise ValueError('unknown miner resource class')
         missing = spec.missing_credentials()
         if missing:
             self._health[spec.miner_id] = MinerHealth(
@@ -326,7 +336,11 @@ class DataMinerPool:
         health = self._health[miner_id]
         self._next_due[miner_id] = now + spec.cadence_seconds
         started = time.time()
-        async with self._semaphore:
+        queued = time.perf_counter()
+        resource = self._local_semaphore if spec.resource_class == 'LOCAL_CPU' else self._semaphore
+        async with resource:
+            health.last_queue_wait_ms = (time.perf_counter()-queued)*1000
+            fetch_started = time.perf_counter()
             try:
                 records = await self._callables[miner_id]()
             except RateLimited as exc:
@@ -346,6 +360,8 @@ class DataMinerPool:
                 health.last_error = f"{type(exc).__name__}: {exc}"
                 return MinerResult(miner_id=miner_id, status="DATA_BLOCKED",
                                    fetched_at=now, detail=health.last_error)
+            finally:
+                health.last_fetch_ms = (time.perf_counter()-fetch_started)*1000
 
         received_at = time.time()
         all_stamped = [{**self._stamp(spec, record, received_at),
@@ -447,6 +463,7 @@ class DataMinerPool:
                 "endpoint": spec.endpoint,
                 "last_success_seconds_ago": row["seconds_since_ok"],
                 "records_total": row["records"],
+                "resource_class": spec.resource_class,
             })
             rows.append(row)
         producing = [row for row in rows if row["records"] > 0]
@@ -475,7 +492,8 @@ class DataMinerPool:
             "silent": [row["miner_id"] for row in silent],
             "total_records": self.total_records,
             "source_tasks_in_flight": len(self._active),
-            "scheduler": "independent source clocks; shared bounded concurrency",
+            "scheduler": "independent source clocks; separate bounded network and local CPU lanes",
+            "resource_concurrency": {'NETWORK': self.concurrency, 'LOCAL_CPU': 1},
             "enrichments_covered": dict(sorted(by_enrichment.items())),
             "cadences": {spec.miner_id: spec.cadence_seconds
                          for spec in sorted(self._specs.values(),

@@ -101,6 +101,10 @@ class SentimentResearch:
             self.db.execute("ALTER TABLE inputs ADD COLUMN origin TEXT NOT NULL DEFAULT 'LIVE'")
             self.db.execute("UPDATE inputs SET origin='REPLAY' WHERE json_extract(body,'$.source_job') IS NULL")
         self.db.execute('CREATE INDEX IF NOT EXISTS inputs_lanes ON inputs(complete,origin,served,created,id)')
+        if 'arrived' not in {row[1] for row in self.db.execute('PRAGMA table_info(inputs)')}:
+            self.db.execute('ALTER TABLE inputs ADD COLUMN arrived INTEGER NOT NULL DEFAULT 0')
+            self.db.execute('UPDATE inputs SET arrived=rowid')
+        self.db.execute('CREATE INDEX IF NOT EXISTS inputs_fresh ON inputs(complete,origin,arrived DESC,served,id)')
         self.db.execute('INSERT OR IGNORE INTO replay VALUES(1,0,?,0)', ('0'*64,))
         # Old unserved rows used zero, which lets an endless stream of new
         # inputs leapfrog the remaining windows of an already-started post.
@@ -149,8 +153,9 @@ class SentimentResearch:
                     self.db.execute("UPDATE inputs SET origin='LIVE' WHERE id=?", (identity,))
                 return identity
             queued_at = time.time()
-            self.db.execute('INSERT OR IGNORE INTO inputs(id,body,created,served,origin) VALUES(?,?,?,?,?)',
-                            (identity, canonical(body), queued_at, self._next_ticket(), origin))
+            ticket = self._next_ticket()
+            self.db.execute('INSERT OR IGNORE INTO inputs(id,body,created,served,origin,arrived) VALUES(?,?,?,?,?,?)',
+                            (identity, canonical(body), queued_at, ticket, origin, ticket))
         return identity
 
     def _metric(self, name):
@@ -162,9 +167,12 @@ class SentimentResearch:
             preferred = 'LIVE' if cursor % 4 < 3 else 'REPLAY'
             exclusion = ' AND id NOT IN ('+','.join('?' for _ in seen)+')' if seen else ''
             for origin in (preferred, 'REPLAY' if preferred == 'LIVE' else 'LIVE'):
+                # Two fresh live slots, one age-fair live slot, one replay
+                # slot. No age threshold drops a post or erases a long tail.
+                order = 'arrived DESC,served,id' if origin == preferred == 'LIVE' and cursor % 4 < 2 else 'served,created,id'
                 row = self.db.execute('SELECT id,body,offset,origin FROM inputs WHERE complete=0 AND origin=? '
                     'AND id NOT IN (SELECT input_id FROM results WHERE ref IS NULL)'+exclusion+
-                    ' ORDER BY served,created,id LIMIT 1', (origin, *seen)).fetchone()
+                    ' ORDER BY '+order+' LIMIT 1', (origin, *seen)).fetchone()
                 if row:
                     return (*row, (cursor+1) % 4)
         return None
@@ -344,7 +352,7 @@ class SentimentResearch:
             'awaiting_canonical_ack': retained-acked, 'last_error_type': self.last_error,
             'last_intake_error_type': self.last_intake_error, 'intake_failures_this_run': self.intake_failures,
             'replay_error_type': self.replay_error, 'replayed_canonical_bytes': replay_offset,
-            'queue_lanes': lanes, 'scheduling': '3 live : 1 replay slots; unused capacity shared; durable age order within each lane',
+            'queue_lanes': lanes, 'scheduling': '2 fresh live : 1 age-fair live : 1 replay; unused capacity shared; no input expiration',
             'inference_cache_entries': cache_entries, 'inference_metrics': metrics,
             'source_ledger_backlog_bytes': max(0, self.ledger_path.stat().st_size-replay_offset)
                 if self.ledger_path and self.ledger_path.exists() else None,
@@ -362,6 +370,7 @@ class SentimentResearch:
         from src.research.data_miners import Enriches, MinerSpec
         return {MINER: pool.register(MinerSpec(MINER, Enriches.NARRATIVE, 2,
             endpoint='local:offline_pinned_onnx',
+            resource_class='LOCAL_CPU',
             detail='all-source durable sentiment windows; uncalibrated research only'), self.fetch)}
 
     async def stop(self):
