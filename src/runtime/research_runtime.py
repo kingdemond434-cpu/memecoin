@@ -209,6 +209,41 @@ class ResearchRuntime:
             "token": token, "fraction": fraction, "proceeds_usd": proceeds,
             "shadow_only": True})
 
+    def _prospective_native_observation_tokens(self, now):
+        """Admit fresh paper controls without replacing the stable outcome cohort.
+
+        An outcome cohort can remain occupied for an hour. It cannot be the
+        sole admission path for a prospective program with a 60-second entry
+        window. This selects observer work only, never an order or a fill.
+        """
+        runner = getattr(self, 'native_prospective_forward', None)
+        if not getattr(self, 'dry_run', False) or runner is None:
+            return []
+        from src.chains.pump_route import PUMP_PROGRAM
+        from src.chains.pumpswap_route import PUMPSWAP_PROGRAM
+        active = getattr(getattr(self, 'dataset_builder', None), 'active_episodes', {})
+        opened = {row.get('cohort_payload', {}).get('token') for row in runner.state.get('positions', {}).values()}
+        experiments = runner.validation.state.get('experiments', {})
+        # Verify each immutable declaration once per observer sweep, not once
+        # per active episode (which would multiply canonical disk reads).
+        windows = [(row['registered_at'],
+                    runner.validation._candidate(row).exact_candidate['max_decision_latency_ms']/1000)
+                   for row in experiments.values()]
+        tokens = []
+        for token, episode in active.items():
+            if token in opened:
+                tokens.append(token)
+                continue
+            if (episode.chain not in {'solana','Solana','Solana Mainnet'} or
+                    episode.factory not in {PUMP_PROGRAM,PUMPSWAP_PROGRAM,'pump','pump.fun','pumpswap'}):
+                continue
+            if any(registered <= episode.created_at <= now <= episode.created_at + latency
+                   for registered,latency in windows):
+                tokens.append(token)
+        observed = getattr(self, '_market_observed_at', {})
+        return sorted(tokens, key=lambda token: (token not in opened, observed.get(token,0),
+                                                 -active[token].created_at, token))
+
     async def _native_forward_tick(self, token: str, observed_at: float) -> dict:
         """Paper research follows the existing bounded market observation loop.
 
