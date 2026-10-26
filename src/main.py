@@ -1933,11 +1933,9 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
     def ingest_curve_account(self, token: str, data: bytes) -> bool:
         """Adopt a full bonding-curve account when the raw bytes are available.
 
-        A trade event carries virtual reserves only, so a state built from one
-        is complete enough to price and to build a transaction, but its real
-        reserves are unknown -- which is what makes every frontier derived
-        from it an upper bound rather than a measurement. An account update
-        carries all of it, so when one arrives it replaces the reconstruction
+        A legacy trade prefix can carry virtual reserves only; current decoded
+        events also supply the real reserve pair. An account update carries
+        its complete account layout, so when one arrives it replaces that state
         rather than being merged into it: mixing a measured field into a
         reconstructed record produces a row that is neither, and nothing
         downstream can tell which parts to trust.
@@ -3164,75 +3162,7 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
         self.counterfactual_lab.record_market_observation(token, multiple, observation["timestamp"])
         return multiple, current_value
 
-    async def _observe_active_markets(self):
-        """Collect outcome paths independently of prediction/trade authority.
 
-        A blocked model must not prevent the research lake from learning. The
-        loop is intentionally budgeted and age-adaptive so thousands of active
-        episodes cannot create an unbounded quote storm.
-        """
-        if not self.dataset_builder or not self.dataset_builder.active_episodes:
-            return
-        self._refresh_market_observation_cohort()
-        tokens = list(self._market_observation_cohort)
-        now = time.time()
-        paper_tokens = self._prospective_native_observation_tokens(now)
-        if not tokens and not paper_tokens:
-            return
-        budget = min(int(self.global_config.get("market_observation_budget", 5)), len(set(tokens) | set(paper_tokens)))
-        # Reserve part of the existing work budget for untouched fresh controls
-        # and their open positions. Do not enlarge RPC concurrency, evict the
-        # stable outcome cohort or request aggregator quotes for this paper lane.
-        paper_due = [token for token in paper_tokens
-                     if now-self._market_observed_at.get(token,0) >= 2][:max(0,(budget+1)//2)]
-        for token in paper_due:
-            self._market_observed_at[token] = now
-        budget -= len(paper_due)
-        inspected = 0
-        due = []
-        while inspected < len(tokens) and budget > 0:
-            token = tokens[self._market_cursor % len(tokens)]
-            self._market_cursor = (self._market_cursor + 1) % max(len(tokens), 1)
-            inspected += 1
-            episode = self.dataset_builder.active_episodes.get(token)
-            if not episode:
-                continue
-            age = max(0.0, now - episode.created_at)
-            interval = 2.0 if age < 60 else 10.0 if age < 300 else 60.0
-            if now - self._market_observed_at.get(token, 0) < interval:
-                continue
-            self._market_observed_at[token] = now
-            budget -= 1
-            due.append(token)
-        all_active = set(self.dataset_builder.active_episodes)
-        for stale in set(self._market_observed_at) - all_active:
-            self._market_observed_at.pop(stale, None)
-            self._market_entry_price.pop(stale, None)
-            self._curve_entry_price.pop(stale, None)
-        if due or paper_due:
-            sampled = due + paper_due
-            results = await asyncio.gather(
-                *(self._observe_token_market(token, now) for token in due),
-                *(self._native_forward_tick(token, now) for token in paper_due),
-                return_exceptions=True,
-            )
-            for token, result in zip(sampled, results):
-                if isinstance(result, Exception):
-                    logger.warning("Market observation failed for %s: %s", token, type(result).__name__)
-
-    def _refresh_market_observation_cohort(self):
-        """Keep a bounded cohort long enough to collect repeated executable marks."""
-        active = self.dataset_builder.active_episodes
-        limit = max(1, int(self.global_config.get("market_observation_cohort_size", 100)))
-        self._market_observation_cohort.intersection_update(active)
-        if len(self._market_observation_cohort) >= limit:
-            return
-        newest = sorted(
-            (episode for token, episode in active.items() if token not in self._market_observation_cohort),
-            key=lambda episode: (float(episode.created_at), episode.token), reverse=True,
-        )
-        for episode in newest[:limit - len(self._market_observation_cohort)]:
-            self._market_observation_cohort.add(episode.token)
 
     async def _observe_token_market(self, token: str, observed_at: float):
         try:
@@ -3871,20 +3801,24 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
                 # is stale. Bumping here rather than on a timer is what makes
                 # staleness mean "the market changed" instead of "time passed".
                 self.state_sequencer.bump(token)
-                # Static facts about the curve -- who created it, how large
-                # the supply is -- do not arrive on trade events and do not
-                # change. Carrying them forward from the creation event is
-                # what lets a trade event produce a state complete enough to
-                # build a transaction from. Without it the native route
-                # refused every trade for want of a creator it had already
-                # been told once.
+                # Preserve creation supply and the fallback creator for older
+                # trade prefixes. Current events can also provide the creator;
+                # no missing field is replaced with a purported observation.
                 static = self._curve_static.get(token, {})
+                real_sol, real_token = event.get('real_sol_reserves'), event.get('real_token_reserves')
+                measured_real = (event.get('real_reserve_data_status') == 'OBSERVED_OFFICIAL_PUMP_TRADE'
+                    and event.get('program') == PumpFunMonitor.PUMP_FUN_PROGRAM
+                    and type(real_sol) is int and type(real_token) is int
+                    and 0 <= real_sol <= virtual_sol and 0 <= real_token <= virtual_token)
+                if event.get('creator'):
+                    static = self._curve_static.setdefault(token,{})
+                    static['creator'] = event['creator']
                 self._latest_curve_state[token] = BondingCurveState(
                     virtual_token_reserves=virtual_token, virtual_sol_reserves=virtual_sol,
-                    # The TradeEvent carries no real reserves. Leaving these at
-                    # zero is what marks every frontier derived from this state
-                    # as an upper bound rather than a measurement.
-                    real_token_reserves=0, real_sol_reserves=0,
+                    # Current official events carry both real reserves. Only
+                    # a decoded, complete and sane pair can replace unknowns.
+                    real_token_reserves=real_token if measured_real else 0,
+                    real_sol_reserves=real_sol if measured_real else 0,
                     token_total_supply=int(static.get("token_total_supply", 0) or 0),
                     complete=False, creator=str(static.get("creator", "") or ""),
                 )
@@ -3929,7 +3863,10 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
                            # pre-migration launch cannot have. Storing the
                            # reserves keeps the derivation point-in-time.
                            "virtual_sol_reserves": virtual_sol or None,
-                           "virtual_token_reserves": virtual_token or None}
+                           "virtual_token_reserves": virtual_token or None,
+                           "real_sol_reserves": event.get('real_sol_reserves'),
+                           "real_token_reserves": event.get('real_token_reserves'),
+                           "real_reserve_data_status": event.get('real_reserve_data_status','UNMEASURED')}
             reference_receipt_at, reference_source_at = time.time(), event.get("timestamp")
             if (virtual_sol > 0 and virtual_token > 0 and event.get("signature")
                     and type(reference_source_at) in (float, int) and math.isfinite(reference_source_at)
