@@ -36,6 +36,11 @@ Paper cashflow includes modeled native fees/impact and measured simulation
 network fees. Actual landing/failure distributions, tips/priority-fee policy and
 account-rent lifecycle parity remain unmeasured. Outcomes explicitly retain
 these limitations, `live_costs_complete: false` and no verified live profit.
+A successful unsigned simulation does not establish confirmed balance-delta
+amounts: paper quantities come from native quote arithmetic. Native-denominated
+PnL is valued at the observed exit SOL/USD reference, not represented as an
+independently reconciled USD cash ledger. Holding marks use local arithmetic;
+fresh fee/simulation RPC work is requested only when an exit rule triggers.
 A positive control outcome is not a profitable strategy or promotion evidence.
 
 `/status.native_prospective_paper` exposes registered programs/experiments,

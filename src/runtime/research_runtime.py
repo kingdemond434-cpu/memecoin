@@ -263,7 +263,10 @@ class ResearchRuntime:
         fee_rows = {}
         adapter = NativeSimulationFeeAdapter(getattr(self, "execution_engine", None), self.trade_evidence)
         intents = {f"{intent['phase']}:{intent['amount']}":intent
-            for runner in producers for intent in runner.cost_requests(token,raw,now=observed_at)}
+            for runner in producers
+            if type(stamp) in (int,float) and observed_at-runner.max_state_age<=stamp<=observed_at
+            for intent in runner.cost_requests(token,raw,now=observed_at,
+                native_state=state,fee_bps=fee_bps)}
         for intent in intents.values():
             try:
                 quote, _ = producer._quote(state, intent["amount"], buying=intent["phase"] == "entry",

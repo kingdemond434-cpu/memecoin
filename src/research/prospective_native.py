@@ -33,6 +33,8 @@ def control_program(seed, registered_at):
         'holding_semantics':'first actually observed executable exit after trigger; never fill at an unseen cutoff',
         'selection_scope':'infrastructure cost control, no claimed predictive edge',
         'cost_scope':'native quote fees/impact plus measured unsigned-simulation network fee',
+        'amount_scope':'paper amounts from native quote arithmetic; simulation success is not confirmed balance-delta execution',
+        'conversion_scope':'native-denominated pnl valued at observed exit SOL/USD; not a USD cash-ledger return',
         'unmeasured_live_costs':['landing/failure distribution','priority fees and bundle tips','rent lifecycle parity']}
 
 
@@ -128,6 +130,7 @@ class ProspectiveNativeValidation(ResearchValidationService):
             'live_costs_complete':False,
             'account_scope':'independent virtual account per cohort',
             'cost_scope':program['cost_scope'],
+            'amount_scope':program['amount_scope'],'conversion_scope':program['conversion_scope'],
             'unmeasured_live_costs':program['unmeasured_live_costs']}
 
     def reconcile_forward(self):

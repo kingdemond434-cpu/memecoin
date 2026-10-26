@@ -39,6 +39,9 @@ def test_prospective_control_opens_and_closes_with_actual_quote_math_without_his
     entered=tick(runner,desk,row,now)
     assert entered['detail']['open_positions']==1,entered
     assert next(iter(runner.state['positions'].values()))['equity_usd']==1000.
+    # Holding marks are local arithmetic, not repeated fee/simulation RPC work.
+    assert runner.cost_requests(row['token'],row,now=now+5,native_state=curve(),fee_bps=100)==[]
+    assert len(runner.cost_requests(row['token'],row,now=now+61,native_state=curve(),fee_bps=100))==1
     closed=tick(runner,desk,row,now+61)
     receipt=closed['detail']['results'][0]
     assert receipt['pnl']<0 and receipt['paper'] is True and receipt['real_fill'] is False

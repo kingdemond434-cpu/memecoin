@@ -156,7 +156,7 @@ class NativeForwardPaper:
             raise ReplayBlocked("canonical native simulation cost receipt mismatch")
         return costs["network_fee_native"], costs["failed_cost_native"]
 
-    def cost_requests(self, token, episode, *, now):
+    def cost_requests(self, token, episode, *, now, native_state=None, fee_bps=None):
         """Bounded exact intents for the registered asynchronous fee adapter."""
         intents = {}
         for eid, experiment in self.validation.state["experiments"].items():
@@ -170,6 +170,15 @@ class NativeForwardPaper:
                 position = self.state["positions"].get(key)
                 if position:
                     phase, amount = "exit", position["tokens"]
+                    if native_state is not None:
+                        quote,_=self._quote(native_state,amount,buying=False,fee_bps=fee_bps,now=now)
+                        if quote.data_status!='OK' or quote.output_amount<=0:
+                            continue
+                        multiple=(quote.output_amount+quote.fee_amount)/LAMPORTS/position['entry_cost_native']
+                        mark=Mark(now,multiple,position['entry_cost_native'],True)
+                        rule=compile_exit(spec.exact_candidate,entry_time=position['entry_at'])
+                        if rule([mark],1.) is None:
+                            continue  # Local mark only; do not spend RPC quota while simply holding.
                 else:
                     program = self._compiled(spec)
                     target = episode["created_at"] + program.mechanism.decision_offset_s
