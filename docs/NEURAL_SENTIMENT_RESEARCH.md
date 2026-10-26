@@ -65,6 +65,16 @@ Existing rows migrate by original intake provenance and durable insertion order.
 Lane backlog and oldest age are reported separately. This bounds competition
 from a large backfill; it does not guarantee processing deadlines under overload.
 
+Replay verifies its source rows before indexing them. All inputs from one byte
+quantum and its replay cursor commit together in the derived SQLite database,
+with a writer reservation and cursor comparison to prevent concurrent rewind.
+An intake failure rolls back that complete batch; retained canonical sources
+remain available for retry. EOF does not commit an unchanged checkpoint. This
+removes per-post commit/fsync overhead without weakening durability, source
+hash checks or canonical annotation ACKs. `replay_commits` and measured
+`last_replay_seconds` expose the work. These are processing observations, not
+provider billing, token prediction accuracy or a guaranteed throughput rate.
+
 The miner declares `LOCAL_CPU` resource use and has a separate serial execution
 lane. Slow sockets can occupy all network slots without occupying this offline
 slot. ONNX still uses one CPU thread, each inference pass has bounded work, and
