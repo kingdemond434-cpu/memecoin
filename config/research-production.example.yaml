@@ -3,6 +3,8 @@
 # requires a sealed, observed corpus; DATA_BLOCKED audit output is not a split.
 global:
   onion_auto_discovery: false
+  # Explicit opt-in default for this example. Inspect the deployed configuration
+  # and successful observation/delivery counters to determine live collection.
   # Persistent expanding frontier: no source/page/depth admission ceiling.
   # Workers and request pacing bound active work; all pending URLs stay on disk.
   onion_frontier_path: data/state/public_onion_frontier.sqlite
