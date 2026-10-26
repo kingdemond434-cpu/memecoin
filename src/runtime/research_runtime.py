@@ -53,6 +53,15 @@ class ResearchRuntime:
         validation.configure_evidence(self.trade_evidence)
         validation.configure_integrations(self.chain_registry,
             {adapter.chain_name: adapter for adapter in self.evm_observers})
+        # A separate prospective cost-control registry can measure fresh paper
+        # cohorts before any historical survivor exists. It never joins the
+        # hypothesis/champion/ForwardEvidence registries or a live order path.
+        if getattr(self, 'dry_run', False):
+            from src.research.prospective_native import ProspectiveNativeValidation, ProspectiveNativeForward
+            self.native_prospective_validation = ProspectiveNativeValidation(
+                self.champion_challenger,self.trade_evidence,
+                virtual_seed_usd=float(self.global_config.get('paper_equity_usd',10_000)),now=time.time())
+            self.native_prospective_forward = ProspectiveNativeForward(self.native_prospective_validation)
         workflows = ResearchWorkflows(self.unknown_engine,
             population=PopulationHunter(self.champion_challenger, actor_store=self.actor_store),
             laboratory=MechanismLaboratory(self.champion_challenger), validation=validation, seed_labs=True,
@@ -208,6 +217,7 @@ class ResearchRuntime:
         """
         from src.research.native_forward import NativeForwardPaper, NativeSimulationFeeAdapter
         from src.research.candidate_replay import ReplayBlocked
+        from src.chains.rpc_manager import RPCError, RPCUnavailable
         workflows = getattr(getattr(self, "unknown_engine", None), "workflows", None)
         validation = getattr(workflows, "validation", None)
         builder = getattr(self, "dataset_builder", None)
@@ -217,6 +227,8 @@ class ResearchRuntime:
         producer = getattr(self, "native_forward_paper", None)
         if producer is None or producer.validation is not validation:
             producer = self.native_forward_paper = NativeForwardPaper(validation)
+        prospective = getattr(self, 'native_prospective_forward', None) if getattr(self, 'dry_run', False) else None
+        producers = [producer]+([prospective] if prospective is not None else [])
         raw = builder._episode_to_dict(episode)
         # These are actual capture times, not claimed availability at the
         # scheduled snapshot cutoff. The exact interpreter may refuse a lag.
@@ -250,7 +262,12 @@ class ResearchRuntime:
                 fee_bps = round(costs["entry_cost"] * 10000)
         fee_rows = {}
         adapter = NativeSimulationFeeAdapter(getattr(self, "execution_engine", None), self.trade_evidence)
-        for intent in producer.cost_requests(token, raw, now=observed_at):
+        intents = {f"{intent['phase']}:{intent['amount']}":intent
+            for runner in producers
+            if type(stamp) in (int,float) and observed_at-runner.max_state_age<=stamp<=observed_at
+            for intent in runner.cost_requests(token,raw,now=observed_at,
+                native_state=state,fee_bps=fee_bps)}
+        for intent in intents.values():
             try:
                 quote, _ = producer._quote(state, intent["amount"], buying=intent["phase"] == "entry",
                                            fee_bps=fee_bps, now=observed_at)
@@ -260,20 +277,21 @@ class ResearchRuntime:
                 # no transaction submission exists in this registered adapter.
                 row = await adapter.acquire(token, intent["amount"], buying=intent["phase"] == "entry", now=observed_at)
                 fee_rows[f"{intent['phase']}:{intent['amount']}"] = row
-            except (ReplayBlocked, ValueError, TypeError, KeyError, ConnectionError, TimeoutError) as exc:
+            except (ReplayBlocked, ValueError, TypeError, KeyError, ConnectionError, TimeoutError, RPCError, RPCUnavailable) as exc:
                 self.trade_evidence.record("research_native_simulation_blocked", {
                     "token": token, "reason": str(exc) if isinstance(exc, ReplayBlocked) else type(exc).__name__,
                     "scope": "READ_ONLY_NATIVE_SIMULATION"})
         decision_at = max(observed_at, time.time())
-        result = producer.tick(token, raw, state, state_observed_at=stamp,
+        results = [runner.tick(token, raw, state, state_observed_at=stamp,
             source_ref=source_ref, equity_usd=(getattr(self, "wallet_equity_usd", None)
                 if getattr(self, "equity_status", None) == "OK" else None),
             native_to_usd=(getattr(self, "sol_price_usd", None)
                 if getattr(self, "sol_price_age_s", float("inf")) <= 30 else None), now=decision_at,
-            fee_bps=fee_bps, execution_costs=fee_rows)
+            fee_bps=fee_bps, execution_costs=fee_rows) for runner in producers]
+        result = results[0]
         # Requests join the existing queue, which already owns backoff and named
         # wake conditions; this seam creates no scheduler.
-        for child in result.get("children", []):
+        for child in (child for item in results for child in item.get('children',[])):
             self.unknown_engine.enqueue_work(child["kind"], child["payload"],
                 evidence_refs=[], now=observed_at)
-        return result
+        return {**result,'prospective_control':results[1]} if len(results)>1 else result

@@ -610,6 +610,9 @@ class ReportingSurface:
                 if getattr(self, "fork_probe", None) is not None else {"status": "NOT_OBSERVED"}),
             'neural_sentiment': (self.neural_sentiment.report()
                 if getattr(self, 'neural_sentiment', None) is not None else {'status': 'NOT_OBSERVED'}),
+            'native_prospective_paper': (self.native_prospective_forward.report()
+                if getattr(self,'native_prospective_forward',None) is not None
+                else {'status':'NOT_CONFIGURED','promotion_eligible':False}),
             "population_research_intake": getattr(self, "population_research_intake", {"status": "NOT_OBSERVED"}),
             # Which operator is answering each question right now, and what
             # is dark. A domain running on its third rung is fine and is
