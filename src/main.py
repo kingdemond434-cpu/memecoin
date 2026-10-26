@@ -3162,75 +3162,7 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
         self.counterfactual_lab.record_market_observation(token, multiple, observation["timestamp"])
         return multiple, current_value
 
-    async def _observe_active_markets(self):
-        """Collect outcome paths independently of prediction/trade authority.
 
-        A blocked model must not prevent the research lake from learning. The
-        loop is intentionally budgeted and age-adaptive so thousands of active
-        episodes cannot create an unbounded quote storm.
-        """
-        if not self.dataset_builder or not self.dataset_builder.active_episodes:
-            return
-        self._refresh_market_observation_cohort()
-        tokens = list(self._market_observation_cohort)
-        now = time.time()
-        paper_tokens = self._prospective_native_observation_tokens(now)
-        if not tokens and not paper_tokens:
-            return
-        budget = min(int(self.global_config.get("market_observation_budget", 5)), len(set(tokens) | set(paper_tokens)))
-        # Reserve part of the existing work budget for untouched fresh controls
-        # and their open positions. Do not enlarge RPC concurrency, evict the
-        # stable outcome cohort or request aggregator quotes for this paper lane.
-        paper_due = [token for token in paper_tokens
-                     if now-self._market_observed_at.get(token,0) >= 2][:max(0,(budget+1)//2)]
-        for token in paper_due:
-            self._market_observed_at[token] = now
-        budget -= len(paper_due)
-        inspected = 0
-        due = []
-        while inspected < len(tokens) and budget > 0:
-            token = tokens[self._market_cursor % len(tokens)]
-            self._market_cursor = (self._market_cursor + 1) % max(len(tokens), 1)
-            inspected += 1
-            episode = self.dataset_builder.active_episodes.get(token)
-            if not episode:
-                continue
-            age = max(0.0, now - episode.created_at)
-            interval = 2.0 if age < 60 else 10.0 if age < 300 else 60.0
-            if now - self._market_observed_at.get(token, 0) < interval:
-                continue
-            self._market_observed_at[token] = now
-            budget -= 1
-            due.append(token)
-        all_active = set(self.dataset_builder.active_episodes)
-        for stale in set(self._market_observed_at) - all_active:
-            self._market_observed_at.pop(stale, None)
-            self._market_entry_price.pop(stale, None)
-            self._curve_entry_price.pop(stale, None)
-        if due or paper_due:
-            sampled = due + paper_due
-            results = await asyncio.gather(
-                *(self._observe_token_market(token, now) for token in due),
-                *(self._native_forward_tick(token, now) for token in paper_due),
-                return_exceptions=True,
-            )
-            for token, result in zip(sampled, results):
-                if isinstance(result, Exception):
-                    logger.warning("Market observation failed for %s: %s", token, type(result).__name__)
-
-    def _refresh_market_observation_cohort(self):
-        """Keep a bounded cohort long enough to collect repeated executable marks."""
-        active = self.dataset_builder.active_episodes
-        limit = max(1, int(self.global_config.get("market_observation_cohort_size", 100)))
-        self._market_observation_cohort.intersection_update(active)
-        if len(self._market_observation_cohort) >= limit:
-            return
-        newest = sorted(
-            (episode for token, episode in active.items() if token not in self._market_observation_cohort),
-            key=lambda episode: (float(episode.created_at), episode.token), reverse=True,
-        )
-        for episode in newest[:limit - len(self._market_observation_cohort)]:
-            self._market_observation_cohort.add(episode.token)
 
     async def _observe_token_market(self, token: str, observed_at: float):
         try:
