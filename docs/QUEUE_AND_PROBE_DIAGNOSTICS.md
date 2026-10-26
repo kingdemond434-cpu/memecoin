@@ -8,6 +8,22 @@ loop. Cancellation drains initiated database operations before resources may
 close. An annotation still requires the existing canonical acknowledgement
 before consumers can read it; neither cancellation nor cache reuse grants one.
 
+The owner-loop observation lookup uses a separate read-only SQLite connection
+and lock. WAL snapshots let it read committed ACKed rows while the queue writer
+holds a transaction or the reporting lock. Uncommitted ACKs remain invisible,
+and availability-time filtering still applies. This removes that shared Python
+lock from delivery; disk I/O, process scheduling and other owner-loop work can
+still delay a request. The reader closes with its component.
+
+Queue reporting has its own read-only connection and lock as well. A single
+input grouping replaces separate totals, oldest-pending and lane scans, and
+an explicit read transaction keeps all database counters on the same committed
+snapshot. Reporting no longer holds the intake/commit or observation Python
+locks. It still scans the retained input index, so it is not constant-time.
+The report includes read-start and elapsed timing; these are measurements,
+not a guarantee of processing capacity or zero backlog. All three connections
+close with the component.
+
 `neural_sentiment.last_fetch_profile` separates disk/lock wait, inference await,
 total fetch elapsed time and returned windows. Inference await includes pipe
 and scheduling delay; it is not pure ONNX compute latency. The model weights,
