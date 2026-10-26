@@ -135,7 +135,22 @@ class MinedRecordIngestion:
         event = {**event, "provisional": not bool(spec and spec.trusted)}
         # Archive before enrichment/admission; unknown executable prices cannot
         # erase a launch from the collection denominator.
-        self.trade_evidence.record("native_launch", event)
+        native_row = self.trade_evidence.record("native_launch", event)
+        if native_row is None:
+            self._stream_events['native_launch:canonical_failed'] = self._stream_events.get(
+                'native_launch:canonical_failed', 0)+1
+            return
+        probe = getattr(self, 'fork_probe', None)
+        if callable(getattr(probe, 'enqueue_native_launch', None)):
+            try:
+                await asyncio.to_thread(probe.enqueue_native_launch, event,
+                    source_ref='native-launch:'+native_row['hash'], available_at=native_row['timestamp'])
+            except Exception as exc:
+                # The canonical raw launch survives for retry/reconciliation;
+                # an intake failure must not erase the other research paths.
+                self._stream_events['native_probe_intake_failed'] = self._stream_events.get(
+                    'native_probe_intake_failed', 0)+1
+                logger.warning('Native probe intake delayed: %s', type(exc).__name__)
         self._record_hot_creator(token, event)
         self.launch_census.see(token, creator=creator, at=observed_at,
                                regime=str(self.current_regime or "unknown"))

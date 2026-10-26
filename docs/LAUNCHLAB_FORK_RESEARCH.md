@@ -1,7 +1,24 @@
 # LaunchLab sampled-bank sellability
 
-Native LaunchLab discovery now feeds the durable local fork-probe queue from
-observed episode mint/pool/quote identities. The adapter reads the actual pool,
+Decoded WSOL LaunchLab launches enter the durable local fork-probe queue after
+their canonical append and before episode enrichment. Polling observed episode
+mint/pool/quote identities remains a fallback. Source hashes, original recorded
+availability and intake time are retained separately from target identity;
+repeat intake does not reset arrival or retry state. Failed canonical appends
+stop downstream launch admission. Queue-write failures increment the stream
+intake-failure counter while the raw journal remains available for recovery.
+Earlier rows can be reconciled explicitly with
+`python -m tools.backfill_native_fork_targets --ledger <sealed-journal> --certificate <owner-certificate> --database <research-db> --output <new-receipt>`.
+The default is a dry run; add `--apply` to enroll reviewed candidates. The
+shared certified-recovery verifier checks every source byte and the final
+record. A temporary disk-backed proposal index keeps admission independent
+of RAM and candidate-count limits. Source changes are rejected before writes;
+repeat enrollment is idempotent. Other quotes/venues remain deferred.
+Historical source availability remains original, while intake and subsequent
+current-bank probes receive their actual new times. This does not reconstruct
+historical banks or turn old launches into retrospectively available fills.
+
+The adapter reads the actual pool,
 global and platform configuration, vaults, mints and executable images. The
 final frame must come from one finalized bank; bootstrap reads do not substitute
 for that frame. Its complete archive is hashed before the isolated VM executes.
@@ -22,6 +39,8 @@ Neither a constant-product approximation nor fabricated reserves are used.
 Failures retain their receipts and are not automatically labeled honeypots.
 
 The existing canonical ACK and point-in-time availability contract applies.
+Consumers cannot read a result before its linked native sources were available
+and ingested, including after a host wall-clock correction.
 There is no real wallet, transaction submission, order authority or promotion
 write. Bundled SVM feature/loader parity with the sampled validator remains
 unverified, and a sampled successful sell cannot guarantee future transferability.
