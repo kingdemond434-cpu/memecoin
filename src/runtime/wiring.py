@@ -586,7 +586,8 @@ class SubsystemWiring:
         # The entry thesis, frozen before the action it justifies.
         self.trade_evidence = TradeEvidenceLedger(
             Path(self.global_config.get("ops_state_dir", "data/state"))
-            / "trade_evidence.jsonl")
+            / "trade_evidence.jsonl",
+            recovery_certificate=self.global_config.get('evidence_recovery_certificate') or None)
         self.monster_machine = MonsterStateMachine(
             monster_probability_threshold=float(
                 self.global_config.get("monster_probability_threshold", 0.15)),

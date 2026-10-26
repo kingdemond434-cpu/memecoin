@@ -12,31 +12,10 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-import re
 import time
 
 from src.research.trade_evidence import GENESIS, _verified_row
-
-SCHEMA = 'canonical-backup-certificate-v1'
-
-
-def fingerprint(value):
-    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
-                                     allow_nan=False).encode()).hexdigest()
-
-
-def validate_certificate(value):
-    body = {key: item for key, item in value.items() if key != 'certificate_sha256'}
-    if (value.get('schema') != SCHEMA or value.get('status') != 'PASS'
-            or value.get('hash_chain_verified') is not True
-            or fingerprint(body) != value.get('certificate_sha256')):
-        raise ValueError('invalid canonical prefix certificate')
-    for key in ('canonical_bytes', 'canonical_records'):
-        if type(value.get(key)) is not int or value[key] < 0:
-            raise ValueError('invalid canonical prefix extent')
-    for key in ('canonical_sha256', 'last_hash'):
-        if not re.fullmatch('[0-9a-f]{64}', value.get(key, '')):
-            raise ValueError('invalid canonical prefix digest')
+from src.research.evidence_certificate import SCHEMA, fingerprint, validate_certificate
 
 
 def verify(path, *, prefix=None, certificate=None):
