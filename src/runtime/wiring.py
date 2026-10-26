@@ -1338,7 +1338,7 @@ class SubsystemWiring:
         self.neural_sentiment = SentimentResearch(
             Path(self.global_config.get('ops_state_dir', 'data/state')) / 'neural_sentiment.sqlite',
             python=sentiment_config.get('python'), model_root=sentiment_config.get('model_root'),
-            ledger_path=self.trade_evidence.path)
+            ledger_path=self.trade_evidence.path, intra_op_threads=sentiment_config.get('intra_op_threads', 1))
         self.miner_registration.update(self.neural_sentiment.register(self.data_miners))
         # Chain facts the program stream does not carry: what landing costs
         # right now, whether the chain is keeping up, whether the supply is

@@ -99,6 +99,63 @@ async def test_result_write_failure_rolls_back_cache_and_annotation_but_counts_r
     queue.close()
 
 
+@pytest.mark.parametrize('value', [0, -1, True, 1.5, '4', None, 9])
+def test_cpu_profile_rejects_invalid_or_oversubscribed_thread_counts(value,monkeypatch):
+    from src.research.neural_sentiment import OfflineWorker
+    monkeypatch.setattr('src.research.neural_sentiment.os.cpu_count', lambda: 8)
+    with pytest.raises(ValueError, match='thread count'):
+        OfflineWorker('python', 'public-model', intra_op_threads=value)
+
+
+@pytest.mark.asyncio
+async def test_cpu_profile_is_reported_and_separates_cache_identity(tmp_path,monkeypatch):
+    from src.research.neural_sentiment import inference_profile
+    monkeypatch.setattr('src.research.neural_sentiment.os.cpu_count', lambda: 8)
+    worker = CountingWorker()
+    queue = SentimentResearch(tmp_path/'nlp.sqlite', worker=worker)
+    enqueue(queue, job='first')
+    first = await queue.fetch()
+    queue.acknowledge(first, 'canonical:first-profile')
+    queue.inference_profile = inference_profile(4)
+    enqueue(queue, job='second')
+    second = await queue.fetch()
+    assert worker.calls == 2
+    assert first[0]['inference_cache_key'] != second[0]['inference_cache_key']
+    assert second[0]['inference_profile']['intra_op_threads'] == 4
+    assert queue.report()['inference_profile'] == second[0]['inference_profile']
+    queue.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mismatch', [False, True])
+async def test_worker_passes_profile_without_credentials_and_verifies_child_receipt(monkeypatch,mismatch):
+    import json
+    from unittest.mock import AsyncMock, Mock
+    from src.research.neural_sentiment import OfflineWorker, inference_profile
+    monkeypatch.setattr('src.research.neural_sentiment.os.cpu_count', lambda: 8)
+    response = {'ok': True, 'result': {'fixture': True},
+                'inference_profile': inference_profile(1 if mismatch else 4)}
+    process = SimpleNamespace(returncode=None,
+        stdin=SimpleNamespace(write=Mock(), drain=AsyncMock()),
+        stdout=SimpleNamespace(readline=AsyncMock(return_value=(json.dumps(response)+'\n').encode())),
+        kill=Mock(), wait=AsyncMock())
+    async def spawn(*args, **kwargs):
+        assert args[-2:] == ('--threads', '4')
+        assert set(kwargs['env']) <= {'SYSTEMROOT','WINDIR','TEMP','TMP','PYTHONPATH',
+                                     'PYTHONIOENCODING','HF_HUB_OFFLINE','TOKENIZERS_PARALLELISM'}
+        return process
+    monkeypatch.setattr('asyncio.create_subprocess_exec', spawn)
+    worker = OfflineWorker('python', 'public-model', intra_op_threads=4)
+    if mismatch:
+        with pytest.raises(ValueError):
+            await worker.infer('public fixture', 0)
+        process.kill.assert_called_once()
+        assert worker.process is None
+    else:
+        assert await worker.infer('public fixture', 0) == {'fixture': True}
+        await worker.stop()
+
+
 @pytest.mark.asyncio
 async def test_newest_post_bypasses_live_backlog_without_starving_old_live_or_replay(tmp_path,monkeypatch):
     path=tmp_path/'nlp.sqlite'
