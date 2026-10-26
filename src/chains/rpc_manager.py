@@ -1,6 +1,7 @@
 import asyncio
 from src.runtime.loop_local import loop_local_lock, loop_local_semaphore
 import logging
+import math
 import os
 import random
 import time
@@ -9,7 +10,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional, Set
 from urllib.parse import urlsplit
-from src.chains.rpc_budget import RPCBudget, RPCBudgetExhausted
+from src.chains.rpc_budget import RPCBudget, RPCBudgetExhausted, RPCProviderCooling, SharedRPCCooldowns
+from email.utils import parsedate_to_datetime
+from datetime import timezone
 
 import aiohttp
 import yaml
@@ -123,6 +126,8 @@ class RPCManager:
         self._request_semaphore = loop_local_semaphore(
             max_concurrent_total, "rpc_manager.requests")
         self._helius_budget = None
+        shared_path = os.getenv('MEMECOIN_RPC_BUDGET_DB')
+        self._shared_cooldowns = SharedRPCCooldowns(shared_path) if shared_path else None
         if os.getenv("HELIUS_API_KEY") and any(self._is_helius(e) for e in self.endpoints):
             self._helius_budget = RPCBudget(os.getenv("MEMECOIN_RPC_BUDGET_DB", "data/state/rpc_budget.sqlite"),
                 os.environ["HELIUS_API_KEY"], rps=float(os.getenv("MEMECOIN_RPC_RPS", "10")),
@@ -134,8 +139,20 @@ class RPCManager:
         return urlsplit(ep.endpoint.url).hostname in {"mainnet.helius-rpc.com", "devnet.helius-rpc.com"}
 
     async def _allocate(self, ep, methods):
+        if self._cooldown_deadline(ep) > time.time():
+            raise RPCProviderCooling(ep.cooldown_until)
         if self._helius_budget is not None and self._is_helius(ep):
             await self._helius_budget.acquire(methods)
+        # A different manager/process may have received 429 while this call
+        # waited for its allocation. Recheck before opening another socket.
+        if self._cooldown_deadline(ep) > time.time():
+            raise RPCProviderCooling(ep.cooldown_until)
+
+    def _cooldown_deadline(self, ep):
+        shared = getattr(self, '_shared_cooldowns', None)
+        if shared is not None:
+            ep.cooldown_until = max(ep.cooldown_until, shared.until(ep.endpoint))
+        return ep.cooldown_until
 
     def _session_for_loop(self):
         """This loop's aiohttp session, created on first use by that loop.
@@ -244,6 +261,9 @@ class RPCManager:
         if self._helius_budget is not None:
             self._helius_budget.close()
             self._helius_budget = None
+        if self._shared_cooldowns is not None:
+            self._shared_cooldowns.close()
+            self._shared_cooldowns = None
 
     async def _initial_health_check(self):
         await asyncio.gather(*[self._check_endpoint(e) for e in self.endpoints])
@@ -254,7 +274,7 @@ class RPCManager:
             await asyncio.gather(*[self._check_endpoint(e) for e in self.endpoints])
 
     async def _check_endpoint(self, ep: EndpointHealth):
-        if ep.cooldown_until > time.time(): return
+        if self._cooldown_deadline(ep) > time.time(): return
         start = time.time()
         method, params = self._health_probe()
         try:
@@ -313,8 +333,7 @@ class RPCManager:
 
     @staticmethod
     def _retry_after_seconds(resp: Any, default: float) -> float:
-        """Honour a provider's own Retry-After, bounded so it cannot park an
-        endpoint for hours on a malformed or hostile header."""
+        """Honor finite delay/date headers, including genuine daily resets."""
         raw = ""
         try:
             raw = str(resp.headers.get("Retry-After", "")).strip()
@@ -322,9 +341,16 @@ class RPCManager:
             raw = ""
         if raw:
             try:
-                return max(0.0, min(float(raw), 300.0))
+                delay = float(raw)
+                if math.isfinite(delay) and delay >= 0:
+                    return delay
             except ValueError:
-                pass
+                try:
+                    until = parsedate_to_datetime(raw)
+                    if until.tzinfo is None: until = until.replace(tzinfo=timezone.utc)
+                    return max(0., until.timestamp()-time.time())
+                except (ValueError, TypeError, OverflowError):
+                    pass
         return default
 
     def _penalise(self, ep: EndpointHealth, status: int, cooldown: float = 0.0) -> None:
@@ -340,6 +366,8 @@ class RPCManager:
         ep.last_status = status
         if cooldown > 0:
             ep.cooldown_until = max(ep.cooldown_until, time.time() + cooldown)
+            if self._shared_cooldowns is not None:
+                self._shared_cooldowns.defer(ep.endpoint, ep.cooldown_until)
         if ep.consecutive_failures >= 3:
             ep.health = RPCHealth.DOWN
         else:
@@ -349,7 +377,7 @@ class RPCManager:
                          method: str = "") -> Optional[EndpointHealth]:
         now = time.time()
         candidates = [e for e in self.endpoints
-                      if e.health != RPCHealth.DOWN and e.cooldown_until <= now
+                      if e.health != RPCHealth.DOWN and self._cooldown_deadline(e) <= now
                       and not (method and method in e.blocked_methods)]
         if not candidates:
             # Retry-After is an actual refusal window, including when every
@@ -432,7 +460,8 @@ class RPCManager:
                     raise
                 except RPCBudgetExhausted as exc:
                     ep.cooldown_until = exc.retry_at
-                    last_refusal = "configured RPC allocation exhausted"
+                    last_refusal = ('RPC provider cooling after refusal' if isinstance(exc,RPCProviderCooling)
+                                    else 'configured RPC allocation exhausted')
                     continue
                 except Exception as e:
                     self._penalise(ep, 0)
@@ -500,7 +529,7 @@ class RPCManager:
             raise RuntimeError("No usable RPC endpoints")
 
         async def submit(item: EndpointHealth):
-            if item.cooldown_until > time.time(): return None
+            if self._cooldown_deadline(item) > time.time(): return None
             await self._allocate(item, [method])
             async with self.session.post(
                 item.endpoint.url,
@@ -508,6 +537,8 @@ class RPCManager:
                 headers=item.endpoint.headers,
             ) as resp:
                 if resp.status != 200:
+                    self._penalise(item,resp.status,self._retry_after_seconds(resp,30.)
+                        if resp.status == 429 else 0.)
                     return None
                 payload = await resp.json()
                 return payload.get("result")
@@ -518,6 +549,8 @@ class RPCManager:
         # after the racing window. The identical signed transaction cannot fill twice.
         for task in pending:
             task.cancel()
+        if pending:
+            await asyncio.gather(*pending,return_exceptions=True)
         results = [task.result() for task in done if not task.cancelled() and task.exception() is None]
         return next((value for value in results if value), None)
 
@@ -527,7 +560,8 @@ class RPCManager:
 
     def get_ws_urls(self) -> List[str]:
         """Return transport candidates without exposing them through status output."""
-        usable = [item for item in self.endpoints if item.endpoint.ws_url and item.health != RPCHealth.DOWN]
+        usable = [item for item in self.endpoints if item.endpoint.ws_url and item.health != RPCHealth.DOWN
+                  and self._cooldown_deadline(item) <= time.time()]
         healthy = [item for item in usable if item.health == RPCHealth.HEALTHY]
         degraded = [item for item in usable if item.health == RPCHealth.DEGRADED]
         return [item.endpoint.ws_url for item in healthy + degraded if item.endpoint.ws_url]
@@ -544,6 +578,7 @@ class RPCManager:
         return {
             "chain": self.chain_config.name,
             "provider_budget": self._helius_budget.report() if self._helius_budget is not None else None,
+            "shared_refusal_windows": self._shared_cooldowns is not None,
             "endpoints": [
                 {
                     # Provider keys commonly live in the query string or final
@@ -552,11 +587,12 @@ class RPCManager:
                     # path/query/fragment data.
                     "url": self._safe_endpoint_origin(e.endpoint.url),
                     "health": e.health.value,
-                    "available": e.health != RPCHealth.DOWN and e.cooldown_until <= time.time(),
+                    "available": e.health != RPCHealth.DOWN and self._cooldown_deadline(e) <= time.time(),
                     "cooldown_until": e.cooldown_until,
                     "latency_ms": round(e.latency_ms, 2),
                     "success": e.success_count,
                     "errors": e.error_count,
+                    "last_http_status": e.last_status,
                 }
                 for e in self.endpoints
             ],
