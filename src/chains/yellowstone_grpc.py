@@ -246,7 +246,7 @@ class YellowstoneClient:
                 raise
             except Exception as exc:
                 self.status = "DEGRADED"
-                self.status_detail = str(exc)
+                self.status_detail = f"transport unavailable: {type(exc).__name__}"
                 self._reconnect_attempts += 1
                 if self._reconnect_attempts > 10:
                     self.status = "DATA_BLOCKED"
@@ -447,7 +447,7 @@ class SolanaRpcProgramStream:
                     self.status_detail += f"; {len(failures)} program polls delayed"
             except Exception as exc:
                 self.status = "DEGRADED"
-                self.status_detail = str(exc)
+                self.status_detail = f"confirmed polling unavailable: {type(exc).__name__}"
             await asyncio.sleep(self.poll_interval)
 
     async def _ws_loop(self):
@@ -510,7 +510,9 @@ class SolanaRpcProgramStream:
                 self._ws_connected = False
                 self._ws_reconnects += 1
                 candidate_index += 1
-                logger.warning("Solana log WebSocket reconnecting: %s", exc)
+                # Transport exceptions can embed credential-bearing URLs or
+                # arbitrary provider close reasons. Keep those out of logs.
+                logger.warning("Solana log WebSocket reconnecting: %s", type(exc).__name__)
                 await asyncio.sleep(min(30, 2 + self._ws_reconnects * 2))
             finally:
                 self._ws = None
