@@ -24,6 +24,11 @@ the nominal timeout. Failed exits retain actual token balances and VM fee
 debits for subsequent attempts. Failed entries are terminal costed trials,
 not free retries with replenished capital.
 
+Venue rotation is persisted independently for each dispatch lane. A venue's
+retry cannot spend its fresh-target turn. This prevents the four-step lane
+cycle from repeatedly assigning the same venues to old-only or retry-only
+work. `lane_venue_service_tickets` exposes those separate service histories.
+
 Inventory and the result outbox commit together in `native_fork_probe.sqlite`.
 A restart redelivers the same pending result. A later execution must match its
 retained inventory to the preceding canonically acknowledged result. Public

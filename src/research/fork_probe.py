@@ -52,6 +52,8 @@ class ForkProbe:
           CREATE INDEX IF NOT EXISTS queue ON jobs(due,id);
           CREATE INDEX IF NOT EXISTS by_token ON results(json_extract(body,'$.token'),available DESC) WHERE ref IS NOT NULL;
           CREATE TABLE IF NOT EXISTS fork_venue_service(venue TEXT PRIMARY KEY,last_ticket INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS fork_lane_venue_service(lane TEXT NOT NULL,venue TEXT NOT NULL,
+            last_ticket INTEGER NOT NULL,PRIMARY KEY(lane,venue));
           CREATE TABLE IF NOT EXISTS native_target_sources(ref TEXT PRIMARY KEY,job TEXT NOT NULL,
             available REAL NOT NULL,ingested REAL NOT NULL);
           CREATE INDEX IF NOT EXISTS native_sources_by_job ON native_target_sources(job,ref);
@@ -122,14 +124,21 @@ class ForkProbe:
             paper_priority = ("CASE WHEN EXISTS(SELECT 1 FROM paper_bank_inventory p WHERE p.job=j.id "
                 "AND p.status='OPEN') THEN 0 ELSE 1 END," if self.paper_controls and lane=='DUE_RETRY' else '')
             job = self.db.execute('SELECT j.id,j.body,j.first_seen,'+venue+' FROM jobs j '
-                'LEFT JOIN fork_venue_service v ON v.venue='+venue+' WHERE due<=? AND '+predicate+
-                ' ORDER BY '+paper_priority+'COALESCE(v.last_ticket,0),'+order+' LIMIT 1', (now,)).fetchone()
+                'LEFT JOIN fork_lane_venue_service v ON v.venue='+venue+' AND v.lane=? WHERE due<=? AND '+predicate+
+                ' ORDER BY '+paper_priority+'COALESCE(v.last_ticket,0),'+order+' LIMIT 1', (lane, now)).fetchone()
             if job:
                 self.db.execute('UPDATE jobs SET due=?,attempts=attempts+1 WHERE id=?', (now+300, job[0]))
                 self.db.execute('UPDATE fork_dispatch SET cursor=? WHERE id=1', ((cursor+1) % 4,))
                 self.db.execute('INSERT INTO fork_venue_service VALUES(?, '
                     '(SELECT COALESCE(MAX(last_ticket),0)+1 FROM fork_venue_service)) '
                     'ON CONFLICT(venue) DO UPDATE SET last_ticket=excluded.last_ticket', (job[3],))
+                # Each lane rotates independently. A shared four-venue clock
+                # can phase-lock to the four-step lane cycle and never give
+                # some venues a fresh attempt, despite fair total counts.
+                self.db.execute('INSERT INTO fork_lane_venue_service VALUES(?,?, '
+                    '(SELECT COALESCE(MAX(last_ticket),0)+1 FROM fork_lane_venue_service WHERE lane=?)) '
+                    'ON CONFLICT(lane,venue) DO UPDATE SET last_ticket=excluded.last_ticket',
+                    (lane, job[3], lane))
                 sources = [{'source_ref': ref, 'available_at': at, 'ingested_at': ingested}
                     for ref, at, ingested in self.db.execute(
                         'SELECT ref,available,ingested FROM native_target_sources WHERE job=? ORDER BY ref', (job[0],))]
@@ -308,6 +317,9 @@ class ForkProbe:
                     'ROUNDTRIP_SUCCEEDED_IN_FORK', 0) else 'CANONICAL_DISPOSITIONS_ONLY' if row[
                     'canonical_dispositions'] else 'TARGETS_PENDING' if row['targets'] else 'NO_TARGETS_OBSERVED')
             venue_service = dict(self.db.execute('SELECT venue,last_ticket FROM fork_venue_service'))
+            lane_service = {}
+            for lane, venue, ticket in self.db.execute('SELECT lane,venue,last_ticket FROM fork_lane_venue_service'):
+                lane_service.setdefault(lane, {})[venue] = ticket
             source_links, source_targets = self.db.execute(
                 'SELECT count(*),count(DISTINCT job) FROM native_target_sources').fetchone()
         return {'status': 'LOCAL_FORK_RESEARCH', 'targets': jobs[0], 'attempts': jobs[1] or 0,
@@ -319,6 +331,7 @@ class ForkProbe:
                 'venue_scheduling': 'least recently serviced eligible venue within each lane; persistent monotone tickets',
                 'retry_policy': '300 seconds normally; observed migrated DBC curves retained with 3600-second recheck; no target deletion',
                 'venue_service_tickets': venue_service,
+                'lane_venue_service_tickets': lane_service,
                 'canonical_native_source_links': source_links, 'canonical_native_linked_targets': source_targets,
                 'supported_adapters': ['pump_curve', 'pumpswap', 'raydium_launchlab','meteora_dbc'],
                 'adapter_subsets': {'raydium_launchlab': 'funding status, SPL/Token-2022 base, WSOL quote; transfer hooks/other layouts unknown',
