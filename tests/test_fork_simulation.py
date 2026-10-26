@@ -266,7 +266,7 @@ def test_pumpswap_adapter_binds_reserve_mints_and_authorities():
 
 
 @pytest.mark.asyncio
-async def test_queue_is_not_a_top_n_and_old_targets_precede_new_ones(monkeypatch, tmp_path):
+async def test_queue_has_no_top_n_and_fresh_targets_bypass_backlog_without_starving_old(monkeypatch, tmp_path):
     from src.research import fork_probe as p
     async def unavailable(rpc, target):
         raise f.ForkUnavailable('synthetic unavailable fixture')
@@ -278,8 +278,126 @@ async def test_queue_is_not_a_top_n_and_old_targets_precede_new_ones(monkeypatch
     assert probe.report()['targets'] == 1100
     new = {'token': str(Pubkey.new_unique()), 'venue': 'pump_curve', 'quote_budget': 1_000_000}
     rows2 = await probe.fetch(None, lambda: [new])
-    assert rows2[0]['token'] != new['token']
+    assert rows2[0]['token'] == new['token']
+    assert rows2[0]['dispatch_lane'] == 'FRESH_UNTRIED'
     assert rows2[0]['sell_simulation_pass'] is None
+    probe.acknowledge(rows2, 'canonical:new')
+    rows3 = await probe.fetch(None, lambda: [])
+    assert rows3[0]['token'] == targets[0]['token']
+    assert rows3[0]['dispatch_lane'] == 'OLDEST_UNTRIED'
+    assert probe.report()['targets'] == 1101
+    assert probe.report()['by_venue']['pump_curve']['untried_targets'] == 1098
+    probe.close()
+
+
+@pytest.mark.asyncio
+async def test_due_retries_keep_their_share_under_fresh_arrivals_across_restart(monkeypatch,tmp_path):
+    from src.research import fork_probe as p
+    async def unavailable(rpc,target):raise f.ForkUnavailable('synthetic unavailable fixture')
+    monkeypatch.setattr(p,'acquire',unavailable)
+    path=tmp_path/'fork.sqlite'
+    probe=ForkProbe(path)
+    targets=[{'token':str(Pubkey.new_unique()),'venue':'pump_curve','quote_budget':1_000_000} for _ in range(5)]
+    first=await probe.fetch(None,lambda:targets[:3])
+    assert first[0]['token']==targets[2]['token']
+    probe.acknowledge(first,'canonical:first')
+    with probe.db:probe.db.execute('UPDATE jobs SET due=0 WHERE attempts>0')
+    fresh=await probe.fetch(None,lambda:[targets[3]])
+    assert fresh[0]['token']==targets[3]['token']
+    probe.acknowledge(fresh,'canonical:fresh')
+    oldest=await probe.fetch(None,lambda:[])
+    assert oldest[0]['token']==targets[0]['token']
+    probe.acknowledge(oldest,'canonical:oldest')
+    probe.close()
+    probe=ForkProbe(path)
+    retry=await probe.fetch(None,lambda:[targets[4]])
+    assert retry[0]['token']==targets[2]['token'] and retry[0]['dispatch_lane']=='DUE_RETRY'
+    probe.acknowledge(retry,'canonical:retry')
+    next_fresh=await probe.fetch(None,lambda:[])
+    assert next_fresh[0]['token']==targets[4]['token']
+    assert probe.report()['targets']==5
+    probe.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_queue_migration_preserves_jobs_and_does_not_invent_arrival_times(monkeypatch,tmp_path):
+    import json
+    import sqlite3
+    from src.research import fork_probe as p
+    async def unavailable(rpc,target):raise f.ForkUnavailable('synthetic unavailable fixture')
+    monkeypatch.setattr(p,'acquire',unavailable)
+    path=tmp_path/'fork.sqlite'
+    targets=[{'token':str(Pubkey.new_unique()),'venue':'pump_curve','quote_budget':1_000_000} for _ in range(2)]
+    with sqlite3.connect(path) as db:
+        db.execute('CREATE TABLE jobs(id TEXT PRIMARY KEY,body TEXT NOT NULL,due REAL NOT NULL,attempts INTEGER NOT NULL)')
+        for target in targets:
+            db.execute('INSERT INTO jobs VALUES(?,?,0,0)',(p.digest(target),json.dumps(target)))
+    probe=ForkProbe(path)
+    rows=await probe.fetch(None,lambda:[])
+    assert rows[0]['token']==targets[1]['token']
+    assert rows[0]['target_first_queued_at'] is None and rows[0]['queue_age_at_attempt_seconds'] is None
+    assert probe.report()['targets']==2
+    cursor=probe.db.execute('SELECT cursor FROM fork_dispatch').fetchone()[0]
+    probe.close()
+    probe=ForkProbe(path)
+    assert await probe.fetch(None,lambda:[])==rows  # Canonical ACK still fences new work.
+    assert probe.db.execute('SELECT cursor FROM fork_dispatch').fetchone()[0]==cursor
+    probe.close()
+
+
+@pytest.mark.asyncio
+async def test_venue_report_counts_only_acknowledged_dispositions(monkeypatch,tmp_path):
+    from src.research import fork_probe as p
+    async def unavailable(rpc,target):raise f.ForkUnavailable('synthetic unavailable fixture')
+    monkeypatch.setattr(p,'acquire',unavailable)
+    probe=ForkProbe(tmp_path/'fork.sqlite')
+    targets=[{'token':str(Pubkey.new_unique()),'venue':venue,'quote_budget':1_000_000}
+             for venue in ('pump_curve','pumpswap','raydium_launchlab')]
+    rows=await probe.fetch(None,lambda:targets)
+    before=probe.report()['by_venue']
+    assert len(before)==3 and not any(row['canonical_dispositions'] for row in before.values())
+    assert before['raydium_launchlab']['attempts']==1 and before['pump_curve']['untried_targets']==1
+    probe.acknowledge(rows,'canonical:venue-unknown')
+    assert probe.report()['by_venue']['raydium_launchlab']['canonical_dispositions']=={'FORK_ENVIRONMENT_UNKNOWN':1}
+    assert probe.report()['by_venue']['pump_curve']['canonical_dispositions']=={}
+    probe.close()
+
+
+@pytest.mark.asyncio
+async def test_arrival_priority_survives_wall_clock_correction_and_labels_queue_age(monkeypatch,tmp_path):
+    from src.research import fork_probe as p
+    tick=[100.]
+    monkeypatch.setattr(p.time,'time',lambda:tick[0])
+    async def unavailable(rpc,target):raise f.ForkUnavailable('synthetic unavailable fixture')
+    monkeypatch.setattr(p,'acquire',unavailable)
+    probe=ForkProbe(tmp_path/'fork.sqlite')
+    targets=[{'token':str(Pubkey.new_unique()),'venue':'pump_curve','quote_budget':1_000_000} for _ in range(3)]
+    rows=await probe.fetch(None,lambda:targets[:2]);probe.acknowledge(rows,'canonical:first')
+    with probe.db:probe.db.execute('UPDATE jobs SET due=0 WHERE attempts=0')
+    tick[0]=50.
+    fresh=await probe.fetch(None,lambda:[targets[2]])
+    assert fresh[0]['token']==targets[2]['token']
+    probe.acknowledge(fresh,'canonical:fresh')
+    old=await probe.fetch(None,lambda:[])
+    assert old[0]['token']==targets[0]['token']
+    assert old[0]['queue_clock_regressed'] is True and old[0]['queue_age_at_attempt_seconds']==0
+    probe.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_untried_lanes_share_capacity_with_due_retries(monkeypatch,tmp_path):
+    from src.research import fork_probe as p
+    async def unavailable(rpc,target):raise f.ForkUnavailable('synthetic unavailable fixture')
+    monkeypatch.setattr(p,'acquire',unavailable)
+    probe=ForkProbe(tmp_path/'fork.sqlite')
+    target={'token':str(Pubkey.new_unique()),'venue':'pump_curve','quote_budget':1_000_000}
+    first=await probe.fetch(None,lambda:[target]);probe.acknowledge(first,'canonical:first')
+    for index in range(4):
+        with probe.db:probe.db.execute('UPDATE jobs SET due=0')
+        rows=await probe.fetch(None,lambda:[])
+        assert rows[0]['token']==target['token'] and rows[0]['dispatch_lane']=='DUE_RETRY'
+        probe.acknowledge(rows,f'canonical:retry:{index}')
+    assert probe.report()['attempts']==5
     probe.close()
 
 

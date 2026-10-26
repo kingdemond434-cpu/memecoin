@@ -44,3 +44,17 @@ vault and creator claim vault when no optional share fee receiver is present.
 Both exact-input instructions use three u64 values with share fee zero. Tests
 check complete order/flags/data, not merely the discriminator or account count.
 Those tests use synthetic state and do not certify an actual mainnet round trip.
+
+The durable native-probe queue allocates two slots to newest untried arrivals,
+one to the oldest untried target and one to due retries; empty lanes share their
+capacity. Persistent arrival tickets and dispatch state survive restart and do
+not rank arrivals by corrected host wall time. Existing jobs migrate without
+inventing their original arrival timestamp. New results retain queue age at
+attempt and explicitly flag clock regression. Canonical ACK still fences new
+work, and no target expires or is removed by this scheduling change.
+
+Reports separate per-venue targets, attempts, untried backlog and acknowledged
+dispositions. A supported adapter with no observed targets is explicitly
+`NO_TARGETS_OBSERVED`; support is not an executed round trip. Cadence, provider
+refusals and backlog can still delay sampling, so the queue has no guaranteed
+launch-to-probe deadline or whole-market coverage denominator.

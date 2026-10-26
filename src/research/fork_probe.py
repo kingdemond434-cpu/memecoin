@@ -33,6 +33,36 @@ class ForkProbe:
           CREATE INDEX IF NOT EXISTS queue ON jobs(due,id);
           CREATE INDEX IF NOT EXISTS by_token ON results(json_extract(body,'$.token'),available DESC) WHERE ref IS NOT NULL;
         ''')
+        columns = {row[1] for row in self.db.execute('PRAGMA table_info(jobs)')}
+        if 'arrived' not in columns:
+            self.db.execute('ALTER TABLE jobs ADD COLUMN arrived INTEGER NOT NULL DEFAULT 0')
+            self.db.execute('UPDATE jobs SET arrived=rowid')
+        if 'first_seen' not in columns:
+            # Legacy retry deadlines do not establish original queue arrival.
+            self.db.execute('ALTER TABLE jobs ADD COLUMN first_seen REAL')
+        self.db.execute('CREATE TABLE IF NOT EXISTS fork_dispatch '
+                        '(id INTEGER PRIMARY KEY CHECK(id=1),cursor INTEGER NOT NULL,ticket INTEGER NOT NULL)')
+        self.db.execute('INSERT OR IGNORE INTO fork_dispatch SELECT 1,0,COALESCE(MAX(arrived),0) FROM jobs')
+        self.db.execute('CREATE INDEX IF NOT EXISTS untried_arrival ON jobs(arrived DESC,id) WHERE attempts=0')
+        self.db.execute('CREATE INDEX IF NOT EXISTS retry_deadline ON jobs(due,id) WHERE attempts>0')
+        self.db.commit()
+
+    def _reserve_job(self, now):
+        """Caller holds the write transaction; tickets survive restart/clock correction."""
+        cursor = self.db.execute('SELECT cursor FROM fork_dispatch WHERE id=1').fetchone()[0]
+        preferred = ('FRESH_UNTRIED', 'FRESH_UNTRIED', 'OLDEST_UNTRIED', 'DUE_RETRY')[cursor % 4]
+        plans = {'FRESH_UNTRIED': ('attempts=0', 'arrived DESC,id'),
+                 'OLDEST_UNTRIED': ('attempts=0', 'arrived,id'),
+                 'DUE_RETRY': ('attempts>0', 'due,id')}
+        for lane in dict.fromkeys((preferred, 'OLDEST_UNTRIED', 'DUE_RETRY')):
+            predicate, order = plans[lane]
+            job = self.db.execute('SELECT id,body,first_seen FROM jobs WHERE due<=? AND '+predicate+
+                                  ' ORDER BY '+order+' LIMIT 1', (now,)).fetchone()
+            if job:
+                self.db.execute('UPDATE jobs SET due=?,attempts=attempts+1 WHERE id=?', (now+300, job[0]))
+                self.db.execute('UPDATE fork_dispatch SET cursor=? WHERE id=1', ((cursor+1) % 4,))
+                return (*job, lane)
+        return None
 
     def _store_frame(self, frame):
         identity = digest(frame)
@@ -89,13 +119,15 @@ class ForkProbe:
         with self.lock, self.db:
             for target in targets():
                 body = json.dumps(target, sort_keys=True, allow_nan=False)
-                self.db.execute('INSERT OR IGNORE INTO jobs VALUES(?,?,?,0)', (digest(target), body, now))
+                inserted = self.db.execute('INSERT OR IGNORE INTO jobs(id,body,due,attempts,arrived,first_seen) '
+                    'VALUES(?,?,?,0,(SELECT ticket+1 FROM fork_dispatch WHERE id=1),?)',
+                    (digest(target), body, now, now))
+                if inserted.rowcount:
+                    self.db.execute('UPDATE fork_dispatch SET ticket=ticket+1 WHERE id=1')
             pending = self.db.execute('SELECT body FROM results WHERE ref IS NULL ORDER BY created LIMIT 1').fetchone()
-            job = self.db.execute('SELECT id,body FROM jobs WHERE due<=? ORDER BY due,id LIMIT 1', (now,)).fetchone()
             if pending:
                 return [json.loads(pending[0])]
-            if job:
-                self.db.execute('UPDATE jobs SET due=?,attempts=attempts+1 WHERE id=?', (now + 300, job[0]))
+            job = self._reserve_job(now)
         if job is None:
             return []
         identity, target = job[0], json.loads(job[1])
@@ -114,6 +146,9 @@ class ForkProbe:
                       'reason': str(exc)[:300] if isinstance(exc, ForkUnavailable) else type(exc).__name__}
         row = {**result, 'provider': 'local_svm', 'fork_kind': 'native_roundtrip',
             'schema': SCHEMA, 'token': target['token'], 'target': target,
+            'dispatch_lane': job[3], 'target_first_queued_at': job[2],
+            'queue_age_at_attempt_seconds': max(0., now-job[2]) if job[2] is not None else None,
+            'queue_clock_regressed': now < job[2] if job[2] is not None else None,
             'input_sha256': frame_id, 'created_at': time.time(),
             'input_archive': 'native_fork_probe.sqlite:frames',
             'real_transaction_submitted': False, 'execution_authority': False,
@@ -149,8 +184,27 @@ class ForkProbe:
             jobs = self.db.execute('SELECT count(*),sum(attempts) FROM jobs').fetchone()
             statuses = dict(self.db.execute("SELECT json_extract(body,'$.status'),count(*) FROM results WHERE ref IS NOT NULL GROUP BY 1"))
             pending = self.db.execute('SELECT count(*) FROM results WHERE ref IS NULL').fetchone()[0]
+            venues = {}
+            for venue, count, attempts, untried in self.db.execute(
+                    "SELECT json_extract(body,'$.venue'),count(*),sum(attempts),sum(attempts=0) FROM jobs GROUP BY 1"):
+                venues[venue or 'UNKNOWN'] = {'targets': count, 'attempts': attempts,
+                    'untried_targets': untried, 'canonical_dispositions': {}}
+            for venue, status, count in self.db.execute("SELECT json_extract(body,'$.target.venue'),"
+                    "json_extract(body,'$.status'),count(*) FROM results WHERE ref IS NOT NULL GROUP BY 1,2"):
+                row = venues.setdefault(venue or 'UNKNOWN', {'targets': 0, 'attempts': 0,
+                    'untried_targets': 0, 'canonical_dispositions': {}})
+                row['canonical_dispositions'][status] = count
+            for venue in ('pump_curve', 'pumpswap', 'raydium_launchlab'):
+                venues.setdefault(venue, {'targets': 0, 'attempts': 0,
+                    'untried_targets': 0, 'canonical_dispositions': {}})
+            for row in venues.values():
+                row['coverage_state'] = ('OBSERVED_LOCAL_ROUNDTRIPS' if row['canonical_dispositions'].get(
+                    'ROUNDTRIP_SUCCEEDED_IN_FORK', 0) else 'CANONICAL_DISPOSITIONS_ONLY' if row[
+                    'canonical_dispositions'] else 'TARGETS_PENDING' if row['targets'] else 'NO_TARGETS_OBSERVED')
         return {'status': 'LOCAL_FORK_RESEARCH', 'targets': jobs[0], 'attempts': jobs[1] or 0,
                 'canonical_dispositions': statuses, 'awaiting_canonical_ack': pending,
+                'by_venue': venues,
+                'scheduling': '2 fresh untried : 1 oldest untried : 1 due retry; empty lanes share capacity',
                 'supported_adapters': ['pump_curve', 'pumpswap', 'raydium_launchlab'],
                 'adapter_subsets': {'raydium_launchlab': 'funding status, SPL/Token-2022 base, WSOL quote; transfer hooks/other layouts unknown'},
                 'other_venues': 'UNSUPPORTED_UNKNOWN', 'live_authority': False,
