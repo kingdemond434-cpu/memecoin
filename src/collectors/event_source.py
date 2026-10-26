@@ -284,6 +284,8 @@ class SourceMesh:
         # here, so no source can hold another's events and no source can grow
         # the memory footprint without bound.
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=self.max_queue)
+        self._queued_durable = set()
+        self.queued_durable_repeats_coalesced = 0
         self._producers: List[asyncio.Task] = []
         self._running = False
         self._owner_loop = None
@@ -370,15 +372,25 @@ class SourceMesh:
         might still depend on -- and dropping is counted, since a queue
         silently shedding events looks exactly like a quiet forest.
         """
+        durable = self._durable_key(event)
+        if durable is not None and durable in self._queued_durable:
+            # One unconsumed copy suffices. This is queue residency, not a
+            # delivery ACK or content deduplication: dequeue/eviction releases
+            # it so a failed consumer can receive the durable outbox again.
+            self.queued_durable_repeats_coalesced += 1
+            return
         if not self._admit(event, now):
             return
         while True:
             try:
                 self._queue.put_nowait(event)
+                if durable is not None:
+                    self._queued_durable.add(durable)
                 return
             except asyncio.QueueFull:
                 try:
-                    self._queue.get_nowait()
+                    removed = self._queue.get_nowait()
+                    self._queued_durable.discard(self._durable_key(removed))
                     self.dropped += 1
                 except asyncio.QueueEmpty:  # pragma: no cover - racing drain
                     return
@@ -406,14 +418,24 @@ class SourceMesh:
 
     async def next_event(self) -> Event:
         """Await the next event from any source. The consumer's entry point."""
-        return await self._queue.get()
+        event = await self._queue.get()
+        self._queued_durable.discard(self._durable_key(event))
+        return event
+
+    @staticmethod
+    def _durable_key(event):
+        metadata = getattr(event, 'metadata', None) or {}
+        identity = metadata.get('onion_observation_id') or metadata.get('onion_directory_observation_id')
+        return (event.source_id,identity) if isinstance(identity,str) and identity else None
 
     def drain(self, limit: Optional[int] = None) -> List[Event]:
         """Everything available right now, without waiting for any source."""
         events: List[Event] = []
         while limit is None or len(events) < limit:
             try:
-                events.append(self._queue.get_nowait())
+                event = self._queue.get_nowait()
+                self._queued_durable.discard(self._durable_key(event))
+                events.append(event)
             except asyncio.QueueEmpty:
                 break
         return events
@@ -472,5 +494,7 @@ class SourceMesh:
             "streaming": self._running,
             "producers": len(self._producers),
             "pending_events": self._queue.qsize(),
+            "pending_durable_events": len(self._queued_durable),
+            "queued_durable_repeats_coalesced": self.queued_durable_repeats_coalesced,
             "coverage": (by_state.get("OK", 0) / len(reports)) if reports else None,
         }

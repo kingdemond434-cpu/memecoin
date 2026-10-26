@@ -79,3 +79,44 @@ def test_frontier_lease_waits_for_writer_without_blocking_loop(tmp_path):
         assert result == []
         await value.stop()
     asyncio.run(scenario())
+
+
+def test_unconsumed_durable_repeats_coalesce_without_suppressing_consumer_retry():
+    from src.collectors.event_source import SourceMesh
+    async def scenario():
+        mesh = SourceMesh(max_queue=3)
+        event = Event('onion:continuous-frontier',SourceClass.WEB,1,2,text='public claim',
+                      metadata={'onion_observation_id':'durable-claim'})
+        for _ in range(100):mesh._publish(event,2)
+        assert mesh.pending == 1 and mesh.dropped == 0
+        assert mesh.health(2)['queued_durable_repeats_coalesced'] == 99
+        assert await mesh.next_event() == event
+        # A failed consumer has not acknowledged the transport. Its next
+        # outbox delivery must still reach the queue, within the dedupe window.
+        mesh._publish(event,3)
+        assert mesh.pending == 1 and await mesh.next_event() == event
+        assert mesh.health(3)['pending_durable_events'] == 0
+    asyncio.run(scenario())
+
+
+def test_eviction_and_drain_release_durable_residency_for_redelivery():
+    from src.collectors.event_source import SourceMesh
+    mesh = SourceMesh(max_queue=1)
+    event = Event('onion:continuous-frontier',SourceClass.WEB,1,2,text='public claim',
+                  metadata={'onion_observation_id':'durable-claim'})
+    other = Event('public:other',SourceClass.WEB,1,2,text='different fresh material')
+    mesh._publish(event,2);mesh._publish(other,2)
+    assert mesh.dropped == 1 and mesh.health(2)['pending_durable_events'] == 0
+    mesh._publish(event,3)
+    assert mesh.dropped == 2 and mesh.drain() == [event]
+    mesh._publish(event,4)
+    assert mesh.drain() == [event]
+
+
+def test_durable_identity_is_scoped_to_source_and_observation_not_text():
+    from src.collectors.event_source import SourceMesh
+    mesh = SourceMesh(max_queue=5)
+    for source,identity in [('onion:a','one'),('onion:a','two'),('onion:b','one')]:
+        mesh._publish(Event(source,SourceClass.WEB,1,2,text='same public text',
+                            metadata={'onion_observation_id':identity}),2)
+    assert mesh.pending == 3 and mesh.dropped == 0
