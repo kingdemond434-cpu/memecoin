@@ -19,6 +19,20 @@ TRANSPORT_FIELDS = frozenset({'_miner', '_enriches', '_endpoint', '_fetched_at',
                               '_request_started_at', '_scheduled_at'})
 
 
+def reviewed_native_target(event):
+    """Candidate identity only; actual bank/owner/route checks still follow."""
+    from solders.pubkey import Pubkey
+    from src.chains.launchlab import LAUNCHLAB_PROGRAM
+    from src.chains.pump_route import WSOL_MINT
+    if (event.get('type') != 'token_launch' or event.get('venue') != 'raydium_launchlab'
+            or event.get('program') != LAUNCHLAB_PROGRAM or event.get('quote_mint') != WSOL_MINT):
+        return None
+    for key in ('token', 'pool'):
+        Pubkey.from_string(event[key])
+    return {'token': event['token'], 'venue': 'raydium_launchlab', 'pool': event['pool'],
+            'quote_budget': 1_000_000}
+
+
 class ForkProbe:
     def __init__(self, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -68,20 +82,13 @@ class ForkProbe:
 
     def enqueue_native_launch(self, event, *, source_ref, available_at):
         """Persist an unexecuted reviewed target after its canonical source append."""
-        from solders.pubkey import Pubkey
-        from src.chains.launchlab import LAUNCHLAB_PROGRAM
-        from src.chains.pump_route import WSOL_MINT
-        if (event.get('type') != 'token_launch' or event.get('venue') != 'raydium_launchlab'
-                or event.get('program') != LAUNCHLAB_PROGRAM or event.get('quote_mint') != WSOL_MINT):
+        target = reviewed_native_target(event)
+        if target is None:
             return None
         if not isinstance(source_ref, str) or not re.fullmatch('native-launch:[0-9a-f]{64}', source_ref):
             raise ValueError('canonical native-launch hash reference required')
         if type(available_at) not in (int, float) or not math.isfinite(available_at):
             raise ValueError('finite canonical source availability required')
-        for key in ('token', 'pool'):
-            Pubkey.from_string(event[key])
-        target = {'token': event['token'], 'venue': 'raydium_launchlab', 'pool': event['pool'],
-                  'quote_budget': 1_000_000}
         now = time.time()
         with self.lock, self.db:
             identity, inserted = self._enqueue_targets_locked([target], now)[0]

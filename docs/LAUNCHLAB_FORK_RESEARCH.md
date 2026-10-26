@@ -7,7 +7,16 @@ availability and intake time are retained separately from target identity;
 repeat intake does not reset arrival or retry state. Failed canonical appends
 stop downstream launch admission. Queue-write failures increment the stream
 intake-failure counter while the raw journal remains available for recovery.
-This handoff does not yet backfill all earlier native journal rows.
+Earlier rows can be reconciled explicitly with
+`python -m tools.backfill_native_fork_targets --ledger <sealed-journal> --certificate <owner-certificate> --database <research-db> --output <new-receipt>`.
+The default is a dry run; add `--apply` to enroll reviewed candidates. The
+shared certified-recovery verifier checks every source byte and the final
+record. A temporary disk-backed proposal index keeps admission independent
+of RAM and candidate-count limits. Source changes are rejected before writes;
+repeat enrollment is idempotent. Other quotes/venues remain deferred.
+Historical source availability remains original, while intake and subsequent
+current-bank probes receive their actual new times. This does not reconstruct
+historical banks or turn old launches into retrospectively available fills.
 
 The adapter reads the actual pool,
 global and platform configuration, vaults, mints and executable images. The
