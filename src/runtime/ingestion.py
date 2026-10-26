@@ -468,6 +468,16 @@ class MinedRecordIngestion:
             if state is not None and state.tradeable and state.pool:
                 targets.append({"token": token, "venue": "pumpswap", "pool": state.pool,
                                 "quote_budget": 1_000_000})
+        # Other native launches do not have Pump reserves. Use their observed
+        # episode identities; ForkProbe persists each target beyond this view.
+        from src.chains.launchlab import LAUNCHLAB_PROGRAM
+        from src.chains.pump_route import WSOL_MINT
+        builder = getattr(self, 'dataset_builder', None)
+        episodes = getattr(builder, 'active_episodes', {})
+        for token, episode in list(episodes.items()):
+            if episode.factory == LAUNCHLAB_PROGRAM and episode.base_token == WSOL_MINT and episode.pair:
+                targets.append({'token': token, 'venue': 'raydium_launchlab', 'pool': episode.pair,
+                                'quote_budget': 1_000_000})
         return targets
 
     def _mineable_tokens(self) -> List[str]:

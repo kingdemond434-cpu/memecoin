@@ -151,7 +151,8 @@ class ForkProbe:
             pending = self.db.execute('SELECT count(*) FROM results WHERE ref IS NULL').fetchone()[0]
         return {'status': 'LOCAL_FORK_RESEARCH', 'targets': jobs[0], 'attempts': jobs[1] or 0,
                 'canonical_dispositions': statuses, 'awaiting_canonical_ack': pending,
-                'supported_adapters': ['pump_curve', 'pumpswap'],
+                'supported_adapters': ['pump_curve', 'pumpswap', 'raydium_launchlab'],
+                'adapter_subsets': {'raydium_launchlab': 'funding status, SPL/Token-2022 base, WSOL quote; transfer hooks/other layouts unknown'},
                 'other_venues': 'UNSUPPORTED_UNKNOWN', 'live_authority': False,
                 'input_archive': 'native_fork_probe.sqlite:frames',
                 'runtime_parity': 'exact validator parity unverified',
