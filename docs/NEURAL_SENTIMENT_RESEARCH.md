@@ -77,7 +77,11 @@ provider billing, token prediction accuracy or a guaranteed throughput rate.
 
 The miner declares `LOCAL_CPU` resource use and has a separate serial execution
 lane. Slow sockets can occupy all network slots without occupying this offline
-slot. ONNX still uses one CPU thread, each inference pass has bounded work, and
+slot. ONNX defaults to one CPU thread; `global.neural_sentiment.intra_op_threads`
+may explicitly select a positive integer within host logical CPU capacity after
+benchmarking on that host. Inter-op concurrency remains one. The profile is
+passed as a subprocess argument, reported on every annotation and included in
+the inference cache key. Each inference pass has bounded work, and
 neither lane bypasses canonical retention or delivery acknowledgements. The
 resource declaration is scheduling metadata for trusted callables, not a network
 sandbox. Per-miner queue-wait and fetch wall times expose actual contention.

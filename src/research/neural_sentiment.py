@@ -41,7 +41,8 @@ def digest(value):
 
 
 class OfflineWorker:
-    def __init__(self, python, model_root):
+    def __init__(self, python, model_root, *, intra_op_threads=1):
+        self.inference_profile = inference_profile(intra_op_threads)
         self.python, self.model_root = str(python), str(model_root)
         self.process = None
 
@@ -52,7 +53,8 @@ class OfflineWorker:
             environment.update(PYTHONPATH=str(Path(__file__).resolve().parents[2]),
                 PYTHONIOENCODING='utf-8', HF_HUB_OFFLINE='1', TOKENIZERS_PARALLELISM='false')
             self.process = await asyncio.create_subprocess_exec(self.python, '-m', __name__,
-                '--worker', self.model_root, stdin=asyncio.subprocess.PIPE,
+                '--worker', self.model_root, '--threads', str(self.inference_profile['intra_op_threads']),
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
                 env=environment, limit=1024 * 1024)
         try:
@@ -60,7 +62,7 @@ class OfflineWorker:
             await self.process.stdin.drain()
             line = await asyncio.wait_for(self.process.stdout.readline(), 30)
             result = json.loads(line)
-            if not result.get('ok'):
+            if not result.get('ok') or result.get('inference_profile') != self.inference_profile:
                 raise ValueError('offline inference unavailable')
             return result['result']
         except BaseException:
@@ -75,8 +77,15 @@ class OfflineWorker:
             await process.wait()
 
 
+def inference_profile(threads):
+    if type(threads) is not int or not 1 <= threads <= (os.cpu_count() or 1):
+        raise ValueError('NLP thread count must be a positive integer within logical CPU capacity')
+    return {'provider': 'CPUExecutionProvider', 'intra_op_threads': threads, 'inter_op_threads': 1}
+
+
 class SentimentResearch:
-    def __init__(self, path, *, python=None, model_root=None, worker=None, ledger_path=None):
+    def __init__(self, path, *, python=None, model_root=None, worker=None, ledger_path=None, intra_op_threads=1):
+        profile = inference_profile(intra_op_threads)
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path, check_same_thread=False, timeout=20)
@@ -113,13 +122,16 @@ class SentimentResearch:
         self.db.commit()
         self.ledger_path = Path(ledger_path) if ledger_path else None
         self.lock = threading.RLock()
-        self.worker = worker or (OfflineWorker(python, model_root) if python and model_root else None)
+        self.worker = worker or (OfflineWorker(python, model_root, intra_op_threads=intra_op_threads)
+                                 if python and model_root else None)
+        self.inference_profile = getattr(self.worker, 'inference_profile', profile)
         self.last_error = None
         self.last_intake_error = None
         self.intake_failures = 0
         self.replay_error = None
         self.last_replay_seconds = None
-        self.inference_code_sha256 = hashlib.sha256(inspect.getsource(worker_main).encode()).hexdigest()
+        self.inference_code_sha256 = hashlib.sha256(
+            (inspect.getsource(worker_main)+inspect.getsource(inference_profile)).encode()).hexdigest()
 
     def _next_ticket(self):
         # Called inside the queue transaction. It survives process restarts
@@ -267,7 +279,8 @@ class SentimentResearch:
             inference_metric = None
             try:
                 started = time.perf_counter()
-                cache_id = digest([REVISION, FILES, self.inference_code_sha256, body['text_sha256'], offset])
+                cache_id = digest([REVISION, FILES, self.inference_code_sha256, self.inference_profile,
+                                   body['text_sha256'], offset])
                 with self.lock:
                     cached = self.db.execute('SELECT body,sha256 FROM inference_cache WHERE id=?', (cache_id,)).fetchone()
                 cache = None
@@ -301,6 +314,7 @@ class SentimentResearch:
                     inference_cache_hit=cache_hit, inference_cache_key=cache_id,
                     actual_inference_at=cache['inferred_at'], actual_inference_worker_sha256=cache['inference_worker_sha256'],
                     inference_code_sha256=self.inference_code_sha256,
+                    inference_profile=self.inference_profile,
                     calibrated=False, trading_skill='UNMEASURED', execution_authority=False,
                     language_training_scope=body['language'].split('-')[0].lower() in LANGUAGES,
                     scope='document sentiment; not factual credibility, insider identity or token-return probability')
@@ -371,7 +385,8 @@ class SentimentResearch:
             metrics = dict(self.db.execute('SELECT name,value FROM metrics'))
             cache_entries = self.db.execute('SELECT count(*) FROM inference_cache').fetchone()[0]
         return {'status': 'OFFLINE_RESEARCH' if self.worker else 'NOT_CONFIGURED',
-            'model_revision': REVISION, 'inputs': total, 'completed_inputs': complete or 0,
+            'model_revision': REVISION, 'inference_profile': self.inference_profile,
+            'inputs': total, 'completed_inputs': complete or 0,
             'pending_inputs': total-(complete or 0), 'oldest_pending_seconds': max(0, time.time()-oldest) if oldest else None,
             'retained_windows': retained, 'canonical_windows': acked,
             'awaiting_canonical_ack': retained-acked, 'last_error_type': self.last_error,
@@ -408,8 +423,9 @@ class SentimentResearch:
             self.db.close()
 
 
-def worker_main(root):
+def worker_main(root, *, intra_op_threads=1):
     """Only pinned public weights/tokenizer data; no remote model code/downloads."""
+    profile = inference_profile(intra_op_threads)
     root = Path(root)
     for name, expected in FILES.items():
         if hashlib.sha256((root/name).read_bytes()).hexdigest() != expected:
@@ -419,7 +435,8 @@ def worker_main(root):
     from tokenizers import Tokenizer
     ort.disable_telemetry_events()
     options = ort.SessionOptions()
-    options.intra_op_num_threads = options.inter_op_num_threads = 1
+    options.intra_op_num_threads = profile['intra_op_threads']
+    options.inter_op_num_threads = profile['inter_op_threads']
     model = ort.InferenceSession(str(root/'onnx/model_quantized.onnx'), options,
                                  providers=['CPUExecutionProvider'])
     tokenizer = Tokenizer.from_file(str(root/'tokenizer.json'))
@@ -445,13 +462,13 @@ def worker_main(root):
                 'char_stop': encoded.offsets[stop-1][1] if stop > offset else 0,
                 'raw_model_scores': {labels[str(i)]: float(v) for i, v in enumerate(scores)}}
             SentimentResearch._validate_window(result, offset)
-            response = {'ok': True, 'result': result}
+            response = {'ok': True, 'result': result, 'inference_profile': profile}
         except Exception as exc:
             response = {'ok': False, 'error_type': type(exc).__name__}
         print(canonical(response), flush=True)
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 3 or sys.argv[1] != '--worker':
+    if len(sys.argv) not in (3, 5) or sys.argv[1] != '--worker' or (len(sys.argv) == 5 and sys.argv[3] != '--threads'):
         raise SystemExit('offline worker arguments required')
-    worker_main(sys.argv[2])
+    worker_main(sys.argv[2], intra_op_threads=int(sys.argv[4]) if len(sys.argv) == 5 else 1)
