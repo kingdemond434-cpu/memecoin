@@ -1,0 +1,25 @@
+Source journal audit
+====================
+
+Run from the development checkout with the existing private interpreter:
+
+    python -m tools.source_journal_audit PATH_TO_SOURCE_INTAKE_SQLITE --sample-limit 100
+
+The command opens an existing database in SQLite read-only mode and uses one
+read transaction so counters, receipts and source-service counts reconcile to
+one snapshot while collection continues. It emits aggregate counts only.
+Exit status is 0 for PASS and 1 for FAIL or ERROR; errors expose type only.
+
+Checks include SQLite quick_check, authoritative counter reconciliation,
+acknowledgement state consistency, per-source pending reconciliation and a
+bounded oldest-pending digest/identity sample. The default sample is 100;
+maximum is 10,000. Full-table reconciliation/quick_check can consume disk IO;
+run periodically, not as a frequent health probe. No full raw-body verification
+or external canonical-reference verification is claimed. A PASS cannot prove
+upstream completeness, processing throughput, profitability or backup recovery.
+Acknowledged raw bodies have been cleared by normal journal operation.
+
+Compare successive saved receipts to measure acceptance and acknowledgement
+rates. Growing pending counts or age remain unresolved throughput evidence even
+when every consistency check passes. Preserve receipts in the private handoff
+area, and keep public status free of source identifiers and content.

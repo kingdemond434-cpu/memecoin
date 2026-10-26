@@ -1,0 +1,26 @@
+Source intake canonical-reference lookup
+=======================================
+
+The source consumer and neural intake need the committed canonical payload
+reference, not a fully hydrated frontier job. FrontierIndex.job_payload_ref
+performs one primary-key SELECT in a fresh connection using the existing
+frontier connection policy. It does not cache references or change transaction
+durability. Full diagnostic job reads remain available through job().
+
+Neural intake treats an absent reference as an explicit deferred intake error.
+The journal consumer retries the still-retained source row when the canonical
+reference is absent; it does not acknowledge or index that source event.
+
+20261026-225330 isolated benchmark: four alternating batches of 100 reads,
+full job median 3.144 seconds; reference lookup median 2.105 seconds. The shared
+VPS was heavily variable (full-job batches 0.403 to 7.611 seconds). This supports
+reduced query work, not a proven end-to-end throughput increase. Synthetic
+100-record intake profiling also found SQLite connection commits a major cost:
+11.476 cumulative seconds in 500 connection context exits, out of 22.102 seconds
+profiled. Imports contributed substantial first-call cost. Neither benchmark
+used production data or provider credentials. Receipts remain in handoff.
+
+No deployment or throughput acceptance is implied. Production backlog continues
+to grow, so downstream commit amortization and processing capacity need further
+work while preserving per-source fairness, PIT clocks, source retention and
+canonical ACK semantics. Do not weaken synchronous FULL to improve benchmarks.

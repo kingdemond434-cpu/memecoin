@@ -235,10 +235,10 @@ class SourceIntelligence:
         if not job_id or neural is None:
             return
         try:
-            source_job = self.unknown_engine.frontier.job(job_id)
-            if not source_job or not source_job.get('payload_ref'):
+            source_ref = self.unknown_engine.frontier.job_payload_ref(job_id)
+            if not source_ref:
                 raise ValueError('canonical narrative source reference unavailable')
-            neural.enqueue(payload, source_job=job_id, source_ref=source_job['payload_ref'], tokens=tokens)
+            neural.enqueue(payload, source_job=job_id, source_ref=source_ref, tokens=tokens)
         except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
             with self.__dict__.setdefault('_neural_intake_error_lock', threading.RLock()):
                 neural.last_intake_error = type(exc).__name__
@@ -565,8 +565,10 @@ class SourceIntelligence:
                         if not delivered:
                             await self.source_mesh.retry_event(event)
                             continue
-                        canonical = await self.source_mesh._disk_call(self.unknown_engine.frontier.job, job_id)
-                        await self.source_mesh.acknowledge_event(event, job_id, canonical['payload_ref'])
+                        canonical_ref = await self.source_mesh._disk_call(self.unknown_engine.frontier.job_payload_ref, job_id)
+                        if not canonical_ref:
+                            raise ValueError('canonical narrative source reference unavailable')
+                        await self.source_mesh.acknowledge_event(event, job_id, canonical_ref)
                 self._index_source_event(event, defer_onion_io=True, record_population=False)
             except Exception as exc:
                 logger.warning("source event indexing failed: %s", type(exc).__name__)

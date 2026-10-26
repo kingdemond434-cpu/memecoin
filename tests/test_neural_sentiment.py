@@ -497,7 +497,7 @@ def test_runtime_only_queues_after_canonical_source_and_retains_output_before_ac
                             metadata={})
     payload = {'text': 'public post', 'source_id': event.source_id, 'observed_at': 100}
     bot = SimpleNamespace(neural_sentiment=queue, unknown_engine=SimpleNamespace(
-        frontier=SimpleNamespace(job=lambda job: {'payload_ref': 'canonical:raw'})),
+        frontier=SimpleNamespace(job_payload_ref=lambda job: 'canonical:raw')),
         public_claim_links=SimpleNamespace(record=lambda **kwargs: None))
     assert SourceIntelligence._record_population_narrative(bot, event,
         prepared_payload=payload, canonical_job_result='job:raw') == 'job:raw'
