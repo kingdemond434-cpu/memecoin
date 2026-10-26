@@ -8,6 +8,7 @@ every change to how a position is sized.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -1114,12 +1115,43 @@ class SubsystemWiring:
         declarations = self.global_config.get("evm_observation", [])
         if not isinstance(declarations, list):
             self.evm_observation_configuration = [{"status": "DATA_BLOCKED", "reason": "evm_observation must be a list"}]
-            return
+            declarations = []
+        from src.chains.evm_native import EVMV2NativeProbe
+        probes = self.global_config.get("evm_native_probes", [])
+        if not isinstance(probes, list):
+            self.evm_native_configuration = [{"status": "DATA_BLOCKED", "reason": "evm_native_probes must be a list"}]
+            probes = []
+        # Every declared chain is considered. Slow independent health probes
+        # overlap, while duplicate routes share a single registry-owned client.
+        startup_errors = {}
+        startup_slots = asyncio.Semaphore(4)
+
+        async def start_optional_chain(name):
+            async with startup_slots:
+                try:
+                    config = self.chain_registry.get_chain(name)
+                    if config is None or getattr(config.chain_type, "value", None) != "evm":
+                        return
+                    if self.chain_registry.get_rpc(name) is None:
+                        await self.chain_registry.start_chain(name)
+                except Exception as exc:
+                    startup_errors[name] = type(exc).__name__
+
+        startup_rows = [row for row in declarations if isinstance(row, dict) and "start_block" in row] + probes
+        names = dict.fromkeys(row["chain"] for row in startup_rows
+            if isinstance(row, dict) and isinstance(row.get("chain"), str) and row["chain"])
+        async with asyncio.TaskGroup() as tasks:
+            for name in names:
+                tasks.create_task(start_optional_chain(name))
         for declaration in declarations:
             name = str(declaration.get("chain", "")) if isinstance(declaration, dict) else ""
             try:
                 if not isinstance(declaration, dict) or not name or "start_block" not in declaration:
                     raise ValueError("native chain and historical start_block are required")
+                if name in startup_errors:
+                    self.evm_observation_configuration.append({"chain": name, "status": "DATA_BLOCKED",
+                        "failure_type": startup_errors[name]})
+                    continue
                 config = self.chain_registry.get_chain(name)
                 if config is None or getattr(config.chain_type, "value", None) != "evm":
                     raise ValueError("configured native EVM chain is unavailable")
@@ -1128,11 +1160,7 @@ class SubsystemWiring:
                     contracts = [FactoryContract(**values) for values in contracts]
                 rpc = self.chain_registry.get_rpc(name)
                 if rpc is None:
-                    # Existing registry manager owns endpoint health, retries
-                    # and shutdown. No second transport or observer task.
-                    rpc = RPCManager(config)
-                    self.chain_registry.rpc_managers[name] = rpc
-                    await rpc.start()
+                    raise RuntimeError("native EVM manager did not start")
                 adapter = EVMObservationAdapter.from_registry(
                     self.chain_registry, name, start_block=declaration["start_block"],
                     factory_contracts=contracts, checkpoint_path=research_path / "frontier.sqlite",
@@ -1146,22 +1174,19 @@ class SubsystemWiring:
                 # secrets; expose type and chain, never exception text.
                 self.evm_observation_configuration.append({"chain": name, "status": "DATA_BLOCKED",
                                                             "failure_type": type(exc).__name__})
-        from src.chains.evm_native import EVMV2NativeProbe
-        probes = self.global_config.get("evm_native_probes", [])
-        if not isinstance(probes, list) or len(probes) > 4:
-            self.evm_native_configuration = [{"status": "DATA_BLOCKED", "reason": "at most four explicit native probes required"}]
-            return
         for declaration in probes:
             name = declaration.get("chain", "") if isinstance(declaration, dict) else ""
             try:
+                if name in startup_errors:
+                    self.evm_native_configuration.append({"chain": name, "status": "DATA_BLOCKED",
+                        "failure_type": startup_errors[name]})
+                    continue
                 config = self.chain_registry.get_chain(name)
                 if config is None or getattr(config.chain_type, "value", None) != "evm":
                     raise ValueError("native EVM registry chain required")
                 rpc = self.chain_registry.get_rpc(name)
                 if rpc is None:
-                    rpc = RPCManager(config)
-                    self.chain_registry.rpc_managers[name] = rpc
-                    await rpc.start()
+                    raise RuntimeError("native EVM manager did not start")
                 probe = EVMV2NativeProbe(rpc, chain=name, chain_id=config.chain_id,
                     **{key: value for key, value in declaration.items() if key != "chain"})
                 self.evm_native_probes.append(probe)

@@ -126,3 +126,51 @@ def test_offline_setup_and_invalid_observer_config_are_truthful(tmp_path):
         assert not desk.evm_observers
         assert desk.evm_observation_configuration[0]["status"] == "DATA_BLOCKED"
     asyncio.run(scenario())
+
+
+def test_native_probe_configuration_has_no_four_route_universe_cap(tmp_path):
+    async def scenario():
+        desk = desk_at(tmp_path)
+        config = SimpleNamespace(chain_id=1, chain_type=ChainType.EVM)
+        rpc = SimpleNamespace()
+        desk.chain_registry = SimpleNamespace(get_chain=lambda name: config, get_rpc=lambda name: rpc)
+        route = {"chain": "ethereum", "factory": "0x" + "11" * 20,
+                 "router": "0x" + "22" * 20, "token_in": "0x" + "33" * 20,
+                 "token_out": "0x" + "44" * 20, "amount_in": 100,
+                 "source_ref": "fixture:official-deployment"}
+        desk.global_config["evm_native_probes"] = [dict(route) for _ in range(9)]
+        await desk._setup_opportunity_observation(tmp_path)
+        assert len(desk.evm_native_probes) == 9
+        assert all(row["status"] == "CONFIGURED_NOT_OBSERVED" for row in desk.evm_native_configuration)
+        assert all(probe.rpc is rpc for probe in desk.evm_native_probes)
+    asyncio.run(scenario())
+
+
+def test_optional_startup_overlaps_chains_isolates_failures_and_reuses_managers(tmp_path):
+    async def scenario():
+        desk = desk_at(tmp_path)
+        configs = {name: SimpleNamespace(chain_id=i + 1, chain_type=ChainType.EVM,
+                   factories={"uniswap_v2": "0x" + "f1" * 20})
+                   for i, name in enumerate(("slow", "fast", "failed"))}
+        managers, calls = {}, []
+        fast_ready = asyncio.Event()
+
+        async def start(name):
+            calls.append(name)
+            if name == "slow":
+                await asyncio.wait_for(fast_ready.wait(), 2)
+            elif name == "fast":
+                fast_ready.set()
+            else:
+                raise ConnectionError("fixture provider URL must stay private")
+            managers[name] = SimpleNamespace()
+        desk.chain_registry = SimpleNamespace(get_chain=configs.get, get_rpc=managers.get, start_chain=start)
+        desk.global_config["evm_observation"] = [
+            {"chain": name, "start_block": 100} for name in ("slow", "fast", "failed", "slow")]
+        await desk._setup_opportunity_observation(tmp_path)
+        assert calls.count("slow") == 1
+        assert len(desk.evm_observers) == 3
+        blocked = [row for row in desk.evm_observation_configuration if row["status"] == "DATA_BLOCKED"]
+        assert blocked == [{"chain": "failed", "status": "DATA_BLOCKED", "failure_type": "ConnectionError"}]
+        assert "provider URL" not in json.dumps(desk.evm_observation_configuration)
+    asyncio.run(scenario())
