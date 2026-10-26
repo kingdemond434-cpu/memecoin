@@ -90,6 +90,12 @@ time/worker hash and never counts as an independent opinion or a new model run.
 Cache corruption triggers real recomputation. Worker calls, cache hits and
 corruption are measured separately. A time-bounded pass can drain cached work
 faster while keeping expensive new model calls bounded; no input is discarded.
+The two-second cooperative dispatch quantum and 256-output batch bound the
+active work; there is no additional four-inference limit. Failed attempts also
+consume that time quantum, so a failing worker cannot multiply its timeout by
+the entire row batch. One in-flight inference may exceed the dispatch quantum
+and retains its own timeout. Cache, annotation and service-ticket writes commit
+together per result; canonical retention/ACK remains a separate required step.
 
 The documented training languages are en/ar/de/es/fr/ja/zh/id/hi/it/ms/pt.
 Other languages remain outside that stated training scope. Raw softmax outputs

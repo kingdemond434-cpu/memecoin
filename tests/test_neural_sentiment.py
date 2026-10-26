@@ -31,10 +31,79 @@ class CountingWorker(Worker):
         return await super().infer(text,offset)
 
 
+def paced_worker(monkeypatch):
+    """Deterministic four-window time quantum, independent of host disk speed."""
+    tick = [0.]
+    monkeypatch.setattr('src.research.neural_sentiment.time.perf_counter', lambda: tick[0])
+    class PacedWorker(Worker):
+        async def infer(self, text, offset):
+            tick[0] += .5
+            return await super().infer(text, offset)
+    return PacedWorker()
+
+
+@pytest.mark.asyncio
+async def test_fast_inference_uses_available_time_and_commits_once_per_result(tmp_path,monkeypatch):
+    monkeypatch.setattr('src.research.neural_sentiment.time.perf_counter', lambda: 0.)
+    worker = CountingWorker()
+    queue = SentimentResearch(tmp_path/'nlp.sqlite', worker=worker)
+    for index in range(12):
+        enqueue(queue, f'distinct public fixture {index}', job=f'job:{index}')
+    commits = []
+    queue.db.set_trace_callback(lambda sql: commits.append(sql) if sql == 'COMMIT' else None)
+    rows = await queue.fetch()
+    assert len(rows) == worker.calls == 12
+    assert len(commits) == 12
+    assert queue.report()['awaiting_canonical_ack'] == 12
+    assert queue.report()['canonical_windows'] == 0
+    queue.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_inference_consumes_dispatch_time_without_dropping_inputs(tmp_path,monkeypatch):
+    tick = [0.]
+    monkeypatch.setattr('src.research.neural_sentiment.time.perf_counter', lambda: tick[0])
+    class FailingWorker(Worker):
+        calls = 0
+        async def infer(self, text, offset):
+            self.calls += 1
+            tick[0] += 1.
+            raise TimeoutError('fixture worker unavailable')
+    worker = FailingWorker()
+    queue = SentimentResearch(tmp_path/'nlp.sqlite', worker=worker)
+    for index in range(12):
+        enqueue(queue, f'public fixture {index}', job=f'job:{index}')
+    assert await queue.fetch() == []
+    assert worker.calls == 2
+    assert queue.report()['pending_inputs'] == 12
+    queue.close()
+
+
+@pytest.mark.asyncio
+async def test_result_write_failure_rolls_back_cache_and_annotation_but_counts_real_work(tmp_path):
+    worker = CountingWorker()
+    queue = SentimentResearch(tmp_path/'nlp.sqlite', worker=worker)
+    enqueue(queue)
+    queue.db.execute("CREATE TRIGGER fixture_fail BEFORE INSERT ON results BEGIN SELECT RAISE(ABORT,'fixture'); END")
+    assert await queue.fetch() == []
+    assert worker.calls == 1
+    assert queue.db.execute('SELECT COUNT(*) FROM results').fetchone()[0] == 0
+    assert queue.db.execute('SELECT COUNT(*) FROM inference_cache').fetchone()[0] == 0
+    assert queue.report()['inference_metrics']['worker_inferences'] == 1
+    assert queue.report()['pending_inputs'] == 1
+    queue.db.execute('DROP TRIGGER fixture_fail')
+    rows = await queue.fetch()
+    assert worker.calls == 2 and len(rows) == 1
+    assert queue.report()['inference_metrics']['worker_inferences'] == 2
+    assert queue.report()['canonical_windows'] == 0
+    queue.close()
+
+
 @pytest.mark.asyncio
 async def test_newest_post_bypasses_live_backlog_without_starving_old_live_or_replay(tmp_path,monkeypatch):
     path=tmp_path/'nlp.sqlite'
-    queue=SentimentResearch(path,worker=Worker())
+    worker = paced_worker(monkeypatch)
+    queue=SentimentResearch(path,worker=worker)
     for index in range(100):
         enqueue(queue,f'old live text {index}',job=f'old:{index}')
     queue.enqueue({'text':'historical text','source_id':'historical','observed_at':1},
@@ -43,7 +112,7 @@ async def test_newest_post_bypasses_live_backlog_without_starving_old_live_or_re
     monkeypatch.setattr('src.research.neural_sentiment.time.time',lambda:50.)
     enqueue(queue,'newest live text',job='fresh:arrival')
     queue.close()
-    queue=SentimentResearch(path,worker=Worker())
+    queue=SentimentResearch(path,worker=worker)
     rows=await queue.fetch()
     assert rows[0]['source_job']=='fresh:arrival'
     assert any(row['source_job']=='old:0' for row in rows)
@@ -59,15 +128,16 @@ async def test_newest_post_bypasses_live_backlog_without_starving_old_live_or_re
 
 
 @pytest.mark.asyncio
-async def test_live_intake_progresses_ahead_of_large_history_without_starving_history(tmp_path):
+async def test_live_intake_progresses_ahead_of_large_history_without_starving_history(tmp_path,monkeypatch):
     path=tmp_path/'nlp.sqlite'
-    queue=SentimentResearch(path,worker=Worker())
+    worker = paced_worker(monkeypatch)
+    queue=SentimentResearch(path,worker=worker)
     for index in range(100):
         queue.enqueue({'text':f'old document {index}', 'source_id':'historical', 'observed_at':10},
             source_job=None,source_ref=f'canonical:replay:{index}')
     enqueue(queue,'current live observation',job='live:first')
     queue.close()
-    queue=SentimentResearch(path,worker=Worker())
+    queue=SentimentResearch(path,worker=worker)
     rows=await queue.fetch()
     assert any(row['source_job']=='live:first' and row['input_origin']=='LIVE' for row in rows)
     assert any(row['input_origin']=='REPLAY' for row in rows)
