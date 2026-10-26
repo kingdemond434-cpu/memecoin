@@ -1,0 +1,25 @@
+Canonical source acknowledgement audit
+======================================
+
+Run from the development checkout:
+
+    python -m tools.source_ack_audit JOURNAL_SQLITE FRONTIER_SQLITE EVIDENCE_JSONL
+
+The default sample is the 100 newest acknowledged journal rows (maximum 10,000).
+Connections use read-only URI and query_only. A journal read snapshot is taken
+before opening the frontier snapshot: canonical rows and frontier jobs precede
+journal acknowledgement. The command checks the exact job kind/reference,
+reference byte boundary, canonical row self-hash and original intake receipt
+(id, body digest, accepted time and first-delivery time). It also checks research
+availability against the observed and delivered clocks. Each read is bounded to
+8 MiB and the captured ledger extent; concurrent appends cannot extend the audit.
+
+Output contains aggregate counts and failure categories, never source text,
+identifiers, canonical references or private exception messages. PASS means only
+the sampled ACK targets passed. No ACKs returns NO_ACK_SAMPLE and exit 1. FAIL
+and ERROR also exit 1. No database or ledger is created on a missing path.
+
+This is not a full-prefix hash-chain proof, backup certificate, upstream coverage
+proof or profitable strategy result. It complements source_journal_audit; keep
+both these scopes explicit when interpreting the receipts. Run periodically,
+not on the market or frequent-health path.
