@@ -211,6 +211,50 @@ async def test_runtime_archives_all_launches_without_pump_reserves_or_execution_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('intake_failure',[False,True])
+async def test_native_capture_hands_off_before_episode_enrichment_and_retains_failures(tmp_path,caplog,intake_failure):
+    from src.chains.pump_route import WSOL_MINT
+    from src.research.fork_probe import ForkProbe
+    from src.research.trade_evidence import TradeEvidenceLedger
+    from src.runtime.ingestion import MinedRecordIngestion
+    events,_=await decode(transactions()[0])
+    event={**events[0],'quote_mint':WSOL_MINT}  # Synthetic quote control.
+    ledger=TradeEvidenceLedger(tmp_path/'launch.jsonl')
+    probe=ForkProbe(tmp_path/'fork.sqlite')
+    if intake_failure:
+        probe.enqueue_native_launch=Mock(side_effect=OSError('private-provider-text'))
+    surface=SimpleNamespace(_stream_events={},observed_bids=Mock(),_note_launch_venue=Mock(),
+        launchpads=SimpleNamespace(specs={}),trade_evidence=ledger,fork_probe=probe,
+        _record_hot_creator=Mock(side_effect=RuntimeError('synthetic enrichment failure')))
+    with pytest.raises(RuntimeError,match='enrichment failure'):
+        await MinedRecordIngestion._on_launchpad_event(surface,event)
+    assert TradeEvidenceLedger.verify(ledger.path)[0]
+    assert len(ledger.path.read_text().splitlines())==1
+    if intake_failure:
+        assert surface._stream_events['native_probe_intake_failed']==1
+        assert 'private-provider-text' not in caplog.text
+    else:
+        assert probe.report()['targets']==1 and probe.report()['canonical_native_source_links']==1
+        raw=json.loads(ledger.path.read_text())
+        assert probe.db.execute('SELECT ref,available FROM native_target_sources').fetchone()==(
+            'native-launch:'+raw['hash'],raw['timestamp'])
+    probe.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_canonical_launch_append_does_not_enter_queue_or_enrichment():
+    from src.runtime.ingestion import MinedRecordIngestion
+    events,_=await decode(transactions()[0])
+    surface=SimpleNamespace(_stream_events={},observed_bids=Mock(),_note_launch_venue=Mock(),
+        launchpads=SimpleNamespace(specs={}),trade_evidence=SimpleNamespace(record=Mock(return_value=None)),
+        fork_probe=SimpleNamespace(enqueue_native_launch=Mock()),_record_hot_creator=Mock())
+    await MinedRecordIngestion._on_launchpad_event(surface,events[0])
+    surface.fork_probe.enqueue_native_launch.assert_not_called()
+    surface._record_hot_creator.assert_not_called()
+    assert surface._stream_events['native_launch:canonical_failed']==1
+
+
+@pytest.mark.asyncio
 async def test_native_monitor_is_wired_before_rpc_start():
     from src.runtime.wiring import SubsystemWiring
     observed = {}

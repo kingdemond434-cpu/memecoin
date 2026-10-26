@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from pathlib import Path
+import re
 import sqlite3
 import threading
 import time
@@ -33,6 +35,9 @@ class ForkProbe:
           CREATE INDEX IF NOT EXISTS queue ON jobs(due,id);
           CREATE INDEX IF NOT EXISTS by_token ON results(json_extract(body,'$.token'),available DESC) WHERE ref IS NOT NULL;
           CREATE TABLE IF NOT EXISTS fork_venue_service(venue TEXT PRIMARY KEY,last_ticket INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS native_target_sources(ref TEXT PRIMARY KEY,job TEXT NOT NULL,
+            available REAL NOT NULL,ingested REAL NOT NULL);
+          CREATE INDEX IF NOT EXISTS native_sources_by_job ON native_target_sources(job,ref);
         ''')
         columns = {row[1] for row in self.db.execute('PRAGMA table_info(jobs)')}
         if 'arrived' not in columns:
@@ -47,6 +52,46 @@ class ForkProbe:
         self.db.execute('CREATE INDEX IF NOT EXISTS untried_arrival ON jobs(arrived DESC,id) WHERE attempts=0')
         self.db.execute('CREATE INDEX IF NOT EXISTS retry_deadline ON jobs(due,id) WHERE attempts>0')
         self.db.commit()
+
+    def _enqueue_targets_locked(self, targets, now):
+        admitted = []
+        for target in targets:
+            body = json.dumps(target, sort_keys=True, allow_nan=False)
+            identity = digest(target)
+            inserted = self.db.execute('INSERT OR IGNORE INTO jobs(id,body,due,attempts,arrived,first_seen) '
+                'VALUES(?,?,?,0,(SELECT ticket+1 FROM fork_dispatch WHERE id=1),?)',
+                (identity, body, now, now))
+            if inserted.rowcount:
+                self.db.execute('UPDATE fork_dispatch SET ticket=ticket+1 WHERE id=1')
+            admitted.append((identity, bool(inserted.rowcount)))
+        return admitted
+
+    def enqueue_native_launch(self, event, *, source_ref, available_at):
+        """Persist an unexecuted reviewed target after its canonical source append."""
+        from solders.pubkey import Pubkey
+        from src.chains.launchlab import LAUNCHLAB_PROGRAM
+        from src.chains.pump_route import WSOL_MINT
+        if (event.get('type') != 'token_launch' or event.get('venue') != 'raydium_launchlab'
+                or event.get('program') != LAUNCHLAB_PROGRAM or event.get('quote_mint') != WSOL_MINT):
+            return None
+        if not isinstance(source_ref, str) or not re.fullmatch('native-launch:[0-9a-f]{64}', source_ref):
+            raise ValueError('canonical native-launch hash reference required')
+        if type(available_at) not in (int, float) or not math.isfinite(available_at):
+            raise ValueError('finite canonical source availability required')
+        for key in ('token', 'pool'):
+            Pubkey.from_string(event[key])
+        target = {'token': event['token'], 'venue': 'raydium_launchlab', 'pool': event['pool'],
+                  'quote_budget': 1_000_000}
+        now = time.time()
+        with self.lock, self.db:
+            identity, inserted = self._enqueue_targets_locked([target], now)[0]
+            previous = self.db.execute('SELECT job,available FROM native_target_sources WHERE ref=?',
+                                       (source_ref,)).fetchone()
+            if previous is not None and previous != (identity, available_at):
+                raise ValueError('canonical native source identity or availability changed')
+            self.db.execute('INSERT OR IGNORE INTO native_target_sources VALUES(?,?,?,?)',
+                            (source_ref, identity, available_at, now))
+        return {'target_id': identity, 'inserted': inserted}
 
     def _reserve_job(self, now):
         """Caller holds the write transaction; tickets survive restart/clock correction."""
@@ -67,7 +112,10 @@ class ForkProbe:
                 self.db.execute('INSERT INTO fork_venue_service VALUES(?, '
                     '(SELECT COALESCE(MAX(last_ticket),0)+1 FROM fork_venue_service)) '
                     'ON CONFLICT(venue) DO UPDATE SET last_ticket=excluded.last_ticket', (job[3],))
-                return (*job, lane)
+                sources = [{'source_ref': ref, 'available_at': at, 'ingested_at': ingested}
+                    for ref, at, ingested in self.db.execute(
+                        'SELECT ref,available,ingested FROM native_target_sources WHERE job=? ORDER BY ref', (job[0],))]
+                return (*job, lane, sources)
         return None
 
     def _store_frame(self, frame):
@@ -123,13 +171,7 @@ class ForkProbe:
         # Batches/cadence bound current resource use; the durable token universe
         # has no top-N or lifetime ceiling. Old and new targets share the queue.
         with self.lock, self.db:
-            for target in targets():
-                body = json.dumps(target, sort_keys=True, allow_nan=False)
-                inserted = self.db.execute('INSERT OR IGNORE INTO jobs(id,body,due,attempts,arrived,first_seen) '
-                    'VALUES(?,?,?,0,(SELECT ticket+1 FROM fork_dispatch WHERE id=1),?)',
-                    (digest(target), body, now, now))
-                if inserted.rowcount:
-                    self.db.execute('UPDATE fork_dispatch SET ticket=ticket+1 WHERE id=1')
+            self._enqueue_targets_locked(targets(), now)
             pending = self.db.execute('SELECT body FROM results WHERE ref IS NULL ORDER BY created LIMIT 1').fetchone()
             if pending:
                 return [json.loads(pending[0])]
@@ -153,6 +195,7 @@ class ForkProbe:
         row = {**result, 'provider': 'local_svm', 'fork_kind': 'native_roundtrip',
             'schema': SCHEMA, 'token': target['token'], 'target': target,
             'dispatch_lane': job[4], 'dispatch_venue': job[3], 'target_first_queued_at': job[2],
+            'native_source_refs': job[5],
             'queue_age_at_attempt_seconds': max(0., now-job[2]) if job[2] is not None else None,
             'queue_clock_regressed': now < job[2] if job[2] is not None else None,
             'input_sha256': frame_id, 'created_at': time.time(),
@@ -183,7 +226,11 @@ class ForkProbe:
                 "json_extract(body,'$.token')=? AND available<=? ORDER BY available DESC LIMIT 1", (token, as_of)).fetchone()
         if row is None:
             return None
-        return {**json.loads(row[0]), 'source_ref': row[1], 'available_at': row[2]}
+        result = json.loads(row[0])
+        if any(source['available_at'] > as_of or source['ingested_at'] > as_of
+               for source in result.get('native_source_refs', [])):
+            return None
+        return {**result, 'source_ref': row[1], 'available_at': row[2]}
 
     def report(self):
         with self.lock:
@@ -208,12 +255,15 @@ class ForkProbe:
                     'ROUNDTRIP_SUCCEEDED_IN_FORK', 0) else 'CANONICAL_DISPOSITIONS_ONLY' if row[
                     'canonical_dispositions'] else 'TARGETS_PENDING' if row['targets'] else 'NO_TARGETS_OBSERVED')
             venue_service = dict(self.db.execute('SELECT venue,last_ticket FROM fork_venue_service'))
+            source_links, source_targets = self.db.execute(
+                'SELECT count(*),count(DISTINCT job) FROM native_target_sources').fetchone()
         return {'status': 'LOCAL_FORK_RESEARCH', 'targets': jobs[0], 'attempts': jobs[1] or 0,
                 'canonical_dispositions': statuses, 'awaiting_canonical_ack': pending,
                 'by_venue': venues,
                 'scheduling': '2 fresh untried : 1 oldest untried : 1 due retry; empty lanes share capacity',
                 'venue_scheduling': 'least recently serviced eligible venue within each lane; persistent monotone tickets',
                 'venue_service_tickets': venue_service,
+                'canonical_native_source_links': source_links, 'canonical_native_linked_targets': source_targets,
                 'supported_adapters': ['pump_curve', 'pumpswap', 'raydium_launchlab'],
                 'adapter_subsets': {'raydium_launchlab': 'funding status, SPL/Token-2022 base, WSOL quote; transfer hooks/other layouts unknown'},
                 'other_venues': 'UNSUPPORTED_UNKNOWN', 'live_authority': False,

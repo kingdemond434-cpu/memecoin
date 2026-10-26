@@ -16,6 +16,74 @@ from src.research import fork_simulation as f
 from src.research.fork_probe import ForkProbe
 
 
+def native_launch_fixture():
+    from src.chains.launchlab import LAUNCHLAB_PROGRAM
+    return {'type':'token_launch','venue':'raydium_launchlab','program':LAUNCHLAB_PROGRAM,
+            'quote_mint':WSOL_MINT,'token':str(Pubkey.new_unique()),'pool':str(Pubkey.new_unique())}
+
+
+@pytest.mark.asyncio
+async def test_native_source_handoff_deduplicates_polling_and_survives_restart(monkeypatch,tmp_path):
+    from src.research import fork_probe as p
+    monkeypatch.setattr(p.time,'time',lambda:200.)
+    async def unavailable(rpc,target):raise f.ForkUnavailable('synthetic unavailable fixture')
+    monkeypatch.setattr(p,'acquire',unavailable)
+    path=tmp_path/'fork.sqlite';probe=ForkProbe(path);event=native_launch_fixture()
+    ref='native-launch:'+'a'*64
+    first=probe.enqueue_native_launch(event,source_ref=ref,available_at=100.)
+    assert first['inserted'] is True
+    assert probe.enqueue_native_launch(event,source_ref=ref,available_at=100.)['inserted'] is False
+    target={key:event[key] for key in ('token','pool','venue')};target['quote_budget']=1_000_000
+    rows=await probe.fetch(None,lambda:[target])
+    assert probe.report()['targets']==1 and probe.report()['canonical_native_source_links']==1
+    assert rows[0]['native_source_refs']==[{'source_ref':ref,'available_at':100.,'ingested_at':200.}]
+    probe.close();probe=ForkProbe(path)
+    assert await probe.fetch(None,lambda:[])==rows
+    assert probe.latest(event['token'],as_of=1000) is None
+    probe.acknowledge(rows,'canonical:source-linked-result')
+    assert probe.latest(event['token'],as_of=199.) is None
+    assert probe.latest(event['token'],as_of=201.)['native_source_refs']==rows[0]['native_source_refs']
+    probe.close()
+
+
+def test_native_source_identity_conflicts_roll_back_new_target_and_ticket(tmp_path):
+    probe=ForkProbe(tmp_path/'fork.sqlite');event=native_launch_fixture();ref='native-launch:'+'b'*64
+    probe.enqueue_native_launch(event,source_ref=ref,available_at=100.)
+    ticket=probe.db.execute('SELECT ticket FROM fork_dispatch').fetchone()[0]
+    changed={**event,'token':str(Pubkey.new_unique())}
+    with pytest.raises(ValueError,match='changed'):
+        probe.enqueue_native_launch(changed,source_ref=ref,available_at=100.)
+    with pytest.raises(ValueError,match='changed'):
+        probe.enqueue_native_launch(event,source_ref=ref,available_at=101.)
+    assert probe.report()['targets']==1 and probe.report()['canonical_native_source_links']==1
+    assert probe.db.execute('SELECT ticket FROM fork_dispatch').fetchone()[0]==ticket
+    probe.close()
+
+
+def test_native_handoff_rejects_missing_provenance_or_bad_keys_and_keeps_other_quotes_unknown(tmp_path):
+    probe=ForkProbe(tmp_path/'fork.sqlite');event=native_launch_fixture();ref='native-launch:'+'c'*64
+    with pytest.raises(ValueError):probe.enqueue_native_launch(event,source_ref='unretained',available_at=100.)
+    with pytest.raises(ValueError):probe.enqueue_native_launch(event,source_ref=ref,available_at=float('nan'))
+    with pytest.raises(ValueError):probe.enqueue_native_launch({**event,'pool':'invalid'},source_ref=ref,available_at=100.)
+    assert probe.enqueue_native_launch({**event,'quote_mint':str(Pubkey.new_unique())},source_ref=ref,available_at=100.) is None
+    assert probe.report()['targets']==0
+    probe.close()
+
+
+@pytest.mark.asyncio
+async def test_native_dependency_availability_cannot_be_backdated_by_result_ack(monkeypatch,tmp_path):
+    from src.research import fork_probe as p
+    monkeypatch.setattr(p.time,'time',lambda:200.)
+    async def unavailable(rpc,target):raise f.ForkUnavailable('synthetic unavailable fixture')
+    monkeypatch.setattr(p,'acquire',unavailable)
+    probe=ForkProbe(tmp_path/'fork.sqlite');event=native_launch_fixture()
+    probe.enqueue_native_launch(event,source_ref='native-launch:'+'d'*64,available_at=300.)
+    rows=await probe.fetch(None,lambda:[]);probe.acknowledge(rows,'canonical:clock-corrected')
+    assert probe.latest(event['token'],as_of=250.) is None
+    assert probe.latest(event['token'],as_of=301.) is not None
+    probe.close()
+
+
 def test_manifest_binds_route_builders_decoder_and_vendored_contracts():
     from pathlib import Path
     import hashlib
