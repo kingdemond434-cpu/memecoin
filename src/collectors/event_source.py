@@ -22,6 +22,7 @@ from when it last produced an event.
 import asyncio
 import hashlib
 import logging
+import threading
 import time
 from collections import OrderedDict, deque
 from abc import ABC, abstractmethod
@@ -284,6 +285,7 @@ class SourceMesh:
         # One total memory budget, with no fixed source admission quota.
         # Each nonempty source gets one delivery before its next turn.
         self._pending_sources = OrderedDict()
+        self._queue_lock = threading.RLock()
         self._pending_count = 0
         self._available = asyncio.Event()
         self._delivered_by_source = {}
@@ -371,6 +373,10 @@ class SourceMesh:
 
     def _publish(self, event: Event, now: float) -> None:
         """Admit fairly; overflow cannot let a hot feed evict every rare feed."""
+        with self._queue_lock:
+            self._publish_locked(event, now)
+
+    def _publish_locked(self, event: Event, now: float) -> None:
         durable = self._durable_key(event)
         if durable is not None and durable in self._queued_durable:
             # One unconsumed copy suffices. This is queue residency, not a
@@ -432,6 +438,10 @@ class SourceMesh:
                 await self._available.wait()
 
     def _take_pending(self) -> Event:
+        with self._queue_lock:
+            return self._take_pending_locked()
+
+    def _take_pending_locked(self) -> Event:
         if not self._pending_sources:
             raise asyncio.QueueEmpty
         source, bucket = self._pending_sources.popitem(last=False)
@@ -461,7 +471,25 @@ class SourceMesh:
 
     @property
     def pending(self) -> int:
-        return self._pending_count
+        with self._queue_lock:
+            return self._pending_count
+
+    def _queue_report(self, now):
+        # Diagnostic projections run in a worker while the owner loop mutates
+        # queues. Copy only scalar counters under this short, I/O-free lock.
+        with self._queue_lock:
+            return {
+                'pending_events': self._pending_count,
+                'delivery_policy': 'ROUND_ROBIN_NONEMPTY_SOURCES',
+                'pending_by_source': {key: len(rows) for key, rows in self._pending_sources.items()},
+                'oldest_pending_age_by_source': {key: max(0., now-rows[0][1])
+                                                for key, rows in self._pending_sources.items()},
+                'delivered_by_source': dict(self._delivered_by_source),
+                'dropped_by_source': dict(self._dropped_by_source),
+                'dropped_events': self.dropped,
+                'pending_durable_events': len(self._queued_durable),
+                'queued_durable_repeats_coalesced': self.queued_durable_repeats_coalesced,
+            }
 
     async def collect(self, now: Optional[float] = None) -> List[Event]:
         """Poll every source once and return the first observations.
@@ -509,17 +537,8 @@ class SourceMesh:
             # The failure mode of a large mesh is six adapters going silent
             # while the dashboard stays green, so the silent ones are named.
             "unhealthy": unhealthy,
-            "dropped_events": self.dropped,
             "streaming": self._running,
             "producers": len(self._producers),
-            "pending_events": self._pending_count,
-            "delivery_policy": "ROUND_ROBIN_NONEMPTY_SOURCES",
-            "pending_by_source": {key: len(rows) for key, rows in self._pending_sources.items()},
-            "oldest_pending_age_by_source": {key: max(0., now-rows[0][1])
-                                             for key, rows in self._pending_sources.items()},
-            "delivered_by_source": dict(self._delivered_by_source),
-            "dropped_by_source": dict(self._dropped_by_source),
-            "pending_durable_events": len(self._queued_durable),
-            "queued_durable_repeats_coalesced": self.queued_durable_repeats_coalesced,
+            **self._queue_report(now),
             "coverage": (by_state.get("OK", 0) / len(reports)) if reports else None,
         }

@@ -1,4 +1,5 @@
 import asyncio
+import threading
 
 import pytest
 
@@ -80,3 +81,28 @@ async def test_two_waiters_receive_distinct_events_and_remaining_waiter_keeps_wa
     mesh._publish(two, 3.)
     assert await asyncio.wait_for(next(iter(pending)), 1) == two
     assert mesh.pending == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_health_reads_are_consistent_during_owner_loop_mutation():
+    mesh = SourceMesh(max_queue=20)
+    started, stop = threading.Event(), threading.Event()
+    def snapshots():
+        seen = 0
+        started.set()
+        while not stop.is_set():
+            report = mesh.health(10.)
+            assert sum(report['pending_by_source'].values()) == report['pending_events']
+            assert sum(report['dropped_by_source'].values()) == report['dropped_events']
+            assert set(report['pending_by_source']) == set(report['oldest_pending_age_by_source'])
+            seen += 1
+        return seen
+    worker = asyncio.create_task(asyncio.to_thread(snapshots))
+    try:
+        while not started.is_set():await asyncio.sleep(0)
+        for number in range(1000):
+            mesh._publish(event(f'source:{number % 17}', number), 2.)
+            if number % 3 == 0:mesh.drain(limit=1)
+            await asyncio.sleep(0)
+    finally:stop.set()
+    assert await worker > 0
