@@ -23,6 +23,7 @@ import asyncio
 import hashlib
 import logging
 import time
+from collections import OrderedDict, deque
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -262,9 +263,9 @@ class SourceMesh:
     latency. With hundreds of sources the serial version's worst case is the
     sum of every timeout.
 
-    The queue is bounded and drops the OLDEST on overflow, for the same reason
-    the archive writer does: a queue that blocks converts a slow source into a
-    stalled mesh, and one that grows without bound converts it into an OOM.
+    Live delivery rotates across nonempty sources. A burst from one producer
+    cannot put every other source behind its entire backlog. Active memory is
+    bounded; overflow removes the oldest item from the largest source backlog.
     """
 
     def __init__(self, sources: Optional[Sequence[EventSource]] = None,
@@ -280,10 +281,13 @@ class SourceMesh:
         # content_hash -> (first_seen_at, [source_ids in arrival order]).
         # Kept rather than discarded, because who saw it FIRST is the signal.
         self._seen: Dict[str, Any] = {}
-        # Bounded fan-in. Every producer writes here and the consumer reads
-        # here, so no source can hold another's events and no source can grow
-        # the memory footprint without bound.
-        self._queue: asyncio.Queue = asyncio.Queue(maxsize=self.max_queue)
+        # One total memory budget, with no fixed source admission quota.
+        # Each nonempty source gets one delivery before its next turn.
+        self._pending_sources = OrderedDict()
+        self._pending_count = 0
+        self._available = asyncio.Event()
+        self._delivered_by_source = {}
+        self._dropped_by_source = {}
         self._queued_durable = set()
         self.queued_durable_repeats_coalesced = 0
         self._producers: List[asyncio.Task] = []
@@ -366,12 +370,7 @@ class SourceMesh:
             await asyncio.sleep(source.retry_delay(elapsed))
 
     def _publish(self, event: Event, now: float) -> None:
-        """Put one event on the fan-in queue, dropping the oldest when full.
-
-        Oldest first, because the newest observation is the one a decision
-        might still depend on -- and dropping is counted, since a queue
-        silently shedding events looks exactly like a quiet forest.
-        """
+        """Admit fairly; overflow cannot let a hot feed evict every rare feed."""
         durable = self._durable_key(event)
         if durable is not None and durable in self._queued_durable:
             # One unconsumed copy suffices. This is queue residency, not a
@@ -381,19 +380,24 @@ class SourceMesh:
             return
         if not self._admit(event, now):
             return
-        while True:
-            try:
-                self._queue.put_nowait(event)
-                if durable is not None:
-                    self._queued_durable.add(durable)
-                return
-            except asyncio.QueueFull:
-                try:
-                    removed = self._queue.get_nowait()
-                    self._queued_durable.discard(self._durable_key(removed))
-                    self.dropped += 1
-                except asyncio.QueueEmpty:  # pragma: no cover - racing drain
-                    return
+        self._pending_sources.setdefault(event.source_id, deque()).append((event, now))
+        self._pending_count += 1
+        if durable is not None:
+            self._queued_durable.add(durable)
+        while self._pending_count > self.max_queue:
+            # Ties evict the oldest queued observation. A source's fresh
+            # burst displaces its own backlog before a lone rare observation.
+            source = max(self._pending_sources, key=lambda key:
+                (len(self._pending_sources[key]), -self._pending_sources[key][0][1]))
+            bucket = self._pending_sources[source]
+            removed, _ = bucket.popleft()
+            if not bucket:
+                del self._pending_sources[source]
+            self._pending_count -= 1
+            self._queued_durable.discard(self._durable_key(removed))
+            self.dropped += 1
+            self._dropped_by_source[source] = self._dropped_by_source.get(source, 0) + 1
+        self._available.set()
 
     async def start(self) -> int:
         """Spawn one persistent producer per source. Returns how many started."""
@@ -418,8 +422,25 @@ class SourceMesh:
 
     async def next_event(self) -> Event:
         """Await the next event from any source. The consumer's entry point."""
-        event = await self._queue.get()
+        while True:
+            try:
+                return self._take_pending()
+            except asyncio.QueueEmpty:
+                # There is no await between checking and clearing: a producer
+                # cannot publish in a lost-wakeup window on the owner loop.
+                self._available.clear()
+                await self._available.wait()
+
+    def _take_pending(self) -> Event:
+        if not self._pending_sources:
+            raise asyncio.QueueEmpty
+        source, bucket = self._pending_sources.popitem(last=False)
+        event, _ = bucket.popleft()
+        if bucket:
+            self._pending_sources[source] = bucket
+        self._pending_count -= 1
         self._queued_durable.discard(self._durable_key(event))
+        self._delivered_by_source[source] = self._delivered_by_source.get(source, 0) + 1
         return event
 
     @staticmethod
@@ -433,16 +454,14 @@ class SourceMesh:
         events: List[Event] = []
         while limit is None or len(events) < limit:
             try:
-                event = self._queue.get_nowait()
-                self._queued_durable.discard(self._durable_key(event))
-                events.append(event)
+                events.append(self._take_pending())
             except asyncio.QueueEmpty:
                 break
         return events
 
     @property
     def pending(self) -> int:
-        return self._queue.qsize()
+        return self._pending_count
 
     async def collect(self, now: Optional[float] = None) -> List[Event]:
         """Poll every source once and return the first observations.
@@ -493,7 +512,13 @@ class SourceMesh:
             "dropped_events": self.dropped,
             "streaming": self._running,
             "producers": len(self._producers),
-            "pending_events": self._queue.qsize(),
+            "pending_events": self._pending_count,
+            "delivery_policy": "ROUND_ROBIN_NONEMPTY_SOURCES",
+            "pending_by_source": {key: len(rows) for key, rows in self._pending_sources.items()},
+            "oldest_pending_age_by_source": {key: max(0., now-rows[0][1])
+                                             for key, rows in self._pending_sources.items()},
+            "delivered_by_source": dict(self._delivered_by_source),
+            "dropped_by_source": dict(self._dropped_by_source),
             "pending_durable_events": len(self._queued_durable),
             "queued_durable_repeats_coalesced": self.queued_durable_repeats_coalesced,
             "coverage": (by_state.get("OK", 0) / len(reports)) if reports else None,

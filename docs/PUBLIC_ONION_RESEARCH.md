@@ -34,6 +34,15 @@ observation. Pending outbox records are redelivered before new network work;
 children still require their parent's canonical acknowledgement. Multiple
 transport instances sharing the database reserve host leases transactionally.
 
+The live source mesh rotates delivery across nonempty source queues. A burst
+from one public feed cannot put the onion outbox behind that feed's entire
+backlog. When the shared memory budget fills, the largest source backlog loses
+its oldest observation first; loss remains counted per source. Durable outbox
+copies coalesce while queued and remain eligible for redelivery after dequeue
+or eviction. This is scheduling fairness, not a canonical acknowledgement or a
+zero-loss guarantee. `source_mesh` reports per-source pending counts, oldest
+queue age, deliveries and drops so overload remains visible.
+
 The separately configured `onion` transport is a bounded single-source crawler.
 Its `max_pages` (up to 256), `max_depth` (up to eight) and `pages_per_poll` (up to
 two) options still apply to that adapter. They do not limit the continuous
