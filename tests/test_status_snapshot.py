@@ -44,11 +44,20 @@ async def test_slow_status_query_is_coalesced_without_blocking_health(tmp_path, 
             assert await asyncio.to_thread(entered.wait,3)
             health=await (await client.get('/health')).json()
             assert health['status']=='healthy' and not release.is_set()
+            one_response,two_response=await first,await second
+            assert one_response.status==two_response.status==503
+            one,two=await one_response.json(),await two_response.json()
+            assert one['phase']==two['phase']=='diagnostics'
+            assert one['diagnostic_snapshot']['available'] is False
+            assert one_response.headers['Retry-After']=='1'
+            task=surface._readiness_refresh_task
             release.set()
-            one=await (await first).json();two=await (await second).json()
-            assert one['engine']['frontier']['pending']==two['engine']['frontier']['pending']==42
+            await task
             assert len(calls)==1
-            cached=await (await client.get('/status')).json()
+            response=await client.get('/status')
+            assert response.status==200
+            cached=await response.json()
+            assert cached['engine']['frontier']['pending']==42
             assert cached['engine']['frontier']['snapshot_age_seconds']>=0 and len(calls)==1
     finally:
         release.set();desk.frontier.close()

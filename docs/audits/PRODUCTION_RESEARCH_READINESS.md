@@ -98,10 +98,9 @@ block-hash state queries.
 - Historical survival must precede prospective registrations. Untouched
   forward cohorts require new events and actual elapsed observation time;
   they cannot be supplied by a synthetic test or relabeled history.
-- The existing Windows task still uses the interactive Administrator session.
-  RDP disconnection is supported; logoff stops that deployment. Switching to
-  an unattended account was rejected by automatic approval review and was
-  not performed.
+- The dedicated Windows paper task now runs as LocalService with a startup
+  trigger. Its service identity and configuration-reader permissions were
+  verified on 26 October; an interactive RDP session is not required.
 
 Starting real public EVM backfills exposed long initial observation passes.
 Each scouting/backfill call now has a 20-second deadline, and the same loop
@@ -120,3 +119,10 @@ sample. Both produced identical JSON bytes. Checkpoints now use one-shot
 encoding and one write, retaining rejection of nonfinite values, temporary
 file cleanup, flush/fsync and atomic replacement. This sample is not an
 end-to-end latency measurement or a production p99 claim.
+
+The first `/status` request now starts a single background diagnostics
+projection and promptly returns HTTP 503, phase `diagnostics`, with
+`Retry-After: 1` until a complete snapshot exists. It does not wait behind a
+cold frontier/database projection or return partial diagnostics as ready.
+Health remains a separate liveness check. Subsequent complete snapshots retain
+their actual observation age and any background refresh error type.

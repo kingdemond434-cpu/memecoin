@@ -897,7 +897,7 @@ class ReportingSurface:
             "champions": self.champion_challenger.get_stats() if self.champion_challenger else {},
         }
 
-    async def _readiness_snapshot(self):
+    async def _readiness_snapshot(self, *, wait_for_initial=True):
         async def refresh():
             try:
                 engine = getattr(self, 'unknown_engine', None)
@@ -919,6 +919,8 @@ class ReportingSurface:
             self._readiness_refresh_task = asyncio.create_task(refresh())
             self._readiness_refresh_task.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
         if cached is None:
+            if not wait_for_initial:
+                return None
             await asyncio.shield(self._readiness_refresh_task)
             cached = self._readiness_cache
         return {**cached[0], 'diagnostic_snapshot': {'observed_at': cached[1],
@@ -1193,7 +1195,17 @@ class ReportingSurface:
                 {"status": "starting", "phase": starting,
                  "uptime_seconds": time.time() - self.start_time},
                 status=503)
-        return web.json_response(await self._readiness_snapshot())
+        snapshot = await self._readiness_snapshot(wait_for_initial=False)
+        if snapshot is None:
+            # The initial off-thread projection may take longer than an HTTP
+            # deadline. Keep one refresh running and expose actual readiness.
+            return web.json_response({"status": "starting", "phase": "diagnostics",
+                "uptime_seconds": time.time()-self.start_time,
+                "diagnostic_snapshot": {"available": False,
+                    "refresh_in_progress": getattr(self, '_readiness_refresh_task', None) is not None,
+                    "refresh_error_type": getattr(self, '_readiness_refresh_error', None)}},
+                status=503, headers={"Retry-After": "1"})
+        return web.json_response(snapshot)
 
     async def _close_health_server(self):
         if self._web_runner:
