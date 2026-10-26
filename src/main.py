@@ -732,6 +732,9 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
                 except asyncio.CancelledError:
                     pass
         await self._close_health_server()
+        close_sources = getattr(getattr(self, 'source_mesh', None), 'close', None)
+        if callable(close_sources):
+            await asyncio.to_thread(close_sources)
         if getattr(self, "phantom_perps", None) is not None:
             await asyncio.to_thread(self.phantom_perps.close)
         if getattr(self, "fork_probe", None) is not None:

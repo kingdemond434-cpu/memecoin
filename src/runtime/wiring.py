@@ -709,7 +709,8 @@ class SubsystemWiring:
         self.source_mesh = SourceMesh(
             sources,
             dedupe_window=float(self.global_config.get("source_dedupe_window", 300.0)),
-            poll_timeout=float(self.global_config.get("source_poll_timeout", 5.0)))
+            poll_timeout=float(self.global_config.get("source_poll_timeout", 5.0)),
+            journal_path=Path(self.global_config.get("ops_state_dir", "data/state")) / "source_intake.sqlite")
         # token -> observations naming it, newest last.
         self._source_events: Dict[str, List[Any]] = {}
         # Set properly once the predictor is constructed; until then a

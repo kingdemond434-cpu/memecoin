@@ -272,7 +272,7 @@ class SourceMesh:
 
     def __init__(self, sources: Optional[Sequence[EventSource]] = None,
                  dedupe_window: float = 300.0, max_queue: int = 10_000,
-                 poll_timeout: float = 5.0):
+                 poll_timeout: float = 5.0, journal_path=None):
         self.sources: List[EventSource] = list(sources or ())
         self.dedupe_window = dedupe_window
         self.max_queue = max(1, max_queue)
@@ -297,6 +297,77 @@ class SourceMesh:
         self._producers: List[asyncio.Task] = []
         self._running = False
         self._owner_loop = None
+        self.journal = None
+        self._journal_leases = {}
+        self._journal_write_gate = asyncio.Lock()
+        self._journal_write_failures = 0
+        self._journal_last_error = None
+        if journal_path is not None:
+            from src.collectors.source_journal import SourceJournal
+            self.journal = SourceJournal(journal_path)
+
+    @staticmethod
+    async def _disk_call(call, *args):
+        pending = asyncio.create_task(asyncio.to_thread(call, *args))
+        try:
+            return await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            # A cancelled await cannot cancel an OS-thread transaction. Drain
+            # it before shutdown may close the database; unacknowledged rows replay.
+            await pending
+            raise
+
+    async def publish_batch(self, events):
+        if self.journal is None:
+            for event in events:
+                self._publish(event, time.time())
+            return
+        # Admission stays on the owner loop; SQLite waits never hold its lock.
+        # Keep the admitted batch until committed. A failed write does not poll
+        # the source again or allow the deduper to silently suppress the retry.
+        with self._queue_lock:
+            fresh = [event for event in events if self._admit(event, time.time())]
+        for offset in range(0, len(fresh), 128):
+            batch = fresh[offset:offset+128]
+            while True:
+                try:
+                    async with self._journal_write_gate:
+                        await self._disk_call(self.journal.append, batch, time.time())
+                    self._journal_last_error = None
+                    self._available.set()
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._journal_write_failures += 1
+                    self._journal_last_error = type(exc).__name__
+                    failures = self._journal_write_failures
+                    if failures <= 3 or failures & (failures-1) == 0:
+                        logger.warning('source journal intake deferred: %s', type(exc).__name__)
+                    await asyncio.sleep(1)
+
+    def delivery_receipt(self, event):
+        leased = self._journal_leases.get(id(event))
+        return dict(leased[1]) if leased is not None and leased[0] is event else None
+
+    async def acknowledge_event(self, event, job, reference):
+        if self.journal is None:
+            return
+        _, receipt, generation = self._journal_leases[id(event)]
+        await self._disk_call(self.journal.acknowledge, event, receipt, generation, job, reference, time.time())
+        self._journal_leases.pop(id(event), None)
+
+    async def retry_event(self, event):
+        if self.journal is None:
+            return
+        _, receipt, generation = self._journal_leases[id(event)]
+        await self._disk_call(self.journal.retry, event, receipt, generation, time.time())
+        self._journal_leases.pop(id(event), None)
+        self._available.set()
+
+    def close(self):
+        if self.journal is not None:
+            self.journal.close()
 
     def add(self, source: EventSource) -> None:
         if any(existing.source_id == source.source_id for existing in self.sources):
@@ -375,13 +446,14 @@ class SourceMesh:
         while self._running:
             started = time.time()
             events = await self._collect_one(source, started)
-            for event in events:
-                self._publish(event, time.time())
+            await self.publish_batch(events)
             elapsed = time.time() - started
             await asyncio.sleep(source.retry_delay(elapsed))
 
     def _publish(self, event: Event, now: float) -> None:
         """Admit fairly; overflow cannot let a hot feed evict every rare feed."""
+        if self.journal is not None:
+            raise RuntimeError('durable source producers must await publish_batch')
         with self._queue_lock:
             self._publish_locked(event, now)
 
@@ -437,6 +509,18 @@ class SourceMesh:
 
     async def next_event(self) -> Event:
         """Await the next event from any source. The consumer's entry point."""
+        if self.journal is not None:
+            while True:
+                self._available.clear()
+                leased = await self._disk_call(self.journal.lease, time.time())
+                if leased is not None:
+                    event, receipt, generation = leased
+                    self._journal_leases[id(event)] = (event, receipt, generation)
+                    return event
+                try:
+                    await asyncio.wait_for(self._available.wait(), 1)
+                except asyncio.TimeoutError:
+                    pass  # Expired leases/retry deadlines become eligible too.
         while True:
             try:
                 return self._take_pending()
@@ -470,6 +554,8 @@ class SourceMesh:
 
     def drain(self, limit: Optional[int] = None) -> List[Event]:
         """Everything available right now, without waiting for any source."""
+        if self.journal is not None:
+            raise RuntimeError('durable source consumers must await next_event and acknowledge')
         events: List[Event] = []
         while limit is None or len(events) < limit:
             try:
@@ -480,12 +566,23 @@ class SourceMesh:
 
     @property
     def pending(self) -> int:
+        if self.journal is not None:
+            return self.journal.report(time.time())['pending_events']
         with self._queue_lock:
             return self._pending_count
 
     def _queue_report(self, now):
         # Diagnostic projections run in a worker while the owner loop mutates
         # queues. Copy only scalar counters under this short, I/O-free lock.
+        if self.journal is not None:
+            report = self.journal.report(now)
+            with self._queue_lock:
+                self._expire(now)
+                return {**report, 'delivery_policy': 'DURABLE_ROUND_ROBIN_WITH_CANONICAL_ACK',
+                    'dedupe_cached_contents': len(self._seen), 'dedupe_window_seconds': self.dedupe_window,
+                    'dropped_events': 0, 'journal_write_failures': self._journal_write_failures,
+                    'journal_last_error_type': self._journal_last_error,
+                    'coverage_scope': 'committed source observations only; disk failure backpressures polling'}
         with self._queue_lock:
             self._expire(now)
             return {
