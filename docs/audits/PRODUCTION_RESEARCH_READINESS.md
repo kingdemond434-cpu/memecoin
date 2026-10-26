@@ -126,3 +126,9 @@ projection and promptly returns HTTP 503, phase `diagnostics`, with
 cold frontier/database projection or return partial diagnostics as ready.
 Health remains a separate liveness check. Subsequent complete snapshots retain
 their actual observation age and any background refresh error type.
+
+Certified ledger recovery now runs in a worker thread during prediction setup.
+Its full-prefix hashing and tail checks are unchanged, and the ledger is not
+published to consumers until construction completes. The already-bound health
+and startup-status routes can answer while that disk/CPU work runs. This removes
+one known startup loop block; it is not a general latency or p99 guarantee.
