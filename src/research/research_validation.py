@@ -60,14 +60,15 @@ def _safe(value: Any) -> Any:
 
 
 class ResearchValidationService:
-    def __init__(self, framework, gauntlet_handler=None, forward_evidence=None):
+    def __init__(self, framework, gauntlet_handler=None, forward_evidence=None, *, checkpoint=CHECKPOINT):
+        self.checkpoint = checkpoint
         self.framework = framework
         self.gauntlet_handler = gauntlet_handler
         self.forward_evidence = forward_evidence
         self.evidence_ledger = None
         self.registry = None
         self.adapters = {}
-        self.state = framework.get_research_component(CHECKPOINT) or {
+        self.state = framework.get_research_component(checkpoint) or {
             "schema_version": 1, "operations": {}, "historical": {},
             "experiments": {}, "attacks": {}, "integrations": {}}
 
@@ -103,7 +104,7 @@ class ResearchValidationService:
         return row
 
     def _save(self):
-        self.framework.checkpoint_research_component(CHECKPOINT, _safe(self.state))
+        self.framework.checkpoint_research_component(self.checkpoint, _safe(self.state))
 
     @staticmethod
     def _result(disposition, detail, children=()):
@@ -453,6 +454,9 @@ class ResearchValidationService:
             result[phase] = body
         return result
 
+    def _outcome_annotations(self, experiment):
+        return {}
+
     def _outcome(self, spec, experiment, payload, refs, now):
         cohort = experiment["cohorts"].get(payload.get("cohort_id"))
         if not cohort or payload.get("partition") != "forward":
@@ -516,7 +520,7 @@ class ResearchValidationService:
             "real_fill": not paper, "pnl": pnl, "elogw": math.log1p(pnl / equity),
             "entry_at": times[0], "exit_at": times[1], "observed_at": times[2],
             "evidence_refs": refs, "framework_recorded": False,
-            "execution": copy.deepcopy(execution)}
+            "execution": copy.deepcopy(execution), **self._outcome_annotations(experiment)}
         # A single owning callback may delegate the global ledger. The normal
         # runtime path already records it, so this is deliberately opt-in.
         if payload.get("record_in_forward_evidence") is True:

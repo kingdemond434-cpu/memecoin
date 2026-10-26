@@ -95,17 +95,21 @@ class NativeSimulationFeeAdapter:
 
 
 class NativeForwardPaper:
-    def __init__(self, validation: ResearchValidationService, *, max_experiments=8, max_state_age=30):
+    def __init__(self, validation: ResearchValidationService, *, max_experiments=8, max_state_age=30, component=COMPONENT):
         self.validation = validation
         self.framework = validation.framework
         self.ledger = validation.evidence_ledger
         self.max_experiments = max(1, min(32, int(max_experiments)))
         self.max_state_age = max(1., min(60., float(max_state_age)))
-        self.state = self.framework.get_research_component(COMPONENT) or {
+        self.component = component
+        self.state = self.framework.get_research_component(component) or {
             "positions": {}, "completed": {}, "blocked": {}, "cursor": 0}
 
     def _save(self):
-        self.framework.checkpoint_research_component(COMPONENT, self.state)
+        self.framework.checkpoint_research_component(self.component, self.state)
+
+    def _compiled(self, spec):
+        return compile_candidate(spec.exact_candidate)
 
     def _blocked(self, variable, reason, candidate_id=None):
         return self.validation._blocked("native_forward_" + variable, reason, {"candidate_id": candidate_id})
@@ -167,7 +171,7 @@ class NativeForwardPaper:
                 if position:
                     phase, amount = "exit", position["tokens"]
                 else:
-                    program = compile_candidate(spec.exact_candidate)
+                    program = self._compiled(spec)
                     target = episode["created_at"] + program.mechanism.decision_offset_s
                     if (not target <= now <= target + spec.exact_candidate["max_decision_latency_ms"] / 1000
                             or program.mechanism.rule(EpisodeView(episode)) is not True):
@@ -184,17 +188,17 @@ class NativeForwardPaper:
              equity_usd, native_to_usd, now, fee_bps=None, execution_costs=None):
         if self.ledger is None:
             return self._blocked("ledger", "canonical evidence ledger unavailable")
-        if (not _number(now, positive=True) or not _number(state_observed_at, positive=True)
-                or not now - self.max_state_age <= state_observed_at <= now or not source_ref):
-            return self._blocked("native_state", "fresh decoded native state provenance required")
-        if not _number(equity_usd, positive=True) or not _number(native_to_usd, positive=True):
-            return self._blocked("equity_conversion", "observed equity and native conversion required")
         if not isinstance(episode, dict) or episode.get("token") != token:
             return self._blocked("episode", "active untouched native episode required")
         eligible = [(eid, experiment) for eid, experiment in self.validation.state["experiments"].items()
                     if experiment["registered_at"] <= episode.get("created_at", 0)]
         if not eligible:
             return {"disposition": "DEEPENING_TASK", "detail": {"status": "NO_REGISTERED_FRESH_COHORT"}, "children": []}
+        if (not _number(now, positive=True) or not _number(state_observed_at, positive=True)
+                or not now - self.max_state_age <= state_observed_at <= now or not source_ref):
+            return self._blocked("native_state", "fresh decoded native state provenance required")
+        if not _number(equity_usd, positive=True) or not _number(native_to_usd, positive=True):
+            return self._blocked("equity_conversion", "observed equity and native conversion required")
         # Existing positions get first opportunity to exit. A bounded rotation
         # services the remaining experiments without another task/scheduler.
         eligible.sort(key=lambda row: (_digest({"experiment": row[0], "token": token})
@@ -215,7 +219,7 @@ class NativeForwardPaper:
                     self.state["positions"].pop(key, None)
                     continue
                 spec = self.validation._candidate(experiment)
-                program = compile_candidate(spec.exact_candidate)
+                program = self._compiled(spec)
                 position = self.state["positions"].get(key)
                 if position is not None and position.get("cohort_pending"):
                     consumed = self.validation.consume("FORWARD_SHADOW", position["cohort_payload"],
@@ -252,7 +256,7 @@ class NativeForwardPaper:
                         "episode_hash": _digest(episode), "observed_at": now}, now)
                     cohort = {"action": "cohort", "experiment_id": eid, "candidate_id": spec.hypothesis_id,
                         "spec_hash": spec.frozen_hash, "cohort_id": cid, "event_at": episode["created_at"],
-                        "available_at": now, "decision_at": now, "observed_at": now}
+                        "available_at": now, "decision_at": now, "observed_at": now, "token": token}
                     quote_ref = self._record("research_forward_native_quote", {
                         "token": token, "phase": "entry", "route": route, "quote": asdict(quote),
                         "state_ref": evidence, "observed_at": now}, now)
@@ -260,7 +264,7 @@ class NativeForwardPaper:
                     costs = quote.fee_amount / LAMPORTS + network + failed
                     cost_row = (execution_costs if "evidence_ref" in execution_costs else execution_costs[f"entry:{amount}"])
                     entry = self._fill(spec, cid, "entry", route, principal, costs, quote_ref,
-                                       cost_row["evidence_ref"], now)
+                                       cost_row["evidence_ref"], now, token=token)
                     position = {"candidate_id": spec.hypothesis_id, "spec_hash": spec.frozen_hash,
                         "cohort_id": cid, "entry_at": now, "entry_cost_native": principal,
                         "entry_costs_native": costs, "tokens": quote.output_amount, "entry_ref": entry,
@@ -302,7 +306,7 @@ class NativeForwardPaper:
                 exit_cost = quote.fee_amount / LAMPORTS + network + failed
                 cost_row = (execution_costs if "evidence_ref" in execution_costs else execution_costs[f"exit:{position['tokens']}"])
                 exit_ref = self._fill(spec, position["cohort_id"], "exit", route, proceeds, exit_cost,
-                                      quote_ref, cost_row["evidence_ref"], now)
+                                      quote_ref, cost_row["evidence_ref"], now, token=token)
                 execution = {"evidence_kind": "native_simulation", "native": True, "filled": True,
                     "route": route, "entry_evidence_ref": position["entry_ref"], "exit_evidence_ref": exit_ref,
                     "entry_cost_native": position["entry_cost_native"], "exit_proceeds_native": proceeds,
@@ -334,10 +338,10 @@ class NativeForwardPaper:
                            "real_fill": False, "open_positions": len(self.state["positions"])},
                 "children": children}
 
-    def _fill(self, spec, cid, phase, route, size, costs, quote_ref, simulation_ref, now):
+    def _fill(self, spec, cid, phase, route, size, costs, quote_ref, simulation_ref, now, *, token):
         return self._record("research_forward_native_execution", {
             "origin": "canonical_native_execution", "phase": phase, "candidate_id": spec.hypothesis_id,
-            "spec_hash": spec.frozen_hash, "cohort_id": cid, "evidence_kind": "native_simulation",
+            "spec_hash": spec.frozen_hash, "cohort_id": cid, "token": token, "evidence_kind": "native_simulation",
             "observed_at": now, "available_at": now, "route": route,
             "size_native": size, "costs_native": costs, "filled": True,
             "quote_ref": quote_ref, "simulation_ref": simulation_ref,
