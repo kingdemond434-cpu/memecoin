@@ -115,6 +115,10 @@ jobs:
           python -m pytest tests/test_perps_acquisition.py -q
           python -m pytest tests -q --durations=20 -o faulthandler_timeout=60
 
+      - name: Diagnose perps test-order contamination
+        if: failure()
+        run: python tools/diagnose_perps_order.py
+
       - name: Latency regression check
         # A correctness regression fails the build and a latency regression
         # did not, which left the one property this system is supposed to have
