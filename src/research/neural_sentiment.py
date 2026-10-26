@@ -250,13 +250,13 @@ class SentimentResearch:
             pending = self.db.execute('SELECT body FROM results WHERE ref IS NULL ORDER BY rowid LIMIT 256').fetchall()
         if pending:
             return [json.loads(row[0]) for row in pending]
-        rows, seen, model_calls = [], [], 0
+        rows, seen = [], []
         deadline = time.perf_counter()+2
         worker_sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         # These are active-work quanta, never source/history admission limits.
         # Cache hits can drain quickly; expensive new inference is bounded.
         for _ in range(256):
-            if rows and time.perf_counter() >= deadline:
+            if seen and time.perf_counter() >= deadline:
                 break
             job = self._job(seen)
             if job is None:
@@ -264,6 +264,7 @@ class SentimentResearch:
             identity, raw, offset, origin, cursor = job
             seen.append(identity)
             body = json.loads(raw)
+            inference_metric = None
             try:
                 started = time.perf_counter()
                 cache_id = digest([REVISION, FILES, self.inference_code_sha256, body['text_sha256'], offset])
@@ -282,21 +283,13 @@ class SentimentResearch:
                             self._metric('cache_corruptions')
                 cache_hit = cache is not None
                 if cache is None:
-                    if model_calls >= 4:
-                        break  # leave dispatch cursor unchanged for this job
-                    model_calls += 1
                     result = await self.worker.infer(body['text'], offset)
                     self._validate_window(result, offset)
                     cache = {'result': result, 'inferred_at': time.time(),
                         'inference_worker_sha256': worker_sha, 'inference_code_sha256': self.inference_code_sha256}
-                    with self.lock, self.db:
-                        self.db.execute('INSERT OR REPLACE INTO inference_cache VALUES(?,?,?)',
-                                        (cache_id, canonical(cache), digest(cache)))
-                        self._metric('worker_inferences')
                 else:
                     result = cache['result']
-                    with self.lock, self.db:
-                        self._metric('cache_hits')
+                inference_metric = 'cache_hits' if cache_hit else 'worker_inferences'
                 inference_seconds = time.perf_counter()-started
                 self._validate_window(result, offset)
                 row = {key: value for key, value in body.items() if key != 'text'}
@@ -313,6 +306,10 @@ class SentimentResearch:
                     scope='document sentiment; not factual credibility, insider identity or token-return probability')
                 row['annotation_id'] = digest(row)
                 with self.lock, self.db:
+                    if not cache_hit:
+                        self.db.execute('INSERT OR REPLACE INTO inference_cache VALUES(?,?,?)',
+                                        (cache_id, canonical(cache), digest(cache)))
+                    self._metric(inference_metric)
                     self.db.execute('INSERT INTO results VALUES(?,?,?,NULL,NULL)',
                                     (row['annotation_id'], identity, canonical(row)))
                     self.db.execute('UPDATE inputs SET served=? WHERE id=?', (self._next_ticket(), identity))
@@ -325,6 +322,10 @@ class SentimentResearch:
                 # Worker failures never erase raw input or print text/credentials.
                 self.last_error = type(exc).__name__
                 with self.lock, self.db:
+                    # Count completed work even if its result transaction rolled
+                    # back; the raw input remains pending for actual retry.
+                    if inference_metric is not None:
+                        self._metric(inference_metric)
                     self.db.execute('UPDATE inputs SET served=? WHERE id=?', (self._next_ticket(), identity))
                     self.db.execute('UPDATE dispatch SET cursor=? WHERE id=1', (cursor,))
         return rows
