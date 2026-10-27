@@ -4,7 +4,7 @@ import threading
 import time
 
 PHASES = ("canonical", "neural_intake", "claim_intake", "owner_hook",
-          "delivery_ack", "owner_index")
+          "delivery_ack", "onion_delivery", "canonical_ref", "journal_ack", "owner_index")
 
 class SourceTiming:
     def __init__(self):
