@@ -1,0 +1,36 @@
+Public claim persistence and event-loop ownership
+================================================
+
+Live canonical narrative and NLP persistence already run in workers. Previously,
+claim indexing then executed a FULL SQLite commit synchronously on the owner
+loop. A slow disk commit could therefore prevent even the RAM-only health
+handler from running. Repeated live claim inserts now use a drained worker call.
+
+PublicClaimLinks has one serialized writer connection with check_same_thread
+false and an RLock. FULL durability, schema, address validation, source-job
+binding, cursor ordering and INSERT OR IGNORE identity remain unchanged. Pages
+and reports open independent mode=ro/query_only WAL snapshot connections, so
+readers do not wait on that writer mutex or see uncommitted claims. Connections
+are closed after each snapshot; no unbounded thread-local reader pool is kept.
+
+Store construction/publication stays on the owner once, preserving its existing
+lifetime. Initial schema setup and explicit synchronous compatibility calls
+remain synchronous. This change targets repeated live writes, not every source
+of event-loop latency. The existing owner-loop narrative hook runs after the
+worker finishes with disk-intake-done flags; source/lead-graph indexing remains
+on the owner loop. It does not repeat canonical/NLP/claim persistence.
+
+Cancellation drains an already-initiated claim write before store shutdown and
+before a source can be acknowledged. On this live path, a committed secondary-index row
+names existing canonical work; an unacknowledged source can replay idempotently.
+As before, claim-index failure is explicit deferred secondary indexing and does
+not manufacture a canonical job, insider identity, fill or execution authority.
+Source observation/availability clocks and journal ACK semantics are unchanged.
+
+Tests stall a real SQLite COMMIT in the worker and exercise an aiohttp health
+endpoint plus committed-snapshot readers while that transaction is blocked.
+They also cover cancellation without source ACK, concurrent idempotent writes,
+reader lifecycle and owner-hook order with exactly one claim write. No production
+health improvement, response percentile, backlog resolution, profitable edge or
+universal coverage is inferred from these isolated tests. Runtime acceptance
+requires actual post-deployment health, advancing counters and retained state.

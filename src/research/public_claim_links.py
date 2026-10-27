@@ -9,6 +9,8 @@ import json
 import math
 import re
 import sqlite3
+import threading
+from contextlib import contextmanager, closing
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -27,8 +29,11 @@ def public_address(value):
 
 class PublicClaimLinks:
     def __init__(self, path):
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path, timeout=.5)
+        self.path = Path(path).resolve()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.RLock()
+        self._closed = False
+        self.db = sqlite3.connect(self.path, timeout=.5, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
@@ -41,7 +46,7 @@ class PublicClaimLinks:
         if not source_job or not source_id or not math.isfinite(observed_at) or observed_at <= 0:
             raise ValueError("canonical public source job and observation time required")
         labels = sorted({str(t)[:64] for t in topics})[:20]
-        with self.db:
+        with self.lock, self.db:
             for value in addresses:
                 address = public_address(value)
                 if not address: continue
@@ -51,19 +56,37 @@ class PublicClaimLinks:
                                 (identity, str(source_job), str(source_id)[:200], normalized, chain,
                                  observed_at, json.dumps(labels), int(publication_known is True)))
 
+    @contextmanager
+    def _reader(self):
+        # Readers never take the writer lock: a stalled claim commit must not
+        # prevent a committed-snapshot page/report from completing under WAL.
+        if self._closed:
+            raise sqlite3.ProgrammingError('public claim store closed')
+        with closing(sqlite3.connect(self.path.resolve().as_uri()+'?mode=ro',
+                                     uri=True, timeout=.5)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute('PRAGMA query_only=ON')
+            db.execute('BEGIN')
+            yield db
+
     def page(self, after=0, limit=100):
         if type(after) is not int or after < 0 or type(limit) is not int or not 1 <= limit <= 200:
             raise ValueError("invalid public claim cursor")
-        rows = self.db.execute("SELECT * FROM links WHERE seq>? ORDER BY seq LIMIT ?", (after, limit)).fetchall()
-        items = [{**dict(row), "topics": json.loads(row["topics"]), "claim_status": "UNVERIFIED_PUBLIC_MENTION",
-                  "entity_role": "UNKNOWN", "trade_authority": False} for row in rows]
-        return {"items": items, "next_cursor": rows[-1]["seq"] if rows else after,
-                "has_more": bool(rows and self.db.execute("SELECT 1 FROM links WHERE seq>? LIMIT 1", (rows[-1]["seq"],)).fetchone()),
-                "status": "OBSERVED" if items else "NO_NEW_OBSERVATIONS"}
+        with self._reader() as db:
+            rows = db.execute("SELECT * FROM links WHERE seq>? ORDER BY seq LIMIT ?", (after, limit)).fetchall()
+            items = [{**dict(row), "topics": json.loads(row["topics"]), "claim_status": "UNVERIFIED_PUBLIC_MENTION",
+                      "entity_role": "UNKNOWN", "trade_authority": False} for row in rows]
+            return {"items": items, "next_cursor": rows[-1]["seq"] if rows else after,
+                    "has_more": bool(rows and db.execute("SELECT 1 FROM links WHERE seq>? LIMIT 1", (rows[-1]["seq"],)).fetchone()),
+                    "status": "OBSERVED" if items else "NO_NEW_OBSERVATIONS"}
 
     def report(self):
-        return {"links": self.db.execute("SELECT count(*) FROM links").fetchone()[0],
-                "by_chain": dict(self.db.execute("SELECT chain,count(*) FROM links GROUP BY chain")),
-                "insider_identity_verified": False, "trade_authority": False}
+        with self._reader() as db:
+            return {"links": db.execute("SELECT count(*) FROM links").fetchone()[0],
+                    "by_chain": dict(db.execute("SELECT chain,count(*) FROM links GROUP BY chain")),
+                    "insider_identity_verified": False, "trade_authority": False}
 
-    def close(self): self.db.close()
+    def close(self):
+        with self.lock:
+            self.db.close()
+            self._closed = True
