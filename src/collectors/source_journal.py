@@ -46,6 +46,8 @@ class SourceJournal:
         self.path = Path(path)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self.lease_batches_this_run = 0
+        self.leased_events_this_run = 0
         self.db = sqlite3.connect(path, timeout=5, check_same_thread=False)
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('PRAGMA synchronous=FULL')
@@ -81,34 +83,63 @@ class SourceJournal:
         return len(rows)
 
     def lease(self, now, lease_seconds=300):
+        rows = self.lease_many(now, limit=1, lease_seconds=lease_seconds)
+        return rows[0] if rows else None
+
+    def lease_many(self, now, *, limit=8, lease_seconds=300):
+        """Lease a bounded fair turn sequence in one FULL-durability commit.
+
+        A corrupt member rolls back every generation/ticket in the batch. Raw
+        bodies remain durable until each separate exact canonical ACK succeeds.
+        """
+        if type(limit) is not int or not 1 <= limit <= 32:
+            raise ValueError('lease batch limit must be between 1 and 32')
         if not math.isfinite(now) or not math.isfinite(lease_seconds) or lease_seconds <= 0:
             raise ValueError('finite positive lease required')
-        with self.lock, self.db:
-            self.db.execute('BEGIN IMMEDIATE')
-            source = self.db.execute('SELECT source FROM source_service s WHERE pending>0 AND EXISTS('
-                'SELECT 1 FROM intake i WHERE i.source=s.source AND i.body IS NOT NULL AND i.due<=?) '
-                'ORDER BY ticket,source LIMIT 1', (now,)).fetchone()
-            if source is None:
-                return None
-            row = self.db.execute('SELECT id,body,accepted,first_delivery,generation,source,body_sha256 '
-                'FROM intake WHERE source=? AND body IS NOT NULL AND due<=? '
-                'ORDER BY due,accepted,rowid LIMIT 1', (source[0],now)).fetchone()
-            if row is None:
-                return None
-            event_id, body, accepted, first, generation, source, body_hash = row
-            if seal(body) != body_hash:
-                raise ValueError('source journal body integrity mismatch')
-            event = decode(body)
-            if identity(event, body) != event_id:
-                raise ValueError('source journal identity mismatch')
-            first = now if first is None else first
-            self.db.execute('UPDATE intake SET first_delivery=?,generation=?,due=? WHERE id=?',
-                            (first, generation+1, now+lease_seconds, event_id))
-            self.db.execute('UPDATE source_service SET ticket=(SELECT COALESCE(MAX(ticket),0)+1 '
-                            'FROM source_service) WHERE source=?', (source,))
-            receipt = {'id': event_id, 'body_sha256': body_hash, 'accepted_at': accepted,
-                       'first_delivered_at': first}
-            return event, receipt, generation+1
+        deadline = now + lease_seconds
+        if not math.isfinite(deadline) or deadline <= now:
+            raise ValueError('lease deadline must be finite and advance the clock')
+        with self.lock:
+            with self.db:
+                self.db.execute('BEGIN IMMEDIATE')
+                rows = []
+                for _ in range(limit):
+                    row = self._lease_one(now, lease_seconds)
+                    if row is None:
+                        break
+                    rows.append(row)
+            if rows:
+                self.lease_batches_this_run += 1
+                self.leased_events_this_run += len(rows)
+            return rows
+
+    def _lease_one(self, now, lease_seconds):
+        # Caller owns the write transaction and lock. Updating the ticket after
+        # each member preserves the same order as sequential one-row leases.
+        source = self.db.execute('SELECT source FROM source_service s WHERE pending>0 AND EXISTS('
+            'SELECT 1 FROM intake i WHERE i.source=s.source AND i.body IS NOT NULL AND i.due<=?) '
+            'ORDER BY ticket,source LIMIT 1', (now,)).fetchone()
+        if source is None:
+            return None
+        row = self.db.execute('SELECT id,body,accepted,first_delivery,generation,source,body_sha256 '
+            'FROM intake WHERE source=? AND body IS NOT NULL AND due<=? '
+            'ORDER BY due,accepted,rowid LIMIT 1', (source[0],now)).fetchone()
+        if row is None:
+            return None
+        event_id, body, accepted, first, generation, source, body_hash = row
+        if seal(body) != body_hash:
+            raise ValueError('source journal body integrity mismatch')
+        event = decode(body)
+        if identity(event, body) != event_id:
+            raise ValueError('source journal identity mismatch')
+        first = now if first is None else first
+        self.db.execute('UPDATE intake SET first_delivery=?,generation=?,due=? WHERE id=?',
+                        (first, generation+1, now+lease_seconds, event_id))
+        self.db.execute('UPDATE source_service SET ticket=(SELECT COALESCE(MAX(ticket),0)+1 '
+                        'FROM source_service) WHERE source=?', (source,))
+        receipt = {'id': event_id, 'body_sha256': body_hash, 'accepted_at': accepted,
+                   'first_delivered_at': first}
+        return event, receipt, generation+1
 
     def _match(self, event, receipt, generation):
         body = encode(event)
@@ -157,7 +188,9 @@ class SourceJournal:
             'database_bytes': self.path.stat().st_size,
             'wal_bytes': Path(str(self.path)+'-wal').stat().st_size if Path(str(self.path)+'-wal').exists() else 0,
             'disk_free_bytes': shutil.disk_usage(self.path.parent).free,
-            'evicted_events': 0, 'upstream_gap_free': False}
+            'evicted_events': 0, 'upstream_gap_free': False,
+            'lease_batches_this_run': self.lease_batches_this_run,
+            'leased_events_this_run': self.leased_events_this_run}
 
     def close(self):
         with self.lock:
