@@ -1,0 +1,10 @@
+Source journal reports use independent mode=ro, query_only WAL transactions.
+All durable counts/source pending/oldest/due rows come from one committed
+snapshot. No health scan holds the writer mutex. Writers retain FULL durability
+and exact lease/body/generation matching. No schema migration or record eviction.
+The two process-local lease counters are copied under a brief independent statistics lock after
+the scan: they and filesystem sizes/free space may be newer than the database
+snapshot. Reports can still be slow and compete for disk/cache; this change is
+not a pipeline capacity or latency guarantee. Reader connections close on all
+paths. A report begun before close can finish using its independent connection;
+a new report after close raises ProgrammingError, matching the closed lifecycle.

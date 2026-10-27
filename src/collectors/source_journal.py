@@ -4,6 +4,7 @@ Accepted observations remain until an exact leased body has a canonical work
 reference. This is at-least-once delivery, not a claim of gap-free upstream
 coverage. SQLite/disk failures backpressure the producer instead of evicting.
 """
+from contextlib import closing
 import hashlib
 import json
 import math
@@ -43,9 +44,11 @@ def identity(event, body):
 
 class SourceJournal:
     def __init__(self, path):
-        self.path = Path(path)
+        self.path = Path(path).resolve()
+        self._closed = False
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self._stats_lock = threading.Lock()
         self.lease_batches_this_run = 0
         self.leased_events_this_run = 0
         self.db = sqlite3.connect(path, timeout=5, check_same_thread=False)
@@ -109,8 +112,9 @@ class SourceJournal:
                         break
                     rows.append(row)
             if rows:
-                self.lease_batches_this_run += 1
-                self.leased_events_this_run += len(rows)
+                with self._stats_lock:
+                    self.lease_batches_this_run += 1
+                    self.leased_events_this_run += len(rows)
             return rows
 
     def _lease_one(self, now, lease_seconds):
@@ -176,11 +180,20 @@ class SourceJournal:
             self.db.execute('UPDATE intake SET due=? WHERE id=?', (now+5, identity))
 
     def report(self, now):
-        with self.lock:
-            counts = self.db.execute('SELECT accepted,acknowledged FROM intake_counts WHERE id=1').fetchone()
-            sources = self.db.execute('SELECT source,pending,(SELECT min(accepted) FROM intake i '
+        # A large health scan must not hold the writer mutex used by intake,
+        # leasing and exact ACKs. One WAL snapshot keeps database counts coherent.
+        if self._closed:
+            raise sqlite3.ProgrammingError('source journal closed')
+        with closing(sqlite3.connect(self.path.as_uri()+'?mode=ro',
+                                     uri=True, timeout=5)) as reader:
+            reader.execute('PRAGMA query_only=ON')
+            reader.execute('BEGIN')
+            counts = reader.execute('SELECT accepted,acknowledged FROM intake_counts WHERE id=1').fetchone()
+            sources = reader.execute('SELECT source,pending,(SELECT min(accepted) FROM intake i '
                 'WHERE i.source=s.source AND i.body IS NOT NULL) FROM source_service s WHERE pending>0').fetchall()
-            due = self.db.execute('SELECT count(*) FROM intake WHERE body IS NOT NULL AND due<=?', (now,)).fetchone()[0]
+            due = reader.execute('SELECT count(*) FROM intake WHERE body IS NOT NULL AND due<=?', (now,)).fetchone()[0]
+        with self._stats_lock:
+            batches, leased = self.lease_batches_this_run, self.leased_events_this_run
         return {'status': 'DURABLE_AT_LEAST_ONCE', 'accepted_observations': counts[0],
             'pending_events': counts[0]-counts[1], 'canonical_acknowledged': counts[1],
             'due_events': due, 'pending_by_source': {row[0]:row[1] for row in sources},
@@ -189,9 +202,10 @@ class SourceJournal:
             'wal_bytes': Path(str(self.path)+'-wal').stat().st_size if Path(str(self.path)+'-wal').exists() else 0,
             'disk_free_bytes': shutil.disk_usage(self.path.parent).free,
             'evicted_events': 0, 'upstream_gap_free': False,
-            'lease_batches_this_run': self.lease_batches_this_run,
-            'leased_events_this_run': self.leased_events_this_run}
+            'lease_batches_this_run': batches,
+            'leased_events_this_run': leased}
 
     def close(self):
         with self.lock:
             self.db.close()
+            self._closed = True

@@ -599,16 +599,19 @@ class SourceIntelligence:
                         # stays on the owner loop. Bulk SQLite admission/ack waits
                         # in the worker and cannot freeze health or market events.
                         frontier = _frontier(self)
-                        delivered = await asyncio.to_thread(deliver, self, event, job_id,
-                                                            frontier=frontier, prepared=True)
+                        with source_timing(self).measure("onion_delivery"):
+                            delivered = await asyncio.to_thread(deliver, self, event, job_id,
+                                                                frontier=frontier, prepared=True)
                         if durable:
                             if not delivered:
                                 await self.source_mesh.retry_event(event)
                                 continue
-                            canonical_ref = await self.source_mesh._disk_call(self.unknown_engine.frontier.job_payload_ref, job_id)
+                            with source_timing(self).measure("canonical_ref"):
+                                canonical_ref = await self.source_mesh._disk_call(self.unknown_engine.frontier.job_payload_ref, job_id)
                             if not canonical_ref:
                                 raise ValueError('canonical narrative source reference unavailable')
-                            await self.source_mesh.acknowledge_event(event, job_id, canonical_ref)
+                            with source_timing(self).measure("journal_ack"):
+                                await self.source_mesh.acknowledge_event(event, job_id, canonical_ref)
                 with source_timing(self).measure("owner_index"):
                     self._index_source_event(event, defer_onion_io=True, record_population=False)
             except Exception as exc:
