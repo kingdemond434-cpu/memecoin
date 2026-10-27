@@ -1,0 +1,14 @@
+Source service timing is process-local bounded telemetry, reset at restart.
+/status source_phase_timing reports completed attempts and interrupted scopes,
+last, maximum and total elapsed perf_counter seconds, grouped into six fixed
+phases. No source identifiers, content, job IDs or provider credentials appear.
+Canonical and neural enqueue are measured in their existing worker. Claim
+measurement covers recurring indexing, not initial store construction. Owner
+hook, onion delivery plus exact canonical ACK, and source indexing are separate.
+Async delivery timing includes worker queue wait and any awaits. Worker timing
+excludes executor queue wait. These totals are not source age, end-to-end
+latency, CPU time, percentile estimates or throughput certification. Scopes
+whose helpers defer errors can complete normally: completed is not proof of
+persistence success. Existing durability, ACK and error counters stay decisive.
+Cancellation is recorded as interruption only in a scope actually interrupted;
+drained worker commits may complete after their calling coroutine is cancelled.

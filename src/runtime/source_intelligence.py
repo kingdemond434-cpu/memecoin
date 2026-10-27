@@ -14,6 +14,7 @@ import json
 import sqlite3
 import threading
 import time
+from src.runtime.source_timing import source_timing
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from src.collectors.transports import (
@@ -211,11 +212,14 @@ class SourceIntelligence:
         payload = SourceIntelligence._population_narrative_payload(self, event)
         metadata = dict(getattr(event, "metadata", None) or {})
         tokens = list(getattr(event, 'token_addresses', ()) or ())
+        timing = source_timing(self)
         def persist():
-            job_id = self._enqueue_population_work('NARRATIVE_OBSERVATION', payload,
-                evidence_refs=metadata.get('evidence_refs') or (),
-                now=payload.get('research_available_at', event.observed_at))
-            SourceIntelligence._enqueue_neural_narrative(self, payload, job_id, tokens)
+            with timing.measure("canonical"):
+                job_id = self._enqueue_population_work('NARRATIVE_OBSERVATION', payload,
+                    evidence_refs=metadata.get('evidence_refs') or (),
+                    now=payload.get('research_available_at', event.observed_at))
+            with timing.measure("neural_intake"):
+                SourceIntelligence._enqueue_neural_narrative(self, payload, job_id, tokens)
             return job_id
         pending = asyncio.create_task(asyncio.to_thread(persist))
         try:
@@ -238,8 +242,10 @@ class SourceIntelligence:
             except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
                 logger.warning('public claim index deferred: %s', type(exc).__name__)
                 return job_id
-        pending = asyncio.create_task(asyncio.to_thread(
-            SourceIntelligence._record_public_claim_links, self, event, payload, job_id))
+        def persist_claims():
+            with timing.measure("claim_intake"):
+                SourceIntelligence._record_public_claim_links(self, event, payload, job_id)
+        pending = asyncio.create_task(asyncio.to_thread(persist_claims))
         try:
             await asyncio.shield(pending)
         except asyncio.CancelledError:
@@ -249,9 +255,10 @@ class SourceIntelligence:
             raise
         # Preserve the existing owner-loop hook (including custom overrides)
         # without repeating any canonical, neural or claim-index disk work.
-        return self._record_population_narrative(event, defer_onion_io=True,
-            prepared_payload=payload, canonical_job_result=job_id,
-            neural_intake_done=True, claim_intake_done=True)
+        with timing.measure("owner_hook"):
+            return self._record_population_narrative(event, defer_onion_io=True,
+                prepared_payload=payload, canonical_job_result=job_id,
+                neural_intake_done=True, claim_intake_done=True)
 
     def _enqueue_neural_narrative(self, payload, job_id, tokens):
         neural = getattr(self, 'neural_sentiment', None)
@@ -585,23 +592,25 @@ class SourceIntelligence:
                 if durable and not job_id:
                     await self.source_mesh.retry_event(event)
                     continue
-                if job_id:
-                    from src.collectors.onion_discovery import _frontier, deliver
-                    # SourceMesh.add may start an asyncio task, so preparation
-                    # stays on the owner loop. Bulk SQLite admission/ack waits
-                    # in the worker and cannot freeze health or market events.
-                    frontier = _frontier(self)
-                    delivered = await asyncio.to_thread(deliver, self, event, job_id,
-                                                        frontier=frontier, prepared=True)
-                    if durable:
-                        if not delivered:
-                            await self.source_mesh.retry_event(event)
-                            continue
-                        canonical_ref = await self.source_mesh._disk_call(self.unknown_engine.frontier.job_payload_ref, job_id)
-                        if not canonical_ref:
-                            raise ValueError('canonical narrative source reference unavailable')
-                        await self.source_mesh.acknowledge_event(event, job_id, canonical_ref)
-                self._index_source_event(event, defer_onion_io=True, record_population=False)
+                with source_timing(self).measure("delivery_ack"):
+                    if job_id:
+                        from src.collectors.onion_discovery import _frontier, deliver
+                        # SourceMesh.add may start an asyncio task, so preparation
+                        # stays on the owner loop. Bulk SQLite admission/ack waits
+                        # in the worker and cannot freeze health or market events.
+                        frontier = _frontier(self)
+                        delivered = await asyncio.to_thread(deliver, self, event, job_id,
+                                                            frontier=frontier, prepared=True)
+                        if durable:
+                            if not delivered:
+                                await self.source_mesh.retry_event(event)
+                                continue
+                            canonical_ref = await self.source_mesh._disk_call(self.unknown_engine.frontier.job_payload_ref, job_id)
+                            if not canonical_ref:
+                                raise ValueError('canonical narrative source reference unavailable')
+                            await self.source_mesh.acknowledge_event(event, job_id, canonical_ref)
+                with source_timing(self).measure("owner_index"):
+                    self._index_source_event(event, defer_onion_io=True, record_population=False)
             except Exception as exc:
                 logger.warning("source event indexing failed: %s", type(exc).__name__)
                 if (getattr(self.source_mesh, 'journal', None) is not None and
