@@ -796,6 +796,9 @@ class ReportingSurface:
             # census rather than per token: what an operator needs is whether
             # anything is igniting, not a row per launch.
             "ignition": self.ignition_census(),
+            "source_phase_timing": (self._source_phase_timing.report()
+                if getattr(self, "_source_phase_timing", None) is not None else
+                {"scope": "process_local_service_time_not_source_latency", "phases": {}}),
             "source_mesh": {**self.source_mesh.health(),
                             "registry": self.source_registry_report.to_dict(),
                             # What is wired, what answered, and what could not
