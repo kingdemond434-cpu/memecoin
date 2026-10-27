@@ -1,0 +1,17 @@
+python -m tools.paper_exit_audit PATH --sample-limit 20
+
+Opens the existing archive mode=ro/query_only with one WAL snapshot. Never
+constructs ForkProbe or calls a provider/SVM. Uses the existing bounded/hash-
+checked frame/blob reader, with a read-only facade, to verify retained inputs.
+Examines at most100 latest unresolved canonical inventory cohorts; aggregate
+status census also separates entry failures from local closures. Canonical
+here means a committed archive ref, not external canonical ledger verification.
+
+Checks current and unique prior inventory, their seals, exact reconstructed
+paper request hash, later bank clocks, reviewed synthetic account overlay,
+actual requested/retained units, cumulative fees and failed-exit account/fee
+conservation. These are integrity diagnostics, not protocol error resolution.
+PASS does not prove a sell succeeds, a honeypot, real fills or profitable alpha.
+A missing/corrupt/ambiguous prerequisite is an explicit failed check. Output
+contains only hashes, numeric diagnostics, local error code and check names;
+no account addresses, bodies, logs, provider URLs or exception strings.
