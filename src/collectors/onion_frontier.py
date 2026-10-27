@@ -6,6 +6,7 @@ not admission. No scripts, login, access-challenge bypass or direct DNS path.
 """
 from __future__ import annotations
 
+from contextlib import closing
 import hashlib
 import asyncio
 import json
@@ -31,6 +32,8 @@ class OnionFrontierTransport(Transport):
         if type(workers) is not int or workers < 1:
             raise ValueError('positive integer active onion concurrency required')
         self.workers = workers
+        self.path = Path(path).resolve()
+        self._closed = False
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path, timeout=3, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -42,6 +45,7 @@ class OnionFrontierTransport(Transport):
             discovered_at REAL NOT NULL,depth INTEGER NOT NULL,next_at REAL NOT NULL DEFAULT 0,
             observed_at REAL,digest TEXT,failures INTEGER NOT NULL DEFAULT 0,last_error TEXT NOT NULL DEFAULT '');
           CREATE INDEX IF NOT EXISTS onion_due ON urls(host,next_at);
+          CREATE INDEX IF NOT EXISTS onion_host_turn ON hosts(last_attempt,host,next_at);
           CREATE TABLE IF NOT EXISTS origins(url TEXT NOT NULL,source_ref TEXT NOT NULL,parent TEXT NOT NULL,
             observed_at REAL NOT NULL,PRIMARY KEY(url,source_ref,parent));
           CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,record TEXT NOT NULL);
@@ -119,8 +123,9 @@ class OnionFrontierTransport(Transport):
                 return [json.loads(row[0]) for row in pending], []
             rows = []
             for _ in range(self.workers):
-                row = self.db.execute("""SELECT u.* FROM urls u JOIN hosts h ON h.host=u.host
-                  WHERE u.next_at<=? AND h.next_at<=?
+                row = self.db.execute("""SELECT u.* FROM hosts h INDEXED BY onion_host_turn
+                  CROSS JOIN urls u INDEXED BY onion_due
+                  WHERE u.host=h.host AND u.next_at<=? AND h.next_at<=?
                   ORDER BY h.last_attempt,((u.observed_at IS NULL)=(h.turn % 2)) DESC,u.next_at,u.discovered_at,u.url LIMIT 1""", (now, now)).fetchone()
                 if row is None:
                     break
@@ -213,12 +218,17 @@ class OnionFrontierTransport(Transport):
             self.db.execute("UPDATE hosts SET next_at=MAX(next_at,?) WHERE host=?", (now + delay, row["host"]))
 
     def report(self):
-        with self.lock:
-            counts = self.db.execute("SELECT count(*),count(observed_at),max(observed_at),sum(failures>0) FROM urls").fetchone()
-            pending = self.db.execute("SELECT count(*) FROM outbox").fetchone()[0]
-            hosts = self.db.execute("SELECT count(*) FROM hosts").fetchone()[0]
-            oldest = self.db.execute("SELECT min(discovered_at) FROM urls WHERE observed_at IS NULL").fetchone()[0]
-            legacy = self.db.execute("SELECT value FROM meta WHERE name='legacy_migrated'").fetchone()
+        if self._closed:
+            raise sqlite3.ProgrammingError('onion frontier closed')
+        with closing(sqlite3.connect(self.path.as_uri()+'?mode=ro',
+                                     uri=True, timeout=3)) as reader:
+            reader.execute('PRAGMA query_only=ON')
+            reader.execute('BEGIN')
+            counts = reader.execute("SELECT count(*),count(observed_at),max(observed_at),sum(failures>0) FROM urls").fetchone()
+            pending = reader.execute("SELECT count(*) FROM outbox").fetchone()[0]
+            hosts = reader.execute("SELECT count(*) FROM hosts").fetchone()[0]
+            oldest = reader.execute("SELECT min(discovered_at) FROM urls WHERE observed_at IS NULL").fetchone()[0]
+            legacy = reader.execute("SELECT value FROM meta WHERE name='legacy_migrated'").fetchone()
         return {**super().report(), "scope": "CONTINUOUS_PUBLIC_ONION_DISCOVERY", "execution_authority": False,
             "hostname_resolution": "SOCKS5_REMOTE", "discovered_hosts": hosts, "pages": counts[0],
             "observed_pages": counts[1], "last_observed_at": counts[2], "deferred_pages": counts[3] or 0,
@@ -232,4 +242,5 @@ class OnionFrontierTransport(Transport):
         def close():
             with self.lock:
                 self.db.close()
+                self._closed = True
         await asyncio.to_thread(close)
