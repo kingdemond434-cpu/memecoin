@@ -1,12 +1,15 @@
 import copy
 import json
 import sqlite3
+import struct
 
 import pytest
 from solders.pubkey import Pubkey
 
 from src.research.fork_probe import ForkProbe
-from src.research.fork_simulation import TOKEN_PROGRAM, digest, virtual_owner
+from src.research.fork_simulation import TOKEN_PROGRAM, PUMP_PROGRAM, IMMUTABLE, _curve_address, digest, virtual_owner
+from src.chains.pump_curve import BONDING_CURVE_DISCRIMINATOR
+from tests.test_fork_simulation import wire
 from src.research.paper_bank import inventory_keys
 from tools.paper_exit_audit import audit
 
@@ -16,12 +19,17 @@ def fixture(path, mutation=None):
     target={"venue":"pump_curve","token":str(Pubkey.new_unique())}
     frame={"target":target,"slot":2,"observed_at":200.,"accounts":{}}
     frame["accounts"]={key:None for key in inventory_keys(frame,TOKEN_PROGRAM)}
+    curve=BONDING_CURVE_DISCRIMINATOR+struct.pack("<5Q?",1000,500,800,100,2000,False)
+    frame["accounts"][_curve_address(target["token"])]=wire(curve,PUMP_PROGRAM)
+    frame["accounts"][PUMP_PROGRAM]=wire(b"\x7fELFSYNTHETIC_NOT_EXECUTED",IMMUTABLE,executable=True)
+    entry_frame={**frame,"slot":1,"observed_at":100.}
+    entry_frame_id=probe._store_frame(entry_frame)
     frame_id=probe._store_frame(frame)
     owner=str(virtual_owner().pubkey())
-    accounts={key:None for key in frame["accounts"]}
+    accounts={key:None for key in inventory_keys(frame,TOKEN_PROGRAM)}
     accounts[owner]={"lamports":100000,"data":["","base64"],"owner":"11111111111111111111111111111111","executable":False}
     prior={"target":target,"token_program":TOKEN_PROGRAM,"token_units":123,"last_slot":1,
-           "last_observed_at":100.,"entry_frame_sha256":"0"*64,"vm_fees_lamports":5000,"accounts":accounts}
+           "last_observed_at":100.,"entry_frame_sha256":entry_frame_id,"vm_fees_lamports":5000,"accounts":accounts}
     prior["seal"]=digest(prior)
     current=copy.deepcopy(prior);current.pop("seal")
     current.update(vm_fees_lamports=10000,last_slot=2,last_observed_at=200.,last_frame_sha256=frame_id)
@@ -104,3 +112,22 @@ def test_malformed_numeric_diagnostics_do_not_emit_untrusted_text(tmp_path):
     assert result["status"]=="FAIL"
     assert result["samples"][0]["sell_input_token_units"] is None
     assert marker not in json.dumps(result)
+
+
+def test_market_and_program_comparison_does_not_claim_source_parity(tmp_path):
+    path=tmp_path/"probe.sqlite";fixture(path)
+    row=audit(path)["samples"][0]
+    assert row["market_facts"]["status"]==row["entry_market_facts"]["status"]=="DECODED_RESEARCH_ONLY"
+    assert row["program_image_unchanged_since_entry"] is True
+    assert row["market_facts"]["program_source_version_matched"] is False
+
+
+def test_missing_optional_entry_market_archive_is_explicit(tmp_path):
+    path=tmp_path/"probe.sqlite";fixture(path)
+    with sqlite3.connect(path) as db:
+        state=json.loads(db.execute("SELECT body FROM paper_bank_inventory").fetchone()[0])
+        db.execute("DELETE FROM frames WHERE id=?",(state["entry_frame_sha256"],))
+    result=audit(path);row=result["samples"][0]
+    assert result["status"]=="PASS"  # required exit-input conservation still verified
+    assert row["entry_market_facts"]["status"]=="UNAVAILABLE"
+    assert row["program_image_unchanged_since_entry"] is None
