@@ -15,3 +15,18 @@ PASS does not prove a sell succeeds, a honeypot, real fills or profitable alpha.
 A missing/corrupt/ambiguous prerequisite is an explicit failed check. Output
 contains only hashes, numeric diagnostics, local error code and check names;
 no account addresses, bodies, logs, provider URLs or exception strings.
+
+Market facts are strict existing-decoder research observations: pool reserves,
+vault token amounts, DBC price/start-floor comparison and archived program ELF
+hash. Unsupported/malformed layouts stay UNSUPPORTED/UNAVAILABLE separately
+from archive conservation checks. No quote, curve reimplementation, liquidity
+injection, source-version match or protocol-cause verdict is inferred. A missing
+program image hash is explicit; an IDL is not proof of deployed source parity.
+
+Entry market facts are optional additional diagnostics, not prerequisites for
+PR97's required exit-input conservation checks. Missing entry archives stay
+explicitly UNAVAILABLE and program comparison is null. Equal entry/exit ELF
+hashes mean only identical archived binaries, not source/parity certification.
+
+Numeric facts are exact raw integer units, including u128 square-root prices;
+consuming code must preserve arbitrary precision rather than coerce to floats.

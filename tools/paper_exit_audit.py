@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from src.research.fork_probe import ForkProbe
 from src.research.fork_simulation import digest
 from src.research.paper_bank import inventory_keys
+from src.research.paper_exit_facts import market_facts
 
 
 def safe_hash(value):
@@ -46,10 +47,23 @@ def diagnose(db, job, probe_id, body, stored_inventory):
               {"pump_curve", "pumpswap", "meteora_dbc", "raydium_launchlab"} else "UNSUPPORTED",
               "local_error_code": local_code(execution.get("exit", {})), "checks": checks}
     frame_id = control["source_frame_sha256"]
-    frame = ForkProbe._read_frame(SimpleNamespace(db=db, lock=threading.RLock()), frame_id)
+    reader = SimpleNamespace(db=db, lock=threading.RLock())
+    frame = ForkProbe._read_frame(reader, frame_id)
     checks["frame_binding"] = (execution["exit_frame_sha256"] == frame_id == row["input_sha256"]
                                 and frame["target"] == current["target"])
     result["exit_frame_sha256"] = frame_id
+    result["market_facts"] = market_facts(frame)
+    try:
+        entry_frame = ForkProbe._read_frame(reader, current["entry_frame_sha256"])
+        if entry_frame["target"] != frame["target"]:
+            raise ValueError("entry market target mismatch")
+        result["entry_market_facts"] = market_facts(entry_frame)
+    except Exception as exc:
+        result["entry_market_facts"] = {"status":"UNAVAILABLE", "error_type":type(exc).__name__}
+    before_image = result["entry_market_facts"].get("program_image_sha256")
+    after_image = result["market_facts"].get("program_image_sha256")
+    result["program_image_unchanged_since_entry"] = (before_image == after_image
+        if before_image is not None and after_image is not None else None)
     previous = db.execute("SELECT body,available FROM results WHERE job=? AND ref=? AND id!=? ORDER BY created DESC LIMIT 2",
                           (job, control.get("previous_canonical_ref"), probe_id)).fetchall()
     checks["unique_prior_canonical_inventory"] = len(previous) == 1
@@ -126,6 +140,7 @@ def audit(path, *, sample_limit=20):
         return {"status": "FAIL" if failures else "PASS" if samples else "NO_UNRESOLVED_SAMPLE",
                 "canonical_execution_statuses": counts, "pending_canonical_inventory_results": pending,
                 "sampled_unresolved": len(samples), "failure_categories": dict(failures), "samples": samples,
+                "market_fact_statuses": dict(Counter(row.get("market_facts",{}).get("status","NOT_EXTRACTED") for row in samples)),
                 "scope": "sampled archived frame/input/overlay/unit/VM-fee integrity, not external canonical-ledger verification",
                 "protocol_failure_resolved": False, "honeypot_proven": False, "real_fill": False,
                 "profitable_edge_established": False}
