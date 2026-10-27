@@ -267,12 +267,19 @@ class SourceMesh:
 
     Live delivery rotates across nonempty sources. A burst from one producer
     cannot put every other source behind its entire backlog. Active memory is
-    bounded; overflow removes the oldest item from the largest source backlog.
+    bounded. The volatile compatibility queue evicts on overflow; the durable
+    journal instead retains every committed body until its canonical ACK.
+    Durable delivery prefetches a bounded fair batch to amortize lease commits.
     """
 
     def __init__(self, sources: Optional[Sequence[EventSource]] = None,
                  dedupe_window: float = 300.0, max_queue: int = 10_000,
-                 poll_timeout: float = 5.0, journal_path=None):
+                 poll_timeout: float = 5.0, journal_path=None, journal_batch_size: int = 8):
+        if type(journal_batch_size) is not int or not 1 <= journal_batch_size <= 32:
+            raise ValueError('journal_batch_size must be between 1 and 32')
+        self.journal_batch_size = journal_batch_size
+        self._journal_prefetch = deque()
+        self._journal_read_gate = asyncio.Lock()
         self.sources: List[EventSource] = list(sources or ())
         self.dedupe_window = dedupe_window
         self.max_queue = max(1, max_queue)
@@ -368,6 +375,7 @@ class SourceMesh:
     def close(self):
         if self.journal is not None:
             self.journal.close()
+            self._journal_prefetch.clear()
 
     def add(self, source: EventSource) -> None:
         if any(existing.source_id == source.source_id for existing in self.sources):
@@ -510,17 +518,25 @@ class SourceMesh:
     async def next_event(self) -> Event:
         """Await the next event from any source. The consumer's entry point."""
         if self.journal is not None:
-            while True:
-                self._available.clear()
-                leased = await self._disk_call(self.journal.lease, time.time())
-                if leased is not None:
-                    event, receipt, generation = leased
-                    self._journal_leases[id(event)] = (event, receipt, generation)
-                    return event
-                try:
-                    await asyncio.wait_for(self._available.wait(), 1)
-                except asyncio.TimeoutError:
-                    pass  # Expired leases/retry deadlines become eligible too.
+            # One bounded buffer across concurrent waiters. Bodies are available
+            # in memory at the batch's first-delivery clock; per-event canonical
+            # persistence/ACK and owner-loop indexing retain their existing order.
+            async with self._journal_read_gate:
+                while True:
+                    if self._journal_prefetch:
+                        event, receipt, generation = self._journal_prefetch.popleft()
+                        self._journal_leases[id(event)] = (event, receipt, generation)
+                        return event
+                    self._available.clear()
+                    leased = await self._disk_call(
+                        lambda: self.journal.lease_many(time.time(), limit=self.journal_batch_size))
+                    if leased:
+                        self._journal_prefetch.extend(leased)
+                        continue
+                    try:
+                        await asyncio.wait_for(self._available.wait(), 1)
+                    except asyncio.TimeoutError:
+                        pass  # Expired leases/retry deadlines become eligible too.
         while True:
             try:
                 return self._take_pending()
@@ -582,6 +598,8 @@ class SourceMesh:
                     'dedupe_cached_contents': len(self._seen), 'dedupe_window_seconds': self.dedupe_window,
                     'dropped_events': 0, 'journal_write_failures': self._journal_write_failures,
                     'journal_last_error_type': self._journal_last_error,
+                    'journal_batch_size': self.journal_batch_size,
+                    'prefetched_events': len(self._journal_prefetch),
                     'coverage_scope': 'committed source observations only; disk failure backpressures polling'}
         with self._queue_lock:
             self._expire(now)

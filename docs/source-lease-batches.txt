@@ -1,0 +1,43 @@
+Bounded durable source lease batches
+===================================
+
+SourceJournal.lease_many leases up to 32 rows in one synchronous FULL SQLite
+transaction. The live SourceMesh default is eight, configurable through its
+journal_batch_size constructor argument (1 restores one-row leasing). The legacy
+lease method delegates to a batch of one. There is no schema migration.
+
+Each member runs the existing per-source ticket selection and increments the
+source ticket before selecting the next member. This matches sequential leasing
+for the sources pending at the batch boundary. A newly arriving source may wait
+for the current prefetched batch, at most seven remaining buffered records with
+the default of eight. This is a record bound, not a wall-clock latency guarantee.
+Do not call it zero starvation or a solution to overall processing capacity.
+
+SourceMesh serializes durable readers and holds one bounded prefetch buffer even
+with concurrent waiters. Bodies are available to the research mesh as a batch;
+first_delivery/research_available_at retain that batch-admission clock, not NLP
+completion or per-record indexing time. Original source/observed clocks remain
+unchanged. Each event is still canonically persisted, indexed and acknowledged
+separately in its existing owner-loop order. Pending counts include buffered rows
+until their exact canonical ACK succeeds. No raw journal body is deleted by a
+lease. A corrupt member rolls back every lease and fairness ticket in the batch.
+
+Cancellation drains an initiated disk transaction. If the batch was committed
+but never returned, its raw rows replay after the lease deadline. Likewise,
+unused buffered rows survive process shutdown in SQLite; restart may wait for
+the existing 300-second lease to expire. First-delivery clocks stay stable across
+retries, and old generations cannot ACK a reclaimed row. Nonfinite or rounded
+nonadvancing lease deadlines are refused. Closing a mesh clears only its memory
+buffer, not journal bodies. FULL durability and per-event ACK commits remain.
+
+Health exposes journal_batch_size, prefetched_events, lease_batches_this_run and
+leased_events_this_run. The latter two count committed nonempty leases and reset
+on process restart; they are not admission or canonical-delivery counters.
+
+Isolated benchmark (source-lease-benchmark-20261027-002329.json in handoff): three
+alternating trials, 128 observations each, FULL durability. One-row leases used
+128 commits; eight-row batches used 16. Median lease-only times were 0.491s and
+0.095s under variable shared VPS load. No ACK/canonical/NLP pipeline improvement,
+provider coverage, profit, model calibration or live execution is certified by
+this result. Production throughput acceptance still requires observed runtime
+counters and backlog/age measurements after reviewed deployment.
