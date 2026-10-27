@@ -225,10 +225,33 @@ class SourceIntelligence:
             # closes its owner. The unacknowledged source can replay safely.
             await pending
             raise
-        # PublicClaimLinks owns a thread-bound SQLite connection. Finish its
-        # indexing, and all source/lead-graph mutations, on the owner loop.
+        # Construct/publish the store once on the owner loop. Repeated FULL
+        # claim commits run off-loop on its serialized writer connection; UI
+        # readers use independent committed WAL snapshots. Graph/source index
+        # mutations still occur on the owner loop after this method returns.
+        if job_id and getattr(self, 'public_claim_links', None) is None:
+            try:
+                from src.research.public_claim_links import PublicClaimLinks
+                self.public_claim_links = PublicClaimLinks(
+                    Path(getattr(self, 'global_config', {}).get('ops_state_dir', 'data/state')) /
+                    'public_claim_links.sqlite')
+            except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+                logger.warning('public claim index deferred: %s', type(exc).__name__)
+                return job_id
+        pending = asyncio.create_task(asyncio.to_thread(
+            SourceIntelligence._record_public_claim_links, self, event, payload, job_id))
+        try:
+            await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            # Do not close the writer or ACK the source before an initiated
+            # claim transaction finishes. The unacknowledged event can replay.
+            await pending
+            raise
+        # Preserve the existing owner-loop hook (including custom overrides)
+        # without repeating any canonical, neural or claim-index disk work.
         return self._record_population_narrative(event, defer_onion_io=True,
-            prepared_payload=payload, canonical_job_result=job_id, neural_intake_done=True)
+            prepared_payload=payload, canonical_job_result=job_id,
+            neural_intake_done=True, claim_intake_done=True)
 
     def _enqueue_neural_narrative(self, payload, job_id, tokens):
         neural = getattr(self, 'neural_sentiment', None)
@@ -247,7 +270,7 @@ class SourceIntelligence:
 
     def _record_population_narrative(self, event: Any, *, defer_onion_io: bool = False,
                                      prepared_payload=None, canonical_job_result=_NOT_ENQUEUED,
-                                     neural_intake_done=False) -> Optional[str]:
+                                     neural_intake_done=False, claim_intake_done=False) -> Optional[str]:
         payload = (prepared_payload if prepared_payload is not None
                    else SourceIntelligence._population_narrative_payload(self, event))
         metadata = dict(getattr(event, "metadata", None) or {})
@@ -261,19 +284,28 @@ class SourceIntelligence:
         if job_id:
             if not neural_intake_done:
                 SourceIntelligence._enqueue_neural_narrative(self, payload, job_id, tokens)
-            try:
-                from src.research.public_claim_links import PublicClaimLinks
-                if getattr(self, "public_claim_links", None) is None:
-                    self.public_claim_links = PublicClaimLinks(
-                        Path(getattr(self, "global_config", {}).get("ops_state_dir", "data/state")) / "public_claim_links.sqlite")
-                flags = payload.get("local_decision_shadow", {}).get("rules", {}).get("flags", {})
-                self.public_claim_links.record(source_job=job_id, source_id=event.source_id,
-                    addresses=[*tokens, *metadata.get("evm_address_mentions", []), *metadata.get("solana_address_mentions", [])],
-                    topics=[*metadata.get("claim_topics", []), *[name for name, present in flags.items() if present]],
-                    observed_at=float(event.observed_at), publication_known=metadata.get("publication_time_known") is True)
-            except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
-                logger.warning("public claim index deferred: %s", type(exc).__name__)
+            if not claim_intake_done:
+                SourceIntelligence._record_public_claim_links(self, event, payload, job_id)
         return job_id
+
+    def _record_public_claim_links(self, event, payload, job_id):
+        """Secondary-index IO only; source and lead-graph mutations stay on owner."""
+        if not job_id:
+            return
+        metadata = dict(getattr(event, "metadata", None) or {})
+        tokens = list(getattr(event, "token_addresses", ()) or ())
+        try:
+            from src.research.public_claim_links import PublicClaimLinks
+            if getattr(self, "public_claim_links", None) is None:
+                self.public_claim_links = PublicClaimLinks(
+                    Path(getattr(self, "global_config", {}).get("ops_state_dir", "data/state")) / "public_claim_links.sqlite")
+            flags = payload.get("local_decision_shadow", {}).get("rules", {}).get("flags", {})
+            self.public_claim_links.record(source_job=job_id, source_id=event.source_id,
+                addresses=[*tokens, *metadata.get("evm_address_mentions", []), *metadata.get("solana_address_mentions", [])],
+                topics=[*metadata.get("claim_topics", []), *[name for name, present in flags.items() if present]],
+                observed_at=float(event.observed_at), publication_known=metadata.get("publication_time_known") is True)
+        except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+            logger.warning("public claim index deferred: %s", type(exc).__name__)
 
     def _record_population_follow_outcome(self, payload: Dict[str, Any], *, evidence_refs=(),
                                           now: Optional[float] = None) -> Optional[str]:

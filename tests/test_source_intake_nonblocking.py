@@ -17,7 +17,7 @@ def event():
                  token_addresses=[ADDRESS], metadata={"chain_id":"solana"})
 
 
-def test_real_canonical_write_yields_and_thread_bound_claims_stay_on_owner(tmp_path):
+def test_real_canonical_write_yields_and_claim_binding_is_retained(tmp_path):
     async def scenario():
         value = desk(tmp_path)
         value.global_config = {"ops_state_dir": str(tmp_path)}
@@ -41,8 +41,8 @@ def test_real_canonical_write_yields_and_thread_bound_claims_stay_on_owner(tmp_p
         job, _ = await asyncio.gather(value._record_population_narrative_async(event()), health())
         assert phases == ["persist", "health"]
         assert value.unknown_engine.frontier.job(job)["kind"] == "NARRATIVE_OBSERVATION"
-        # This real SQLite connection was created on the owner thread. An
-        # accidental worker-side finalization would be rejected and lose links.
+        # Store construction occurs on the owner; committed claim rows are
+        # visible through an independent WAL reader after worker completion.
         items = value.public_claim_links.page()["items"]
         assert len(items) == 1 and items[0]["source_job"] == job
         assert TradeEvidenceLedger.verify(value.unknown_engine.evidence.path)[0]
