@@ -1,0 +1,20 @@
+Source service receipt comparison
+=================================
+Run python -m tools.source_service_delta BEFORE.json AFTER.json on sanitized
+runtime receipts. Reads files only; never connects to services or providers.
+
+Journal admission/ACK and neural window counter differences describe the sample
+interval. Neural pending is a gauge and may decrease. Negative cumulative deltas
+are rejected as reset/invalid intervals. Missing phases have no invented baseline.
+Even monotonic counters cannot prove no process restart: continuity remains
+UNVERIFIED. These independently sampled fields are not an atomic system snapshot.
+
+Phase time differences describe recorded attempts, including interrupted attempts.
+Attempts enter the timing report on completion/interruption, so an attempt may
+start before the sample interval. Do not interpret phase seconds as utilization,
+source latency, executor queue time, p99, or measured sustainable capacity.
+Parent delivery_ack overlaps onion_delivery/canonical_ref/journal_ack; do not sum
+phases. Lifetime maximum/last values are deliberately not differenced. Phase
+completion does not by itself prove a successful durable write or canonical ACK.
+Only fixed numeric fields are emitted. No source bodies, identifiers or error
+strings from input receipts are exported.
