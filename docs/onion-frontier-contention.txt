@@ -1,0 +1,18 @@
+Onion frontier health reports use independent read-only/query-only WAL
+transactions. Database census fields share one committed snapshot. A report
+scan cannot hold the writer mutex used for delivery/child admission; transport
+base counters may be newer than the database snapshot. A started reader may
+finish after stop, but later reports fail with ProgrammingError.
+
+Lease selection retains the original full ordering: host last attempt, the
+host turn's new/revisit preference, URL deadline, discovery time, URL. Hosts
+are scanned in last-attempt order via onion_host_turn, with indexed due URL
+lookups for each host. SQLite can stop after the earliest eligible host group
+without scanning later host groups' URLs. Tied host groups still require the
+original global secondary ordering and can be large. The schema addition is
+an idempotent index; no records or outbox bodies are removed or rewritten.
+BEGIN IMMEDIATE, 60-second leases, host pacing/backoff, active worker count,
+canonical outbox replay and child-before-parent admission are unchanged.
+Reports/query execution still consume disk/cache; executor and other locks
+can still delay delivery. Synthetic query work is not live throughput, public
+coverage or profitable strategy evidence.
