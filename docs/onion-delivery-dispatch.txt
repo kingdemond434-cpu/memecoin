@@ -1,0 +1,17 @@
+The source consumer uses deliver_async for prepared onion delivery. Ordinary
+public events without valid onion candidates or an onion/onion_directory outbox
+return immediately, without executor admission. Candidate parsing uses the same
+reviewed candidate_urls helper as actual delivery, including text, URLs and
+metadata. Frontier/source preparation remains on the owner loop.
+
+Real delivery still runs the existing synchronous deliver in a worker. Child
+admission precedes parent outbox acknowledgement; failure returns False and the
+consumer retries without journal ACK. Cancellation drains an initiated worker
+before propagating, preventing owner closure during a background write. Repeated
+cancellation behavior follows existing source disk-call draining conventions.
+
+Canonical payload-reference lookup, exact generation/receipt matching, FULL
+journal commit and post-ACK indexing are unchanged. Empty onion work is skipped,
+not source events. Existing onion_delivery timing includes an immediate no-op
+for plain events; its mean will mix no-op and real deliveries. It must not be
+interpreted as a measured SQLite speedup. Sustainable capacity remains unproven.

@@ -594,14 +594,13 @@ class SourceIntelligence:
                     continue
                 with source_timing(self).measure("delivery_ack"):
                     if job_id:
-                        from src.collectors.onion_discovery import _frontier, deliver
+                        from src.collectors.onion_discovery import _frontier, deliver_async
                         # SourceMesh.add may start an asyncio task, so preparation
                         # stays on the owner loop. Bulk SQLite admission/ack waits
                         # in the worker and cannot freeze health or market events.
                         frontier = _frontier(self)
                         with source_timing(self).measure("onion_delivery"):
-                            delivered = await asyncio.to_thread(deliver, self, event, job_id,
-                                                                frontier=frontier, prepared=True)
+                            delivered = await deliver_async(self, event, job_id, frontier=frontier)
                         if durable:
                             if not delivered:
                                 await self.source_mesh.retry_event(event)

@@ -103,3 +103,24 @@ def deliver(desk, event, canonical_job_id, *, frontier=None, prepared=False):
         logging.getLogger(__name__).warning("onion canonical delivery deferred: %s", type(exc).__name__)
         return False
     return True
+
+
+async def deliver_async(desk, event, canonical_job_id, *, frontier=None):
+    """Avoid executor admission for deliveries with no onion side effects.
+
+    Onion transports always have an outbox ACK, even with no discovered links.
+    Initiated worker writes are drained on cancellation before owners can close.
+    """
+    import asyncio
+    if not canonical_job_id:
+        return False
+    transport = getattr(desk, "transports", {}).get(event.source_id)
+    if getattr(transport, "kind", None) not in {"onion", "onion_directory"} and not candidate_urls(event):
+        return True
+    pending = asyncio.create_task(asyncio.to_thread(
+        deliver, desk, event, canonical_job_id, frontier=frontier, prepared=True))
+    try:
+        return await asyncio.shield(pending)
+    except asyncio.CancelledError:
+        await pending
+        raise
