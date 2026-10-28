@@ -954,8 +954,24 @@ class ReportingSurface:
                     logger.debug("memory governor read failed: %s", exc)
                 await asyncio.sleep(10)
             snapshot = await self._readiness_snapshot()
+            await self._publish_readiness(snapshot)
+
+    async def _publish_readiness(self, snapshot):
+        # The projection is already detached/read-only. Logging, duplicate
+        # JSON rendering and atomic file replacement may wait on storage;
+        # none should execute synchronously on the intake/HTTP owner loop.
+        def publish():
             logger.info("HEALTH %s", json.dumps(snapshot, separators=(",", ":")))
             self._persist_readiness(snapshot)
+        pending = asyncio.create_task(asyncio.to_thread(publish))
+        try:
+            await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            # Finish the initiated publication before shutdown returns. Only
+            # one health-loop publication can be active; no overlapping file
+            # writers or partially abandoned replacement are introduced.
+            await pending
+            raise
 
     def _record_ops_event(self, stream: str, payload: Dict[str, Any]) -> None:
         """Append one operational telemetry row for the monitor and audit pack.
