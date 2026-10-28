@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import inspect
+import math
 import queue
 import threading
 import time
@@ -53,6 +54,9 @@ OFFLOAD_SCHEMA_VERSION = "v1"
 #: burst of several miners finishing at once, not for an outage: if the main
 #: loop stops draining, dropping is the correct behaviour and growing is not.
 DEFAULT_QUEUE_DEPTH = 4_096
+
+# Checked between batches only; a single synchronous sink cannot be pre-empted.
+OWNER_DRAIN_QUANTUM_SECONDS = 0.01
 
 
 class OffloadedPool:
@@ -82,6 +86,10 @@ class OffloadedPool:
         self.delivered = 0
         self.dropped = 0
         self.sink_errors = 0
+        self.sink_returned = 0
+        self.sink_interrupted = 0
+        self.sink_seconds_total = 0.0
+        self.sink_seconds_max = 0.0
         self.started_at = 0.0
         self.last_delivery_at = 0.0
         self.thread_error = ""
@@ -178,22 +186,32 @@ class OffloadedPool:
     async def _drain_loop(self) -> None:
         while self._running:
             try:
-                self.drain()
+                self.drain(max_seconds=OWNER_DRAIN_QUANTUM_SECONDS)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pragma: no cover - defensive
                 logger.warning("offload drain error: %s", exc)
             await asyncio.sleep(self.drain_interval_s)
 
-    def drain(self, budget: int = 64) -> int:
+    def drain(self, budget: int = 64, *, max_seconds: Optional[float] = None) -> int:
         """Move up to `budget` batches onto the main loop's state.
 
+        max_seconds checks elapsed time between batches, leaving the FIFO tail
+        queued. A single sink may exceed it. Manual calls default to count-only.
         Bounded per pass on purpose. Draining the whole queue in one go turns
         a miner burst into exactly the stall this module exists to prevent,
         just moved to a different line of code.
         """
+        if max_seconds is not None and (isinstance(max_seconds, bool)
+                or not math.isfinite(max_seconds) or max_seconds <= 0):
+            raise ValueError("positive finite drain quantum required")
+        started = time.perf_counter()
         moved = 0
         while moved < budget:
+            # Leave the remaining FIFO untouched for the next owner turn.
+            # Always allow one batch; this is not a pre-emptive deadline.
+            if moved and max_seconds is not None and time.perf_counter()-started >= max_seconds:
+                break
             try:
                 miner_id, records = self._queue.get_nowait()
             except queue.Empty:
@@ -201,11 +219,20 @@ class OffloadedPool:
             moved += 1
             self.delivered += 1
             self.last_delivery_at = time.time()
+            sink_started = time.perf_counter()
             try:
                 self.sink(miner_id, records)
+                self.sink_returned += 1
             except Exception as exc:
                 self.sink_errors += 1
                 logger.warning("offload sink raised for %s: %s", miner_id, exc)
+            except BaseException:
+                self.sink_interrupted += 1
+                raise
+            finally:
+                elapsed = max(0.0, time.perf_counter()-sink_started)
+                self.sink_seconds_total += elapsed
+                self.sink_seconds_max = max(self.sink_seconds_max, elapsed)
         return moved
 
     # --- reporting -------------------------------------------------------
@@ -241,6 +268,12 @@ class OffloadedPool:
             "delivered": self.delivered,
             "dropped": self.dropped,
             "sink_errors": self.sink_errors,
+            "sink_returned": self.sink_returned,
+            "sink_interrupted": self.sink_interrupted,
+            "sink_seconds_total": self.sink_seconds_total,
+            "sink_seconds_max": self.sink_seconds_max,
+            "delivery_scope": "delivered counts attempted owner sink calls; return is not durable or per-record acceptance",
+            "owner_drain_quantum_seconds": OWNER_DRAIN_QUANTUM_SECONDS,
             "seconds_since_delivery": (round(moment - self.last_delivery_at, 1)
                                        if self.last_delivery_at else None),
         }

@@ -1,0 +1,14 @@
+The automatic thread-offload drainer checks a 10 ms active time budget between
+batches, in addition to its existing 64-batch count cap, then yields through its
+existing sleep cadence. One synchronous sink cannot be pre-empted and may exceed
+the budget. Remaining FIFO entries stay queued; this introduces no new eviction,
+retry or durable-ACK policy. Existing queue overflow behavior remains visible and
+unchanged; raw miner retention does not prove successful owner consumption.
+
+Existing delivered counts attempted owner sink calls. New sink_returned counts
+normal synchronous return, sink_errors retains caught Exception counts, and
+sink_interrupted counts propagated BaseException. Total/max durations measure the
+owner call including error handling, not worker time, end-to-end or p99. A normal
+return does not establish per-record application, episode inclusion, durability,
+profitability or coverage. Manual drain() defaults remain count-only. No state
+mutation moves off-owner; no source journal/native/budget/trading changes.
