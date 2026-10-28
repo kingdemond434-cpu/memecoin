@@ -1099,12 +1099,14 @@ class PointInTimeDatasetBuilder:
                            "first_observed_at": distinct_times[0], "last_observed_at": distinct_times[-1]},
         }
 
-    def record_market_observation(self, token: str, observation: Dict[str, Any]):
+    def record_market_observation(self, token: str, observation: Dict[str, Any]) -> bool:
+        """Return explicit in-memory application only, never a persistence receipt."""
         episode = self.active_episodes.get(token) or self.completed_episodes.get(token)
         if not episode:
-            return
+            return False
         record = {**observation, "timestamp": observation.get("timestamp", time.time())}
         episode.market_observations.append(record)
+        return True
 
     def record_risk_report(self, token: str, report: Dict[str, Any]):
         episode = self.active_episodes.get(token)

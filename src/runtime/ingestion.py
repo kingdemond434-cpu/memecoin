@@ -641,13 +641,11 @@ class MinedRecordIngestion:
                 # Raw result and bank archive are already canonical. This is a
                 # research observation; it never triggers an order or labels
                 # a VM/environment failure as a proven on-chain honeypot.
-                probe_id = record.get("probe_id")
-                if not probe_id:
-                    continue  # No identity can establish a canonical result binding.
-                proof = self.fork_probe.latest(record["token"], as_of=time.time(), probe_id=probe_id)
-                if proof and proof.get("probe_id") == probe_id:
-                    self.dataset_builder.record_market_observation(record["token"],
-                        {**proof, "type": "native_fork_roundtrip", "timestamp": proof["available_at"]})
+                from src.runtime.native_fork_delivery import NativeForkOwnerDelivery
+                if getattr(self, "_native_fork_owner_delivery", None) is None:
+                    self._native_fork_owner_delivery = NativeForkOwnerDelivery()
+                self._native_fork_owner_delivery.deliver(record, probe=self.fork_probe,
+                    builder=self.dataset_builder, as_of=time.time())
                 continue
             if record.get("provider") == "native_pool_attribution":
                 if record.get("attribution_kind") == "recovered_trade":

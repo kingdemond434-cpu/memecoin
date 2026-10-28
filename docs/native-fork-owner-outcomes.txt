@@ -1,0 +1,5 @@
+Native fork owner outcome visibility
+
+Existing exact-ID/token/as_of canonical lookup and native-source PIT guards remain. The owner records fixed process-local outcome counts for each native fork record: invalid identity, unavailable proof, mismatched identity, lookup/application error, interruption, unavailable episode, explicit in-memory application, or unconfirmed alternate sink return. Exceptions still propagate. No per-token archive, additional IO, new worker, order, fee/inventory rewrite or replay ACK is introduced.
+
+The real dataset builder explicitly returns True only after appending to the existing active/completed episode list, False for absent episode. Existing callers can ignore this result. Legacy/alternate sinks returning None are unconfirmed. Status exposes native_fork_owner_delivery separately from native_fork_probe; reports state episode memory only, restart-reset counters, durable_acceptance=false/full_replay_verified=false/real_fill=false/promotion_eligible=false. These are not durable application receipts or source throughput/edge proof.
