@@ -1,0 +1,9 @@
+Guarded older SQLite backup consolidation
+
+Use python -m tools.consolidate_backup SOURCE --backups-root ROOT --verification-receipt PRIOR_PASS_JSON --protected-receipt NEWEST_PASS_JSON --protected-receipt SECOND_NEWEST_PASS_JSON --retirement-receipt NEW_RECEIPT_JSON.
+
+Only a whitelisted SQLite file directly inside an identified report-deployment-backup directory is eligible. The complete prior verification receipt must identify its exact directory, SHA256 and byte count. The newest two certified recovery directories must match distinct passing receipts and retain all ten original SQLite copies. Canonical JSONL, certificates/configuration and live state are excluded. Source path boundaries are checked before any mutation.
+
+With at least twice the file size plus12GiB free, create or reuse its gzip archive, restore to unique isolated scratch, check exact trusted byte count, persisted read-back hash and readonly SQLite quick_check. Re-read source hash and check observed mutation. Write/fsync an exclusive recovery receipt BEFORE removing only the verified older uncompressed file. Archive and both newest complete backups remain. Final receipt records net backup bytes saved; scratch is cleaned. On an interruption the receipt may still say original retained; check actual paths and restore only to a new isolated file using the recorded hash/size. Never overwrite later live state from an old snapshot.
+
+This is a single-file retention control and isolated file recovery proof, not full service recovery or canonical chain/replay acceptance. Existing deployment helpers still require canonical prefixes/certificates at their original paths. No scheduler, automatic recurring retention or production service action is added.
