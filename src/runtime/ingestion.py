@@ -644,7 +644,9 @@ class MinedRecordIngestion:
                 from src.runtime.native_fork_delivery import NativeForkOwnerDelivery
                 if getattr(self, "_native_fork_owner_delivery", None) is None:
                     self._native_fork_owner_delivery = NativeForkOwnerDelivery()
-                self._native_fork_owner_delivery.deliver(record, probe=self.fork_probe,
+                self._native_fork_owner_delivery.deliver(record,
+                    lookup=lambda token, *, as_of, probe_id: self.fork_probe.latest(
+                        token, as_of=as_of, probe_id=probe_id),
                     builder=self.dataset_builder, as_of=time.time())
                 continue
             if record.get("provider") == "native_pool_attribution":

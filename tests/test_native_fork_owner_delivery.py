@@ -72,7 +72,7 @@ def test_sink_failure_propagates_and_never_becomes_acceptance(error,key):
     def fail(*args):raise error('isolated sink fixture')
     with pytest.raises(error):
         tracker.deliver({'token':'active','probe_id':'id'},
-            probe=SimpleNamespace(latest=lambda *a,**kw:{'probe_id':'id','available_at':10}),
+            lookup=lambda *a,**kw:{'probe_id':'id','available_at':10},
             builder=SimpleNamespace(record_market_observation=fail),as_of=30)
     counts=tracker.report()['counts'];assert counts[key]==1 and counts['in_memory_applied']==0
 
@@ -80,7 +80,7 @@ def test_sink_failure_propagates_and_never_becomes_acceptance(error,key):
 def test_normal_legacy_sink_return_is_unconfirmed_and_report_is_snapshot():
     tracker=NativeForkOwnerDelivery()
     tracker.deliver({'token':'active','probe_id':'id'},
-        probe=SimpleNamespace(latest=lambda *a,**kw:{'probe_id':'id','available_at':10}),
+        lookup=lambda *a,**kw:{'probe_id':'id','available_at':10},
         builder=SimpleNamespace(record_market_observation=lambda *a:None),as_of=30)
     report=tracker.report();assert report['counts']['application_unconfirmed']==1
     report['counts']['in_memory_applied']=999
@@ -100,7 +100,7 @@ def test_lookup_failure_propagates_without_application(error,key):
     tracker=NativeForkOwnerDelivery();seen=[]
     def fail(*a,**kw):raise error('isolated lookup fixture')
     with pytest.raises(error):
-        tracker.deliver({'token':'active','probe_id':'id'},probe=SimpleNamespace(latest=fail),
+        tracker.deliver({'token':'active','probe_id':'id'},lookup=fail,
             builder=SimpleNamespace(record_market_observation=lambda *a:seen.append(a)),as_of=30)
     assert tracker.report()['counts'][key]==1 and seen==[]
 
@@ -108,6 +108,6 @@ def test_lookup_failure_propagates_without_application(error,key):
 def test_mismatched_proof_never_reaches_episode():
     tracker=NativeForkOwnerDelivery();seen=[]
     tracker.deliver({'token':'active','probe_id':'id'},
-        probe=SimpleNamespace(latest=lambda *a,**kw:{'probe_id':'different','available_at':10}),
+        lookup=lambda *a,**kw:{'probe_id':'different','available_at':10},
         builder=SimpleNamespace(record_market_observation=lambda *a:seen.append(a)),as_of=30)
     assert tracker.report()['counts']['identity_mismatch']==1 and seen==[]

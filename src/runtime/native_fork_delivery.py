@@ -10,14 +10,14 @@ class NativeForkOwnerDelivery:
             'identity_mismatch', 'lookup_errors', 'application_errors', 'interrupted',
             'episode_unavailable', 'in_memory_applied', 'application_unconfirmed'), 0)
 
-    def deliver(self, record, *, probe, builder, as_of):
+    def deliver(self, record, *, lookup, builder, as_of):
         self.counts['records_seen'] += 1
         token, identity = record.get('token'), record.get('probe_id')
         if not isinstance(token, str) or not token or not isinstance(identity, str) or not identity:
             self.counts['invalid_identity'] += 1
             return
         try:
-            proof = probe.latest(token, as_of=as_of, probe_id=identity)
+            proof = lookup(token, as_of=as_of, probe_id=identity)
         except Exception:
             self.counts['lookup_errors'] += 1
             raise
