@@ -606,6 +606,9 @@ class ReportingSurface:
                 if getattr(self, "free_discovery", None) is not None else {"status": "NOT_OBSERVED"}),
             "phantom_perps": (self.phantom_perps.report()
                 if getattr(self, "phantom_perps", None) is not None else {"status": "NOT_OBSERVED"}),
+            "native_fork_owner_delivery": (self._native_fork_owner_delivery.report()
+                if getattr(self, "_native_fork_owner_delivery", None) is not None
+                else {"status": "NOT_OBSERVED", "durable_acceptance": False}),
             "native_fork_probe": (self.fork_probe.report()
                 if getattr(self, "fork_probe", None) is not None else {"status": "NOT_OBSERVED"}),
             'neural_sentiment': (self.neural_sentiment.report()
