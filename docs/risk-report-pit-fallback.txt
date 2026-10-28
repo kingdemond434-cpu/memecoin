@@ -1,0 +1,5 @@
+Risk-report point-in-time fallback
+
+Token feature capture previously filtered the report history by timestamp, then used episode.risk_report unconditionally if that history was empty. A latest report learned after the requested snapshot could therefore populate earlier mint/ownership/concentration fields. Both history and fallback now require an explicit finite nonnegative timestamp no later than the finite cutoff. Recorded available_at/ingested_at clocks, when present, must also be valid and no later than that cutoff.
+
+If no report qualifies, retain the existing creation-native PARTIAL result with unknown enrichment fields. No timestamps are invented, raw reports deleted, observations/positions/fees rewritten or old snapshots relabeled. A timestamped eligible legacy fallback remains supported, including an exact-cutoff observation. This fixes risk-report selection only; historical snapshots/models are not retroactively re-certified and other owner/PIT/replay acceptance remains unfinished.

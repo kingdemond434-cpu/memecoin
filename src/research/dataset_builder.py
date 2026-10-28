@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import time
 import json
 import gzip
@@ -203,6 +204,23 @@ def pump_curve_invariant_holds(sol_reserves: float, token_reserves: float) -> bo
     if sol_reserves <= 0 or token_reserves <= 0:
         return False
     return abs(sol_reserves * token_reserves - PUMP_CURVE_K) / PUMP_CURVE_K <= PUMP_CURVE_K_TOLERANCE
+
+
+def _risk_report_visible_at(report: Dict[str, Any], as_of: float) -> bool:
+    """Require an explicit event clock and honor any recorded knowledge clocks."""
+    for field in ("timestamp", "available_at", "ingested_at"):
+        if field not in report and field != "timestamp":
+            continue
+        value = report.get(field)
+        if value is None or isinstance(value, bool):
+            return False
+        try:
+            clock = float(value)
+        except (ValueError, TypeError, OverflowError):
+            return False
+        if not math.isfinite(clock) or clock < 0 or clock > as_of:
+            return False
+    return True
 
 
 class PointInTimeDatasetBuilder:
@@ -747,9 +765,14 @@ class PointInTimeDatasetBuilder:
         return result
 
     async def _capture_token_features(self, episode: LaunchEpisode, as_of: float) -> Dict[str, Any]:
+        as_of = float(as_of)
+        if not math.isfinite(as_of):
+            raise ValueError("finite risk feature cutoff required")
         reports = [item for item in episode.market_observations
-                   if item.get("type") == "risk_report" and float(item.get("timestamp", 0) or 0) <= as_of]
-        report = max(reports, key=lambda item: float(item.get("timestamp", 0) or 0)) if reports else episode.risk_report
+                   if item.get("type") == "risk_report" and _risk_report_visible_at(item, as_of)]
+        fallback = episode.risk_report
+        report = (max(reports, key=lambda item: float(item["timestamp"])) if reports
+                  else fallback if fallback and _risk_report_visible_at(fallback, as_of) else {})
         if not report:
             # Degraded, not absent. A risk report is ENRICHMENT -- it arrives
             # from account-owner lookups that take an RPC round trip -- and
