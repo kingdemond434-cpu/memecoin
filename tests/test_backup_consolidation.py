@@ -7,6 +7,13 @@ import pytest
 from tools.consolidate_backup import DATABASES, consolidate
 
 
+@pytest.fixture(autouse=True)
+def controlled_fixture_headroom(monkeypatch):
+    from types import SimpleNamespace
+    import tools.consolidate_backup as module
+    monkeypatch.setattr(module.shutil, "disk_usage", lambda path: SimpleNamespace(free=100*1024**3))
+
+
 def fixture(tmp_path):
     folders = [tmp_path/f'report-deployment-backup-20261028-0{i}0000' for i in (1,2,3)]
     receipts = []
@@ -94,3 +101,16 @@ def test_outside_root_rejected(tmp_path):
     with pytest.raises(ValueError, match='root'):
         run(tmp_path, folders, receipts, backups_root=folders[0])
     assert (folders[0]/'phantom_perps.sqlite').exists()
+
+
+
+def test_low_disk_reserve_blocks_before_archive_or_retirement(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import tools.consolidate_backup as module
+    folders, receipts = fixture(tmp_path)
+    monkeypatch.setattr(module.shutil, 'disk_usage', lambda path: SimpleNamespace(free=12*1024**3))
+    with pytest.raises(ValueError, match='headroom'):
+        run(tmp_path, folders, receipts)
+    source = folders[0]/'phantom_perps.sqlite'
+    assert source.exists() and not source.with_suffix('.sqlite.gz').exists()
+    assert not (tmp_path/'retired.json').exists()
