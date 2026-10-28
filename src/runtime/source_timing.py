@@ -8,7 +8,9 @@ PHASES = ("canonical", "neural_intake", "claim_intake", "owner_hook",
           "canonical_ref_dispatch_wait", "canonical_ref_worker",
           "journal_ack_dispatch_wait", "journal_ack_worker",
           "canonical_ack", "canonical_ack_dispatch_wait", "canonical_ack_worker",
-          "canonical_ref_inline", "journal_ack_inline")
+          "canonical_ref_inline", "journal_ack_inline",
+          "canonical_ref_owner_resume", "journal_ack_owner_resume",
+          "canonical_ack_owner_resume")
 
 class SourceTiming:
     def __init__(self):
@@ -50,9 +52,27 @@ class SourceTiming:
         queued = time.perf_counter()
         def run():
             self._record(phase + "_dispatch_wait", max(0.0, time.perf_counter() - queued), True)
-            with self.measure(phase + "_worker"):
-                return call(*args)
+            try:
+                with self.measure(phase + "_worker"):
+                    return call(*args)
+            finally:
+                run.finished_at = time.perf_counter()
+        run.finished_at = None
         return run
+
+    def resumed(self, phase, worker, succeeded):
+        """Record worker completion to caller return, including cancellation drain.
+
+        This includes completion notification and owner scheduling, not pure
+        loop lag. Missing completion (e.g. cancelled before dispatch) is omitted.
+        Outcome describes caller return, never durable transaction success.
+        """
+        if phase not in ("canonical_ref", "journal_ack", "canonical_ack"):
+            raise ValueError("unknown source dispatch phase")
+        finished = worker.finished_at
+        if finished is not None:
+            self._record(phase + "_owner_resume",
+                         max(0.0, time.perf_counter() - finished), succeeded)
 
     def report(self):
         with self._lock:

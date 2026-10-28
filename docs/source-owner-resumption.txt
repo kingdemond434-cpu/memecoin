@@ -1,0 +1,14 @@
+Source disk callback return diagnostics
+
+For the three reviewed SourceMesh disk-call groups, owner_resume measures from
+worker wrapper completion (after worker timing bookkeeping) to the caller finally
+boundary. It includes thread completion notification, owner scheduling and, for
+cancellation, the existing drain. It is not pure loop lag, SQLite commit latency,
+or end-to-end source latency. Completed/interrupted describes normal/exceptional
+caller return; it does not establish durable success. An undispatched callback has
+no invented completion clock. Existing dispatch and worker scopes are unchanged.
+
+Use direct recorded samples; do not subtract independently sampled parent/child
+counters to infer this interval. Equal counts do not prove matching cohorts.
+Reports remain process-local aggregates, not p99 or sustainable capacity proof.
+No journal durability, exact ACK, lease, fairness or cancellation policy changes.

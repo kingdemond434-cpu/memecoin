@@ -318,13 +318,19 @@ class SourceMesh:
         if timing is not None:
             call, args = timing.worker(phase, call, *args), ()
         pending = asyncio.create_task(asyncio.to_thread(call, *args))
+        succeeded = False
         try:
-            return await asyncio.shield(pending)
+            result = await asyncio.shield(pending)
+            succeeded = True
+            return result
         except asyncio.CancelledError:
             # A cancelled await cannot cancel an OS-thread transaction. Drain
             # it before shutdown may close the database; unacknowledged rows replay.
             await pending
             raise
+        finally:
+            if timing is not None:
+                timing.resumed(phase, call, succeeded)
 
     async def publish_batch(self, events):
         if self.journal is None:
