@@ -314,7 +314,9 @@ class SourceMesh:
             self.journal = SourceJournal(journal_path)
 
     @staticmethod
-    async def _disk_call(call, *args):
+    async def _disk_call(call, *args, timing=None, phase=None):
+        if timing is not None:
+            call, args = timing.worker(phase, call, *args), ()
         pending = asyncio.create_task(asyncio.to_thread(call, *args))
         try:
             return await asyncio.shield(pending)
@@ -357,11 +359,12 @@ class SourceMesh:
         leased = self._journal_leases.get(id(event))
         return dict(leased[1]) if leased is not None and leased[0] is event else None
 
-    async def acknowledge_event(self, event, job, reference):
+    async def acknowledge_event(self, event, job, reference, *, timing=None):
         if self.journal is None:
             return
         _, receipt, generation = self._journal_leases[id(event)]
-        await self._disk_call(self.journal.acknowledge, event, receipt, generation, job, reference, time.time())
+        await self._disk_call(self.journal.acknowledge, event, receipt, generation, job, reference, time.time(),
+                              timing=timing, phase="journal_ack")
         self._journal_leases.pop(id(event), None)
 
     async def retry_event(self, event):

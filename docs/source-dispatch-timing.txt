@@ -1,0 +1,21 @@
+Source disk dispatch timings
+===========================
+canonical_ref_dispatch_wait and journal_ack_dispatch_wait measure monotonic time
+from wrapping a call on the owner loop until worker entry. This includes owner
+task scheduling and default executor queue wait; it is not pure executor latency.
+A completed dispatch means only that the worker entered, not that a write passed.
+
+canonical_ref_worker and journal_ack_worker measure the actual callback through
+return or exception. They include lock waits, SQLite work and FULL commit where
+applicable. They do not yet separately measure lock vs commit time, nor CPU time.
+Worker exception counts interrupted; a successfully drained worker after caller
+cancellation counts completed. A never-started call has no completed timing row.
+
+Parent canonical_ref/journal_ack await times remain. Children overlap those
+parents and must not be added to them. Worker time excludes await resumption.
+Recorded attempt boundaries may straddle sampled status intervals. The fixed
+four additional phase names do not contain event IDs or provider error strings.
+No new executor, writer, transaction, retry or ordering is introduced. The same
+shield/drain behavior and exact FULL journal ACK contract remain authoritative.
+Use measurements to distinguish dispatch congestion from callback wait before
+changing scheduling or commits; no capacity or end-to-end source latency claim.
