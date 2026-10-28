@@ -1,0 +1,6 @@
+Verified backup compression
+
+Run python -m tools.compress_backup CLOSED_BACKUP NEW_ARCHIVE.gz --expected-sha256 HASH_FROM_VERIFIED_RECEIPT.
+The source must be a closed, immutable backup, never a live database. The utility streams gzip level 1, checks the source hash against the supplied prior receipt, rejects observed source mutation, fsyncs, then reads/decompresses every archived byte and checks the restored hash/size before exclusive publication. No source or existing destination is removed or replaced. Temporary partial output is removed on failure. No credentials/network/service actions are involved.
+
+This is a lossless byte recovery control, not a database integrity check, canonical certificate, full service restore drill or backup retention policy. Keep the original, its certificate and the latest verified recovery paths. Space reclaimed remains zero. The archive consumes additional headroom; check it before use. Compression of a mutable file, deletion of originals and automatic recovery-helper use are outside this increment.
