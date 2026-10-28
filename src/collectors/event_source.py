@@ -367,6 +367,31 @@ class SourceMesh:
                               timing=timing, phase="journal_ack")
         self._journal_leases.pop(id(event), None)
 
+    async def acknowledge_bound_event(self, event, job, lookup, *, timing=None):
+        """Fresh binding and exact FULL ACK in one drained disk dispatch.
+
+        Capture the lease on its owner loop; only committed database work runs
+        in the worker. No owner index mutation precedes the durable ACK.
+        """
+        if self.journal is None:
+            return
+        _, receipt, generation = self._journal_leases[id(event)]
+        def commit():
+            if timing is None:
+                reference = lookup(job)
+            else:
+                with timing.measure("canonical_ref_inline"):
+                    reference = lookup(job)
+            if not reference:
+                raise ValueError('canonical narrative source reference unavailable')
+            if timing is None:
+                self.journal.acknowledge(event, receipt, generation, job, reference, time.time())
+            else:
+                with timing.measure("journal_ack_inline"):
+                    self.journal.acknowledge(event, receipt, generation, job, reference, time.time())
+        await self._disk_call(commit, timing=timing, phase="canonical_ack")
+        self._journal_leases.pop(id(event), None)
+
     async def retry_event(self, event):
         if self.journal is None:
             return
