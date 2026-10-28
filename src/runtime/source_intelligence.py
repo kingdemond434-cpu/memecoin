@@ -606,8 +606,8 @@ class SourceIntelligence:
                                 await self.source_mesh.retry_event(event)
                                 continue
                             with source_timing(self).measure("canonical_ack"):
-                                await self.source_mesh.acknowledge_bound_event(event, job_id,
-                                    self.unknown_engine.frontier.job_payload_ref,
+                                await self.source_mesh.acknowledge_event(event, job_id,
+                                    lookup=self.unknown_engine.frontier.job_payload_ref,
                                     timing=source_timing(self))
                 with source_timing(self).measure("owner_index"):
                     self._index_source_event(event, defer_onion_io=True, record_population=False)

@@ -27,7 +27,7 @@ def test_binding_then_full_ack_uses_one_worker_dispatch(tmp_path,monkeypatch):
             calls.append(('ack',threading.get_ident()));return original(*args)
         monkeypatch.setattr(mesh,'_disk_call',dispatch);monkeypatch.setattr(mesh.journal,'acknowledge',ack)
         try:
-            await mesh.acknowledge_bound_event(item,'work-one',lookup,timing=timing)
+            await mesh.acknowledge_event(item,'work-one',lookup=lookup,timing=timing)
             assert len(dispatches)==1
             assert calls[0][0]=='lookup' and calls[1][0]=='ack' and calls[0][1]==calls[1][1]
             assert mesh.journal.report(20)['canonical_acknowledged']==1 and not mesh._journal_leases
@@ -50,7 +50,7 @@ def test_failed_binding_or_stale_lease_retains_raw_body_and_counters(tmp_path,fa
             with mesh.journal.db:mesh.journal.db.execute('UPDATE intake SET generation=generation+1')
         try:
             with pytest.raises((ValueError,OSError)):
-                await mesh.acknowledge_bound_event(item,'work-one',lookup)
+                await mesh.acknowledge_event(item,'work-one',lookup=lookup)
             assert mesh.journal.report(20)['canonical_acknowledged']==0
             assert mesh.journal.db.execute('SELECT body FROM intake').fetchone()[0] is not None
             assert mesh.delivery_receipt(item) is not None
@@ -64,7 +64,7 @@ def test_cancelled_started_binding_drains_exact_ack_before_owner_can_close(tmp_p
         def lookup(job):
             entered.set();assert released.wait(5);return 'evidence:one'
         try:
-            task=asyncio.create_task(mesh.acknowledge_bound_event(item,'work-one',lookup))
+            task=asyncio.create_task(mesh.acknowledge_event(item,'work-one',lookup=lookup))
             while not entered.is_set():await asyncio.sleep(.001)
             task.cancel();await asyncio.sleep(0)
             assert not task.done() and mesh.journal.report(20)['canonical_acknowledged']==0
@@ -73,4 +73,17 @@ def test_cancelled_started_binding_drains_exact_ack_before_owner_can_close(tmp_p
             assert mesh.journal.report(20)['canonical_acknowledged']==1
             assert mesh.journal.db.execute('SELECT body FROM intake').fetchone()[0] is None
         finally:released.set();await mesh.stop();mesh.close()
+    asyncio.run(scenario())
+
+
+def test_lookup_and_explicit_reference_are_not_ambiguously_combined(tmp_path):
+    async def scenario():
+        mesh,item=await ready(tmp_path/'journal.sqlite')
+        def forbidden(job):pytest.fail('ambiguous lookup executed')
+        try:
+            with pytest.raises(ValueError):
+                await mesh.acknowledge_event(item,'work-one','evidence:one',lookup=forbidden)
+            assert mesh.journal.report(20)['canonical_acknowledged']==0
+            assert mesh.journal.db.execute('SELECT body FROM intake').fetchone()[0] is not None
+        finally:await mesh.stop();mesh.close()
     asyncio.run(scenario())

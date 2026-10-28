@@ -359,7 +359,11 @@ class SourceMesh:
         leased = self._journal_leases.get(id(event))
         return dict(leased[1]) if leased is not None and leased[0] is event else None
 
-    async def acknowledge_event(self, event, job, reference, *, timing=None):
+    async def acknowledge_event(self, event, job, reference=None, *, timing=None, lookup=None):
+        if lookup is not None:
+            if reference is not None:
+                raise ValueError('choose a binding lookup or an explicit reference')
+            return await self._acknowledge_bound_event(event, job, lookup, timing=timing)
         if self.journal is None:
             return
         _, receipt, generation = self._journal_leases[id(event)]
@@ -367,7 +371,7 @@ class SourceMesh:
                               timing=timing, phase="journal_ack")
         self._journal_leases.pop(id(event), None)
 
-    async def acknowledge_bound_event(self, event, job, lookup, *, timing=None):
+    async def _acknowledge_bound_event(self, event, job, lookup, *, timing=None):
         """Fresh binding and exact FULL ACK in one drained disk dispatch.
 
         Capture the lease on its owner loop; only committed database work runs
