@@ -1,0 +1,21 @@
+Periodic readiness publication
+==============================
+The health loop still observes the memory governor six times on its owner loop
+and obtains the existing dated readiness projection. It then awaits one drained
+worker call that performs the existing HEALTH log rendering and atomic readiness
+file publication. The existing serializer, log message, file schema, temporary
+file/replace behavior and nonfatal OSError handling are unchanged.
+
+This removes synchronous publication filesystem/logging work from intake/HTTP
+owner callbacks. There is only one health-loop publication at a time, using the
+existing default executor. Cancellation drains an initiated publication before
+returning, so shutdown does not intentionally abandon a replacement in flight.
+No additional publisher process, cadence, trading authority or state writer is
+created. The snapshot is the existing JSON-safe detached read-only projection;
+publication does not re-read or mutate owner-bound strategy/source state.
+
+This is not proof that publication caused all observed health stalls. Executor
+queueing, CPython GIL-bound serialization, status HTTP serialization and other
+owner callbacks can still delay responses. Runtime file freshness, health and
+collection advancement must be checked, and source capacity/p99/latency remain
+unaccepted until measured. No full-source or profitability claims follow.
