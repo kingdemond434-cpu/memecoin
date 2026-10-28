@@ -606,11 +606,13 @@ class SourceIntelligence:
                                 await self.source_mesh.retry_event(event)
                                 continue
                             with source_timing(self).measure("canonical_ref"):
-                                canonical_ref = await self.source_mesh._disk_call(self.unknown_engine.frontier.job_payload_ref, job_id)
+                                canonical_ref = await self.source_mesh._disk_call(self.unknown_engine.frontier.job_payload_ref, job_id,
+                                    timing=source_timing(self), phase="canonical_ref")
                             if not canonical_ref:
                                 raise ValueError('canonical narrative source reference unavailable')
                             with source_timing(self).measure("journal_ack"):
-                                await self.source_mesh.acknowledge_event(event, job_id, canonical_ref)
+                                await self.source_mesh.acknowledge_event(event, job_id, canonical_ref,
+                                    timing=source_timing(self))
                 with source_timing(self).measure("owner_index"):
                     self._index_source_event(event, defer_onion_io=True, record_population=False)
             except Exception as exc:

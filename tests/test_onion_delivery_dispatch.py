@@ -107,6 +107,10 @@ def test_real_consumer_plain_event_keeps_canonical_ack_and_inventory(tmp_path, m
             assert indexed==[True]
             row=mesh.journal.db.execute('SELECT body,canonical_job,canonical_ref FROM intake').fetchone()
             assert row[0] is None and row[1].startswith('work-') and row[2]
+            phases=value._source_phase_timing.report()['phases']
+            for name in ('canonical_ref_dispatch_wait','canonical_ref_worker',
+                         'journal_ack_dispatch_wait','journal_ack_worker'):
+                assert phases[name]['attempts']==phases[name]['completed']==1
         finally:
             await mesh.stop();mesh.close()
             if getattr(value,'public_claim_links',None):value.public_claim_links.close()
