@@ -1,0 +1,8 @@
+Fork-result owner delivery reads committed snapshots through a dedicated
+read-only WAL connection and short reader lock. It no longer shares the archive
+writer/report lock. The existing indexed query, canonical ACK visibility,
+availability cutoff and native-source availability/ingestion PIT guard stay intact.
+Uncommitted ACKs remain invisible; each subsequent query can see a new commit.
+Both connections close on shutdown. This removes a concrete possible owner wait;
+it does not establish the cause of observed long return delays, sustainable source
+capacity, local simulation profitability, real fills or a honeypot verdict.

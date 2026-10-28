@@ -71,6 +71,13 @@ class ForkProbe:
         self.db.execute('CREATE INDEX IF NOT EXISTS untried_arrival ON jobs(arrived DESC,id) WHERE attempts=0')
         self.db.execute('CREATE INDEX IF NOT EXISTS retry_deadline ON jobs(due,id) WHERE attempts>0')
         self.db.commit()
+        # Owner-loop delivery only reads committed, canonically ACKed results.
+        # It must not wait behind archive writes or diagnostic scans holding
+        # the writer lock. WAL keeps uncommitted annotations/ACKs invisible.
+        self.observation_db = sqlite3.connect(Path(path).resolve().as_uri()+'?mode=ro',
+            uri=True, check_same_thread=False, timeout=3)
+        self.observation_db.execute('PRAGMA query_only=ON')
+        self.observation_lock = threading.RLock()
         self.paper_controls = None
         if paper_enabled:
             from src.research.fork_paper import ForkPaperControls
@@ -281,8 +288,8 @@ class ForkProbe:
                                 (ref, time.time(), row['probe_id']))
 
     def latest(self, token, *, as_of):
-        with self.lock:
-            row = self.db.execute('SELECT body,ref,available FROM results WHERE ref IS NOT NULL AND '
+        with self.observation_lock:
+            row = self.observation_db.execute('SELECT body,ref,available FROM results WHERE ref IS NOT NULL AND '
                 "json_extract(body,'$.token')=? AND available<=? ORDER BY available DESC LIMIT 1", (token, as_of)).fetchone()
         if row is None:
             return None
@@ -351,3 +358,5 @@ class ForkProbe:
     def close(self):
         with self.lock:
             self.db.close()
+        with self.observation_lock:
+            self.observation_db.close()
