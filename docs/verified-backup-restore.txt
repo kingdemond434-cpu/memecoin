@@ -1,0 +1,7 @@
+Verified isolated backup restoration
+
+Run python -m tools.restore_backup ARCHIVE.gz NEW_ISOLATED_FILE --expected-sha256 HASH_FROM_PRIOR_VERIFIED_RECEIPT --expected-bytes ORIGINAL_BYTE_COUNT --sqlite-check.
+
+The destination must be a new isolated recovery file, never live state. Expected size bounds decompression. The tool checks the stream hash/size, fsyncs output, re-reads the complete output hash and optionally uses a read-only SQLite connection for quick_check. It rejects observed archive mutation, wrong receipts, corrupt streams and existing/racing destinations. Exclusive publication cannot overwrite a file; failure cleans only its unique partial. The archive is retained.
+
+This restores one file. It does not restore a service, check a canonical hash chain, replay later records, preserve later live rows, retire backups or select a recovery point. Keep prior certificates and latest recovery paths. Service recovery still requires the existing deployment/recovery protocol. No automatic integration or backup deletion is introduced here.
