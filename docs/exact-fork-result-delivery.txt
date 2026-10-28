@@ -1,0 +1,11 @@
+Fork miner handoff pins observation lookup to the queued probe_id as well as
+token and as_of. An already committed newer result must not cause the older
+queued result to be silently skipped. Unpinned latest-at-time callers keep their
+existing behavior. Exact mode uses the primary key and the same read-only WAL
+reader, canonical ACK visibility, availability and native-source PIT guards.
+Missing identities do not fall back to an unrelated latest observation.
+
+No result status, archived input, inventory, units, failed fees, market overlay,
+capital or trading authority changes. This binds the observation delivered to the
+queued record; it does not prove that an episode exists or persisted the record,
+that all handoffs replay, or that a local result is a real fill/profitable edge.

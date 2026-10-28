@@ -287,10 +287,19 @@ class ForkProbe:
                 self.db.execute('UPDATE results SET ref=COALESCE(ref,?),available=COALESCE(available,?) WHERE id=?',
                                 (ref, time.time(), row['probe_id']))
 
-    def latest(self, token, *, as_of):
+    def latest(self, token, *, as_of, probe_id=None):
+        """Committed PIT observation; optional identity pins queued delivery.
+
+        A newer result for the same token must not shadow an older queued
+        result. Unpinned callers retain the existing latest-at-time behavior.
+        """
         with self.observation_lock:
-            row = self.observation_db.execute('SELECT body,ref,available FROM results WHERE ref IS NOT NULL AND '
-                "json_extract(body,'$.token')=? AND available<=? ORDER BY available DESC LIMIT 1", (token, as_of)).fetchone()
+            if probe_id is None:
+                row = self.observation_db.execute('SELECT body,ref,available FROM results WHERE ref IS NOT NULL AND '
+                    "json_extract(body,'$.token')=? AND available<=? ORDER BY available DESC LIMIT 1", (token, as_of)).fetchone()
+            else:
+                row = self.observation_db.execute('SELECT body,ref,available FROM results WHERE id=? AND ref IS NOT NULL AND '
+                    "json_extract(body,'$.token')=? AND available<=?", (probe_id, token, as_of)).fetchone()
         if row is None:
             return None
         result = json.loads(row[0])
