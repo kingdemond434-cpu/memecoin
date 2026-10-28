@@ -1,0 +1,32 @@
+Bound canonical source acknowledgement
+=====================================
+The durable consumer now calls SourceMesh.acknowledge_event with a lookup callback after successful
+onion delivery. It captures the existing receipt/generation on the owner loop,
+then its private helper runs a fresh frontier payload-reference lookup followed by the existing
+SourceJournal.acknowledge in one drained disk dispatch. This removes one mandatory
+executor dispatch and intermediate owner resumption per durable event. It does
+not introduce another writer, cache a canonical reference, batch commits or
+weaken FULL durability, exact receipt checks, source fairness or PIT clocks.
+
+Missing/failed lookup and stale leases fail without clearing a source body or
+changing ACK counts. ACK wall time is taken in the worker after lookup, before
+calling the existing journal method; it is still not the actual commit timestamp.
+Owner indexing remains after the completed durable ACK. Cancellation drains an
+initiated combined call: it can commit the exact ACK before propagating caller
+cancellation. Such a row remains ACKed on restart; it is not made pending again.
+Owner in-memory lease cleanup/indexing can be skipped by cancellation as in the
+previous post-commit cancellation window; no exactly-once graph-index guarantee.
+
+New fixed phases: canonical_ack (parent await), canonical_ack_dispatch_wait,
+canonical_ack_worker, canonical_ref_inline and journal_ack_inline. Inline phases
+measure callbacks inside the combined worker, excluding executor/owner wait.
+Worker and inline phases overlap the parent and must not be added together.
+The consumer no longer emits the old separate canonical_ref/journal_ack await
+phases on this path. Legacy direct ACK timing still exists. Do not compare their
+means as if scopes were identical. SourceTiming and the receipt-delta tool retain
+fixed cardinality and missing phases have no invented baseline. Runtime capacity,
+p99, pure lock/commit and owner-resumption attribution remain unverified.
+
+The existing public direct-reference ACK API remains supported. A lookup and an
+explicit reference cannot be supplied together; ambiguity fails before any IO.
+The public method retains its real production caller; no orphan baseline waiver.

@@ -6,7 +6,9 @@ import time
 PHASES = ("canonical", "neural_intake", "claim_intake", "owner_hook",
           "delivery_ack", "onion_delivery", "canonical_ref", "journal_ack", "owner_index",
           "canonical_ref_dispatch_wait", "canonical_ref_worker",
-          "journal_ack_dispatch_wait", "journal_ack_worker")
+          "journal_ack_dispatch_wait", "journal_ack_worker",
+          "canonical_ack", "canonical_ack_dispatch_wait", "canonical_ack_worker",
+          "canonical_ref_inline", "journal_ack_inline")
 
 class SourceTiming:
     def __init__(self):
@@ -38,12 +40,12 @@ class SourceTiming:
             row["last_seconds"] = elapsed
 
     def worker(self, phase, call, *args):
-        """Wrap only the two reviewed disk calls, before scheduling to_thread.
+        """Wrap only the reviewed disk calls, before scheduling to_thread.
 
         Dispatch wait includes owner scheduling and executor wait until worker
         entry. Worker time includes locks/SQLite/commit, not pure CPU time.
         """
-        if phase not in ("canonical_ref", "journal_ack"):
+        if phase not in ("canonical_ref", "journal_ack", "canonical_ack"):
             raise ValueError("unknown source dispatch phase")
         queued = time.perf_counter()
         def run():

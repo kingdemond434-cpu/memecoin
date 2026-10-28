@@ -359,12 +359,41 @@ class SourceMesh:
         leased = self._journal_leases.get(id(event))
         return dict(leased[1]) if leased is not None and leased[0] is event else None
 
-    async def acknowledge_event(self, event, job, reference, *, timing=None):
+    async def acknowledge_event(self, event, job, reference=None, *, timing=None, lookup=None):
+        if lookup is not None:
+            if reference is not None:
+                raise ValueError('choose a binding lookup or an explicit reference')
+            return await self._acknowledge_bound_event(event, job, lookup, timing=timing)
         if self.journal is None:
             return
         _, receipt, generation = self._journal_leases[id(event)]
         await self._disk_call(self.journal.acknowledge, event, receipt, generation, job, reference, time.time(),
                               timing=timing, phase="journal_ack")
+        self._journal_leases.pop(id(event), None)
+
+    async def _acknowledge_bound_event(self, event, job, lookup, *, timing=None):
+        """Fresh binding and exact FULL ACK in one drained disk dispatch.
+
+        Capture the lease on its owner loop; only committed database work runs
+        in the worker. No owner index mutation precedes the durable ACK.
+        """
+        if self.journal is None:
+            return
+        _, receipt, generation = self._journal_leases[id(event)]
+        def commit():
+            if timing is None:
+                reference = lookup(job)
+            else:
+                with timing.measure("canonical_ref_inline"):
+                    reference = lookup(job)
+            if not reference:
+                raise ValueError('canonical narrative source reference unavailable')
+            if timing is None:
+                self.journal.acknowledge(event, receipt, generation, job, reference, time.time())
+            else:
+                with timing.measure("journal_ack_inline"):
+                    self.journal.acknowledge(event, receipt, generation, job, reference, time.time())
+        await self._disk_call(commit, timing=timing, phase="canonical_ack")
         self._journal_leases.pop(id(event), None)
 
     async def retry_event(self, event):
