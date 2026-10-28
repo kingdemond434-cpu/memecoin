@@ -33,7 +33,7 @@ def test_binding_then_full_ack_uses_one_worker_dispatch(tmp_path,monkeypatch):
             assert mesh.journal.report(20)['canonical_acknowledged']==1 and not mesh._journal_leases
             assert mesh.journal.db.execute('PRAGMA synchronous').fetchone()[0]==2
             phases=timing.report()['phases']
-            assert set(phases)=={'canonical_ack_dispatch_wait','canonical_ack_worker','canonical_ref_inline','journal_ack_inline'}
+            assert set(phases)=={'canonical_ack_dispatch_wait','canonical_ack_worker','canonical_ref_inline','journal_ack_inline','canonical_ack_owner_resume'}
             assert all(row['completed']==1 for row in phases.values())
         finally:await mesh.stop();mesh.close()
     asyncio.run(scenario())
