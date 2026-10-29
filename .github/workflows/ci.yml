@@ -50,6 +50,12 @@ jobs:
           python -m pytest tests -q --durations=15 -o faulthandler_timeout=60
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tools/bench_hotpath.py --json native-wheels/benchmark.json
+      - name: Verify hard CPU budget and descendant isolation
+        shell: powershell
+        run: |
+          $fixtureRoot = Join-Path $env:RUNNER_TEMP ('memecoin-cpu-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT)
+          & .\deploy\windows\test-cpu-budgets.ps1 -FixtureRoot $fixtureRoot -PythonExe (Get-Command python).Source -FixtureScript (Join-Path $env:GITHUB_WORKSPACE 'tests\windows_cpu_fixture.py')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Retain wheel provenance
         env:
           SOURCE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
