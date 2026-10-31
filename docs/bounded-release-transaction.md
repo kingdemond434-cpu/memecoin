@@ -39,3 +39,28 @@ kernel receipts after restart, advancing durable counters, recovery checks and
 resource measurements. The current production manifest has an unprotected DACL;
 it was read only during development. No live manifest, task, ACL or service was
 changed by these tests.
+
+
+Read-only preflight is implemented in `ops.bounded_preflight`. The task collector
+exports the actual registered definition through a direct child PowerShell
+process. It checks a single LocalService service-account principal, LeastPrivilege,
+existing priority7/IgnoreNew, and the exact installed CPU wrapper action. It
+fingerprints the entire XML so changes to other settings are also detected by a
+later snapshot comparison. No raw task definition or underlying private role
+action is returned. Export failure, unsupported arguments or a mismatching
+identity blocks the operation. Existing execution-policy text is only matched;
+this collector does not execute the exported action or change execution policy.
+
+The revision preflight reads the private isolated validation report, checks its
+required pass/native/isolation fields, verifies the actual isolated checkout HEAD
+and cleanliness, and compares Git source-tree objects against the proposed
+release. An equivalent merge tree is allowed; a changed tree or dirty checkout is
+not. Reports must originate in the trusted private validation workflow. This
+comparison is not a report signature, CI check or review attestation.
+
+These collectors replace caller assertions for task/revision evidence, but do
+not yet form a complete deployment orchestrator. Verified state backups,
+canonical-prefix continuity, resource/IO measurements, review/CI gates, safe
+stop/restart and recovery, repeated task snapshots, fresh post-start kernel
+receipts and advancing service counters remain integration requirements. Do not
+run the old task-replacing helper on the strength of this preflight alone.
