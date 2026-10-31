@@ -75,3 +75,9 @@ The fingerprint includes both representations. The earlier CIM export timeout
 and strict missing-field rejection remain operational receipts; neither caused
 a task or permission change. Snapshot verification establishes the registered
 definition, not listener health or current runtime containment of that service.
+
+LocalService XML/COM name and SID representations are normalized only within
+the fixed existing LocalService allowlist (S-1-5-19); no other principal is
+accepted. Read-only task collection has a bounded60-second timeout under the
+existing development CPU cap. A timeout remains a rejection, never a substitute
+for evidence or a reason to increase resource budgets.

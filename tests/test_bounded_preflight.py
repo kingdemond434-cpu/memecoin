@@ -127,3 +127,9 @@ def test_typed_properties_cannot_override_conflicting_identity(key,value):
     actual=properties();actual[key]=value
     with pytest.raises(ValueError):
         inspect_task_xml(xml(),'spot',definition_properties=actual)
+
+
+@pytest.mark.parametrize('name',['LOCAL SERVICE','NT AUTHORITY\\LOCAL SERVICE'])
+def test_native_localservice_name_matches_xml_builtin_sid(name):
+    actual=properties();actual['user_id']=name
+    assert inspect_task_xml(xml(),'spot',definition_properties=actual)['principal']=='LOCAL_SERVICE'

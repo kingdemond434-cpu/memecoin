@@ -60,9 +60,10 @@ def inspect_task_xml(xml, role, *, resource_root=ROOT, shell=SHELL, definition_p
     principal, action = principals[0], actions[0]
     text = lambda node, tag: node.findtext('t:'+tag, default='', namespaces=NS)
     user = text(principal, 'UserId').upper()
+    service_aliases = ('S-1-5-19', 'LOCAL SERVICE', 'NT AUTHORITY\\LOCAL SERVICE')
     properties = definition_properties
     if properties is not None:
-        if (not isinstance(properties, dict) or properties.get('user_id', '').upper() != user
+        if (not isinstance(properties, dict) or properties.get('user_id', '').upper() not in service_aliases or user not in service_aliases
                 or any(type(properties.get(k)) is not int or properties[k] != v
                        for k, v in {'logon_type': 5, 'run_level': 0, 'priority': 7,
                                     'multiple_instances': 2}.items())):
@@ -78,7 +79,7 @@ def inspect_task_xml(xml, role, *, resource_root=ROOT, shell=SHELL, definition_p
         level = level or 'LeastPrivilege'
         priority = priority or '7'
         policy = policy or 'IgnoreNew'
-    if (user not in ('S-1-5-19', 'LOCAL SERVICE', 'NT AUTHORITY\\LOCAL SERVICE')
+    if (user not in service_aliases
             or logon != 'ServiceAccount' or level != 'LeastPrivilege'
             or priority != '7' or policy != 'IgnoreNew'):
         raise ValueError('Bounded task identity or scheduling fence mismatch')
