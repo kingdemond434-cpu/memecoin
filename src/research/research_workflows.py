@@ -6,6 +6,7 @@ from typing import Any
 
 from src.research.data_requests import ResearchDataService, finite
 from src.research.frontier import AuctionInputs
+from src.research.operator_play import KINDS as OPERATOR, OperatorPlayService
 
 
 POPULATION = {"ACTOR_OBSERVATION", "NARRATIVE_OBSERVATION", "FOLLOW_OUTCOME", "SOURCE_OUTCOME"}
@@ -29,7 +30,8 @@ class ResearchWorkflows:
         self.engine = engine
         self.population, self.laboratory, self.validation = population, laboratory, validation
         self.data = data or ResearchDataService(engine.framework, engine._load_refs)
-        self.kinds = POPULATION | LABORATORY | VALIDATION | DATA | INGESTION
+        self._operator = None
+        self.kinds = POPULATION | LABORATORY | VALIDATION | DATA | INGESTION | OPERATOR
         self.configuration_ref = engine._record("research_consumers_configured", {
             "kinds": sorted(self.kinds), "max_rows_per_conversion": self.data.max_points,
             "resource_semantics": "declared bounded operations; monetary cost unmeasured"}, __import__("time").time())
@@ -38,6 +40,15 @@ class ResearchWorkflows:
         self.blocked_cursor = state.get("blocked_source_cursor", "")
         self.seed_labs = seed_labs
         self.lab_contexts = dict(lab_contexts or {})
+
+    @property
+    def operator(self) -> OperatorPlayService:
+        if self._operator is None:
+            from pathlib import Path
+            state_path = getattr(self.engine.framework, "state_path", None)
+            path = Path(state_path).with_suffix(".operator.sqlite") if state_path else None
+            self._operator = OperatorPlayService(path, actor_store=self.population.actor_store)
+        return self._operator
 
     def auction(self, kind: str) -> AuctionInputs:
         if kind == "GAUNTLET":
@@ -97,8 +108,14 @@ class ResearchWorkflows:
 
     def consume(self, kind: str, payload: dict, refs: list[str], axes: dict, now: float) -> dict:
         payload = self.unwrap(payload)
+        if kind in OPERATOR:
+            return self.operator.consume(kind, payload, refs, now)
         if kind in POPULATION:
-            return self.population.consume(kind, payload, refs, now)
+            result = self.population.consume(kind, payload, refs, now)
+            if kind == "ACTOR_OBSERVATION" and result.get("disposition") == "OBSERVED":
+                result = {**result, "children": [*result.get("children", []),
+                    *self.operator.actor_children(payload, refs)]}
+            return result
         if kind in LABORATORY:
             return self.laboratory.consume(kind, payload, refs, now)
         if kind in VALIDATION:

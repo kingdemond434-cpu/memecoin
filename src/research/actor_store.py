@@ -280,6 +280,21 @@ class ActorStore:
         bucket = self._out.get((node, kind)) or []
         return self._cut(bucket, as_of)
 
+    def observed_prefix(self, node: str, kind: EdgeKind, as_of: float, *,
+                        limit: int = 25, offset: int = 0,
+                        outgoing: bool = False) -> Tuple[List[Edge], int]:
+        """Page an observation-ordered adjacency without materialising its tail.
+
+        This is observation order, not an assertion of transaction order. The
+        returned count includes every visible edge, including deferred pages.
+        """
+        if (not math.isfinite(as_of) or type(limit) is not int or not 1 <= limit <= 1024
+                or type(offset) is not int or offset < 0):
+            raise ValueError("finite cutoff and bounded adjacency page required")
+        bucket = (self._out if outgoing else self._in).get((node, kind)) or []
+        count = self._cut(bucket, as_of)
+        return [self.edges[index] for _, index in bucket[offset:min(count, offset+limit)]], count
+
     def is_hub(self, node: str, kind: EdgeKind, as_of: float) -> bool:
         """Hub-ness is as-of too.
 
