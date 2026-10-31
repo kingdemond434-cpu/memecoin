@@ -1,6 +1,8 @@
 """Isolated Windows job-budget fixture; never imports bot/runtime configuration."""
 import ctypes,ctypes.wintypes as w,hashlib,json,os,subprocess,sys,time
 from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+from ops.worker_resource_guard import current_job_cpu
 
 kernel=ctypes.WinDLL('kernel32',use_last_error=True)
 kernel.OpenJobObjectW.argtypes=[w.DWORD,w.BOOL,w.LPCWSTR];kernel.OpenJobObjectW.restype=w.HANDLE
@@ -18,7 +20,9 @@ def membership():
         rate=(w.DWORD*2)()
         assert kernel.QueryInformationJobObject(handle,15,ctypes.byref(rate),ctypes.sizeof(rate),None)
         assert list(rate)==[5,100]
-        return {'pid':os.getpid(),'in_budget_job':True,'cpu_rate':rate[1],'control_flags':rate[0]}
+        assert current_job_cpu()=={'flags':5,'rate':100}
+        return {'pid':os.getpid(),'in_budget_job':True,'cpu_rate':rate[1],'control_flags':rate[0],
+                'python_current_job_query_verified':True}
     finally:kernel.CloseHandle(handle)
 
 folder=Path(sys.argv[1]);folder.mkdir(parents=True,exist_ok=True)
