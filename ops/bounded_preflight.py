@@ -45,7 +45,7 @@ def _tokens(value):
     return tokens
 
 
-def inspect_task_xml(xml, role, *, resource_root=ROOT, shell=SHELL):
+def inspect_task_xml(xml, role, *, resource_root=ROOT, shell=SHELL, definition_properties=None):
     if role not in TASKS or not isinstance(xml, str) or len(xml) > 131072:
         raise ValueError('Bounded task definition invalid')
     if '<!DOCTYPE' in xml.upper() or '<!ENTITY' in xml.upper():
@@ -60,11 +60,27 @@ def inspect_task_xml(xml, role, *, resource_root=ROOT, shell=SHELL):
     principal, action = principals[0], actions[0]
     text = lambda node, tag: node.findtext('t:'+tag, default='', namespaces=NS)
     user = text(principal, 'UserId').upper()
+    properties = definition_properties
+    if properties is not None:
+        if (not isinstance(properties, dict) or properties.get('user_id', '').upper() != user
+                or any(type(properties.get(k)) is not int or properties[k] != v
+                       for k, v in {'logon_type': 5, 'run_level': 0, 'priority': 7,
+                                    'multiple_instances': 2}.items())):
+            raise ValueError('Typed task definition properties mismatch')
+    logon = text(principal, 'LogonType')
+    level = text(principal, 'RunLevel')
+    priority = tree.findtext('t:Settings/t:Priority', namespaces=NS)
+    policy = tree.findtext('t:Settings/t:MultipleInstancesPolicy', namespaces=NS)
+    # Task Scheduler omits defaults in XML. Only native typed properties from
+    # the SAME definition object can establish those otherwise unknown values.
+    if properties is not None:
+        logon = logon or 'ServiceAccount'
+        level = level or 'LeastPrivilege'
+        priority = priority or '7'
+        policy = policy or 'IgnoreNew'
     if (user not in ('S-1-5-19', 'LOCAL SERVICE', 'NT AUTHORITY\\LOCAL SERVICE')
-            or text(principal, 'LogonType') != 'ServiceAccount'
-            or text(principal, 'RunLevel') != 'LeastPrivilege'
-            or tree.findtext('t:Settings/t:Priority', namespaces=NS) != '7'
-            or tree.findtext('t:Settings/t:MultipleInstancesPolicy', namespaces=NS) != 'IgnoreNew'):
+            or logon != 'ServiceAccount' or level != 'LeastPrivilege'
+            or priority != '7' or policy != 'IgnoreNew'):
         raise ValueError('Bounded task identity or scheduling fence mismatch')
     if (_path(text(action, 'Command')) != _path(shell)
             or _path(text(action, 'WorkingDirectory')) != _path(resource_root)):
@@ -82,7 +98,7 @@ def inspect_task_xml(xml, role, *, resource_root=ROOT, shell=SHELL):
     return {'task': TASKS[role], 'role': role, 'wrapped': True,
             'principal': 'LOCAL_SERVICE', 'run_level': 'LeastPrivilege',
             'priority': 7, 'multiple_instances': 'IgnoreNew',
-            'definition_sha256': hashlib.sha256(xml.encode('utf-8')).hexdigest()}
+            'definition_sha256': hashlib.sha256((xml + json.dumps(properties, sort_keys=True)).encode('utf-8')).hexdigest()}
 
 
 def _environment():
@@ -100,13 +116,21 @@ def snapshot_bounded_task(role, *, resource_root=ROOT, shell=SHELL, run=subproce
     # CPU-capped host. Connect has no remote host or alternate credentials.
     command = ("$ErrorActionPreference='Stop'; [Console]::OutputEncoding="
                "[Text.UTF8Encoding]::new($false); $service=New-Object -ComObject Schedule.Service; "
-               "$service.Connect(); [Console]::Write($service.GetFolder('\\').GetTask('"
-               + TASKS[role] + "').Xml)")
+               "$service.Connect(); $definition=$service.GetFolder('\\').GetTask('"
+               + TASKS[role] + "').Definition; $row=@{xml=$definition.XmlText; "
+               "properties=@{user_id=[string]$definition.Principal.UserId; "
+               "logon_type=[int]$definition.Principal.LogonType; "
+               "run_level=[int]$definition.Principal.RunLevel; "
+               "priority=[int]$definition.Settings.Priority; "
+               "multiple_instances=[int]$definition.Settings.MultipleInstances}}; "
+               "[Console]::Write(($row | ConvertTo-Json -Depth 4 -Compress))")
     try:
         result = run([shell, '-NoProfile', '-NonInteractive', '-Command', command],
                      env=_environment(), capture_output=True, text=True,
-                     encoding='utf-8', errors='strict', timeout=30, check=True)
-        return inspect_task_xml(result.stdout, role, resource_root=resource_root, shell=shell)
+                     encoding='utf-8', errors='strict', timeout=60, check=True)
+        envelope = json.loads(result.stdout)
+        return inspect_task_xml(envelope['xml'], role, resource_root=resource_root, shell=shell,
+                                definition_properties=envelope['properties'])
     except Exception:
         raise RuntimeError('Bounded task export/verification failed; private output suppressed') from None
 

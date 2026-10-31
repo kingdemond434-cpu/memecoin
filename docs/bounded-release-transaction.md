@@ -64,3 +64,14 @@ canonical-prefix continuity, resource/IO measurements, review/CI gates, safe
 stop/restart and recovery, repeated task snapshots, fresh post-start kernel
 receipts and advancing service counters remain integration requirements. Do not
 run the old task-replacing helper on the strength of this preflight alone.
+
+
+On the current VPS, the native task XML omits default-valued principal and
+scheduling fields. The collector therefore reads XML and typed properties from
+the same local COM `ITaskDefinition`, without alternate credentials. Missing XML
+values are accepted only when typed UserId/LogonType/RunLevel/Priority/
+MultipleInstances prove the required values. Explicit XML conflicts still fail.
+The fingerprint includes both representations. The earlier CIM export timeout
+and strict missing-field rejection remain operational receipts; neither caused
+a task or permission change. Snapshot verification establishes the registered
+definition, not listener health or current runtime containment of that service.

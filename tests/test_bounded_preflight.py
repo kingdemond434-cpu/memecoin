@@ -39,12 +39,12 @@ def test_task_declarations_rejected():
 def test_export_is_read_only_and_strips_unrelated_tokens(monkeypatch):
     monkeypatch.setenv('GH_TOKEN','fixture-secret');monkeypatch.setenv('GITHUB_TOKEN','fixture-other')
     def run(command, **kwargs):
-        assert '.GetTask(' in command[-1] and ').Xml' in command[-1]
+        assert '.GetTask(' in command[-1] and ').Definition' in command[-1]
         assert 'Schedule.Service' in command[-1] and '$service.Connect();' in command[-1]
         assert 'Set-ScheduledTask' not in command[-1]
         assert 'GH_TOKEN' not in kwargs['env'] and 'GITHUB_TOKEN' not in kwargs['env']
-        assert kwargs['timeout'] == 30
-        return SimpleNamespace(stdout=xml())
+        assert kwargs['timeout'] == 60
+        return SimpleNamespace(stdout=json.dumps({'xml': xml(), 'properties': properties()}))
     assert snapshot_bounded_task('spot',run=run)['wrapped']
 
 
@@ -109,3 +109,21 @@ def test_actual_dirty_isolated_checkout_rejected(revisions,tmp_path):
         with pytest.raises(ValueError,match='Clean'):
             verify_tested_release(revisions[1],revisions[4],path)
     finally:dirty.write_bytes(original)
+
+
+def properties():
+    return dict(user_id='S-1-5-19',logon_type=5,run_level=0,priority=7,multiple_instances=2)
+
+
+def test_omitted_defaults_need_actual_typed_properties():
+    omitted = xml().replace('<LogonType>ServiceAccount</LogonType>','').replace('<RunLevel>LeastPrivilege</RunLevel>','').replace('<Priority>7</Priority>','')
+    with pytest.raises(ValueError):
+        inspect_task_xml(omitted,'spot')
+    assert inspect_task_xml(omitted,'spot',definition_properties=properties())['wrapped']
+
+
+@pytest.mark.parametrize('key,value',[('logon_type',1),('run_level',1),('priority',5),('multiple_instances',0),('user_id','S-1-5-18')])
+def test_typed_properties_cannot_override_conflicting_identity(key,value):
+    actual=properties();actual[key]=value
+    with pytest.raises(ValueError):
+        inspect_task_xml(xml(),'spot',definition_properties=actual)
