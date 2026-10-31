@@ -18,7 +18,7 @@ try:
 except ImportError:
     from worker_resource_guard import verify
 
-ROOT = Path('C:/Users/Administrator/memecoin-autonomous')
+ROOT = Path(__file__).resolve().parent
 
 
 def save(path, value):
