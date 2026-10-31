@@ -41,3 +41,14 @@ latency under less CPU. Backlog, capture gaps and health must remain visible.
 Retain original records and costs; never reduce checks or drop observations to
 claim unchanged effectiveness. Review any budget adjustment with quant's
 resource priority as the governing constraint.
+
+
+Sandboxed development descendants can occupy a nested immediate job with no
+CPU-rate setting. The worker guard first checks the immediate job. If that does
+not match, it opens only the existing named development job with QUERY access,
+uses IsProcessInJob on the current process and that exact handle, then verifies
+ENABLE|HARD_CAP, the manifest development rate, BelowNormal priority limit and
+kill-on-close. A named rate or status receipt without current-process membership
+is insufficient. No assignment, limit change, new job or uncapped fallback occurs.
+All native-thread environment checks still apply. Access denial or unavailable
+kernel evidence blocks work. This verification does not establish RAM/IO limits.
