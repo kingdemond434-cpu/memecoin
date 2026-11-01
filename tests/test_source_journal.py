@@ -70,6 +70,9 @@ def test_corruption_and_noncanonical_ack_never_remove_observations(tmp_path):
 
 @pytest.mark.asyncio
 async def test_disk_commit_is_nonblocking_and_cancellation_drains_it(tmp_path):
+    # Load test server utilities before arming the timed blocked-write fixture.
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient,TestServer
     mesh=SourceMesh(max_queue=2,journal_path=tmp_path/'intake.sqlite')
     entered,released=threading.Event(),threading.Event()
     original=mesh.journal.append
@@ -82,8 +85,6 @@ async def test_disk_commit_is_nonblocking_and_cancellation_drains_it(tmp_path):
     task=asyncio.create_task(mesh.publish_batch([event(number=i) for i in range(100)]))
     try:
         assert await asyncio.to_thread(entered.wait,3)
-        from aiohttp import web
-        from aiohttp.test_utils import TestClient,TestServer
         async def health(request):return web.json_response({'healthy':True})
         app=web.Application();app.router.add_get('/health',health)
         async with TestClient(TestServer(app)) as client:
