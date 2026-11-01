@@ -1,4 +1,4 @@
-﻿"""Bind trusted artifact bytes to the existing private runtime probe."""
+"""Bind trusted artifact bytes to the existing private runtime probe."""
 import subprocess
 from pathlib import Path
 from ops.native_artifact_digest import verify_native_digest
@@ -23,11 +23,12 @@ def probe_digest_bound_runtime(*, stage, relative_path, expected_sha256,
     before=verify_native_digest(**args)
     expected=Path(stage).absolute()/PRIVATE/relative_path
     runtime=probe_private_runtime(stage=stage,run=run,resource_check=resource_check,
-                                  expected_extension=expected)
+                                  expected_extension=expected,require_abi_smoke=True)
     after=verify_native_digest(**args)
-    return dict(status='PRIVATE_RUNTIME_DIGEST_AND_LOCATION_VERIFIED',
+    return dict(status='PRIVATE_RUNTIME_DIGEST_LOCATION_AND_SMOKE_VERIFIED',
                 artifact_before=before,artifact_after=after,runtime=runtime,
                 native_binary_digest_verified=True,native_abi_tested=False,
+                native_abi_smoke_tested=True,
                 deployment_authorized=False,services_changed=False,
                 trusted_serialized_stage_required=True,
                 interpreter_and_dependency_digests_verified=False)
