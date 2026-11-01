@@ -1,0 +1,21 @@
+Staged SQLite verification (source only)
+
+ops.staged_integrity.verify_staged_sqlite accepts the exact private readback
+receipt from stage_sqlite_backup and a new, regular .pending copy. The caller
+must serialize access in a private staging directory and supply only staged
+copies. The suffix and receipt checks do not independently prove that caller
+contract. WAL/SHM/journal sidecars are rejected rather than ignored.
+
+Policy: maximum 8 MiB, quick_check(1), instruction budget, <=60 second deadline,
+repeated host admission, disabled mmap and a 256 KiB requested SQLite cache.
+A paced SHA256 readback after quick_check must match the staging receipt. File
+identity/size/mtime are checked before, on open and after verification. Failures
+preserve files and expose only fixed error classifications.
+
+This is a small-copy consistency gate, not full integrity_check, a coherent
+all-store checkpoint, canonical-prefix certificate, recovery or deployment
+acceptance. Large production stores are explicitly unsupported by this gate.
+Hash work has logical pacing; SQLite reads, cache/OS behavior and OS calls are
+not a physical IO cap or hard preemption guarantee. Do not run it on production
+until trusted host admission and the complete maintenance path are integrated.
+No production copy/check was performed for this increment; tests use fixtures.
