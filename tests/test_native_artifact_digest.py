@@ -1,4 +1,4 @@
-﻿import hashlib
+import hashlib
 import pytest
 from ops.native_artifact_digest import verify_native_digest
 from ops.native_runtime_preflight import PRIVATE
@@ -41,4 +41,3 @@ def test_changed_during_admission_rejected(tmp_path):
         return True
     args['continue_check']=admission
     with pytest.raises(ValueError):verify_native_digest(**args)
-

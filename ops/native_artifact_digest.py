@@ -1,4 +1,4 @@
-﻿"""Bounded read-only digest check; caller supplies trusted artifact provenance."""
+"""Bounded read-only digest check; caller supplies trusted artifact provenance."""
 import hashlib
 import math
 from pathlib import Path
@@ -79,4 +79,3 @@ def verify_native_digest(*, stage, relative_path, expected_sha256, expected_size
                 native_binary_digest_verified=True, trusted_expectation_required=True,
                 native_abi_tested=False, deployment_authorized=False,
                 services_changed=False, physical_io_capped=False)
-
