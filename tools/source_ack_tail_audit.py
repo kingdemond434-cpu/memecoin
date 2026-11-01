@@ -94,16 +94,21 @@ def audit_recent_acknowledgements(journal_path, frontier_path, ledger_path, *,
                 if offset < end:result['next_window_end']=offset
                 else:result['boundary_row_not_sampled']=True
         rows = []
-        for line in data.splitlines(keepends=True):
-            if line.endswith(b'\n'):
-                rows.append((offset, line))
-            offset += len(line)
-        result['line_budget_exhausted'] = len(rows) > max_lines
+        position = len(data) if data.endswith(b'\n') else data.rfind(b'\n')+1
+        for _ in range(max_lines):
+            guard()
+            if not position:break
+            beginning = data.rfind(b'\n',0,position-1)+1
+            rows.append((offset+beginning,data[beginning:position]))
+            position = beginning
+        result['line_budget_exhausted'] = position > 0
+        earliest_inspected = None
         targets = []
         with ExitStack() as receipt_handles:
             journal = None
-            for offset, line in reversed(rows[-max_lines:]):
+            for offset, line in rows:
                 guard(); result['lines_inspected'] += 1
+                earliest_inspected = offset
                 try:
                     row = json.loads(line)
                     if row.get('event_type') != 'research_typed_work':continue
@@ -147,6 +152,8 @@ def audit_recent_acknowledgements(journal_path, frontier_path, ledger_path, *,
                     if len(targets) >= sample_limit:break
                 except (ValueError, TypeError, KeyError, AttributeError, UnicodeError):
                     failures['canonical_candidate_or_receipt'] += 1
+        if earliest_inspected is not None:
+            result['next_window_end'] = earliest_inspected if earliest_inspected else None
         # Journal ACK snapshot precedes frontier snapshot, as ACK follows the
         # durable frontier/canonical writes. No full-table selection is needed.
         if targets:
@@ -176,6 +183,8 @@ def audit_recent_acknowledgements(journal_path, frontier_path, ledger_path, *,
         'intake_to_ack_seconds':measured([k-a for a,d,k in verified_clocks])}
     result['ack_clock_range'] = measured([k for a,d,k in verified_clocks])
     result['latency_scope'] = 'journal wall-clock ranges for verified window-selected targets only; not p99, pure owner-loop delay, causality or sustainable capacity'
+    if result['status']=='RESOURCE_BLOCKED':
+        result['next_window_end']=result.get('window_end')
     result.update(failures=dict(failures), sql_progress_instructions_observed=operations, sql_progress_interval=100,
                   elapsed_seconds=clock()-start)
     return result

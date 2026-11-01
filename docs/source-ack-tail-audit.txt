@@ -55,3 +55,9 @@ the first candidate, and frontier opening requires an exact ACK target. Thus a
 no-sample result also makes no claim that either store was opened or healthy.
 The deadline is checked after lookups as well; valid bindings cannot turn an
 over-budget operation into an admitted success.
+
+Only max_lines line objects are retained/parsed; selecting backwards avoids a
+per-line object for every tiny line in the byte window. Cursor continuation
+starts before the earliest actually inspected row, including when a line or
+target-count limit stops the sample. A resource-blocked result does not advance
+the cursor. These bounds do not certify overall process RAM or device IO caps.

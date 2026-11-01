@@ -205,3 +205,43 @@ def test_tail_no_candidate_does_not_open_or_imply_verification_of_stores(tmp_pat
     result=audit_recent_acknowledgements(*paths,tail_bytes=1024)
     assert result['status']=='NO_ACK_TARGET_SAMPLE' and result['candidate_rows']==0
     assert not result['sqlite_integrity_verified']
+
+
+def test_tail_short_lines_do_not_build_unbounded_row_objects(tmp_path):
+    import tracemalloc
+    paths=fixture(tmp_path)
+    with paths[2].open('ab') as stream:stream.write(b'{}\n'*20000)
+    tracemalloc.start()
+    try:
+        result=audit_recent_acknowledgements(*paths,tail_bytes=65536,max_lines=4)
+        _,peak=tracemalloc.get_traced_memory()
+    finally:tracemalloc.stop()
+    assert result['lines_inspected']==4 and result['line_budget_exhausted']
+    assert peak<1024*1024
+
+
+def test_tail_cursor_keeps_uninspected_lines_when_line_budget_is_reached(tmp_path):
+    paths=fixture(tmp_path)
+    with paths[2].open('ab') as stream:stream.write(b'{}\n'*5)
+    cursor=None;verified=0;windows=0
+    for _ in range(7):
+        result=audit_recent_acknowledgements(*paths,max_lines=1,end_offset=cursor)
+        verified+=result['verified_acknowledgements'];windows+=1
+        cursor=result['next_window_end']
+        if cursor is None:break
+        assert cursor<result['window_end']
+    assert verified==1 and windows==6
+
+
+def test_tail_target_limit_cursor_does_not_skip_older_ack(tmp_path):
+    paths=fixture(tmp_path);journal=SourceJournal(paths[0]);frontier=FrontierIndex(paths[1]);evidence=TradeEvidenceLedger(paths[2])
+    journal.append([Event('source',SourceClass.NEWS,1,2,text='second fixture')],6)
+    event,receipt,generation=journal.lease(7)
+    ref=evidence.record_reference('research_typed_work',{'work_kind':'NARRATIVE_OBSERVATION','point_payload':{'observed_at':2,'research_available_at':7,'source_intake_receipt':receipt}},timestamp=7)
+    frontier.enqueue('NARRATIVE_OBSERVATION',ref,job_id='work-second',now=7)
+    journal.acknowledge(event,receipt,generation,'work-second',ref,8);journal.close();frontier.close()
+    first=audit_recent_acknowledgements(*paths,sample_limit=1)
+    second=audit_recent_acknowledgements(*paths,sample_limit=1,end_offset=first['next_window_end'])
+    assert first['verified_acknowledgements']==second['verified_acknowledgements']==1
+    assert first['ack_clock_range']['max']==8 and second['ack_clock_range']['max']==5
+    assert second['next_window_end'] is None
