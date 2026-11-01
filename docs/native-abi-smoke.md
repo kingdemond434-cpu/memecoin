@@ -1,4 +1,4 @@
-﻿# Offline native ABI smoke surface
+# Offline native ABI smoke surface
 
 `check_native_abi_smoke` accepts an already trusted loaded native module. The caller
 must establish location and artifact trust before loading it. Five fixed vectors
@@ -14,3 +14,7 @@ does not impose a timeout on a native call: run it only in a bounded direct chil
 with the existing resource and environment checks. The actual deployment
 orchestrator still must compose trusted digest provenance, tested-tree gates,
 coherent backup recovery and fresh service receipts.
+
+The digest-bound preflight requires this smoke surface in its isolated child.
+Location-only callers retain an explicit optional `require_abi_smoke` switch.
+Both routes keep full ABI and deployment authorization false.

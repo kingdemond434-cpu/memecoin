@@ -1,4 +1,4 @@
-﻿# Digest-bound private native preflight
+# Digest-bound private native preflight
 
 `probe_digest_bound_runtime` composes the bounded private extension digest verifier
 with the existing direct-child location and CPU preflight. It verifies development
@@ -15,8 +15,9 @@ binary digests are not verified. Each bounded digest pass retains its own logica
 read pacing and cooperative deadline; it is not an OS IO/RAM cap. The child has
 its existing60-second timeout,2% inherited job and allowlisted environment.
 
-This gate does not perform ABI checks or validate CI/review, coherent backups,
+The digest-bound gate now requires the five-vector offline ABI smoke receipt from
+the same isolated child. It rejects absent or malformed results and still leaves
+full native ABI testing false. It does not validate CI/review, coherent backups,
 recoverability or post-start collection. It cannot authorize deployment or change
-services. Integration with the offline smoke surface and the full cap-aware
-deployment transaction remains required. No production binary certification was
+services. Integration with the full cap-aware deployment transaction remains required. No production binary certification was
 attempted without independently trusted expected bytes.

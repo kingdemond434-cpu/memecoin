@@ -10,7 +10,18 @@ from ops.worker_resource_guard import THREAD_VARIABLES, verify
 PRIVATE = 'runtime-native-45125a6'
 
 
-def inspect_runtime(envelope, stage, *, expected_extension=None):
+def inspect_runtime(envelope, stage, *, expected_extension=None, require_abi_smoke=False):
+    if type(require_abi_smoke) is not bool:
+        raise ValueError('Explicit ABI smoke requirement required')
+    smoke = envelope.get('abi_smoke')
+    if require_abi_smoke and (not isinstance(smoke, dict)
+            or smoke.get('status') != 'OFFLINE_NATIVE_ABI_SMOKE_PASSED'
+            or type(smoke.get('fixed_vectors')) is not int or smoke['fixed_vectors'] != 5
+            or smoke.get('native_abi_smoke_tested') is not True
+            or any(smoke.get(k) is not False for k in ('full_native_abi_tested',
+                'binary_provenance_verified', 'deployment_authorized', 'network_used',
+                'services_changed'))):
+        raise ValueError('Exact offline ABI smoke evidence required')
     root = (Path(stage)/PRIVATE).resolve()
     def same(value, expected):
         return isinstance(value, str) and Path(value).resolve() == expected
@@ -38,12 +49,13 @@ def inspect_runtime(envelope, stage, *, expected_extension=None):
             'isolated_child': True, 'bytecode_writes_disabled': True,
             'private_extension_location_verified': True,
             'native_binary_digest_verified': False, 'native_abi_tested': False,
+            'native_abi_smoke_tested': require_abi_smoke,
             'tested_release_verified': False, 'deployment_authorized': False,
             'services_changed': False}
 
 
 def probe_private_runtime(*, stage, run=subprocess.run, resource_check=verify,
-                          expected_extension=None):
+                          expected_extension=None, require_abi_smoke=False):
     """Launch only the private Python as a direct inherited-job child.
 
     Caller supplies a trusted stage directory. This does not execute a role
@@ -51,6 +63,8 @@ def probe_private_runtime(*, stage, run=subprocess.run, resource_check=verify,
     Importing the installed module is permitted only as trusted installed code.
     No provider, signer or GitHub environment is supplied to the probe.
     """
+    if type(require_abi_smoke) is not bool:
+        raise ValueError('Explicit ABI smoke requirement required')
     cpu = resource_check()
     if cpu.get('status') != 'VERIFIED' or cpu.get('cpu_rate') != 200:
         raise RuntimeError('Development CPU proof required')
@@ -65,6 +79,7 @@ def probe_private_runtime(*, stage, run=subprocess.run, resource_check=verify,
                               'PROGRAMDATA','ALLUSERSPROFILE'}
            or key in THREAD_VARIABLES or key == 'TOKENIZERS_PARALLELISM'}
     guard = str(Path(__file__).with_name('worker_resource_guard.py').resolve())
+    smoke_path = str(Path(__file__).with_name('native_abi_smoke.py').resolve())
     # No action/argument/config strings from the role manifest are executed.
     script = '''import importlib.util,importlib.machinery,json,sys
 spec=importlib.util.spec_from_file_location('resource_probe_guard',GUARD)
@@ -75,16 +90,22 @@ extensions=sorted({m.__file__ for name,m in list(sys.modules.items())
  if (name=='solana_fastpath' or name.startswith('solana_fastpath.'))
  and getattr(m,'__file__',None)
  and any(m.__file__.endswith(s) for s in importlib.machinery.EXTENSION_SUFFIXES)})
+abi_smoke=None
+if REQUIRE_SMOKE:
+ spec=importlib.util.spec_from_file_location('offline_native_smoke',SMOKE_PATH)
+ checker=importlib.util.module_from_spec(spec);spec.loader.exec_module(checker)
+ abi_smoke=checker.check_native_abi_smoke(solana_fastpath)
 print(json.dumps(dict(executable=sys.executable,prefix=sys.prefix,
  isolated=sys.flags.isolated,dont_write_bytecode=bool(sys.dont_write_bytecode),
- extensions=extensions,cpu=cpu)))
-'''.replace('GUARD', json.dumps(guard))
+ extensions=extensions,cpu=cpu,abi_smoke=abi_smoke)))
+'''.replace('GUARD', json.dumps(guard)).replace('REQUIRE_SMOKE', repr(require_abi_smoke)).replace('SMOKE_PATH', json.dumps(smoke_path))
     try:
         result = run([str(interpreter), '-I', '-B', '-c', script], cwd=str(root),
                      env=env, capture_output=True, text=True, timeout=60, check=True)
         if len(result.stdout) > 16384:
             raise ValueError('Probe output budget')
         return inspect_runtime(json.loads(result.stdout), stage,
-                               expected_extension=expected_extension)
+                               expected_extension=expected_extension,
+                               require_abi_smoke=require_abi_smoke)
     except Exception:
         raise RuntimeError('Private native runtime probe failed; private output suppressed') from None
