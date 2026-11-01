@@ -619,10 +619,11 @@ class SourceIntelligence:
                         await self.source_mesh.retry_event(event)
                     except Exception as retry_exc:
                         logger.warning('source lease retry deferred: %s', type(retry_exc).__name__)
-            # Queue.get() completes synchronously while producers keep the
-            # queue nonempty. Yield between durable records so a replay/feed
-            # burst cannot monopolize health, market and shutdown callbacks.
-            await asyncio.sleep(0)
+            finally:
+                # Awaiting a ready queue/retry coroutine need not suspend. Yield
+                # on success, retry continues and errors, including cancellation
+                # cleanup; this does not preempt work inside a single record.
+                await asyncio.sleep(0)
 
     def _index_source_event(self, event: Any, *, defer_onion_io: bool = False,
                             record_population: bool = True) -> Optional[str]:
