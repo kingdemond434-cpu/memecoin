@@ -1,4 +1,4 @@
-"""Bounded read-only digest check; caller supplies trusted artifact provenance."""
+﻿"""Bounded read-only digest check; caller supplies trusted artifact provenance."""
 import hashlib
 import math
 from pathlib import Path
@@ -29,7 +29,7 @@ def verify_native_digest(*, stage, relative_path, expected_sha256, expected_size
         raise ValueError('Invalid native artifact expectation or read budget')
     root = Path(stage).absolute()/PRIVATE
     relative = Path(relative_path)
-    if relative.is_absolute() or relative.drive or ':' in str(relative) or '..' in relative.parts or relative.suffix.lower() != '.pyd':
+    if relative.is_absolute() or relative.root or relative.drive or ':' in str(relative) or '..' in relative.parts or relative.suffix.lower() != '.pyd':
         raise ValueError('Private relative native extension required')
     path = root/relative
     started = time.monotonic()

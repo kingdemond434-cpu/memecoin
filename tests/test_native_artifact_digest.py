@@ -41,3 +41,50 @@ def test_changed_during_admission_rejected(tmp_path):
         return True
     args['continue_check']=admission
     with pytest.raises(ValueError):verify_native_digest(**args)
+
+@pytest.mark.parametrize('relative_path',['/outside.pyd','C:/outside.pyd','Lib/native.pyd:stream'])
+def test_rejects_rooted_and_stream_paths(tmp_path,relative_path):
+    args=setup(tmp_path);args['relative_path']=relative_path
+    with pytest.raises(ValueError):verify_native_digest(**args)
+
+
+def test_mid_read_admission_rejection_preserves_artifact(tmp_path):
+    args=setup(tmp_path)
+    path=tmp_path/PRIVATE/'Lib/native.pyd'
+    original=b'x'*65537
+    path.write_bytes(original)
+    args.update(expected_size=len(original),expected_sha256=hashlib.sha256(original).hexdigest())
+    calls=0
+    def admission():
+        nonlocal calls
+        calls+=1
+        return calls<3
+    args['continue_check']=admission
+    with pytest.raises(RuntimeError,match='admission'):verify_native_digest(**args)
+    assert path.read_bytes()==original
+
+
+def test_deadline_exhaustion_does_not_read_or_accept(tmp_path,monkeypatch):
+    import ops.native_artifact_digest as module
+    args=setup(tmp_path)
+    times=iter([0,61])
+    monkeypatch.setattr(module.time,'monotonic',lambda: next(times))
+    with pytest.raises(RuntimeError,match='admission'):verify_native_digest(**args)
+
+
+def test_post_read_mutation_rejected_even_with_expected_digest(tmp_path):
+    args=setup(tmp_path);calls=0
+    def admission():
+        nonlocal calls
+        calls+=1
+        if calls==3:
+            path=tmp_path/PRIVATE/'Lib/native.pyd'
+            path.write_bytes(b'replacement data')
+        return True
+    args['continue_check']=admission
+    with pytest.raises(ValueError):verify_native_digest(**args)
+
+
+def test_truthy_admission_is_not_explicit_admission(tmp_path):
+    args=setup(tmp_path);args['continue_check']=lambda: 1
+    with pytest.raises(RuntimeError):verify_native_digest(**args)
