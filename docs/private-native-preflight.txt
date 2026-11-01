@@ -2,7 +2,8 @@
 
 ops.native_runtime_preflight.probe_private_runtime launches only
 runtime-native-45125a6/Scripts/python.exe as a direct child of the existing
-bounded developer. It does not use Task Scheduler, execute manifest actions,
+bounded developer. The caller must explicitly supply its trusted stage directory;
+no account home path is embedded in repository source. It does not use Task Scheduler, execute manifest actions,
 start receivers, run trading functions, change environments, write bytecode,
 install packages or modify the shared .venv/native extension.
 

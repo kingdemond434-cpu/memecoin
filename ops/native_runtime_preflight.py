@@ -7,11 +7,10 @@ import subprocess
 
 from ops.worker_resource_guard import THREAD_VARIABLES, verify
 
-STAGE = Path('C:/Users/Administrator/memecoin-codex-stage-20261020')
 PRIVATE = 'runtime-native-45125a6'
 
 
-def inspect_runtime(envelope, stage=STAGE):
+def inspect_runtime(envelope, stage):
     root = (Path(stage)/PRIVATE).resolve()
     def same(value, expected):
         return isinstance(value, str) and Path(value).resolve() == expected
@@ -42,7 +41,7 @@ def inspect_runtime(envelope, stage=STAGE):
             'services_changed': False}
 
 
-def probe_private_runtime(*, stage=STAGE, run=subprocess.run, resource_check=verify):
+def probe_private_runtime(*, stage, run=subprocess.run, resource_check=verify):
     """Launch only the private Python as a direct inherited-job child.
 
     Caller supplies a trusted stage directory. This does not execute a role
