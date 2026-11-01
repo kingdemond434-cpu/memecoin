@@ -1,0 +1,63 @@
+﻿# Bounded canonical-tail receipt audit
+
+`tools.source_ack_tail_audit` samples a fixed-size canonical tail and follows
+only indexed journal/queue keys. It never runs quick_check, table counts,
+acknowledgement-time sorting, index creation or a canonical-prefix stream.
+The legacy journal consistency audit still has broad scans; the old ACK audit
+uses direct canonical offsets but its newest-ACK selection lacks an ACK-time
+index. Do not run those broad selections on a busy host without admission.
+
+Use `python -m tools.source_ack_tail_audit JOURNAL FRONTIER LEDGER` from the
+checkout. Default tail256KiB, max1MiB; default128 complete lines, max256;
+default20 exact targets, max100. A leading partial line and unfinished final
+line are omitted with explicit flags. The candidate window is file-tail based,
+not a newest-ACK census or statistically representative sample.
+
+Connections use mode=ro/query_only. Each receipt/job lookup must have a SEARCH
+query plan without SCAN before execution. SQL progress callbacks and a deadline
+can stop the audit; missing indexes return RESOURCE_BLOCKED. Progress counts
+are observed100-instruction quanta, not an exact count of every instruction.
+Neither callback timing nor CPU containment is a physical IO/RAM cap or a way
+to preempt a blocked OS read. No source rows, schemas, counters or services change.
+
+An accepted sample checks canonical row self-hash and exact byte-offset target,
+retained receipt digest/clocks, stripped journal body, and committed frontier
+kind/reference. The journal snapshot precedes the frontier snapshot. Pending
+receipts are not ACKs. Valid retained retry rows are explicitly non-targets;
+malformed references or invalid receipt state are failures. No source text,
+wallet/token identifiers, receipt IDs or private reference strings are emitted.
+
+Status SAMPLED_BINDINGS_VERIFIED requires at least one verified exact target
+and no sampled failures. Empty/partial-budget results never become a pass.
+Clocks report only min/max/count of intake-to-first-delivery, first-delivery-to-
+ACK and intake-to-ACK for verified targets. Empty ranges remain null. They are
+wall-clock point samples, not p99, owner-loop lag, causality or capacity proof.
+
+Database integrity, full-prefix chain, durable owner application and gap-free
+coverage flags remain false. A sampled binding does not certify a backup,
+prove infinite raw retention, authorize promotion, establish a fill or show
+profitable edge. Keep source latency/backlog, provider/maintenance/capture gaps
+and unsupported execution requirements visible independently.
+
+
+An optional --end-offset cursor admits ONE earlier window, using next_window_end
+from a prior result. Each call retains the same byte/line/query/time limits;
+there is no automatic backwards sweep or budget expansion. The cursor ends at
+the discarded leading line boundary where possible, so ordinary cross-window
+rows can be inspected by the next window. Oversized boundary rows may remain
+unsampled and are flagged. Callers must admit and checkpoint each window,
+account for ledger replacement/truncation and measure effects before another.
+A cursor is not a whole-prefix certificate or permission for a bulk historical
+scan. No matching target still means NO_ACK_TARGET_SAMPLE, not zero latency.
+
+No-candidate windows do not open either SQLite store. Journal opening is lazy at
+the first candidate, and frontier opening requires an exact ACK target. Thus a
+no-sample result also makes no claim that either store was opened or healthy.
+The deadline is checked after lookups as well; valid bindings cannot turn an
+over-budget operation into an admitted success.
+
+Only max_lines line objects are retained/parsed; selecting backwards avoids a
+per-line object for every tiny line in the byte window. Cursor continuation
+starts before the earliest actually inspected row, including when a line or
+target-count limit stops the sample. A resource-blocked result does not advance
+the cursor. These bounds do not certify overall process RAM or device IO caps.
