@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from contextlib import closing
+from contextlib import closing, ExitStack
 import hashlib
 import json
 import math
@@ -100,7 +100,8 @@ def audit_recent_acknowledgements(journal_path, frontier_path, ledger_path, *,
             offset += len(line)
         result['line_budget_exhausted'] = len(rows) > max_lines
         targets = []
-        with closing(connect(journal_path)) as journal:
+        with ExitStack() as receipt_handles:
+            journal = None
             for offset, line in reversed(rows[-max_lines:]):
                 guard(); result['lines_inspected'] += 1
                 try:
@@ -118,6 +119,8 @@ def audit_recent_acknowledgements(journal_path, frontier_path, ledger_path, *,
                     event_id = receipt['id']
                     if not isinstance(event_id, str) or not 1 <= len(event_id) <= 256:
                         raise ValueError('receipt identity')
+                    if journal is None:
+                        journal = receipt_handles.enter_context(closing(connect(journal_path)))
                     target = indexed(journal, 'intake',
                         'SELECT id,body_sha256,accepted,first_delivery,canonical_job,canonical_ref,acknowledged,body IS NULL FROM intake WHERE id=?', (event_id,))
                     if target is None:
@@ -146,15 +149,17 @@ def audit_recent_acknowledgements(journal_path, frontier_path, ledger_path, *,
                     failures['canonical_candidate_or_receipt'] += 1
         # Journal ACK snapshot precedes frontier snapshot, as ACK follows the
         # durable frontier/canonical writes. No full-table selection is needed.
-        with closing(connect(frontier_path)) as frontier:
-            for job, reference, accepted, delivered, acked in targets:
-                binding = indexed(frontier, 'jobs',
-                    'SELECT kind,payload_ref FROM jobs WHERE job_id=?',(job,))
-                if binding != ('NARRATIVE_OBSERVATION',reference):
-                    failures['frontier_binding'] += 1
-                else:
-                    result['verified_acknowledgements'] += 1
-                    verified_clocks.append((accepted,delivered,acked))
+        if targets:
+            with closing(connect(frontier_path)) as frontier:
+                for job, reference, accepted, delivered, acked in targets:
+                    binding = indexed(frontier, 'jobs',
+                        'SELECT kind,payload_ref FROM jobs WHERE job_id=?',(job,))
+                    if binding != ('NARRATIVE_OBSERVATION',reference):
+                        failures['frontier_binding'] += 1
+                    else:
+                        result['verified_acknowledgements'] += 1
+                        verified_clocks.append((accepted,delivered,acked))
+        guard()
         result['status'] = ('FAIL_SAMPLED_BINDINGS' if failures else
             'SAMPLED_BINDINGS_VERIFIED' if result['verified_acknowledgements'] else 'NO_ACK_TARGET_SAMPLE')
     except _Budget as exc:

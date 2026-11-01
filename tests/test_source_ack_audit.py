@@ -196,3 +196,12 @@ def test_tail_oversized_boundary_is_explicitly_unsampled(tmp_path):
     assert result['status']=='NO_ACK_TARGET_SAMPLE'
     assert result['boundary_row_not_sampled'] and result['incomplete_tail']
     assert result['next_window_end'] < result['window_end']
+
+
+def test_tail_no_candidate_does_not_open_or_imply_verification_of_stores(tmp_path,monkeypatch):
+    paths=fixture(tmp_path);ledger=TradeEvidenceLedger(paths[2])
+    ledger.record_reference('fixture_padding',{'padding':'x'*4096},timestamp=6)
+    monkeypatch.setattr('tools.source_ack_tail_audit.sqlite3.connect',lambda *a,**k:pytest.fail('no receipt candidate needs a store lookup'))
+    result=audit_recent_acknowledgements(*paths,tail_bytes=1024)
+    assert result['status']=='NO_ACK_TARGET_SAMPLE' and result['candidate_rows']==0
+    assert not result['sqlite_integrity_verified']

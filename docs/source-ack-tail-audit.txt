@@ -49,3 +49,9 @@ unsampled and are flagged. Callers must admit and checkpoint each window,
 account for ledger replacement/truncation and measure effects before another.
 A cursor is not a whole-prefix certificate or permission for a bulk historical
 scan. No matching target still means NO_ACK_TARGET_SAMPLE, not zero latency.
+
+No-candidate windows do not open either SQLite store. Journal opening is lazy at
+the first candidate, and frontier opening requires an exact ACK target. Thus a
+no-sample result also makes no claim that either store was opened or healthy.
+The deadline is checked after lookups as well; valid bindings cannot turn an
+over-budget operation into an admitted success.
