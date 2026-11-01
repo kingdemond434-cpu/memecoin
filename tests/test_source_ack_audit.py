@@ -166,3 +166,33 @@ def test_tail_reports_only_verified_journal_clock_ranges(tmp_path):
     assert result['journal_timings']['intake_to_ack_seconds']=={'count':1,'min':2.0,'max':2.0}
     empty=audit_recent_acknowledgements(*fixture(tmp_path/'pending',acknowledge=False))
     assert empty['journal_timings']['intake_to_ack_seconds']=={'count':0,'min':None,'max':None}
+
+
+def test_tail_explicit_windows_progress_without_automatically_expanding_budget(tmp_path):
+    paths=fixture(tmp_path);ledger=TradeEvidenceLedger(paths[2])
+    for _ in range(40):ledger.record_reference('fixture_padding',{'padding':'x'*4096},timestamp=6)
+    cursor=None;verified=0;results=[]
+    for _ in range(4):
+        result=audit_recent_acknowledgements(*paths,tail_bytes=65536,end_offset=cursor)
+        results.append(result);assert result['bytes_read']<=65536
+        verified+=result['verified_acknowledgements']
+        following=result['next_window_end']
+        if following is None:break
+        assert following < result['window_end'];cursor=following
+    assert results[0]['status']=='NO_ACK_TARGET_SAMPLE'
+    assert verified==1
+    assert all(not r['full_prefix_chain_verified'] for r in results)
+
+
+@pytest.mark.parametrize('cursor',[True,-1,10**20])
+def test_tail_invalid_cursor_rejected(tmp_path,cursor):
+    with pytest.raises(ValueError):audit_recent_acknowledgements(*fixture(tmp_path),end_offset=cursor)
+
+
+def test_tail_oversized_boundary_is_explicitly_unsampled(tmp_path):
+    paths=fixture(tmp_path)
+    with paths[2].open('ab') as stream:stream.write(b'x'*4096)
+    result=audit_recent_acknowledgements(*paths,tail_bytes=1024)
+    assert result['status']=='NO_ACK_TARGET_SAMPLE'
+    assert result['boundary_row_not_sampled'] and result['incomplete_tail']
+    assert result['next_window_end'] < result['window_end']

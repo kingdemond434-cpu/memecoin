@@ -25,7 +25,7 @@ def _finite(value):
 
 def audit_recent_acknowledgements(journal_path, frontier_path, ledger_path, *,
         sample_limit=20, tail_bytes=262144, max_lines=128, vm_budget=20000,
-        deadline_seconds=30, clock=time.monotonic):
+        deadline_seconds=30, clock=time.monotonic, end_offset=None):
     if (type(sample_limit) is not int or not 1 <= sample_limit <= 100
             or type(tail_bytes) is not int or not 1024 <= tail_bytes <= 1048576
             or type(max_lines) is not int or not 1 <= max_lines <= 256
@@ -33,11 +33,13 @@ def audit_recent_acknowledgements(journal_path, frontier_path, ledger_path, *,
             or type(deadline_seconds) not in (int, float)
             or not math.isfinite(deadline_seconds) or not 0 < deadline_seconds <= 60):
         raise ValueError('Bounded ACK sample policy required')
+    if end_offset is not None and (type(end_offset) is not int or end_offset < 0):
+        raise ValueError('Bounded canonical window cursor required')
     start = clock(); operations = 0; stop = None
     result = {'status': 'NO_ACK_TARGET_SAMPLE', 'candidate_rows': 0,
         'verified_acknowledgements': 0, 'pending_receipts': 0,
         'non_target_rows': 0, 'lines_inspected': 0, 'bytes_read': 0,
-        'failures': {}, 'sqlite_integrity_verified': False,
+        'failures': {}, 'boundary_row_not_sampled': False, 'sqlite_integrity_verified': False,
         'full_prefix_chain_verified': False, 'durable_owner_application_verified': False,
         'upstream_gap_free': False, 'physical_io_cap_claimed': False,
         'scope': 'bounded canonical tail candidates and exact committed ACK targets only; not newest-ACK census, store integrity, full chain, owner replay or coverage'}
@@ -74,16 +76,23 @@ def audit_recent_acknowledgements(journal_path, frontier_path, ledger_path, *,
     try:
         guard()
         with Path(ledger_path).open('rb') as ledger:
-            ledger.seek(0, 2); extent = ledger.tell(); offset = max(0, extent-tail_bytes)
-            ledger.seek(offset); data = ledger.read(extent-offset)
-        result.update(bytes_read=len(data), ledger_extent=extent,
-                      leading_line_discarded=offset > 0, incomplete_tail=not data.endswith(b'\n'))
+            ledger.seek(0, 2); extent = ledger.tell()
+            end = extent if end_offset is None else end_offset
+            if end > extent:raise ValueError('Cursor exceeds current ledger extent')
+            offset = max(0, end-tail_bytes)
+            ledger.seek(offset); data = ledger.read(end-offset)
+        result.update(bytes_read=len(data), ledger_extent=extent, window_end=end,
+                      next_window_end=offset if offset else None,
+                      leading_line_discarded=offset > 0, incomplete_tail=bool(data) and not data.endswith(b'\n'))
         if offset:
             first = data.find(b'\n')
             if first < 0:
+                result['boundary_row_not_sampled']=True
                 data = b''
             else:
                 offset += first+1; data = data[first+1:]
+                if offset < end:result['next_window_end']=offset
+                else:result['boundary_row_not_sampled']=True
         rows = []
         for line in data.splitlines(keepends=True):
             if line.endswith(b'\n'):
@@ -161,7 +170,7 @@ def audit_recent_acknowledgements(journal_path, frontier_path, ledger_path, *,
         'first_delivery_to_ack_seconds':measured([k-d for a,d,k in verified_clocks]),
         'intake_to_ack_seconds':measured([k-a for a,d,k in verified_clocks])}
     result['ack_clock_range'] = measured([k for a,d,k in verified_clocks])
-    result['latency_scope'] = 'journal wall-clock ranges for verified tail-selected targets only; not p99, pure owner-loop delay, causality or sustainable capacity'
+    result['latency_scope'] = 'journal wall-clock ranges for verified window-selected targets only; not p99, pure owner-loop delay, causality or sustainable capacity'
     result.update(failures=dict(failures), sql_progress_instructions_observed=operations, sql_progress_interval=100,
                   elapsed_seconds=clock()-start)
     return result
@@ -171,8 +180,9 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('journal',type=Path);parser.add_argument('frontier',type=Path);parser.add_argument('ledger',type=Path)
     parser.add_argument('--sample-limit',type=int,default=20);parser.add_argument('--tail-bytes',type=int,default=262144)
+    parser.add_argument('--end-offset',type=int,default=None)
     args=parser.parse_args()
-    try:result=audit_recent_acknowledgements(args.journal,args.frontier,args.ledger,sample_limit=args.sample_limit,tail_bytes=args.tail_bytes)
+    try:result=audit_recent_acknowledgements(args.journal,args.frontier,args.ledger,sample_limit=args.sample_limit,tail_bytes=args.tail_bytes,end_offset=args.end_offset)
     except Exception as exc:result={'status':'ERROR','error_type':type(exc).__name__}
     print(json.dumps(result,sort_keys=True))
     return 0 if result['status']=='SAMPLED_BINDINGS_VERIFIED' else 1

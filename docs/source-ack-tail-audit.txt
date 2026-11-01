@@ -38,3 +38,14 @@ coverage flags remain false. A sampled binding does not certify a backup,
 prove infinite raw retention, authorize promotion, establish a fill or show
 profitable edge. Keep source latency/backlog, provider/maintenance/capture gaps
 and unsupported execution requirements visible independently.
+
+
+An optional --end-offset cursor admits ONE earlier window, using next_window_end
+from a prior result. Each call retains the same byte/line/query/time limits;
+there is no automatic backwards sweep or budget expansion. The cursor ends at
+the discarded leading line boundary where possible, so ordinary cross-window
+rows can be inspected by the next window. Oversized boundary rows may remain
+unsampled and are flagged. Callers must admit and checkpoint each window,
+account for ledger replacement/truncation and measure effects before another.
+A cursor is not a whole-prefix certificate or permission for a bulk historical
+scan. No matching target still means NO_ACK_TARGET_SAMPLE, not zero latency.
