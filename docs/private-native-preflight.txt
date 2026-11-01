@@ -1,0 +1,20 @@
+﻿Private native-runtime preflight
+
+ops.native_runtime_preflight.probe_private_runtime launches only
+runtime-native-45125a6/Scripts/python.exe as a direct child of the existing
+bounded developer. It does not use Task Scheduler, execute manifest actions,
+start receivers, run trading functions, change environments, write bytecode,
+install packages or modify the shared .venv/native extension.
+
+Parent and child each prove development containment. Child uses -I -B, a
+limited OS/thread environment and no inherited provider/signer/GitHub variables.
+The installed solana_fastpath module is imported as trusted local code. The
+reported sys.executable, sys.prefix and single loaded extension must resolve
+inside the private runtime. Native extension binary bytes and ABI behavior
+remain separate unverified gates. Trusted stage paths/installed code are caller
+requirements; this is not an untrusted binary execution facility.
+
+Fixed timeout and sanitized failure classifications suppress private child
+output. Success is location/inherited CPU evidence only: release tree, CI,
+review, full state backup, restore and deployment acceptance remain required.
+CPU containment is not a RAM or disk IO limit.
