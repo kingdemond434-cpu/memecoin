@@ -10,7 +10,7 @@ from ops.worker_resource_guard import THREAD_VARIABLES, verify
 PRIVATE = 'runtime-native-45125a6'
 
 
-def inspect_runtime(envelope, stage):
+def inspect_runtime(envelope, stage, *, expected_extension=None):
     root = (Path(stage)/PRIVATE).resolve()
     def same(value, expected):
         return isinstance(value, str) and Path(value).resolve() == expected
@@ -30,7 +30,8 @@ def inspect_runtime(envelope, stage):
     if not isinstance(extension, str):
         raise ValueError('Private native extension location required')
     path = Path(extension).resolve()
-    if path.suffix.lower() != '.pyd' or root not in path.parents:
+    if (path.suffix.lower() != '.pyd' or root not in path.parents
+            or (expected_extension is not None and path != Path(expected_extension).resolve())):
         raise ValueError('Native extension resolves outside private runtime')
     return {'status': 'PRIVATE_NATIVE_RUNTIME_LOCATION_AND_CPU_VERIFIED',
             'cpu_percent': 2, 'native_threads': 1,
@@ -41,7 +42,8 @@ def inspect_runtime(envelope, stage):
             'services_changed': False}
 
 
-def probe_private_runtime(*, stage, run=subprocess.run, resource_check=verify):
+def probe_private_runtime(*, stage, run=subprocess.run, resource_check=verify,
+                          expected_extension=None):
     """Launch only the private Python as a direct inherited-job child.
 
     Caller supplies a trusted stage directory. This does not execute a role
@@ -82,6 +84,7 @@ print(json.dumps(dict(executable=sys.executable,prefix=sys.prefix,
                      env=env, capture_output=True, text=True, timeout=60, check=True)
         if len(result.stdout) > 16384:
             raise ValueError('Probe output budget')
-        return inspect_runtime(json.loads(result.stdout), stage)
+        return inspect_runtime(json.loads(result.stdout), stage,
+                               expected_extension=expected_extension)
     except Exception:
         raise RuntimeError('Private native runtime probe failed; private output suppressed') from None
