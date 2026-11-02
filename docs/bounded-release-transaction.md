@@ -81,3 +81,20 @@ the fixed existing LocalService allowlist (S-1-5-19); no other principal is
 accepted. Read-only task collection has a bounded60-second timeout under the
 existing development CPU cap. A timeout remains a rejection, never a substitute
 for evidence or a reason to increase resource budgets.
+
+Backup-set staging now considers the metadata size of at most the ten exact
+unfinished sources, and stages at most one eligible store per call. A source
+whose regular-file size exceeds the caller's explicit budget remains outstanding
+in blocked_by_store_budget. It is never added to the completed-store checkpoint.
+If every remaining store is over budget, no copy starts and retained checkpoint
+and copies are unchanged. A later call can reconsider stores with an explicitly
+changed budget. This does not authorize larger production copies on a busy host.
+
+This eligibility pass does not open source databases or scan their contents.
+It rechecks host admission before each metadata read and before staging, rejects
+nonregular/reparse sources, and preserves the CPU, paced copy/readback, disk and
+SQLite size gates. File size is advisory: committed WAL growth or concurrent
+source changes can still make the selected real backup fail its page/copy budget.
+That failure remains explicit; there is no automatic fallback to another copy
+in the same call. Deferring a store does not complete the ten-store requirement,
+verify SQLite integrity/coherence/recovery, or authorize deployment.

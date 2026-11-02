@@ -63,8 +63,22 @@ def stage_next_store(*,sources,staging_root,max_store_bytes,continue_check,
                     or re.fullmatch('[0-9a-f]{64}',receipt['sha256']) is None):
                 raise ValueError('Prior staged copy missing, changed or unaccepted scope invalid')
         remaining=sorted(DATABASES-set(entries))
-        if remaining:
-            name=remaining[0]
+        # Metadata admission only: do not open/scan oversized source stores or
+        # let the first one prevent staging an independently eligible store.
+        # SQLite page/WAL growth and every copy budget remain the stager's gates.
+        blocked=[];eligible=[]
+        for name in remaining:
+            if continue_check() is not True:
+                raise RuntimeError('Backup metadata admission stopped')
+            info=paths[name].lstat()
+            if (not stat.S_ISREG(info.st_mode)
+                    or getattr(info,'st_file_attributes',0)&0x400):
+                raise ValueError('Regular non-reparse backup source required')
+            (blocked if info.st_size>max_store_bytes else eligible).append(name)
+        if eligible:
+            if continue_check() is not True:
+                raise RuntimeError('Backup staging admission stopped')
+            name=eligible[0]
             receipt=stage(paths[name],root/(name+'.pending'),max_bytes=max_store_bytes,
                           continue_check=continue_check)
             if (receipt.get('status')!='SINGLE_SQLITE_COPY_READBACK_VERIFIED_INTEGRITY_PENDING'
@@ -80,6 +94,7 @@ def stage_next_store(*,sources,staging_root,max_store_bytes,continue_check,
             os.replace(temporary,checkpoint)
         return dict(status='BACKUP_SET_STAGING_CHECKPOINT_ONLY',staged=len(entries),total=10,
                     all_stores_staged=len(entries)==10,previous_receipts_revalidated=False,
+                    blocked_by_store_budget=blocked,source_size_metadata_only=True,
                     sqlite_integrity_verified=False,canonical_prefix_verified=False,
                     cross_store_checkpoint_verified=False,recovery_verified=False,
                     deployment_backup_accepted=False,services_changed=False)
