@@ -67,7 +67,7 @@ def _adopt(source,pending,offset,size,extent,source_identity,guard,rate,clock,sl
 
 
 def advance_fragment_step(source,progress_path,*,anchor,anchor_evidence_sha256,target_extent,
-                          expected_progress_sha256,continue_check,max_records=64,window_bytes=1048576,
+                          expected_progress_sha256,continue_check,max_records=64,window_bytes=1048576,rollover_link=None,
                           rate_bytes_per_second=256*1024,deadline_seconds=60,
                           resource_check=verify,free_bytes=None,clock=time.monotonic,sleep=time.sleep):
     """At most one new <=1MiB raw copy; retain at most two inputs per attempt.
@@ -103,6 +103,13 @@ def advance_fragment_step(source,progress_path,*,anchor,anchor_evidence_sha256,t
         if hashlib.sha256(raw).hexdigest()!=expected_progress_sha256:raise ValueError('Progress pin mismatch; reconciliation required')
         state=json.loads(raw,object_pairs_hook=history._pairs)
         cursor=history._state(state,anchor,anchor_evidence_sha256,target_extent,root)
+        rollover_seeds=[]
+        if rollover_link is not None:
+            from ops.canonical_fragment_rollover import load_rollover_inputs
+            if Path(rollover_link).absolute()!=path.with_name(path.name+'.rollover.json'):
+                raise ValueError('Exact sibling rollover link required')
+            rollover_seeds=load_rollover_inputs(path,anchor=anchor,anchor_evidence_sha256=anchor_evidence_sha256,
+                target_extent=target_extent,guard=guard)
         common=dict(baseline_authenticated=False,full_prefix_chain_verified=False,cross_store_checkpoint_verified=False,
                     recovery_verified=False,deployment_backup_accepted=False,source_write_requested=False,
                     physical_io_cap_claimed=False)
@@ -116,7 +123,7 @@ def advance_fragment_step(source,progress_path,*,anchor,anchor_evidence_sha256,t
         binding=dict(version=1,progress_sha256=expected_progress_sha256,cursor=cursor,anchor=anchor,
             anchor_evidence_sha256=anchor_evidence_sha256,target_extent=target_extent,window_bytes=window_bytes,
             source_path_sha256=hashlib.sha256(str(source.resolve()).encode()).hexdigest(),source_identity=list(source_identity))
-        seeds=[]
+        seeds=rollover_seeds if not state['steps'] else []
         if state['steps']:
             previous=state['steps'][-1]['inputs']
             for i,item in enumerate(previous):
@@ -157,7 +164,7 @@ def advance_fragment_step(source,progress_path,*,anchor,anchor_evidence_sha256,t
                     'RECOVERY_STEP_NOT_RECORDED')
             return dict(status=status,history_result=result,next_cursor=result['next_cursor'],
                 progress_sha256=result['progress_sha256'],attempt_path=str(journal),attempt_sha256=journal_pin,
-                retained_inputs=len(attempt['inputs']),reused_prior_inputs=len(seeds),new_source_bytes_copied=copied,adopted_existing=adopted,
+                rollover_link_checked=rollover_link is not None,retained_inputs=len(attempt['inputs']),reused_prior_inputs=len(seeds),new_source_bytes_copied=copied,adopted_existing=adopted,
                 bounded_row_window_exhausted=status=='RECOVERY_WINDOW_RETAINED' and len(attempt['inputs'])==2,
                 elapsed_seconds=clock()-started,**common)
         if attempt['inputs']:
