@@ -22,3 +22,22 @@ and truncation checks do not prove absence of concurrent in-place rewriting.
 Logical pacing and cooperative deadlines do not cap physical IO/RAM or interrupt
 filesystem calls. A captured extent excludes subsequent appends; a partial final
 row is preserved as bytes and is never represented as a complete record.
+
+`ops.canonical_fragmented_row.verify_fragmented_row` can verify exactly one
+canonical row from one or two private raw-range receipts (at most 2 MiB total
+input). It validates all receipt bounds/contiguity/captured extent, reads each
+fragment with pacing and digest/identity checks, rejects aliases and duplicate
+JSON keys, and checks sequence, predecessor and canonical self-hash. A complete
+row advances only to its exact newline boundary; overread bytes remain explicit.
+An incomplete row returns `NO_COMPLETE_FRAGMENTED_ROW` with the original chain
+cursor. Rejected/resource-blocked attempts also retain the original cursor.
+
+This is a bounded row verification primitive, not a general streaming parser or
+recovery certificate. A row still incomplete after two fragments is unresolved;
+callers must not skip it or infer its full size. Larger-row handling, authenticated
+baseline and fragment histories, durable row receipts, reconstruction of the full
+tail and cross-store recoverability remain unfinished. JSON parsing may allocate
+more RAM than raw input size and cannot preempt a filesystem call or a single
+parse; CPU containment and input bounds are not a hard RAM/IO cap. Receipts and
+private ancestors must be authenticated by the caller. No production writes,
+provider requests, full-prefix acceptance or deployment authority are added.
