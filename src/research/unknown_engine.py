@@ -616,7 +616,7 @@ class UnknownOpportunityEngine:
         async def refresh():
             try:
                 started = time.time()
-                value = await asyncio.to_thread(self.frontier.report)
+                value = await asyncio.to_thread(getattr(self.frontier, 'diagnostic_report', self.frontier.report))
                 self._frontier_report_cache = (value, started, time.monotonic())
                 self._frontier_report_error = None
             except Exception as exc:

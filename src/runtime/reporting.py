@@ -25,6 +25,7 @@ from src.research.funnel_invariant import check_desk
 from src.runtime.research_reads import research_report
 from src.research.global_research_miner import GlobalResearchMiner
 from src.runtime.diagnostic_reads import diagnostic_reads
+from src.research.frontier import FrontierDiagnosticBudgetExceeded
 from src.chains.yellowstone_grpc import (
     NATIVE_FASTPATH_STATUS, PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
     create_combined_subscription,
@@ -956,7 +957,13 @@ class ReportingSurface:
                 except Exception as exc:  # pragma: no cover - defensive
                     logger.debug("memory governor read failed: %s", exc)
                 await asyncio.sleep(10)
-            snapshot = await self._readiness_snapshot()
+            try:
+                snapshot = await self._readiness_snapshot()
+            except FrontierDiagnosticBudgetExceeded:
+                # A missing initial diagnostic is explicit, not a zero-filled
+                # readiness projection. Keep the existing governor/cadence alive.
+                logger.warning("readiness refresh blocked by frontier diagnostic budget")
+                continue
             await self._publish_readiness(snapshot)
 
     async def _publish_readiness(self, snapshot):
