@@ -1,4 +1,4 @@
-﻿# Bounded raw canonical ranges
+# Bounded raw canonical ranges
 
 `ops.canonical_raw_chunk.stage_raw_chunk` preserves one contiguous raw byte range
 of at most 1 MiB, including a row fragment. It needs a caller-authenticated source,
@@ -56,4 +56,3 @@ or resource rejection retains the supplied cursor for the entire batch, even if
 earlier rows were checked. This allows reuse of preserved overread without new
 production copying. It does not change the 2 MiB input limit, authenticate caller
 history, loop automatically, update a recovery manifest or authorize deployment.
-
