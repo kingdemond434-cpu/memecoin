@@ -63,3 +63,17 @@ def test_fresh_publication_cannot_hide_stale_projection(tmp_path):
     assert r['projection_age_seconds']==1005 and r['projection_refresh_in_progress'] is True
     assert r['projection_refresh_error_present'] and 'secret-fixture-value' not in json.dumps(r)
     assert run(fixture(tmp_path))['projection_fresh'] is None
+
+
+def test_refresh_wait_metadata_allowlist_and_legacy_unknown(tmp_path):
+    p=fixture(tmp_path);assert run(p)['refresh_phase'] is None
+    d=json.loads(p.read_text());stamp=p.stat().st_mtime
+    d['diagnostic_snapshot']=dict(refresh_phase='frontier_snapshot',refresh_pending_seconds=120,
+        refresh_phase_seconds=100,refresh_wait_observed_at=stamp)
+    p.write_text(json.dumps(d));r=run(p,now=lambda:stamp+5)
+    assert r['refresh_phase']=='frontier_snapshot' and r['refresh_wait_age_seconds']==5
+    assert r['refresh_pending_seconds']==120 and r['refresh_phase_seconds']==100
+    d['diagnostic_snapshot'].update(refresh_phase='secret-fixture-value',refresh_pending_seconds=True)
+    p.write_text(json.dumps(d));r=run(p)
+    assert r['refresh_phase'] is None and r['refresh_pending_seconds'] is None
+    assert 'secret-fixture-value' not in json.dumps(r)

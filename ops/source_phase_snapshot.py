@@ -3,6 +3,7 @@ import json,math,os,stat,time
 from pathlib import Path
 from ops.worker_resource_guard import verify
 from src.runtime.source_timing import PHASES
+from src.runtime.readiness_timing import PHASES as REFRESH_PHASES
 
 SCOPE='process_local_service_time_not_source_latency'
 COUNTS=('attempts','completed','interrupted')
@@ -72,6 +73,11 @@ def read_source_phase_snapshot(path,*,continue_check,resource_check=verify,
     captured=diagnostic.get('observed_at')
     captured=captured if type(captured) in (int,float) and math.isfinite(captured) and captured>=0 else None
     projection_age=observed-captured if captured is not None else None
+    wait_captured=diagnostic.get('refresh_wait_observed_at')
+    wait_captured=wait_captured if type(wait_captured) in (int,float) and math.isfinite(wait_captured) and wait_captured>=0 else None
+    def elapsed(key):
+        value=diagnostic.get(key)
+        return value if type(value) in (int,float) and math.isfinite(value) and value>=0 else None
     return dict(status='READINESS_SOURCE_PHASE_SAMPLE',observed_at=observed,bytes_read=read,
         snapshot_age_seconds=age,snapshot_fresh=0<=age<=max_age_seconds,
         max_age_seconds=max_age_seconds,clock_skew_detected=age<0,
@@ -80,6 +86,11 @@ def read_source_phase_snapshot(path,*,continue_check,resource_check=verify,
         projection_fresh=(0<=projection_age<=max_age_seconds) if projection_age is not None else None,
         projection_refresh_in_progress=diagnostic.get('refresh_in_progress') if type(diagnostic.get('refresh_in_progress')) is bool else None,
         projection_refresh_error_present=diagnostic.get('refresh_error_type') is not None,
+        refresh_phase=diagnostic.get('refresh_phase') if diagnostic.get('refresh_phase') in REFRESH_PHASES else None,
+        refresh_pending_seconds=elapsed('refresh_pending_seconds'),
+        refresh_phase_seconds=elapsed('refresh_phase_seconds'),
+        refresh_wait_observed_at=wait_captured,
+        refresh_wait_age_seconds=observed-wait_captured if wait_captured is not None else None,
         scope=SCOPE,timing_available=available,phases=phases,invalid_phases=invalid,
         http_health_verified=False,stall_cause_established=False,source_latency_verified=False,
         source_write_requested=False,physical_io_cap_claimed=False)

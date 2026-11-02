@@ -25,6 +25,7 @@ from src.research.funnel_invariant import check_desk
 from src.runtime.research_reads import research_report
 from src.research.global_research_miner import GlobalResearchMiner
 from src.runtime.diagnostic_reads import diagnostic_reads
+from src.runtime.readiness_timing import ReadinessRefreshTiming
 from src.chains.yellowstone_grpc import (
     NATIVE_FASTPATH_STATUS, PumpFunMonitor, PumpSwapMonitor, RaydiumMonitor, SolanaRpcProgramStream, YellowstoneClient,
     create_combined_subscription,
@@ -907,32 +908,37 @@ class ReportingSurface:
         }
 
     async def _readiness_snapshot(self, *, wait_for_initial=True):
-        async def refresh():
+        async def refresh(timing):
             try:
+                timing.frontier()
                 engine = getattr(self, 'unknown_engine', None)
                 frontier = await engine.frontier_snapshot() if engine is not None and callable(
                     getattr(engine, 'frontier_snapshot', None)) else None
                 observed_at = time.time()
                 # Reporting is a read-only projection. Keep its filesystem,
                 # statistics and serialization work away from market intake.
-                value = await asyncio.to_thread(self._build_readiness_projection, engine, frontier)
+                value = await asyncio.to_thread(timing.worker(self._build_readiness_projection, engine, frontier))
                 self._readiness_cache = (value, observed_at, time.monotonic())
                 self._readiness_refresh_error = None
             except Exception as exc:
                 self._readiness_refresh_error = type(exc).__name__
                 raise
             finally:
+                timing.finish()
                 self._readiness_refresh_task = None
         cached = getattr(self, '_readiness_cache', None)
         if (cached is None or time.monotonic()-cached[2] >= 1) and getattr(self, '_readiness_refresh_task', None) is None:
-            self._readiness_refresh_task = asyncio.create_task(refresh())
+            timing = self._readiness_refresh_timing = ReadinessRefreshTiming()
+            self._readiness_refresh_task = asyncio.create_task(refresh(timing))
             self._readiness_refresh_task.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
         if cached is None:
             if not wait_for_initial:
                 return None
             await asyncio.shield(self._readiness_refresh_task)
             cached = self._readiness_cache
-        return {**cached[0], 'diagnostic_snapshot': {'observed_at': cached[1],
+        timing = getattr(self, '_readiness_refresh_timing', None)
+        return {**cached[0], 'diagnostic_snapshot': {**(timing.report() if timing is not None else {}),
+            'observed_at': cached[1],
             'age_seconds': max(0, time.time()-cached[1]),
             'refresh_in_progress': getattr(self, '_readiness_refresh_task', None) is not None,
             'refresh_error_type': getattr(self, '_readiness_refresh_error', None)}}
