@@ -379,13 +379,17 @@ class OperatorPlayService:
             children.append({'kind':'OPERATOR_ANALYSIS','payload':body,'axes':{'chain':p['chain_id']}})
         if not self._has_watches and not self._has_armed:
             return children
+        # The canonical actor observation remains retained upstream. Operator
+        # children project only their contract, not raw text/selection payloads.
+        base = {k:p[k] for k in ('chain_id','chain_family','event_at','observed_at','observation_id') if k in p}
         with self.lock, closing(self._connect()) as db:
             if kind == 'funded' and db.execute('SELECT 1 FROM watches WHERE funder=? LIMIT 1',(node,)).fetchone():
-                body = {**p, 'source':p['address'], 'target':relation['target'],
+                funding = {k:p[k] for k in ('amount_raw','amount_unit','wallet_history','wallet_history_evidence_refs') if k in p}
+                body = {**base, **funding, 'source':p['address'], 'target':relation['target'],
                         'source_type':source_type, 'target_type':relation.get('target_type', 'wallet')}
                 children.append({'kind':'OPERATOR_FUNDING','payload':body,'axes':{'chain':p['chain_id']}})
             elif kind in {'deployed','bought'} and db.execute('SELECT 1 FROM armed WHERE wallet=? AND closed=0 LIMIT 1',(node,)).fetchone():
-                body = {**p, 'wallet':p['address'], 'wallet_type':source_type,
+                body = {**base, 'wallet':p['address'], 'wallet_type':source_type,
                         'token':relation['target'], 'trigger':'CREATION' if kind=='deployed' else 'BUY'}
                 children.append({'kind':'OPERATOR_LAUNCH','payload':body,'axes':{'chain':p['chain_id']}})
         return children

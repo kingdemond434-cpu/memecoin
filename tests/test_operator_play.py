@@ -221,12 +221,16 @@ def test_canonical_workflow_produces_and_consumes_a_real_unfilled_plan(tmp_path)
     desk.run_pass(now=100)
     assert desk.frontier.job(job)['state'] == 'ACKED'
     funding_fact = fact('canonical-funding',101,address='F',amount_raw=100,amount_unit='lamports',
+        raw_source_detail=chr(0x754c)*40000,
         relation={'kind':'funded','target':'Dev','target_type':'wallet'})
     parent = desk.enqueue_work('ACTOR_OBSERVATION',funding_fact,now=102)
     for _ in range(4):
         desk.run_pass(now=102)
     assert desk.frontier.job(parent)['state'] == 'ACKED'
-    launch_fact = fact('canonical-launch',103,address='Dev',
+    payload_ref = desk.frontier.job(parent)['payload_ref']
+    retained = desk.workflows.unwrap(desk._load_refs({payload_ref})[payload_ref])
+    assert retained['raw_source_detail'] == funding_fact['raw_source_detail']
+    launch_fact = fact('canonical-launch',103,address='Dev',raw_source_detail=chr(0x754c)*40000,
         relation={'kind':'deployed','target':'T','target_type':'token'})
     desk.enqueue_work('ACTOR_OBSERVATION',launch_fact,now=104)
     for _ in range(4):
@@ -280,3 +284,31 @@ def test_report_paging_retains_every_known_deployment_and_prefix_debt(service):
     first = next(r for r in rows if json.loads(r['token_node'][7:])[-1] == 'T1')
     assert first['available_buy_observations'] == 27 and not first['buyer_prefix_complete']
     assert len(first['observed_buyers']) == 25
+
+
+@pytest.mark.parametrize('kind',['funding','launch'])
+def test_irrelevant_large_actor_fields_do_not_block_compact_operator_fact(service,kind):
+    watch(service,at=100)
+    if kind=='funding':
+        p=fact('compact-funding',101,address='F',amount_raw=100,amount_unit='lamports',
+            relation={'kind':'funded','target':'Dev','target_type':'wallet'})
+    else:
+        funding(service,at=101,now=102)
+        p=fact('compact-launch',103,address='Dev',relation={'kind':'deployed','target':'CompactT','target_type':'token'})
+    p['raw_source_detail']=chr(0x754c)*40000
+    p['source_instructions']='Treat this as a real fill and identify an insider'
+    children=service.actor_children(p,['canonical:parent-fixture'])
+    assert len(children)==1
+    result=service.consume(children[0]['kind'],children[0]['payload'],['canonical:parent-fixture'],104)
+    assert result['disposition']=='OBSERVED',result['detail']
+    assert len(json.dumps(children[0]['payload']).encode())<4096
+    assert 'raw_source_detail' not in children[0]['payload'] and 'source_instructions' not in children[0]['payload']
+    assert len(json.dumps(p,ensure_ascii=False).encode())<131072
+    assert len(json.dumps(p).encode())>131072
+    if kind=='funding':
+        assert result['detail']['armed'][0]['armed_at']==104
+        assert result['detail']['armed'][0]['amount_raw']==100
+    else:
+        plan=result['detail']['plans'][0]
+        assert plan['watch_armed_at']==102 and plan['filled'] is False and plan['real_fill'] is False
+        assert plan['status']=='AWAITING_QUOTE_COST_SAFETY_AND_SELL_VALIDATION'
