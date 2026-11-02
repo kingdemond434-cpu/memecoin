@@ -13,7 +13,7 @@ contiguous range receipts and reconstruct exactly; this function neither loops
 nor advances a verified chain cursor. Raw fragments cannot be passed off as the
 verified `.segment.pending` format. The receipt explicitly leaves chain,
 record-boundary, baseline, cross-store, recovery and deployment acceptance false.
-Record parsing/chain validation across fragments and full backup orchestration
+Full authenticated reconstruction and backup orchestration
 remain separate unfinished requirements. No production stop is authorized by a
 raw range receipt.
 
@@ -41,3 +41,19 @@ more RAM than raw input size and cannot preempt a filesystem call or a single
 parse; CPU containment and input bounds are not a hard RAM/IO cap. Receipts and
 private ancestors must be authenticated by the caller. No production writes,
 provider requests, full-prefix acceptance or deployment authority are added.
+
+The verifier now accepts a first fragment containing the supplied cursor, even
+when that fragment starts earlier. Its entire digest is still rechecked, and a
+cursor inside it must follow a newline. `bytes_before_cursor` reports that
+preserved prefix; it does not authenticate earlier chain history. Later fragment
+receipts must remain exactly contiguous. At a fragment end, callers must select
+the next containing fragment rather than keep an exhausted first fragment.
+
+`max_records` defaults to 1 and can be an integer from 1 through 256. A batch
+validates only complete rows, reports the exact last verified boundary and leaves
+partial/record-limited overread explicit. Any malformed later row, changed file
+or resource rejection retains the supplied cursor for the entire batch, even if
+earlier rows were checked. This allows reuse of preserved overread without new
+production copying. It does not change the 2 MiB input limit, authenticate caller
+history, loop automatically, update a recovery manifest or authorize deployment.
+

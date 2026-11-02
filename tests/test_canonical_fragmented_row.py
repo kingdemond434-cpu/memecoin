@@ -98,3 +98,67 @@ def test_policy_bounds_reject_before_read(tmp_path,policy):
         with pytest.raises(ValueError):check(rs,dict(BASE,sequence=False))
     else:
         with pytest.raises(ValueError):check(rs,deadline_seconds=61)
+
+def test_resume_inside_second_fragment_reuses_verified_overread(tmp_path):
+    raw,rs=fragments(tmp_path);first=check(rs);cursor=first['next_cursor']
+    r=check(rs[1:],cursor,max_records=64)
+    assert r['status']=='SINGLE_FRAGMENTED_CHAIN_ROW_VERIFIED' and r['next_cursor']['sequence']==2
+    assert r['next_cursor']['offset']==len(raw) and r['unconsumed_bytes']==0
+    assert r['bytes_before_cursor']==cursor['offset']-rs[1]['offset']
+    assert r['bytes_read']==rs[1]['bytes']
+
+
+def small_rows(tmp_path):
+    source=tmp_path/'small.jsonl';w=TradeEvidenceLedger(source)
+    for i in range(3):w.record('fixture',{'i':i})
+    return source.read_bytes()
+
+
+def test_bounded_batch_resumes_without_gaps_or_recopy(tmp_path):
+    raw=small_rows(tmp_path);_,rs=fragments(tmp_path,raw)
+    first=check(rs,max_records=2)
+    assert first['status']=='BOUNDED_FRAGMENTED_CHAIN_ROWS_VERIFIED' and first['verified_records']==2
+    assert first['record_limit_reached'] and first['next_cursor']['sequence']==2
+    end=sum(map(len,raw.splitlines(keepends=True)[:2]))
+    assert first['next_cursor']['offset']==end and first['verified_bytes']==end
+    second=check(rs,first['next_cursor'],max_records=2)
+    assert second['verified_records']==1 and second['next_cursor']['offset']==len(raw)
+    assert second['next_cursor']['sequence']==3 and second['bytes_before_cursor']==end
+
+
+def test_late_invalid_row_never_commits_earlier_checked_rows(tmp_path):
+    lines=small_rows(tmp_path).splitlines(keepends=True);bad=json.loads(lines[-1])
+    bad['payload']={'changed':True};lines[-1]=_canonical(bad)+b'\n'
+    _,rs=fragments(tmp_path,b''.join(lines));r=check(rs,max_records=3)
+    assert r['status']=='FRAGMENTED_ROW_REJECTED' and r['next_cursor']==BASE
+    assert r['verified_records']==0 and r['rows_checked_before_rejection']==2
+
+
+def test_interior_non_boundary_cursor_rejects(tmp_path):
+    raw=small_rows(tmp_path);_,rs=fragments(tmp_path,raw)
+    first=check(rs);cursor=dict(first['next_cursor']);cursor['offset']+=1
+    r=check(rs,cursor,max_records=3)
+    assert r['status']=='FRAGMENTED_ROW_REJECTED' and r['next_cursor']==cursor
+
+
+@pytest.mark.parametrize('limit',[True,0,257])
+def test_strict_batch_limit(tmp_path,limit):
+    _,rs=fragments(tmp_path,b'abc')
+    with pytest.raises(ValueError):check(rs,max_records=limit)
+
+def test_resource_stop_after_two_rows_rolls_back_entire_batch(tmp_path,monkeypatch):
+    import ops.canonical_fragmented_row as module
+    raw=small_rows(tmp_path);_,rs=fragments(tmp_path,raw);calls=[];original=module._canonical
+    def canonical(row):
+        calls.append(True)
+        return original(row)
+    monkeypatch.setattr(module,'_canonical',canonical)
+    r=check(rs,max_records=3,continue_check=lambda:len(calls)<2)
+    assert r['status']=='RESOURCE_BLOCKED' and r['next_cursor']==BASE
+    assert r['rows_checked_before_rejection']==2 and r['verified_records']==0
+
+
+def test_cursor_at_first_fragment_end_requires_selecting_next_fragment(tmp_path):
+    _,rs=fragments(tmp_path);cursor=dict(BASE,offset=rs[0]['end_offset'])
+    r=check(rs,cursor,max_records=3)
+    assert r['status']=='FRAGMENTED_ROW_REJECTED' and r['next_cursor']==cursor and r['bytes_read']==0
