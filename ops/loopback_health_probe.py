@@ -1,4 +1,4 @@
-﻿"""Deadline-bounded loopback health stages; no service control or remote endpoints."""
+"""Deadline-bounded loopback health stages; no service control or remote endpoints."""
 import json, math, socket, time
 
 PORTS = frozenset((18081, 18082, 18083, 18084))
@@ -32,7 +32,7 @@ def probe(port, *, deadline_seconds=4, max_body_bytes=65536,
         stage = 'connect'; conn.settimeout(remaining())
         conn.connect(('127.0.0.1', port)); marks['connect'] = clock() - start
         stage = 'request'; conn.settimeout(remaining())
-        conn.sendall(b'GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n')
+        conn.sendall(('GET /health HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nConnection: close\r\n\r\n' % port).encode('ascii'))
         marks['request'] = clock() - start
         stage = 'headers'; buf = bytearray()
         while b'\r\n\r\n' not in buf:
@@ -94,4 +94,3 @@ def probe(port, *, deadline_seconds=4, max_body_bytes=65536,
             except Exception: pass
     result.update(elapsed_seconds=clock() - start, completed_stages_seconds=marks)
     return result
-

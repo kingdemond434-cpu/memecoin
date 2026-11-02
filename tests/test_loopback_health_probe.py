@@ -1,4 +1,4 @@
-﻿import json
+import json
 import pytest
 from ops.loopback_health_probe import probe
 
@@ -13,6 +13,7 @@ class Conn:
         if self.fail=='connect':raise TimeoutError('private connect detail')
     def sendall(self, data):
         assert data.startswith(b'GET /health ')
+        assert b'Host: 127.0.0.1:18081\r\n' in data
         if self.fail=='request':raise OSError('private request detail')
     def recv(self, size):
         assert 0 < size <= 4096
@@ -95,4 +96,3 @@ def test_deadline_is_total_not_reset_per_read():
 def test_bad_field_types_cannot_smuggle_objects():
     r=call(Conn([response(b'{"status":{"secret":"private"},"live_submission_locked":1,"committed_program_records":true}')]))
     assert r['health']=={} and 'private' not in json.dumps(r)
-
