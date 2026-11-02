@@ -97,3 +97,91 @@ def test_insufficient_disk_reserve_still_blocks_real_copy(tmp_path,monkeypatch):
     assert not list(args['staging_root'].glob('*.pending'))
     assert not (args['staging_root']/'backup-set.json').exists()
     assert all(path.read_bytes()==originals[name] for name,path in args['sources'].items())
+
+
+def grow(path):
+    with sqlite3.connect(path) as db:
+        db.execute('INSERT INTO evidence VALUES(2,?)',('x'*65536,))
+
+
+def test_oversized_first_store_does_not_starve_real_smaller_copy(tmp_path):
+    args=setup(tmp_path);large=sorted(DATABASES)[0];grow(args['sources'][large])
+    original=args['sources'][large].read_bytes()
+    r=stage_next_store(**args)
+    assert r['blocked_by_store_budget']==[large] and r['source_size_metadata_only']
+    assert r['staged']==1 and not r['all_stores_staged'] and not r['deployment_backup_accepted']
+    state=json.loads((args['staging_root']/'backup-set.json').read_bytes())
+    selected=sorted(DATABASES)[1];assert set(state['stores'])=={selected}
+    with sqlite3.connect(args['staging_root']/(selected+'.pending')) as db:
+        assert db.execute('SELECT value FROM evidence').fetchone()==('retained',)
+    assert args['sources'][large].read_bytes()==original
+
+
+def test_all_over_budget_stores_stay_outstanding_without_stager_call(tmp_path):
+    args=setup(tmp_path);args['max_store_bytes']=1
+    def never(*a,**k):raise AssertionError('copy must not start')
+    r=stage_next_store(**args,stage=never)
+    assert r['blocked_by_store_budget']==sorted(DATABASES) and r['staged']==0
+    assert not r['all_stores_staged'] and not r['recovery_verified']
+    assert not list(args['staging_root'].glob('*.pending'))
+    assert not (args['staging_root']/'backup-set.json').exists()
+
+
+def test_deferred_store_reconsidered_only_after_explicit_budget_change(tmp_path):
+    args=setup(tmp_path);large=sorted(DATABASES)[0];grow(args['sources'][large])
+    first=stage_next_store(**args);assert first['blocked_by_store_budget']==[large]
+    prior=next(args['staging_root'].glob('*.pending'));before=prior.read_bytes()
+    args['max_store_bytes']=262144
+    r=stage_next_store(**args)
+    assert r['staged']==2 and r['blocked_by_store_budget']==[]
+    assert prior.read_bytes()==before
+    with sqlite3.connect(args['staging_root']/(large+'.pending')) as db:
+        assert db.execute('SELECT length(value) FROM evidence WHERE id=2').fetchone()==(65536,)
+
+
+def test_budget_blocks_do_not_rewrite_retained_checkpoint_or_copy(tmp_path):
+    args=setup(tmp_path);stage_next_store(**args)
+    root=args['staging_root'];checkpoint=root/'backup-set.json';before=checkpoint.read_bytes()
+    copy=next(root.glob('*.pending'));copied=copy.read_bytes()
+    args['max_store_bytes']=1;r=stage_next_store(**args)
+    assert r['staged']==1 and len(r['blocked_by_store_budget'])==9
+    assert checkpoint.read_bytes()==before and copy.read_bytes()==copied
+
+
+def test_live_wal_size_still_enforced_by_real_stager(tmp_path):
+    from ops.incremental_backup import BackupStopped
+    args=setup(tmp_path);first=sorted(DATABASES)[0];source=args['sources'][first]
+    db=sqlite3.connect(source)
+    try:
+        db.execute('PRAGMA journal_mode=WAL');db.execute('PRAGMA wal_autocheckpoint=0')
+        db.execute('INSERT INTO evidence VALUES(2,?)',('x'*65536,));db.commit()
+        assert source.stat().st_size<=args['max_store_bytes']
+        with pytest.raises(BackupStopped,match='source_size_budget'):stage_next_store(**args)
+        assert not list(args['staging_root'].glob('*.pending'))
+        assert not (args['staging_root']/'backup-set.json').exists()
+        assert db.execute('SELECT count(*) FROM evidence').fetchone()==(2,)
+    finally:db.close()
+
+
+def test_admission_withdrawn_after_metadata_prevents_stager_call(tmp_path):
+    args=setup(tmp_path);calls=0
+    def admit():
+        nonlocal calls
+        calls+=1
+        return calls<12
+    args['continue_check']=admit
+    def never(*a,**k):raise AssertionError('copy must not start')
+    with pytest.raises(RuntimeError,match='staging admission'):stage_next_store(**args,stage=never)
+    assert not list(args['staging_root'].glob('*.pending'))
+
+
+def test_reparse_source_metadata_is_not_silently_skipped(tmp_path,monkeypatch):
+    from pathlib import Path
+    from types import SimpleNamespace
+    args=setup(tmp_path);target=args['sources'][sorted(DATABASES)[0]];real=Path.lstat
+    def info(path,*a,**k):
+        value=real(path,*a,**k)
+        return SimpleNamespace(st_mode=value.st_mode,st_file_attributes=0x400,st_size=value.st_size) if path==target else value
+    monkeypatch.setattr(Path,'lstat',info)
+    with pytest.raises(ValueError,match='non-reparse'):stage_next_store(**args)
+    assert not list(args['staging_root'].glob('*.pending'))
