@@ -3,6 +3,15 @@ import pytest
 from ops.backup_set import stage_next_store
 from ops.incremental_backup import DATABASES
 
+@pytest.fixture(autouse=True)
+def deterministic_disk_space(monkeypatch):
+    # The real backup path still executes; only host free-space input is modeled.
+    from types import SimpleNamespace
+    import ops.incremental_backup as backup
+    monkeypatch.setattr(backup.shutil,"disk_usage",
+        lambda _path:SimpleNamespace(free=backup.RESERVE+1024*1024))
+
+
 
 def setup(tmp_path):
     source=tmp_path/'source';source.mkdir()
@@ -76,3 +85,15 @@ def test_changed_prior_copy_blocks_resume_without_erasing_checkpoint(tmp_path):
 def test_normalized_staging_cannot_alias_source_directory(tmp_path):
     args=setup(tmp_path);args['staging_root']=tmp_path/'alias'/'..'/'source'
     with pytest.raises(ValueError):stage_next_store(**args)
+
+
+def test_insufficient_disk_reserve_still_blocks_real_copy(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    import ops.incremental_backup as backup
+    args=setup(tmp_path)
+    originals={name:path.read_bytes() for name,path in args['sources'].items()}
+    monkeypatch.setattr(backup.shutil,'disk_usage',lambda _path:SimpleNamespace(free=backup.RESERVE))
+    with pytest.raises(backup.BackupStopped,match='disk_reserve'):stage_next_store(**args)
+    assert not list(args['staging_root'].glob('*.pending'))
+    assert not (args['staging_root']/'backup-set.json').exists()
+    assert all(path.read_bytes()==originals[name] for name,path in args['sources'].items())

@@ -4,6 +4,15 @@ from ops.backup_set import stage_next_store
 from ops.backup_set_integrity import verify_next_staged_store
 from ops.incremental_backup import DATABASES,BackupStopped
 
+@pytest.fixture(autouse=True)
+def deterministic_disk_space(monkeypatch):
+    # The real backup path still executes; only host free-space input is modeled.
+    from types import SimpleNamespace
+    import ops.incremental_backup as backup
+    monkeypatch.setattr(backup.shutil,"disk_usage",
+        lambda _path:SimpleNamespace(free=backup.RESERVE+1024*1024))
+
+
 
 @pytest.fixture
 def staged(tmp_path):
