@@ -9,7 +9,7 @@ failure and low-value hibernation so restart cannot erase coverage debt.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 import hashlib
 import json
@@ -20,6 +20,10 @@ import time
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence
 import uuid
 import weakref
+
+
+class FrontierDiagnosticBudgetExceeded(RuntimeError):
+    """Diagnostic aggregation was interrupted; no partial counts are accepted."""
 
 
 SCHEMA_VERSION = 1
@@ -985,12 +989,53 @@ class FrontierIndex:
                         inputs.total_cost, inputs.cost_unit, job_id))
             self._event(db, job_id, "wake", "HIBERNATED", "READY", enabling_change, refs, moment)
 
-    def report(self, *, now: Optional[float] = None, window_seconds: float = 3600) -> Dict[str, Any]:
+    def diagnostic_report(self, *, now=None, window_seconds=3600,
+                          vm_step_budget=100000, deadline_seconds=2, clock=time.monotonic):
+        """Read-only bounded diagnostic aggregation; not a work/coverage certificate.
+
+        VM/time guards are cooperative, not syscall or physicalIO/RAM caps.
+        Caller retains dated cache on failure. No partial report is returned.
+        """
+        if (type(vm_step_budget) is not int or not 100<=vm_step_budget<=1000000
+                or type(deadline_seconds) not in (int,float)
+                or not math.isfinite(deadline_seconds) or not 0<deadline_seconds<=5):
+            raise ValueError('Bounded diagnostic policy required')
+        finalizer=getattr(self,'_close_keeper',None)
+        if finalizer is not None and not finalizer.alive:
+            raise RuntimeError('research frontier is closed')
+        started=clock();steps=0;stopped=False
+        def progress():
+            nonlocal steps,stopped
+            steps+=100
+            stopped=steps>=vm_step_budget or clock()-started>=deadline_seconds
+            return int(stopped)
+        db=sqlite3.connect(self.path.absolute().as_uri()+'?mode=ro',uri=True,timeout=.1)
+        db.row_factory=sqlite3.Row
+        try:
+            db.execute('PRAGMA query_only=ON');db.execute('PRAGMA mmap_size=0')
+            db.execute('PRAGMA cache_size=-256')
+            db.set_progress_handler(progress,100)
+            if clock()-started>=deadline_seconds:
+                raise FrontierDiagnosticBudgetExceeded('diagnostic query budget exhausted')
+            db.execute('BEGIN')
+            try:
+                value=self.report(now=now,window_seconds=window_seconds,_connection=db)
+                if clock()-started>=deadline_seconds:
+                    raise FrontierDiagnosticBudgetExceeded('diagnostic query budget exhausted')
+                return value
+            except sqlite3.OperationalError:
+                if stopped:raise FrontierDiagnosticBudgetExceeded('diagnostic query budget exhausted') from None
+                raise
+        finally:
+            db.set_progress_handler(None,0);db.close()
+
+    def report(self, *, now: Optional[float] = None, window_seconds: float = 3600,
+               _connection=None) -> Dict[str, Any]:
         moment = time.time() if now is None else float(now)
         window = _number(window_seconds, "window_seconds", optional=False)
         if window <= 0:
             raise ValueError("window_seconds must be positive")
-        with self._db() as db:
+        with (self._db() if _connection is None else nullcontext(_connection)) as db:
             # One pass over a compact covering index, rather than repeated
             # scans of the growing job table and its large evidence/JSON rows.
             groups = [dict(row) for row in db.execute(

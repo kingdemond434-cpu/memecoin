@@ -28,7 +28,7 @@ async def test_slow_status_query_is_coalesced_without_blocking_health(tmp_path, 
         calls.append(1);entered.set()
         if not release.wait(5):raise RuntimeError('test reader gate expired')
         return {'pending':42}
-    monkeypatch.setattr(desk.frontier,'report',report)
+    monkeypatch.setattr(desk.frontier,'diagnostic_report',report)
     class Surface(ReportingSurface):
         unknown_engine=desk
         _starting_phase=''
@@ -66,11 +66,11 @@ async def test_slow_status_query_is_coalesced_without_blocking_health(tmp_path, 
 @pytest.mark.asyncio
 async def test_refresh_failure_retains_dated_snapshot_and_reports_error(tmp_path, monkeypatch):
     desk=engine(tmp_path)
-    monkeypatch.setattr(desk.frontier,'report',lambda:{'pending':42})
+    monkeypatch.setattr(desk.frontier,'diagnostic_report',lambda:{'pending':42})
     try:
         first=await desk.frontier_snapshot()
         def unavailable():raise RuntimeError('injected database unavailable')
-        monkeypatch.setattr(desk.frontier,'report',unavailable)
+        monkeypatch.setattr(desk.frontier,'diagnostic_report',unavailable)
         stale=await desk.frontier_snapshot(max_age_seconds=0)
         assert stale['pending']==42 and stale['refresh_in_progress']
         task=desk._frontier_report_task
