@@ -161,3 +161,72 @@ def test_progress_changed_during_copy_is_not_overwritten(tmp_path,monkeypatch):
     monkeypatch.setattr(module,'stage_raw_chunk',changed)
     with pytest.raises(ValueError):run(source,path,pin,extent)
     assert path.read_bytes()==b'concurrent change' and len(list(path.parent.glob('step-*.raw.pending')))==1
+
+
+def test_successive_batches_reuse_pinned_overread_without_copy(tmp_path,monkeypatch):
+    source,path,pin,extent=fixture(tmp_path)
+    first=run(source,path,pin,extent,max_records=1)
+    assert first['next_cursor']['sequence']==2 and first['new_source_bytes_copied']>0
+    prior=json.loads(path.read_bytes())['steps'][-1]['inputs'][0]
+    saved=(path.parent/prior['name']).read_bytes()
+    def no_copy(*a,**k):raise AssertionError('pinned overread must be reused')
+    monkeypatch.setattr(module,'stage_raw_chunk',no_copy)
+    second=run(source,path,first['progress_sha256'],extent,max_records=1)
+    assert second['next_cursor']['sequence']==3 and second['new_source_bytes_copied']==0
+    assert second['reused_prior_inputs']==1
+    assert (path.parent/prior['name']).read_bytes()==saved
+    state=json.loads(path.read_bytes())
+    assert state['steps'][-1]['inputs']==state['steps'][-2]['inputs']
+    assert state['steps'][-1]['start_cursor']==state['steps'][-2]['next_cursor']
+
+
+def test_changed_retained_overread_rejected_without_copy_or_history_change(tmp_path,monkeypatch):
+    source,path,pin,extent=fixture(tmp_path)
+    first=run(source,path,pin,extent,max_records=1);saved=path.read_bytes()
+    prior=json.loads(saved)['steps'][-1]['inputs'][0];raw=path.parent/prior['name']
+    raw.write_bytes(b'x'*raw.stat().st_size);damaged=raw.read_bytes()
+    def no_copy(*a,**k):raise AssertionError('invalid retained input must not cause recopy')
+    monkeypatch.setattr(module,'stage_raw_chunk',no_copy)
+    result=run(source,path,first['progress_sha256'],extent)
+    assert result['status']=='RECOVERY_STEP_NOT_RECORDED' and result['new_source_bytes_copied']==0
+    assert result['next_cursor']==first['next_cursor'] and result['progress_sha256']==first['progress_sha256']
+    assert path.read_bytes()==saved and raw.read_bytes()==damaged
+
+
+def test_retained_input_cannot_be_removed_from_attempt_journal(tmp_path,monkeypatch):
+    source,path,pin,extent=fixture(tmp_path)
+    first=run(source,path,pin,extent,max_records=1);saved=path.read_bytes()
+    original=module.record_fragment_step
+    def interrupt(*a,**k):raise OSError('fixture interrupted verification')
+    monkeypatch.setattr(module,'record_fragment_step',interrupt)
+    with pytest.raises(OSError):run(source,path,first['progress_sha256'],extent)
+    journals=[p for p in path.parent.glob('*.fragment-attempt.json') if json.loads(p.read_bytes())['binding']['version']==2]
+    assert len(journals)==1
+    journal=journals[0];state=json.loads(journal.read_bytes());state['inputs']=[]
+    journal.write_text(json.dumps(state));altered=journal.read_bytes()
+    monkeypatch.setattr(module,'record_fragment_step',original)
+    with pytest.raises(ValueError,match='Pinned retained inputs changed'):
+        run(source,path,first['progress_sha256'],extent)
+    assert path.read_bytes()==saved and journal.read_bytes()==altered
+
+
+def test_prior_partial_window_extends_contiguously_without_recopy(tmp_path):
+    source,path,pin,extent=fixture(tmp_path,1100000)
+    # Rebuild the initial source before its captured history is seeded.
+    # Use a fresh fixture with a small row before the large one.
+    root=path.parent
+    writer=TradeEvidenceLedger(source);writer.record('fixture',{'last':True})
+    extent=source.stat().st_size
+    initial=json.loads(path.read_bytes());initial['target_extent']=extent
+    initial['steps'][0]['inputs'][0]['captured_extent']=extent
+    path.write_text(json.dumps(initial));pin=hashlib.sha256(path.read_bytes()).hexdigest()
+    # A small bounded window can verify the large row only after two windows.
+    first=run(source,path,pin,extent)
+    assert first['status']=='RECOVERY_WINDOW_RETAINED'
+    second=run(source,path,pin,extent,max_records=1)
+    assert second['next_cursor']['sequence']==2 and second['retained_inputs']==2
+    # Cursor now lies in the second input; discard the already consumed first
+    # input from the new attempt, rehash the suffix, and reach the final row.
+    third=run(source,path,second['progress_sha256'],extent)
+    assert third['next_cursor']['sequence']==3 and third['new_source_bytes_copied']==0
+    assert third['reused_prior_inputs']==1 and third['retained_inputs']==1

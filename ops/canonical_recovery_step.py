@@ -74,6 +74,7 @@ def advance_fragment_step(source,progress_path,*,anchor,anchor_evidence_sha256,t
 
     Trusted append-only source/private ancestors required. No automatic loop,
     unpinned reconciliation, orphan deletion, history rollover or deployment.
+    Pinned prior-step overread is freshly verified before copying another window.
     File fsync and bounded pacing do not prove full recoverability or cap RAM/IO.
     """
     anchor=history._cursor(anchor);history._hash(anchor_evidence_sha256);history._hash(expected_progress_sha256)
@@ -115,6 +116,14 @@ def advance_fragment_step(source,progress_path,*,anchor,anchor_evidence_sha256,t
         binding=dict(version=1,progress_sha256=expected_progress_sha256,cursor=cursor,anchor=anchor,
             anchor_evidence_sha256=anchor_evidence_sha256,target_extent=target_extent,window_bytes=window_bytes,
             source_path_sha256=hashlib.sha256(str(source.resolve()).encode()).hexdigest(),source_identity=list(source_identity))
+        seeds=[]
+        if state['steps']:
+            previous=state['steps'][-1]['inputs']
+            for i,item in enumerate(previous):
+                if item['offset']<=cursor['offset']<item['end_offset']:
+                    seeds=[dict(v) for v in previous[i:]];break
+        if seeds:
+            binding.update(version=2,retained_inputs=seeds)
         key=hashlib.sha256(_encoded(binding)).hexdigest();journal=root/('attempt-'+key+'.fragment-attempt.json')
         if os.path.lexists(journal):
             old=history._read(journal);attempt=json.loads(old,object_pairs_hook=history._pairs)
@@ -124,11 +133,13 @@ def advance_fragment_step(source,progress_path,*,anchor,anchor_evidence_sha256,t
                     or len(attempt['inputs'])>2):raise ValueError('Attempt binding mismatch')
             journal_pin=hashlib.sha256(old).hexdigest()
         else:
-            attempt=dict(version=1,binding=binding,inputs=[]);guard();journal_pin=_publish(journal,attempt,None)
+            attempt=dict(version=1,binding=binding,inputs=[dict(v) for v in seeds]);guard();journal_pin=_publish(journal,attempt,None)
+        if attempt['inputs'][:len(seeds)]!=seeds:
+            raise ValueError('Pinned retained inputs changed')
         if attempt['inputs']:
             history._inputs(attempt['inputs'],root,cursor,target_extent,stored=True)
-            offset=cursor['offset']
-            for i,item in enumerate(attempt['inputs']):
+            offset=seeds[-1]['end_offset'] if seeds else cursor['offset']
+            for i,item in enumerate(attempt['inputs'][len(seeds):],start=len(seeds)):
                 if (item['name']!='step-'+key+'-'+str(i)+'.raw.pending' or item['offset']!=offset
                         or item['bytes']!=min(window_bytes,target_extent-offset)):
                     raise ValueError('Attempt raw interval mismatch')
@@ -146,7 +157,7 @@ def advance_fragment_step(source,progress_path,*,anchor,anchor_evidence_sha256,t
                     'RECOVERY_STEP_NOT_RECORDED')
             return dict(status=status,history_result=result,next_cursor=result['next_cursor'],
                 progress_sha256=result['progress_sha256'],attempt_path=str(journal),attempt_sha256=journal_pin,
-                retained_inputs=len(attempt['inputs']),new_source_bytes_copied=copied,adopted_existing=adopted,
+                retained_inputs=len(attempt['inputs']),reused_prior_inputs=len(seeds),new_source_bytes_copied=copied,adopted_existing=adopted,
                 bounded_row_window_exhausted=status=='RECOVERY_WINDOW_RETAINED' and len(attempt['inputs'])==2,
                 elapsed_seconds=clock()-started,**common)
         if attempt['inputs']:

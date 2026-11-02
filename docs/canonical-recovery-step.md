@@ -30,3 +30,15 @@ caps and cannot preempt filesystem calls or a JSON parse. The driver does not
 change services, tasks, wrappers, provider budgets or live authority. Reaching a
 captured byte tip is history-only; full-tail reconstruction, baseline and SQLite
 integrity, cross-store recovery and tested deployment gates remain outstanding.
+
+
+After a successful step, the next pinned call selects only the suffix of the
+previous step's inputs containing the exact verified cursor. Those input facts
+are included in the new attempt binding and checked against its journal. The
+fragment verifier rehashes retained files before advancing any rows. Complete
+remaining rows can advance with zero new source bytes copied; an incomplete row
+may use one additional contiguous window, within the existing two-input bound.
+Changed retained bytes fail closed without replacing them or advancing history.
+This reuses overread across successful batches; exact step intervals still exclude
+previously verified prefixes. Existing version1 attempts without retained inputs
+keep their binding. Prior raw files and history are never evicted.
