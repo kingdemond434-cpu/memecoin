@@ -1,4 +1,4 @@
-﻿"""Preserve a bounded raw canonical range, including partial/oversized rows."""
+"""Preserve a bounded raw canonical range, including partial/oversized rows."""
 import hashlib, math, os, shutil, stat, time, uuid
 from pathlib import Path
 from ops.incremental_backup import BackupStopped, RESERVE
@@ -45,8 +45,10 @@ def stage_raw_chunk(source, pending, *, offset, extent, continue_check,
     def charge(amount):
         nonlocal charged
         charged+=amount
-        while charged/rate_bytes_per_second > clock()-started:
-            guard(); sleep(min(.1,charged/rate_bytes_per_second-(clock()-started)))
+        delay=charged/rate_bytes_per_second-(clock()-started)
+        while delay>1e-9:
+            guard(); sleep(min(.1,delay))
+            delay=charged/rate_bytes_per_second-(clock()-started)
         guard()
     def identity(a,b): return (a.st_dev,a.st_ino)==(b.st_dev,b.st_ino)
     guard()

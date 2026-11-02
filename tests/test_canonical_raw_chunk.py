@@ -94,3 +94,18 @@ def test_source_directory_staging_rejected(tmp_path):
     source,dest=setup(tmp_path,b'abc'); nested=source.parent/'nested'; nested.mkdir()
     with pytest.raises(ValueError): stage(source,nested/'a.raw.pending')
     assert list(nested.iterdir())==[]
+
+
+def test_clock_advancing_across_guard_never_requests_negative_sleep(tmp_path):
+    source,dest=setup(tmp_path,b'abc'); calls=0; sleeps=[]
+    def clock():
+        nonlocal calls
+        calls+=1
+        return 10.0 if calls>=7 else 0.0
+    def sleep(delay):
+        assert 0<=delay<=.1
+        sleeps.append(delay)
+    result=stage_raw_chunk(source,dest/'a.raw.pending',offset=0,extent=3,
+        continue_check=lambda:True,resource_check=CPU,free_bytes=lambda:RESERVE+100,
+        clock=clock,sleep=sleep)
+    assert result['bytes']==3 and sleeps and (dest/'a.raw.pending').read_bytes()==b'abc'
