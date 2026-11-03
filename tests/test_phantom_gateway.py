@@ -49,11 +49,14 @@ class PhantomTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], self.bridge.requests())
 
     async def test_mutated_message_is_refused(self):
+        # Build the mutated transaction BEFORE opening the 100 ms request, so
+        # a slow runner cannot expire it mid-compile (windows CI 2026-11-03).
+        other = MessageV0.try_compile(self.key.pubkey(), [], [], Hash.default())
+        mutated = base64.b64encode(bytes(VersionedTransaction(other, [self.key]))).decode()
         task = asyncio.create_task(self.bridge.sign(self.payload, self.address))
         await asyncio.sleep(0)
-        other = MessageV0.try_compile(self.key.pubkey(), [], [], Hash.default())
         with self.assertRaisesRegex(ValueError, "different transaction"):
-            self.bridge.complete(self.bridge.requests()[0]["id"], base64.b64encode(bytes(VersionedTransaction(other, [self.key]))).decode())
+            self.bridge.complete(self.bridge.requests()[0]["id"], mutated)
         self.bridge.disconnect()
         with self.assertRaises(PermissionError): await task
 
