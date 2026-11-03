@@ -30,7 +30,11 @@ foreach($r in $roles.Keys){
  if($r -ne 'development'){
   if($row.cpu_state -ne 'BOUNDED'){$red+=($r+': cpu_state '+$row.cpu_state)}
   elseif($row.status_age_s -gt 120){$red+=($r+': status stale '+$row.status_age_s+'s')}
-  if($row.health -and -not $row.health.ok){$red+=($r+': health '+$row.health.error)}}
+  if($row.health -and -not $row.health.ok){$red+=($r+': health '+$row.health.error)}
+  elseif($row.health -and @('ok','healthy') -notcontains ([string]$row.health.status).ToLower()){$red+=($r+': health status '+$row.health.status)}
+  if(@('Ready','Running') -notcontains $row.state){$red+=($r+': task '+$row.state)}
+  elseif(@('0x0','0x41301','0x41303','0x800710E0') -notcontains $row.last_result){$red+=($r+': last_result '+$row.last_result)}
+  if($row.status_write_errors -gt 0){$red+=($r+': status_write_errors '+$row.status_write_errors)}}
  $tasks[$r]=$row}
 $summary=[ordered]@{schema='memecoin_health/1';observed_at=$now;red=$red;verdict=$(if($red.Count){'RED'}else{'GREEN'});roles=$tasks;
  cpu_budget_percent=[ordered]@{spot=5;prediction=1;capture=1.5;terminal=0.5;development=2};
