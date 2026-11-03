@@ -40,5 +40,9 @@ Ranking is by expected E[log W] impact on the memecoin goals: capturable early b
 | 32 | Item 38 exit set (BE, trail, partials, time, regime/news/liquidity exits) | PRESENT/PORT | Ratchet, partials and adaptive exits exist; the liquidity-drain and news exits get added with #17 |
 | 33 | Account parity | PRESENT (n/a) | A single paper book; recheck when Phantom/perps books go live |
 | 34 | Combiner auto-enrol (#604/#618) | PORT | The same item as #5 |
+| 35 | quant #630 CI account-parity gate | PORT (later) | Once Phantom/perps books exist, add a CI gate that every book runs the same veto, sizing and exit mechanisms |
+| 36 | quant #637 signed release attestations | SKIP | This repo releases through GitHub CI receipts plus the cap-aware bounded release |
+| 37 | quant #622 loss-learner min-lot read | SKIP | There are no lot minimums on-chain; the analogue is the dust/min-notional guard already in sizing |
+| 38 | quant #628 exit overlay grid (liquidity-drain exit) | PORT | Same as row 32; memecoin depth collapses faster than FX, so test a drain exit against the ratchet |
 
 Build order after spot is restored and paper accounting is proven: 6+4, then 3, then 17, then 14, then 9.
