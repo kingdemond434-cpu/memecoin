@@ -684,6 +684,13 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
         # and can take seconds, and systemd counts that against
         # TimeoutStopSec unless it has been told the exit is deliberate.
         self.systemd.stopping("shutting down")
+        # Persist the evidence tail so the next boot resumes in O(recent rows)
+        # instead of re-verifying the whole ledger. Best-effort by design.
+        if self.trade_evidence is not None:
+            try:
+                await asyncio.to_thread(self.trade_evidence.flush_checkpoint)
+            except Exception as exc:  # pragma: no cover - shutdown only
+                logger.warning("evidence checkpoint at shutdown: %s", exc)
         # Producers first: they hold sockets, and cancelling the consumer
         # while producers keep publishing fills a queue nobody drains.
         try:
