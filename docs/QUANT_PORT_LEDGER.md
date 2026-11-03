@@ -27,5 +27,18 @@ Ranking is by expected E[log W] impact on the memecoin goals: capturable early b
 | 19 | Clock law / PIT availability | PRESENT | `research_available_at`, PIT episodes |
 | 20 | Prop-firm rules, MT5 gateway, FTMO parity | SKIP | Not applicable to on-chain spot. |
 | 21 | Registry merge path, sealed signing | SKIP | This repo merges through GitHub CI; no registry here. |
+| 22 | quant #585 loss-learner v2 (losses + missed trades -> tweak trials) | PORT | Same as #4/#6; the trials go through promotion_gate with counted trials |
+| 23 | quant #610 loss-learner drift watch | PORT | It rides with #22 |
+| 24 | quant #581 ntfy digest alerts | SKIP | The hourly pass relays memecoin REDs from MEMECOIN_HEALTH.json, and a second alert path would duplicate it |
+| 25 | quant #612 replay prop lane | SKIP | It is prop-firm specific; `src/research/candidate_replay.py` covers replay |
+| 26 | quant #579 deterministic reviewer pattern | SKIP | This repo gates through GitHub CI plus the Auditor |
+| 27 | PSI/KS feature-drift early warning on live inputs (idea 278) | PRESENT/CHECK | Drift exists (`shadow_trainer.py`); confirm it is computed per input feature, not only on the score |
+| 28 | Horizon fan-out as charged trials (idea 279) | PORT | Hold horizons of 10s-24h per family, each counted in the DSR trial total |
+| 29 | MFE/MAE + stop path per trade (idea 280) | PORT | It feeds the exit research; `paper_exit_facts.py` is the place |
+| 30 | James-Stein shrinkage before Kelly (idea 281) | PORT | The same item as #3 |
+| 31 | Lawful discovery: Common Crawl CDX, GDELT, RSS (idea 263) | PORT | GDELT is the event feed for #17 event-driven sniping |
+| 32 | Item 38 exit set (BE, trail, partials, time, regime/news/liquidity exits) | PRESENT/PORT | Ratchet, partials and adaptive exits exist; the liquidity-drain and news exits get added with #17 |
+| 33 | Account parity | PRESENT (n/a) | A single paper book; recheck when Phantom/perps books go live |
+| 34 | Combiner auto-enrol (#604/#618) | PORT | The same item as #5 |
 
 Build order after spot is restored and paper accounting is proven: 6+4, then 3, then 17, then 14, then 9.
