@@ -181,6 +181,12 @@ class _Totals:
     #: reason never touched a launch" even while it is costing monsters.
     rejected_by_reason: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
     rugs_by_mechanism: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    #: The other side of every screen's price. A screen that discards a
+    #: monster is only mispriced if it is not also discarding the rugs from
+    #: the same cohort; without these two counters a miss audit is pure
+    #: survivorship and would argue for loosening every filter.
+    rugs_by_stage: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    rugs_by_screen: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
     dispositions: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
 
 
@@ -425,6 +431,14 @@ class LaunchCensus:
                 mechanism = rug_mechanism or "unclassified"
                 record.rug_mechanism = mechanism
                 self._totals.rugs_by_mechanism[mechanism] += 1
+                self._totals.rugs_by_stage[record.stage.value] += 1
+                if record.stage == Stage.SCREENED:
+                    self._totals.rugs_by_screen[
+                        record.screen_reason or "unattributed"] += 1
+                elif (record.stage == Stage.DECIDED
+                        and record.decided_action == "REJECT"):
+                    self._totals.rugs_by_screen[
+                        record.disposition_reason or "unattributed_reject"] += 1
         elif rug_mechanism and not record.rug_mechanism:
             record.rug_mechanism = rug_mechanism
 
@@ -530,6 +544,57 @@ class LaunchCensus:
                        "and is reported as null rather than as perfect"),
         }
 
+    def miss_audit(self) -> Dict[str, Any]:
+        """Classify every resolved monster by where it was lost, and price
+        each screen on BOTH sides: monsters discarded against rugs avoided.
+
+        Classes follow the funnel stage the launch held when it crossed the
+        monster threshold. Coverage outside this census (launches the stream
+        never carried), detection latency, and exit quality need facts this
+        module does not hold; they are reported as UNMEASURED, never as zero.
+        Rug-side counts begin when this counter was introduced, so
+        `rugs_attributed` can be below the lifetime rug total.
+        """
+        totals = self._totals
+        stage = lambda counter, *names: sum(int(counter.get(n.value, 0)) for n in names)
+        monsters, rugs = totals.monsters_by_stage, totals.rugs_by_stage
+        classes = {
+            "pipeline_never_reached_a_screen": (Stage.SEEN, Stage.AWAITING_STATE,
+                                                Stage.DECISION_READY),
+            "data_blocked": (Stage.DATA_BLOCKED,),
+            "decision_screened_out": (Stage.SCREENED,),
+            "decision_declined": (Stage.DECIDED,),
+            "entered": (Stage.ENTERED,),
+        }
+        reasons = set(totals.monsters_by_screen) | set(totals.rugs_by_screen)
+        screens = []
+        for reason in reasons:
+            lost = int(totals.monsters_by_screen.get(reason, 0))
+            saved = int(totals.rugs_by_screen.get(reason, 0))
+            screens.append({
+                "reason": reason, "monsters_discarded": lost, "rugs_avoided": saved,
+                "total_rejected": (totals.screened_by_reason.get(reason, 0)
+                                   + totals.rejected_by_reason.get(reason, 0)),
+                # Counts, not a verdict: a monster and a rug are not the same
+                # size of outcome, so this ratio ranks screens for review and
+                # carries no authority to change one.
+                "monsters_per_rug_avoided": (lost / saved) if saved else None})
+        screens.sort(key=lambda row: (-row["monsters_discarded"], row["rugs_avoided"],
+                                      row["reason"]))
+        return {
+            "resolved_launches": totals.resolved,
+            "monsters_resolved": totals.monsters,
+            "rugs_resolved": totals.rugs,
+            "rugs_attributed": sum(int(v) for v in rugs.values()),
+            "by_class": {name: {"monsters": stage(monsters, *stages),
+                                "rugs": stage(rugs, *stages)}
+                         for name, stages in classes.items()},
+            "screens_two_sided": screens[:20],
+            "unmeasured": ["coverage_outside_census", "detection_latency",
+                           "execution_feasible_size_and_price", "exit_proceeds"],
+            "policy_change_authority": False,
+        }
+
     def positive_opportunity_review(self, limit: int = 100) -> Dict[str, Any]:
         """Review every retained positive peak, not just the 10x tail.
 
@@ -613,6 +678,7 @@ class LaunchCensus:
             "rug_mechanisms": dict(sorted(totals.rugs_by_mechanism.items(),
                                           key=lambda item: item[1], reverse=True)),
             "missed_monsters": self.missed_monster_report(),
+            "miss_audit": self.miss_audit(),
             "memory": {"in_memory": len(self._records),
                        "cap": self.max_records,
                        "spilled_to_disk": self.spilled},
@@ -633,6 +699,8 @@ class LaunchCensus:
                 "screened_by_reason": dict(self._totals.screened_by_reason),
                 "rejected_by_reason": dict(self._totals.rejected_by_reason),
                 "rugs_by_mechanism": dict(self._totals.rugs_by_mechanism),
+                "rugs_by_stage": dict(self._totals.rugs_by_stage),
+                "rugs_by_screen": dict(self._totals.rugs_by_screen),
                 "dispositions": dict(self._totals.dispositions),
             },
             "spilled": self.spilled,
@@ -689,6 +757,8 @@ class LaunchCensus:
             screened_by_reason=defaultdict(int, totals.get("screened_by_reason") or {}),
             rejected_by_reason=defaultdict(int, totals.get("rejected_by_reason") or {}),
             rugs_by_mechanism=defaultdict(int, totals.get("rugs_by_mechanism") or {}),
+            rugs_by_stage=defaultdict(int, totals.get("rugs_by_stage") or {}),
+            rugs_by_screen=defaultdict(int, totals.get("rugs_by_screen") or {}),
             dispositions=dispositions)
         self.spilled = int(state.get("spilled", 0))
         self.expired_unresolved = int(state.get("expired_unresolved", 0))
