@@ -10,6 +10,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 from src.research.evidence_certificate import validate_certificate
+from src.runtime.disk_floor import DiskFloor
 
 
 SCHEMA_VERSION = "v1"
@@ -52,6 +53,7 @@ class TradeEvidenceLedger:
         self.recovery_mode = 'LEGACY_FULL_PARSE'
         self.certified_prefix_records = 0
         self.recovery_error_type = None
+        self.disk_floor = DiskFloor(self.path.parent)
         started = time.perf_counter()
         self._recover_tail()
         self.recovery_seconds = time.perf_counter()-started
@@ -165,6 +167,12 @@ class TradeEvidenceLedger:
         if not event_type or not self.last_hash:
             self.write_failures += 1
             return None
+        # Never grow the ledger into the volume's reserve: a full disk would
+        # stop the separate trading system that shares it. The chain is left
+        # exactly as it was, so appends resume cleanly once space returns.
+        if self.disk_floor.blocked():
+            self.write_failures += 1
+            return None
         body = {
             "schema": SCHEMA_VERSION, "sequence": self.sequence + 1,
             "timestamp": float(timestamp or time.time()),
@@ -231,7 +239,8 @@ class TradeEvidenceLedger:
                 "recovery_mode": self.recovery_mode,
                 "certified_prefix_records": self.certified_prefix_records,
                 "recovery_seconds": self.recovery_seconds,
-                "recovery_error_type": self.recovery_error_type}
+                "recovery_error_type": self.recovery_error_type,
+                "disk_floor": self.disk_floor.report()}
 
 
 def evidence_packet(*, mint: str, timestamp: float,
