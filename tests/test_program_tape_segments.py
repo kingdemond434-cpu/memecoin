@@ -192,3 +192,106 @@ def test_compaction_archives_every_sealed_file_and_the_tape_still_verifies(tmp_p
     assert report["segments"]["archived"] == report["segments"]["archived_this_run"] > 1
     assert not list(tmp_path.glob("*.sealed.sqlite"))
     assert ProgramEventTape.verify(path)["records"] == 60
+
+
+def test_a_reopen_failure_after_sealing_never_replays_the_committed_batch(tmp_path, monkeypatch):
+    """Rotation runs after the commit; a raise there would duplicate the batch."""
+    path = tmp_path / "program-events.sqlite"
+
+    async def run():
+        tape = ProgramEventTape(path, batch_size=4, batch_delay=0, segment_bytes=1)
+        real, calls = tape._open, {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("reopen failed")
+            return real()
+
+        monkeypatch.setattr(tape, "_open", flaky)
+        for index in range(12):
+            await tape.enqueue("transaction", {"program": "P", "n": index})
+            await tape.flush()
+        report = tape.report()
+        await tape.stop()
+        return report, calls["n"]
+
+    report, calls = asyncio.run(run())
+    assert calls >= 2 and report["committed_records"] == 12
+    assert report["write_errors_this_run"] == 0
+    assert ProgramEventTape.verify(path)["records"] == 12
+
+
+def test_stop_survives_a_tape_left_closed_by_a_failed_rotation(tmp_path, monkeypatch):
+    path = tmp_path / "program-events.sqlite"
+
+    async def run():
+        tape = ProgramEventTape(path, batch_size=4, batch_delay=0, segment_bytes=1)
+        monkeypatch.setattr(tape, "_open", lambda: (_ for _ in ()).throw(RuntimeError("no")))
+        await tape.enqueue("transaction", {"program": "P", "n": 0})
+        await tape.queue.join()
+        assert tape.db is None
+        await tape.stop()
+
+    asyncio.run(run())
+
+
+def test_verification_and_hashing_also_honour_a_stop_request(tmp_path, monkeypatch):
+    monkeypatch.setattr(segments, "_CHECK_EVERY", 4)
+    path = tmp_path / "program-events.sqlite"
+    _fill(path, 40)
+    sealed = segments.sealed_path(path, 1, 40)
+    path.rename(sealed)
+    calls = {"n": 0}
+
+    def stop():                       # true only once the write pass is over
+        calls["n"] += 1
+        return calls["n"] > 10
+
+    assert segments.archive_segment(sealed, stop=stop)["deferred"] == "STOPPED"
+    assert sealed.exists() and not list(tmp_path.glob("*.gz*"))
+    assert not list(tmp_path.glob("*.manifest.json"))
+
+
+def test_a_manifest_for_a_different_file_never_authorises_removal(tmp_path):
+    path = tmp_path / "program-events.sqlite"
+    _fill(path, 10)
+    sealed = segments.sealed_path(path, 1, 10)
+    path.rename(sealed)
+    keep = sealed.read_bytes()
+    segments.archive_segment(sealed)
+    _, manifest_path = segments.archive_paths(sealed)
+    manifest = json.loads(manifest_path.read_text())
+    manifest["last_hash"] = "f" * 64
+    manifest_path.write_text(json.dumps(manifest))
+    sealed.write_bytes(keep)
+    rebuilt = segments.archive_segment(sealed)     # rebuilt from the source instead
+    assert rebuilt["last_hash"] != "f" * 64 and not sealed.exists()
+    assert ProgramEventTape.verify(path)["records"] == 10
+
+
+def test_low_disk_is_not_retried_until_more_space_is_free(tmp_path):
+    path = tmp_path / "program-events.sqlite"
+    free = {"bytes": 0}
+    usage = lambda _: Usage(1, 1, free["bytes"])
+
+    async def run():
+        tape = ProgramEventTape(path, batch_size=4, batch_delay=0, segment_bytes=1)
+        for index in range(8):
+            await tape.enqueue("transaction", {"program": "P", "n": index})
+        await tape.flush()
+        tape.compact(duty=1.0, usage=usage)
+        first = tape.report()["segments"]
+        free["bytes"] = 1024**3 - 1                 # still not more than before + 1 GiB
+        tape.compact(duty=1.0, usage=usage)
+        blocked = tape.report()["segments"]
+        free["bytes"] = 50 * 1024**3
+        tape.compact(duty=1.0, usage=usage)
+        done = tape.report()["segments"]
+        await tape.stop()
+        return first, blocked, done
+
+    first, blocked, done = asyncio.run(run())
+    assert first["archive_deferred"] == "LOW_DISK" and first["archive_needs_free_bytes"] == 1024**3
+    assert blocked["archive_deferred"] == "LOW_DISK" and blocked["archived"] == 0
+    assert done["archive_deferred"] is None and done["sealed"] == 0 and done["archived"] > 1

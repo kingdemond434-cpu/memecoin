@@ -101,23 +101,43 @@ def _check(raw, sequence, previous):
     return sequence + 1, _digest(body), body['kind']
 
 
-def verify_archive(archive, manifest):
+def verify_archive(archive, manifest, pace=None):
     """Read the archive back and recompute its chain against its manifest."""
     sequence, previous = manifest['base_sequence'], manifest['base_hash']
     with gzip.open(archive, 'rt', encoding='utf-8', newline='\n') as handle:
         for line in handle:
             sequence, previous, _ = _check(line[:-1], sequence, previous)
+            if pace and sequence % _CHECK_EVERY == 0:
+                pace.tick()
     if (sequence, previous) != (manifest['last_sequence'], manifest['last_hash']):
         raise ValueError('archive tail does not match its manifest')
     return sequence, previous
 
 
-def _sha256(path):
+def _sha256(path, pace=None):
     digest = hashlib.sha256()
     with open(path, 'rb') as handle:
-        for block in iter(lambda: handle.read(1 << 20), b''):
+        for count, block in enumerate(iter(lambda: handle.read(1 << 20), b''), 1):
             digest.update(block)
+            if pace and count % 16 == 0:
+                pace.tick()
     return digest.hexdigest()
+
+
+class _Pace:
+    """Duty-cycle limit and stop check shared by every long pass."""
+
+    def __init__(self, duty=1.0, stop=lambda: False, sleep=time.sleep):
+        self.duty, self.stop, self.sleep = duty, stop, sleep
+        self.began = time.perf_counter()
+
+    def tick(self):
+        if self.stop():
+            raise _Stopped()
+        if self.duty < 1:
+            worked = time.perf_counter() - self.began
+            self.sleep(worked * (1 - self.duty) / self.duty)
+            self.began = time.perf_counter()
 
 
 class _LowDisk(Exception):
@@ -126,6 +146,17 @@ class _LowDisk(Exception):
 
 class _Stopped(Exception):
     pass
+
+
+def _matches_source(sealed, manifest):
+    """The manifest describes THIS sealed file, not merely a same-named one."""
+    db = sqlite3.connect(Path(sealed).resolve().as_uri() + '?mode=ro', uri=True)
+    try:
+        tail = tuple(db.execute('SELECT sequence,last_hash FROM tape_meta WHERE id=1').fetchone())
+        return (read_base(db) == (manifest['base_sequence'], manifest['base_hash'])
+                and tail == (manifest['last_sequence'], manifest['last_hash']))
+    finally:
+        db.close()
 
 
 def _remove_source(sealed):
@@ -144,15 +175,23 @@ def archive_segment(sealed, *, duty=1.0, usage=shutil.disk_usage, sleep=time.sle
     """
     sealed = Path(sealed)
     archive, manifest_path = archive_paths(sealed)
+    size = sealed.stat().st_size
+    pace = _Pace(duty, stop, sleep)
+    stopped = {'deferred': 'STOPPED', 'source_bytes': size}
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
-        if archive.exists() and _sha256(archive) == manifest['archive_sha256']:
+        try:
+            finished = (archive.exists() and _matches_source(sealed, manifest)
+                        and _sha256(archive, pace) == manifest['archive_sha256'])
+        except _Stopped:
+            return stopped
+        if finished:
             _remove_source(sealed)       # finished before; only removal was left
             return manifest
         manifest_path.unlink()           # incomplete: rebuild from the source
-    size = sealed.stat().st_size
-    low = {'deferred': 'LOW_DISK', 'source_bytes': size}
-    if usage(sealed.parent).free < ARCHIVE_HEADROOM_BYTES:
+    free = usage(sealed.parent).free
+    low = {'deferred': 'LOW_DISK', 'source_bytes': size, 'free_bytes_at_start': free}
+    if free < ARCHIVE_HEADROOM_BYTES:
         return low
     partial = archive.with_name(archive.name + '.partial')
     db = sqlite3.connect(sealed.resolve().as_uri() + '?mode=ro', uri=True)
@@ -160,7 +199,6 @@ def archive_segment(sealed, *, duty=1.0, usage=shutil.disk_usage, sleep=time.sle
         base_sequence, base_hash = read_base(db)
         sequence, previous = base_sequence, base_hash
         kinds = {}
-        began = time.perf_counter()
         with open(partial, 'wb') as raw_handle:
             with gzip.GzipFile(fileobj=raw_handle, mode='wb', compresslevel=6, mtime=0) as handle:
                 for number, raw, seal in db.execute(
@@ -172,14 +210,9 @@ def archive_segment(sealed, *, duty=1.0, usage=shutil.disk_usage, sleep=time.sle
                     handle.write(raw.encode('utf-8') + b'\n')
                     if sequence % _CHECK_EVERY:
                         continue
-                    if stop():
-                        raise _Stopped()
                     if usage(sealed.parent).free < ARCHIVE_HEADROOM_BYTES:
                         raise _LowDisk()
-                    if duty < 1:
-                        worked = time.perf_counter() - began
-                        sleep(worked * (1 - duty) / duty)
-                        began = time.perf_counter()
+                    pace.tick()
             raw_handle.flush()
             os.fsync(raw_handle.fileno())
         tail, seal, counts = db.execute(
@@ -191,22 +224,25 @@ def archive_segment(sealed, *, duty=1.0, usage=shutil.disk_usage, sleep=time.sle
         return low
     except _Stopped:
         partial.unlink(missing_ok=True)
-        return {'deferred': 'STOPPED', 'source_bytes': size}
+        return stopped
     except BaseException:
         partial.unlink(missing_ok=True)
         raise
     finally:
         db.close()
-    manifest = {
-        'schema': MANIFEST_SCHEMA, 'base_sequence': base_sequence, 'base_hash': base_hash,
-        'first_sequence': base_sequence + 1, 'last_sequence': sequence, 'last_hash': previous,
-        'records': sequence - base_sequence, 'records_by_kind': kinds,
-        'counts': json.loads(counts), 'source_bytes': size,
-        'archive_bytes': partial.stat().st_size, 'archive_sha256': _sha256(partial),
-        'format': 'gzip; one exact row body per line, in sequence order',
-    }
     try:
-        verify_archive(partial, manifest)    # the source is removed only after this
+        manifest = {
+            'schema': MANIFEST_SCHEMA, 'base_sequence': base_sequence, 'base_hash': base_hash,
+            'first_sequence': base_sequence + 1, 'last_sequence': sequence, 'last_hash': previous,
+            'records': sequence - base_sequence, 'records_by_kind': kinds,
+            'counts': json.loads(counts), 'source_bytes': size,
+            'archive_bytes': partial.stat().st_size, 'archive_sha256': _sha256(partial, pace),
+            'format': 'gzip; one exact row body per line, in sequence order',
+        }
+        verify_archive(partial, manifest, pace)   # the source is removed only after this
+    except _Stopped:
+        partial.unlink(missing_ok=True)
+        return stopped
     except BaseException:
         partial.unlink(missing_ok=True)
         raise

@@ -12,6 +12,7 @@ import hashlib
 import json
 from pathlib import Path
 import os
+import shutil
 import sqlite3
 import threading
 import time
@@ -50,7 +51,7 @@ class ProgramEventTape:
             raise ValueError('positive segment size required')
         self.path=Path(path);self.path.parent.mkdir(parents=True,exist_ok=True)
         self.segment_bytes=segment_bytes;self.rotations=0;self.rotation_errors=0;self.rotate_after=0.
-        self.archive_error=None;self.archive_deferred=None;self.archived_this_run=0
+        self.archive_error=None;self.archive_deferred=None;self.archived_this_run=0;self.archive_needs_free=0
         sequence,seal,counts,clean=self._open()
         self.previous_shutdown_clean=bool(clean)
         self.db.execute('UPDATE tape_meta SET clean_shutdown=0 WHERE id=1');self.db.commit()
@@ -71,6 +72,11 @@ class ProgramEventTape:
         closed=segments.list_segments(self.path)
         tail=segments.read_tail(closed[-1]) if closed else (0,GENESIS,{})
         self.db=sqlite3.connect(self.path,timeout=20,check_same_thread=False)
+        try:return self._prepare(closed,tail)
+        except BaseException:
+            self.db.close();self.db=None;raise
+
+    def _prepare(self,closed,tail):
         self.db.execute('PRAGMA journal_mode=WAL');self.db.execute('PRAGMA synchronous=FULL')
         self.db.executescript('''
           CREATE TABLE IF NOT EXISTS records(sequence INTEGER PRIMARY KEY,observation_id TEXT UNIQUE NOT NULL,
@@ -106,26 +112,35 @@ class ProgramEventTape:
             self.db.close();self.db=None
             try:os.replace(self.path,target)
             finally:
-                self._open()
+                # If this reopen fails the handle stays None and the next
+                # append reopens BEFORE it writes, so nothing is replayed.
+                self.db=None;self._open()
                 self.db.execute('UPDATE tape_meta SET clean_shutdown=0 WHERE id=1');self.db.commit()
             self.rotations+=1
-        except (OSError,sqlite3.Error):
-            # e.g. another process holds the file open on Windows. Try again
+        except Exception:
+            # Never raise: this runs after the batch committed, and a raise
+            # would make the writer replay that batch. e.g. another process holds the file open on Windows. Try again
             # in a minute rather than on every commit.
             self.rotation_errors+=1;self.rotate_after=time.monotonic()+60
 
-    def compact(self,*,duty=.1):
+    def compact(self,*,duty=.1,usage=shutil.disk_usage):
         """Archive closed segments, oldest first. Runs off the event loop."""
         for segment in segments.list_segments(self.path):
             if segment['kind']!='sealed':continue
             if self.closed:return
+            # An archive that ran out of disk restarts from its first row, so
+            # it is retried only once more space is free than it had then.
+            if usage(self.path.parent).free<self.archive_needs_free:
+                self.archive_deferred='LOW_DISK';return
             try:
-                result=segments.archive_segment(segment['path'],duty=duty,stop=lambda:self.closed)
+                result=segments.archive_segment(segment['path'],duty=duty,stop=lambda:self.closed,usage=usage)
             except Exception as exc:
                 self.archive_error=type(exc).__name__;return
             self.archive_error=None;self.archive_deferred=result.get('deferred')
+            if self.archive_deferred=='LOW_DISK':
+                self.archive_needs_free=result['free_bytes_at_start']+1024**3
             if self.archive_deferred:return
-            self.archived_this_run+=1
+            self.archive_needs_free=0;self.archived_this_run+=1
 
     def start(self):
         if self.closed:raise RuntimeError('tape is closed')
@@ -212,8 +227,10 @@ class ProgramEventTape:
         if self.worker:
             self.worker.cancel();await asyncio.gather(self.worker,return_exceptions=True)
         def close():
-            with self.lock,self.db:self.db.execute('UPDATE tape_meta SET clean_shutdown=1 WHERE id=1')
-            self.db.close()
+            with self.lock:
+                if self.db is None:return  # a failed rotation left it closed
+                with self.db:self.db.execute('UPDATE tape_meta SET clean_shutdown=1 WHERE id=1')
+                self.db.close()
         await asyncio.to_thread(close)
 
     def report(self):
@@ -228,7 +245,8 @@ class ProgramEventTape:
             'history_count_limit':None,'segment_bytes':self.segment_bytes,
             'segments':{**segments.segment_report(self.path),'rotations_this_run':self.rotations,
                 'rotation_errors_this_run':self.rotation_errors,'archived_this_run':self.archived_this_run,
-                'archive_error_type':self.archive_error,'archive_deferred':self.archive_deferred},
+                'archive_error_type':self.archive_error,'archive_deferred':self.archive_deferred,
+                'archive_needs_free_bytes':self.archive_needs_free},
             'all_programs_coverage':False,'execution_authority':False}
 
     @staticmethod
