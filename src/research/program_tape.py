@@ -172,7 +172,12 @@ class ProgramEventTape:
     def _append(self,batch):
         began=time.perf_counter()
         with self.lock:
-            if self.db is None:self._open()  # a failed rotation left it closed
+            if self.db is None:
+                # A failed rotation left it closed, possibly with the flag it
+                # set before sealing still at 1. Mark this run unclean again
+                # before writing, or a later crash would be reported as clean.
+                self._open()
+                self.db.execute('UPDATE tape_meta SET clean_shutdown=0 WHERE id=1');self.db.commit()
             with self.db:
                 self.db.execute('BEGIN IMMEDIATE')
                 sequence,previous,raw=self.db.execute('SELECT sequence,last_hash,counts FROM tape_meta WHERE id=1').fetchone()

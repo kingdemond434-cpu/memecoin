@@ -295,3 +295,40 @@ def test_low_disk_is_not_retried_until_more_space_is_free(tmp_path):
     assert first["archive_deferred"] == "LOW_DISK" and first["archive_needs_free_bytes"] == 1024**3
     assert blocked["archive_deferred"] == "LOW_DISK" and blocked["archived"] == 0
     assert done["archive_deferred"] is None and done["sealed"] == 0 and done["archived"] > 1
+
+
+def test_a_crash_after_a_failed_rotation_reopen_is_reported_unclean(tmp_path, monkeypatch):
+    path = tmp_path / "program-events.sqlite"
+
+    async def run():
+        tape = ProgramEventTape(path, batch_size=4, batch_delay=0, segment_bytes=1)
+        real, calls = tape._open, {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("reopen failed")
+            return real()
+
+        monkeypatch.setattr(tape, "_open", flaky)
+        await tape.enqueue("transaction", {"program": "P", "n": 0})
+        await tape.flush()                       # rotation: seal, reopen fails
+        tape.segment_bytes = None                # keep the next file active
+        await tape.enqueue("transaction", {"program": "P", "n": 1})
+        await tape.flush()                       # append reopens, then writes
+        tape.worker.cancel()
+        await asyncio.gather(tape.worker, return_exceptions=True)
+        tape.db.close()                          # crash: no clean stop()
+
+    asyncio.run(run())
+
+    async def reopen():
+        tape = ProgramEventTape(path)
+        report = tape.report()
+        await tape.stop()
+        return report
+
+    report = asyncio.run(reopen())
+    assert report["previous_shutdown_clean"] is False
+    assert report["uncommitted_loss_after_unclean_shutdown"] == "UNKNOWN"
+    assert report["committed_records"] == 2
