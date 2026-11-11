@@ -779,6 +779,7 @@ class ReportingSurface:
                              else {"status": "DATA_BLOCKED",
                                    "detail": "no Pump monitor is wired"}),
             "launch_census": self.launch_census.report(),
+            "world_event_heat": _world_event_heat_report(),
             "launchlab_decoder": (self.launchlab_monitor.decoder_report()
                 if getattr(self, "launchlab_monitor", None) is not None
                 else {"status": "DATA_BLOCKED", "detail": "no LaunchLab monitor is wired"}),
@@ -1249,3 +1250,8 @@ class ReportingSurface:
         if self._web_runner:
             await self._web_runner.cleanup()
             self._web_runner = None
+
+
+def _world_event_heat_report():
+    from src.research.world_event_heat import WORLD_EVENT_HEAT
+    return WORLD_EVENT_HEAT.report()

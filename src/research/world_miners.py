@@ -31,6 +31,7 @@ not read that as a fault.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import zipfile
@@ -157,7 +158,8 @@ def parse_gkg(payload: bytes, terms: Sequence[str] = DEFAULT_TERMS,
     return records
 
 
-def gdelt_world_news_miner(client: Any, terms: Sequence[str] = DEFAULT_TERMS
+def gdelt_world_news_miner(client: Any, terms: Sequence[str] = DEFAULT_TERMS,
+                           heat: Any = None
                            ) -> Callable[[], Awaitable[List[Dict[str, Any]]]]:
     """Worldwide mainstream news mentioning this desk's subjects.
 
@@ -188,6 +190,18 @@ def gdelt_world_news_miner(client: Any, terms: Sequence[str] = DEFAULT_TERMS
                 raise
             url = current
             payload = await _get_bytes(client, url)
+        # Every person and organisation in the slice, not only the rows that
+        # mention crypto: the event a coin is named after is rarely a crypto
+        # story. Off the event loop; a failure here never costs the corpus.
+        target = heat
+        if target is None:
+            from src.research.world_event_heat import WORLD_EVENT_HEAT as target
+        if url != getattr(fetch, "last_heat_url", None):
+            try:
+                await asyncio.to_thread(target.observe_gkg, payload)
+                fetch.last_heat_url = url
+            except Exception as exc:
+                logger.warning("world event heat skipped a slice: %s", type(exc).__name__)
         return [{**row, "archive_url": url} for row in parse_gkg(payload, terms)]
 
     return fetch
