@@ -50,6 +50,9 @@ class WalletProfile:
     win_rate_2x: float = 0.0
     win_rate_5x: float = 0.0
     win_rate_10x: float = 0.0
+    #: Launch outcomes the win rates above were measured on; the sample size
+    #: the empirical-Bayes shrinkage needs. 0 on profiles saved before it.
+    win_rate_trials: int = 0
     rug_exposure: float = 0.0
     median_entry_pct: float = 50.0
     median_exit_pct: float = 50.0
@@ -349,6 +352,7 @@ class GenealogyGraph:
                 w.win_rate_2x = sum(1 for o in outcomes if o.get("max_multiple", 0) >= 2) / len(outcomes)
                 w.win_rate_5x = sum(1 for o in outcomes if o.get("max_multiple", 0) >= 5) / len(outcomes)
                 w.win_rate_10x = sum(1 for o in outcomes if o.get("max_multiple", 0) >= 10) / len(outcomes)
+                w.win_rate_trials = len(outcomes)
                 w.rug_exposure = sum(1 for o in outcomes if o.get("rugged")) / len(outcomes)
                 w.realized_pnl = sum(o.get("realized_pnl", 0) for o in outcomes)
                 
@@ -359,12 +363,41 @@ class GenealogyGraph:
                 if exit_pcts:
                     w.median_exit_pct = np.median(exit_pcts)
                 
-                w.is_smart_money = (w.win_rate_5x > 0.3 and w.rug_exposure < 0.3 and w.realized_pnl > 0)
+                w.is_smart_money = (self.shrunk_win_rate_5x(w) > 0.3 and w.rug_exposure < 0.3
+                                    and w.realized_pnl > 0)
                 w.trust_score = self._calculate_trust_score(w)
+
+    #: How long a fitted 5x-rate prior is reused before refitting on the pool.
+    WIN5_PRIOR_SECONDS = 60.0
+
+    def _win5_prior(self):
+        """Beta prior on the 5x hit rate, fitted on every measured wallet."""
+        from src.research.eb_shrinkage import fit_beta_prior
+        cached = getattr(self, "_win5_prior_cache", None)
+        now = time.monotonic()
+        if cached is None or now - cached[0] >= self.WIN5_PRIOR_SECONDS:
+            prior = fit_beta_prior(
+                (round(w.win_rate_5x * w.win_rate_trials), w.win_rate_trials)
+                for w in self.wallets.values() if w.win_rate_trials > 0)
+            cached = (now, prior)
+            self._win5_prior_cache = cached
+        return cached[1]
+
+    def shrunk_win_rate_5x(self, w: WalletProfile) -> float:
+        """The 5x rate to judge a wallet on: shrunk toward the pool.
+
+        3 of 5 launches at 5x is a raw 0.6 and, at memecoin base rates, mostly
+        luck; it must not clear a 0.3 smart-money bar that 60 of 300 cannot.
+        A profile with no recorded sample size keeps its raw rate.
+        """
+        if w.win_rate_trials <= 0:
+            return w.win_rate_5x
+        hits = min(w.win_rate_trials, max(0, round(w.win_rate_5x * w.win_rate_trials)))
+        return self._win5_prior().shrink(hits, w.win_rate_trials)
 
     def _calculate_trust_score(self, w: WalletProfile) -> float:
         score = 0.5
-        score += (w.win_rate_5x - 0.2) * 0.5
+        score += (self.shrunk_win_rate_5x(w) - 0.2) * 0.5
         score -= w.rug_exposure * 0.3
         score += min(w.realized_pnl / 10000, 0.2)
         score -= max(0, w.median_entry_pct - 30) * 0.002
@@ -535,7 +568,7 @@ class GenealogyGraph:
     def get_smart_money_wallets(self, min_trust: float = 0.7, min_win_rate: float = 0.3) -> List[WalletProfile]:
         return [
             w for w in self.wallets.values()
-            if w.trust_score >= min_trust and w.win_rate_5x >= min_win_rate and w.is_smart_money
+            if w.trust_score >= min_trust and self.shrunk_win_rate_5x(w) >= min_win_rate and w.is_smart_money
         ]
 
     def get_entity_graph_stats(self) -> Dict:
@@ -548,6 +581,7 @@ class GenealogyGraph:
             "graph_nodes": self.graph.number_of_nodes(),
             "graph_edges": self.graph.number_of_edges()
             ,"data_status": dict(self.data_status)
+            ,"win5_prior": self._win5_prior().report()
         }
 
     def serialize(self) -> Dict:

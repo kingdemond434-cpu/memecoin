@@ -1272,4 +1272,7 @@ class WalletIntelligenceEngine:
             # can be checked against what it was shrunk to.
             "hit_rate_priors": {f"{regime.value}:{name}": prior.report()
                                 for (regime, name), prior in getattr(self, "hit_rate_priors", {}).items()},
+            # How often the prior hit its strength ceiling: a high share means
+            # the pool shows little real spread and rankings lean on the cap.
+            "hit_rate_priors_capped": sum(prior.capped for prior in getattr(self, "hit_rate_priors", {}).values()),
         }
