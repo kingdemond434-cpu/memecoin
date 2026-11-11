@@ -198,7 +198,8 @@ def gdelt_world_news_miner(client: Any, terms: Sequence[str] = DEFAULT_TERMS,
             from src.research.world_event_heat import WORLD_EVENT_HEAT as target
         if url != getattr(fetch, "last_heat_url", None):
             try:
-                await asyncio.to_thread(target.observe_gkg, payload)
+                from src.research.world_event_heat import slice_time
+                await asyncio.to_thread(target.observe_gkg, payload, slice_time(url))
                 fetch.last_heat_url = url
             except Exception as exc:
                 logger.warning("world event heat skipped a slice: %s", type(exc).__name__)
