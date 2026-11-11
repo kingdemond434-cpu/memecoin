@@ -1268,6 +1268,17 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
             except Exception as exc:
                 decision["asymmetric_tail_shadow"] = {
                     "status": "DATA_BLOCKED", "failure_type": type(exc).__name__, "shadow_only": True}
+        if not should_trade and getattr(self, "_lottery_consider_declined", None) is not None:
+            # The tail sleeve only rides trades the core accepted; this files a
+            # counterfactual ticket on the declined ones, to measure whether a
+            # lottery sleeve on them would pay. No authority.
+            try:
+                matched = (getattr(candidate, "metadata", {}) or {}).get("world_event_match") or []
+                self._lottery_consider_declined(
+                    token, prediction, str(trade_info.get("reason", "")), sized_veto or {},
+                    world_event=str(matched[0].get("entity", "")) if matched else "")
+            except Exception as exc:
+                logger.debug("lottery counterfactual skipped: %s", exc)
         if not should_trade:
             # A launch we screened is a closed trace, not an abandoned one.
             # Screening is most of the funnel, and a ledger that only ever saw
@@ -3844,6 +3855,9 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
                 # screen threw away.
                 self.launch_census.resolve(
                     token, peak_multiple=curve_multiple, at=stamp)
+                lottery = getattr(self, "lottery_ledger", None)
+                if lottery is not None and token in lottery.open:
+                    lottery.mark(token, curve_multiple, stamp)
                 # The same peak, attached to every decision made about this
                 # launch. This is the counterfactual: what was available,
                 # measured on a token the desk may never have touched.

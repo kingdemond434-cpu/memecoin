@@ -161,6 +161,9 @@ class DeskMaintenance:
             return
         self.launch_census.resolve(
             token, rugged=True, rug_mechanism=verdict.mechanism.value)
+        lottery = getattr(self, "lottery_ledger", None)
+        if lottery is not None and token in lottery.open:
+            lottery.rugged(token, time.time())
         # The adversarial detector's only feed. A feature value that used to
         # precede monsters and now precedes rugs is exactly what it exists to
         # notice, and nothing was telling it how anything ended.

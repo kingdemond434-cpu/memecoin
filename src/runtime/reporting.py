@@ -263,6 +263,17 @@ class ReportingSurface:
         intelligence["status"] = "OK"
         return intelligence
 
+    def _lottery_report(self) -> Dict[str, Any]:
+        """Counterfactual lottery tickets on declined launches; expires old ones."""
+        ledger = getattr(self, "lottery_ledger", None)
+        if ledger is None:
+            return {"status": "NOT_OBSERVED", "detail": "no declined launch considered yet"}
+        if ledger.expire(time.time()):
+            checkpoint = getattr(self, "_lottery_checkpoint", None)
+            if checkpoint is not None:
+                checkpoint()
+        return ledger.report()
+
     def mark_report(self) -> Dict[str, Any]:
         """Whether marking is actually local, and whether it is right.
 
@@ -779,6 +790,7 @@ class ReportingSurface:
                              else {"status": "DATA_BLOCKED",
                                    "detail": "no Pump monitor is wired"}),
             "launch_census": self.launch_census.report(),
+            "lottery_counterfactual": self._lottery_report(),
             "launchlab_decoder": (self.launchlab_monitor.decoder_report()
                 if getattr(self, "launchlab_monitor", None) is not None
                 else {"status": "DATA_BLOCKED", "detail": "no LaunchLab monitor is wired"}),
