@@ -188,9 +188,15 @@ class ResearchRuntime:
     def _lottery_consider_declined(self, token: str, prediction: Any, reason: str,
                                    veto: dict, world_event: str = "") -> None:
         """A declined, safety-clean launch with a priced tail gets a virtual ticket."""
+        # Absolute curve price: the in-memory anchor behind the stream mark is
+        # reset when the episode leaves memory or on restart, so a multiple of
+        # it cannot be compared with a later mark.
         mark = (getattr(self, "_latest_stream_mark", {}) or {}).get(token) or {}
+        anchor = (getattr(self, "_curve_entry_price", {}) or {}).get(token)
+        price = (float(anchor) * float(mark["multiple"])
+                 if anchor and mark.get("multiple") else None)
         filed = self._lottery().consider(
-            token, at=time.time(), entry_multiple=mark.get("multiple"),
+            token, at=time.time(), entry_price=price,
             p_10x=float(getattr(prediction, "p_10x", 0.0) or 0.0), reason=reason,
             safety_clear=veto.get("clear") is True and not veto.get("unmeasured"),
             equity_usd=float(getattr(self, "wallet_equity_usd", 0.0) or 0.0),

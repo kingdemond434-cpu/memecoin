@@ -12,7 +12,7 @@ def _ledger(**kw):
 
 def _file(ledger, token="m", at=0.0, entry=2.0, p10=0.2, reason="p_2x_below_gate",
           clear=True, equity=10_000.0):
-    return ledger.consider(token, at=at, entry_multiple=entry, p_10x=p10, reason=reason,
+    return ledger.consider(token, at=at, entry_price=entry, p_10x=p10, reason=reason,
                            safety_clear=clear, equity_usd=equity)
 
 
@@ -87,7 +87,36 @@ def test_the_runtime_files_a_declined_launch_from_its_live_mark():
     desk.champion_challenger = None
     desk.wallet_equity_usd = 5_000.0
     desk._latest_stream_mark = {"mint": {"multiple": 1.7}}
+    desk._curve_entry_price = {"mint": 2e-8}
     desk._lottery_consider_declined("mint", SimpleNamespace(p_10x=0.3), "p_2x_below_gate",
                                     {"clear": True})
     ticket = desk.lottery_ledger.open["mint"]
-    assert ticket.entry_multiple == 1.7 and ticket.cost_usd == 5.0
+    assert math.isclose(ticket.entry_price, 3.4e-8) and ticket.cost_usd == 5.0
+    # The desk drops (or restarts without) its in-memory anchor; the ticket
+    # does not depend on it, so a later absolute price reads the same multiple.
+    desk._curve_entry_price.clear()
+    desk.lottery_ledger.mark("mint", 3 * 3.4e-8, 10)
+    assert math.isclose(ticket.last, 3.0) and ticket.harvested
+
+
+def test_equity_level_growth_is_the_real_size_log_and_totals_survive_restart():
+    ledger = _ledger(round_trip_cost=0.0)
+    _file(ledger, "a"); _file(ledger, "b")
+    ledger.rugged("a", 10)                          # money multiple 0
+    ledger.mark("b", 2.0 * 5, 20); ledger.expire(8 * DAY)   # 0.5*3 + 0.5*5 = 4x
+    report = ledger.report()
+    expected = (math.log(1 - 0.001) + math.log(1 + 0.001 * 3)) / 2
+    assert math.isclose(report["mean_log_equity_growth_per_ticket"], expected)
+    restored = _ledger(round_trip_cost=0.0)
+    state = ledger.state(); state["closed"] = []    # inspection list trimmed away
+    restored.load(state)
+    assert restored.report()["closed_tickets"] == 2
+    assert math.isclose(restored.report()["closed_proceeds_usd"], 40.0)
+
+
+def test_a_migrated_runner_is_counted_as_unmarked():
+    ledger = _ledger()
+    _file(ledger)
+    ledger.migrated("m")
+    ledger.expire(8 * DAY)
+    assert ledger.report()["unmarked_after_migration"] == 1

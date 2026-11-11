@@ -3807,6 +3807,9 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
                 # Migration is itself an outcome, and one that separates a
                 # curve that stalled from one that graduated and then died.
                 self.launch_census.resolve(token, migrated=True)
+                lottery = getattr(self, "lottery_ledger", None)
+                if lottery is not None:
+                    lottery.migrated(token)
             curve_price = float(event.get("curve_price_raw", 0) or 0)
             virtual_sol = int(event.get("virtual_sol_reserves") or 0)
             virtual_token = int(event.get("virtual_token_reserves") or 0)
@@ -3857,7 +3860,8 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
                     token, peak_multiple=curve_multiple, at=stamp)
                 lottery = getattr(self, "lottery_ledger", None)
                 if lottery is not None and token in lottery.open:
-                    lottery.mark(token, curve_multiple, stamp)
+                    if lottery.mark(token, curve_price, stamp):
+                        self._lottery_checkpoint()   # a harvest is rare and must survive a restart
                 # The same peak, attached to every decision made about this
                 # launch. This is the counterfactual: what was available,
                 # measured on a token the desk may never have touched.

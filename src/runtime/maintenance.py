@@ -164,6 +164,9 @@ class DeskMaintenance:
         lottery = getattr(self, "lottery_ledger", None)
         if lottery is not None and token in lottery.open:
             lottery.rugged(token, time.time())
+            checkpoint = getattr(self, "_lottery_checkpoint", None)
+            if checkpoint is not None:
+                checkpoint()
         # The adversarial detector's only feed. A feature value that used to
         # precede monsters and now precedes rugs is exactly what it exists to
         # notice, and nothing was telling it how anything ended.
