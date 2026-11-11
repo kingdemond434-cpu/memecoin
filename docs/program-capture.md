@@ -50,3 +50,32 @@ while a WAL writer is active can omit committed rows. Keep the separate state
 directory across release changes. The desk does not yet replay this raw tape into
 its research corpus automatically; recording and downstream replay are separate
 acceptance requirements.
+
+## Segments and archives
+
+One permanent SQLite file grows without bound (98 GB on 2026-11-10). The
+recorder therefore seals the active file at `--segment-bytes` (default 2 GiB,
+`0` disables) and continues the SAME sequence and hash chain in a new
+`program-events.sqlite`. Nothing is dropped and no history limit is imposed.
+
+- A sealed file is `program-events.<first>-<last>.sealed.sqlite`.
+- A background archiver, limited to `--archive-duty` of wall time (default 0.1)
+  so it cannot starve the recorder inside the role's CPU budget, rewrites each
+  sealed file as `program-events.<first>-<last>.jsonl.gz`: the exact row bodies,
+  one per line. Every other column is derivable from the body, so this is
+  lossless.
+- The sealed SQLite file is removed only after the finished archive has been
+  read back and its whole chain recomputed against the manifest
+  (`...manifest.json`, which also pins the archive's SHA-256).
+- Archiving stops and discards its partial output if free space falls to 4 GiB,
+  on a stop request, or on any chain failure. In each case the sealed source is
+  left untouched and `/status` reports it under `tape.segments`.
+- A new active file takes its starting sequence and hash from the newest closed
+  segment on disk, so a crash between sealing and creating the successor cannot
+  restart the chain.
+
+`--verify-only` verifies every archive, every sealed file and the active file as
+one chain. Keep all `program-events.*` files together when moving the state
+directory. Duplicate suppression by observation id applies within the active
+file.
+
