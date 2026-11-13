@@ -45,13 +45,20 @@ try {
  $child.StandardInput.Close()
  $snapshot=[MemecoinCpuBudgetJob]::Current()
  if(@($snapshot.ProcessIds) -notcontains [long]$child.Id -and -not $child.HasExited){throw 'Child escaped CPU job'}
- Save-CpuStatus 'BOUNDED' $snapshot $child.Id $null
+ try {Save-CpuStatus 'BOUNDED' $snapshot $child.Id $null}catch{}
+ # A status write is telemetry, not supervision. This job is KILL_ON_JOB_CLOSE,
+ # so an exception here would end the launcher and kill the capped service
+ # (spot died this way on 2026-11-03 with FAILED_IOException). Transient write
+ # failures (reader holding the file, full disk) are counted and retried; the
+ # child keeps running inside the same kernel cap.
+ $statusFailures=0
  while(-not $child.WaitForExit(5000)){
-  Save-CpuStatus 'BOUNDED' ([MemecoinCpuBudgetJob]::Current()) $child.Id $null
+  try {Save-CpuStatus 'BOUNDED' ([MemecoinCpuBudgetJob]::Current()) $child.Id $null;$statusFailures=0}
+  catch {$statusFailures++;try{[IO.File]::AppendAllText($statusPath+'.errors',([DateTimeOffset]::UtcNow.ToUnixTimeSeconds().ToString()+' '+$_.Exception.GetType().Name+' '+$statusFailures+"`r`n"))}catch{}}
  }
  $code=$child.ExitCode
  while(([MemecoinCpuBudgetJob]::Current()).ActiveProcesses -gt 1){Start-Sleep -Seconds 2}
- Save-CpuStatus 'EXITED' ([MemecoinCpuBudgetJob]::Current()) $child.Id $code
+ try {Save-CpuStatus 'EXITED' ([MemecoinCpuBudgetJob]::Current()) $child.Id $code}catch{}
  [MemecoinCpuBudgetJob]::ReleaseAfterChildrenExit()
  exit $code
 }catch{
