@@ -32,8 +32,9 @@ def program_ids(extra=()):
 
 
 class ProgramCapture:
-    def __init__(self,rpc,tape,programs):
+    def __init__(self,rpc,tape,programs,*,archive_duty=.1):
         self.rpc,self.tape,self.programs=rpc,tape,list(programs)
+        self.archive_duty=archive_duty;self.compactor=None
         self.task=None;self.running=False;self.connected=False;self.status='NOT_STARTED'
         self.last_error=None;self.errors=0;self.connections=0;self.last_received_at=None
         self.subscribed=[];self.refused={};self.deferred={};self.observed_notifications=0
@@ -60,6 +61,15 @@ class ProgramCapture:
     async def start(self):
         self.tape.start();self.running=True
         self.task=asyncio.create_task(self._run(),name='permanent-raw-program-capture')
+        self.compactor=asyncio.create_task(self._compact(),name='program-tape-compaction')
+
+    async def _compact(self):
+        # Closed tape segments are archived off the event loop at a low duty
+        # cycle, so compaction shares the role's CPU budget without starving
+        # the recorder. A tight disk defers it; it never drops a record.
+        while self.running:
+            await asyncio.to_thread(self.tape.compact,duty=self.archive_duty)
+            await asyncio.sleep(3600 if self.tape.archive_deferred or self.tape.archive_error else 60)
 
     async def _run(self):
         cursor=0
@@ -137,8 +147,9 @@ class ProgramCapture:
 
     async def stop(self):
         self.running=False
-        if self.task:
-            self.task.cancel();await asyncio.gather(self.task,return_exceptions=True)
+        for task in (self.task,self.compactor):
+            if task:
+                task.cancel();await asyncio.gather(task,return_exceptions=True)
         await self.transition('STOPPED')
         await self.tape.stop()
         await self.rpc.stop()
@@ -189,9 +200,14 @@ def main():
     parser.add_argument('--state-dir',required=True)
     parser.add_argument('--port',type=int,default=18084)
     parser.add_argument('--program',action='append',default=[])
+    parser.add_argument('--segment-bytes',type=int,default=2*1024**3,
+        help='Seal the active tape file at this size and continue the same chain in a new one; 0 disables')
+    parser.add_argument('--archive-duty',type=float,default=.1,
+        help='Fraction of wall time the closed-segment archiver may work')
     parser.add_argument('--verify-only',action='store_true',help='Verify a committed tape snapshot and exit without connecting')
     args=parser.parse_args()
     if not 1024<=args.port<=65535:parser.error('unprivileged loopback port required')
+    if args.segment_bytes<0 or not 0<args.archive_duty<=1:parser.error('non-negative segment size and duty in (0, 1] required')
     tape_path=Path(args.state_dir)/'program-events.sqlite'
     if args.verify_only:
         print(json.dumps(ProgramEventTape.verify(tape_path)))
@@ -199,8 +215,8 @@ def main():
     registry=ChainRegistry(args.config)
     chain=registry.get_chain('solana')
     if chain is None:parser.error('configured Solana RPC required')
-    tape=ProgramEventTape(tape_path)
-    capture=ProgramCapture(RPCManager(chain),tape,program_ids(args.program))
+    tape=ProgramEventTape(tape_path,segment_bytes=args.segment_bytes or None)
+    capture=ProgramCapture(RPCManager(chain),tape,program_ids(args.program),archive_duty=args.archive_duty)
     web.run_app(create_app(capture),host='127.0.0.1',port=args.port,print=None)
 
 
