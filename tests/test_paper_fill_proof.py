@@ -136,7 +136,7 @@ def test_run_and_cli_write_separate_artifacts(tmp_path):
     art = run(tmp_path)
     assert json.loads((tmp_path / "paper_fill_proof.json").read_text())["schema"] == art["schema"]
     assert main(["--state-dir", str(tmp_path)]) == 1          # not PROVEN, exit 1
-    assert (tmp_path / "paper_fill_proof.audit.json").exists()
+    assert (tmp_path / "paper_fill_proof_check.json").exists()
     assert (tmp_path / "paper_fill_proof.state.json").exists()
 
 
@@ -174,3 +174,61 @@ async def _desk_round_trip(tmp_path):
     assert art["verdict"] == "PROVEN", (art["checks"], art["identity_examples"])
     assert art["totals"]["sells"] == 2 and art["totals"]["round_trips"] == 1
     assert abs(art["totals"]["realized_pnl_usd"] - 87.5) < 1e-6
+
+
+def test_break_latches_until_the_ledger_is_replaced(tmp_path):
+    path = tmp_path / "trade_evidence.jsonl"
+    ledger = TradeEvidenceLedger(path)
+    _buy(ledger, "A", 10.0)
+    _sell(ledger, "A", 12.0, 10.0, True)
+    rows = path.read_text().splitlines()
+    path.write_text(rows[0] + "\n" + rows[1].replace('"proceeds_usd":12.0', '"proceeds_usd":120.0') + "\n")
+    proof = _proof(tmp_path)
+    proof.scan()
+    assert proof.artifact()["verdict"] == "CHAIN_BROKEN"
+    with path.open("a") as handle:                  # appending does not heal it
+        handle.write(rows[1] + "\n")
+    proof.scan()
+    assert proof.artifact()["verdict"] == "CHAIN_BROKEN"
+    path.unlink()                                   # a new segment / ledger
+    fresh = TradeEvidenceLedger(path)
+    _buy(fresh, "B", 10.0)
+    _sell(fresh, "B", 11.0, 10.0, True)
+    proof.scan()
+    art = proof.artifact()
+    assert art["verdict"] == "PROVEN", art["checks"]
+    assert len(art["chain_restarts"]) == 1 and "row 2" in art["chain_restarts"][0]["error"]
+    assert art["totals"]["round_trips"] == 1
+
+
+def test_health_loop_runs_the_proof_as_its_own_task(tmp_path, monkeypatch):
+    import asyncio
+    from src.runtime.reporting import ReportingSurface
+    calls = []
+
+    class Surface(ReportingSurface):
+        _running = True
+        memory = type("M", (), {"observe": staticmethod(lambda: None)})()
+        global_config = {"ops_state_dir": str(tmp_path)}
+
+        async def _readiness_snapshot(self):
+            return {}
+
+        async def _publish_readiness(self, snapshot):
+            self._running = False
+
+    async def fast(_):
+        return None
+
+    monkeypatch.setattr("src.runtime.reporting.asyncio.sleep", fast)
+
+    async def go():
+        surface = Surface()
+        await surface._health_loop()
+        assert surface._paper_proof_task is not None
+        await surface._paper_proof_task
+        calls.append(surface._paper_proof_verdict)
+
+    asyncio.run(go())
+    assert calls == ["NO_FILLS"]
+    assert (tmp_path / "paper_fill_proof.json").exists()

@@ -972,7 +972,11 @@ class ReportingSurface:
                 logger.warning("readiness refresh blocked by frontier diagnostic budget")
                 continue
             await self._publish_readiness(snapshot)
-            await self._paper_fill_proof_tick()
+            # Its own task: a long catch-up scan must never delay the
+            # health cadence. At most one runs at a time.
+            running = getattr(self, "_paper_proof_task", None)
+            if running is None or running.done():
+                self._paper_proof_task = asyncio.create_task(self._paper_fill_proof_tick())
 
     async def _paper_fill_proof_tick(self, *, force: bool = False) -> None:
         """Write the contracted paper-fill proof on its schedule (hourly).

@@ -111,16 +111,45 @@ class PaperFillProof:
         os.replace(tmp, self.state_path)
 
     # -- scanning ----------------------------------------------------
+    def _identity(self) -> Optional[List[Any]]:
+        """(size, first-row hash) of the ledger now, or None if unreadable."""
+        try:
+            with self.evidence_path.open("rb") as handle:
+                first = handle.readline()
+                size = os.fstat(handle.fileno()).st_size
+        except OSError:
+            return None
+        return [size, hashlib.sha256(first).hexdigest()]
+
     def _broken(self, why: str) -> None:
         self.state["chain_ok"] = False
         self.state["chain_error"] = why
+        # What the ledger looked like when it broke. A break latches only
+        # while the ledger is unchanged; once it is replaced, rotated or
+        # segmented, verification restarts from its first row.
+        self.state["broken_identity"] = self._identity()
+
+    def _unlatch_if_replaced(self) -> bool:
+        state = self.state
+        now = self._identity()
+        if now is None or now == state.get("broken_identity"):
+            return False
+        if now[0] > (state.get("broken_identity") or [0])[0] and now[1] == (
+                state.get("broken_identity") or [None, None])[1]:
+            return False                        # same file, only appended to
+        breaks = (state.get("breaks") or []) + [{
+            "at": self._clock(), "error": state["chain_error"],
+            "rows_verified": state["sequence"]}]
+        self.state = _empty_state()
+        self.state["breaks"] = breaks[-20:]
+        return True
 
     def scan(self) -> Dict[str, Any]:
         """Verify and aggregate committed rows past the checkpoint."""
-        state = self.state
         self.scan_complete = False
-        if not state["chain_ok"]:
-            return state
+        if not self.state["chain_ok"] and not self._unlatch_if_replaced():
+            return self.state
+        state = self.state
         try:
             size = self.evidence_path.stat().st_size
         except OSError:
@@ -272,6 +301,7 @@ class PaperFillProof:
             "seconds_since_last_fill": None if last is None else now - last,
             "recent_fills": state["recent"],
             "identity_examples": state["identity_examples"],
+            "chain_restarts": state.get("breaks") or [],
         }
 
 
@@ -301,7 +331,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--out", default=None)
     parser.add_argument("--max-mb", type=int, default=256)
     parser.add_argument("--duty", type=float, default=0.25)
-    parser.add_argument("--name", default="paper_fill_proof.audit",
+    parser.add_argument("--name", default="paper_fill_proof_check",
                         help="checkpoint/artifact name; never the desk's own")
     args = parser.parse_args(argv)
     if args.name == "paper_fill_proof":

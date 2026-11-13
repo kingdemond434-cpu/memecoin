@@ -27,4 +27,4 @@ Independent audit run, own checkpoint, read-only on the ledger:
 
     python -m src.research.paper_fill_proof --state-dir <ops_state_dir>
 
-It writes `paper_fill_proof.audit.json` and exits 0 only when `PROVEN`.
+It writes `paper_fill_proof_check.json` and exits 0 only when `PROVEN`.
