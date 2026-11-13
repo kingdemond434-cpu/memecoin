@@ -135,8 +135,9 @@ pub fn build_signed(payer: &Pubkey, instructions: &[Instruction],
     let serialized_message = message.serialize();
     let required = message.signers();
     let mut signatures = Vec::with_capacity(required);
-    for index in 0..required {
-        let account = message.account_keys[index];
+    // Same bounds as indexing each key: panics if the message claims more
+    // signers than keys, rather than silently signing fewer.
+    for (index, &account) in message.account_keys[..required].iter().enumerate() {
         match signers.iter().find(|signer| signer.public == account) {
             Some(signer) => signatures.push(signer.sign(&serialized_message)),
             None if allow_partial => signatures.push([0u8; SIGNATURE_LEN]),
