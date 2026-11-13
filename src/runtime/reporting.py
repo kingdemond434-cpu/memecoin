@@ -21,6 +21,7 @@ from dataclasses import asdict, is_dataclass, replace as dataclasses_replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from aiohttp import web
+from src.research import paper_fill_proof
 from src.research.funnel_invariant import check_desk
 from src.runtime.research_reads import research_report
 from src.research.global_research_miner import GlobalResearchMiner
@@ -971,6 +972,32 @@ class ReportingSurface:
                 logger.warning("readiness refresh blocked by frontier diagnostic budget")
                 continue
             await self._publish_readiness(snapshot)
+            await self._paper_fill_proof_tick()
+
+    async def _paper_fill_proof_tick(self, *, force: bool = False) -> None:
+        """Write the contracted paper-fill proof on its schedule (hourly).
+
+        Incremental and paced, off the event loop; a failure is logged and
+        retried next hour, never allowed to touch the desk.
+        """
+        config = getattr(self, "global_config", None)
+        if config is None:
+            return                              # not a configured desk
+        interval = float(config.get("paper_fill_proof_seconds", 3600.0))
+        now = time.time()
+        if interval <= 0 or (not force and now - getattr(self, "_paper_proof_at", 0.0) < interval):
+            return
+        self._paper_proof_at = now
+        root = Path(config.get("ops_state_dir", "data/state"))
+        try:
+            artifact = await asyncio.to_thread(paper_fill_proof.run, root)
+            self._paper_proof_verdict = artifact["verdict"]
+            logger.info("PAPER_FILL_PROOF verdict=%s round_trips=%s fills_today=%s",
+                        artifact["verdict"], artifact["totals"]["round_trips"],
+                        artifact["today"])
+        except Exception as exc:
+            self._paper_proof_verdict = f"ERROR:{type(exc).__name__}"
+            logger.warning("paper fill proof failed: %s", type(exc).__name__)
 
     async def _publish_readiness(self, snapshot):
         # The projection is already detached/read-only. Logging, duplicate
