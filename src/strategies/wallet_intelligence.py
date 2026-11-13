@@ -947,8 +947,39 @@ class WalletIntelligenceEngine:
             pass
         return 0.0
 
+    #: The hit-rate thresholds a regime performance records.
+    _HIT_RATES = ("win_rate_2x", "win_rate_5x", "win_rate_10x")
+
+    def _fit_hit_rate_priors(self) -> None:
+        """One Beta prior per (regime, threshold), fitted on every wallet.
+
+        Fitted on the whole population, not only the rankable wallets, because
+        the pool is what a small sample is being shrunk toward.
+        """
+        from src.research.eb_shrinkage import fit_beta_prior
+        priors = {}
+        by_regime: Dict[WalletRegime, list] = defaultdict(list)
+        for regimes in self.regime_performances.values():
+            for regime, perf in regimes.items():
+                if perf.trades > 0:
+                    by_regime[regime].append(perf)
+        for regime, rows in by_regime.items():
+            for name in self._HIT_RATES:
+                priors[(regime, name)] = fit_beta_prior(
+                    (round(getattr(perf, name) * perf.trades), perf.trades) for perf in rows)
+        self.hit_rate_priors = priors
+
+    def _shrunk(self, perf: WalletRegimePerformance, name: str) -> float:
+        """The rate to rank on: the EB posterior mean, not the raw ratio."""
+        prior = getattr(self, "hit_rate_priors", {}).get((perf.regime, name))
+        raw = getattr(perf, name)
+        if prior is None or perf.trades <= 0:
+            return raw
+        return prior.shrink(min(perf.trades, max(0, round(raw * perf.trades))), perf.trades)
+
     async def _recalculate_all_scores(self):
         all_wallets = set(self.genealogy.wallets.keys()) | set(self.regime_performances.keys())
+        self._fit_hit_rate_priors()
         
         scores = []
         for wallet in all_wallets:
@@ -978,8 +1009,11 @@ class WalletIntelligenceEngine:
                 continue
             
             early_quality = max(0, 1 - perf.avg_entry_pct / 100)
-            forward_quality = (perf.win_rate_2x * 0.3 + perf.win_rate_5x * 0.5 + perf.win_rate_10x * 0.2)
-            consistency = 1 - abs(perf.win_rate_5x - perf.win_rate_2x * 0.5)
+            # Shrunk toward the pool: a few lucky trades must not outrank a
+            # long record (see src/research/eb_shrinkage.py).
+            r2, r5, r10 = (self._shrunk(perf, name) for name in self._HIT_RATES)
+            forward_quality = (r2 * 0.3 + r5 * 0.5 + r10 * 0.2)
+            consistency = 1 - abs(r5 - r2 * 0.5)
             
             independence = perf.independence_score
             
@@ -1001,8 +1035,9 @@ class WalletIntelligenceEngine:
         overall = np.mean(list(regime_scores.values()))
         
         early_entry = np.mean([max(0, 1 - p.avg_entry_pct / 100) for p in regimes.values() if p.trades >= 5])
-        forward_return = np.mean([p.win_rate_5x for p in regimes.values() if p.trades >= 5])
-        consistency = np.mean([1 - abs(p.win_rate_5x - p.win_rate_2x * 0.5) for p in regimes.values() if p.trades >= 5])
+        forward_return = np.mean([self._shrunk(p, "win_rate_5x") for p in regimes.values() if p.trades >= 5])
+        consistency = np.mean([1 - abs(self._shrunk(p, "win_rate_5x") - self._shrunk(p, "win_rate_2x") * 0.5)
+                               for p in regimes.values() if p.trades >= 5])
         independence = np.mean([p.independence_score for p in regimes.values() if p.trades >= 5])
         sample_size = sum(p.trades for p in regimes.values())
         rug_exposure = np.mean([p.rug_exposure for p in regimes.values() if p.trades >= 5])
@@ -1233,4 +1268,11 @@ class WalletIntelligenceEngine:
             "wallet_value": self.wallet_value.report(),
             "data_blocked_wallets": sum(1 for status in self.data_status.values() if status.startswith("DATA_BLOCKED")),
             "data_status": dict(self.data_status),
+            # The pool each wallet's hit rate is shrunk toward, so a ranking
+            # can be checked against what it was shrunk to.
+            "hit_rate_priors": {f"{regime.value}:{name}": prior.report()
+                                for (regime, name), prior in getattr(self, "hit_rate_priors", {}).items()},
+            # How often the prior hit its strength ceiling: a high share means
+            # the pool shows little real spread and rankings lean on the cap.
+            "hit_rate_priors_capped": sum(prior.capped for prior in getattr(self, "hit_rate_priors", {}).values()),
         }
