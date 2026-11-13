@@ -166,6 +166,44 @@ class ResearchRuntime:
         if not saved:
             framework.checkpoint_research_component("ASYMMETRIC_TAIL", sleeve.state())
 
+    def _lottery(self):
+        """The counterfactual lottery ledger, restored from its checkpoint once."""
+        ledger = getattr(self, "lottery_ledger", None)
+        if ledger is None:
+            from src.research.lottery_ledger import LotteryLedger, LotteryPolicy
+            ledger = LotteryLedger(LotteryPolicy(**self.global_config.get("lottery_policy", {})))
+            framework = getattr(self, "champion_challenger", None)
+            saved = framework.get_research_component("LOTTERY_COUNTERFACTUAL") if framework else None
+            if saved:
+                ledger.load(saved)
+            self.lottery_ledger = ledger
+        return ledger
+
+    def _lottery_checkpoint(self) -> None:
+        framework = getattr(self, "champion_challenger", None)
+        if framework is not None and getattr(self, "lottery_ledger", None) is not None:
+            framework.checkpoint_research_component("LOTTERY_COUNTERFACTUAL",
+                                                    self.lottery_ledger.state())
+
+    def _lottery_consider_declined(self, token: str, prediction: Any, reason: str,
+                                   veto: dict, world_event: str = "") -> None:
+        """A declined, safety-clean launch with a priced tail gets a virtual ticket."""
+        # Absolute curve price: the in-memory anchor behind the stream mark is
+        # reset when the episode leaves memory or on restart, so a multiple of
+        # it cannot be compared with a later mark.
+        mark = (getattr(self, "_latest_stream_mark", {}) or {}).get(token) or {}
+        anchor = (getattr(self, "_curve_entry_price", {}) or {}).get(token)
+        price = (float(anchor) * float(mark["multiple"])
+                 if anchor and mark.get("multiple") else None)
+        filed = self._lottery().consider(
+            token, at=time.time(), entry_price=price,
+            p_10x=float(getattr(prediction, "p_10x", 0.0) or 0.0), reason=reason,
+            safety_clear=veto.get("clear") is True and not veto.get("unmeasured"),
+            equity_usd=float(getattr(self, "wallet_equity_usd", 0.0) or 0.0),
+            world_event=world_event)
+        if filed:
+            self._lottery_checkpoint()
+
     def _tail_shadow_candidate(self, candidate: Any, opportunity: Opportunity,
                                veto: dict) -> dict:
         sleeve = getattr(self, "asymmetric_tail", None)
