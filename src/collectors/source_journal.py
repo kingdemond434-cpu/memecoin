@@ -14,6 +14,7 @@ import threading
 from pathlib import Path
 
 from src.collectors.event_source import Event, SourceClass
+from src.runtime.disk_floor import DiskFloor
 
 
 def encode(event):
@@ -50,6 +51,7 @@ class SourceJournal:
         self.lock = threading.RLock()
         self._stats_lock = threading.Lock()
         self.lease_batches_this_run = 0
+        self.disk_floor = DiskFloor(self.path.parent)
         self.leased_events_this_run = 0
         self.db = sqlite3.connect(path, timeout=5, check_same_thread=False)
         self.db.execute('PRAGMA journal_mode=WAL')
@@ -73,6 +75,11 @@ class SourceJournal:
         # The caller retains this same batch if either validation or IO fails.
         if not math.isfinite(now):
             raise ValueError('finite admission clock required')
+        # Below the volume's free-space floor the journal stops admitting.
+        # OSError is this method's existing disk-failure signal: the producer
+        # keeps the same batch and retries, and nothing accepted is evicted.
+        if self.disk_floor.blocked():
+            raise OSError('source journal volume is below its free-space floor')
         rows = [(identity(event,body), event.source_id, body, seal(body), now, now)
                 for event in events for body in (encode(event),)]
         with self.lock, self.db:
@@ -202,6 +209,7 @@ class SourceJournal:
             'wal_bytes': Path(str(self.path)+'-wal').stat().st_size if Path(str(self.path)+'-wal').exists() else 0,
             'disk_free_bytes': shutil.disk_usage(self.path.parent).free,
             'evicted_events': 0, 'upstream_gap_free': False,
+            'disk_floor': self.disk_floor.report(),
             'lease_batches_this_run': batches,
             'leased_events_this_run': leased}
 
