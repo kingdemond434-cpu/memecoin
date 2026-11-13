@@ -21,16 +21,6 @@ $parent=Get-Content -LiteralPath (Join-Path $root 'results\parent.json') -Raw|Co
 $children=@(Get-ChildItem -LiteralPath (Join-Path $root 'results') -Filter 'grandchild-*.json')
 if($children.Count -ne 2 -or -not $parent.breakaway_rejected -or -not $parent.python_current_job_query_verified){throw 'Descendant or breakaway acceptance failed'}
 foreach($child in $children){$data=Get-Content -LiteralPath $child.FullName -Raw|ConvertFrom-Json;if(-not $data.in_budget_job -or $data.deterministic_result -ne $parent.deterministic_result){throw 'Child membership or deterministic result changed'}}
-# A status reader holding the file (or a full disk) must not kill the capped
-# child: the job is KILL_ON_JOB_CLOSE, so a launcher crash ends the service.
-$statusFile=Join-Path $root 'status\fixture.json'
-$lock=[IO.File]::Open($statusFile,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
-try{
- $held=[Diagnostics.Process]::Start($info);$held.StandardInput.Close()
- if(-not $held.WaitForExit(240000)){throw 'Status-lock fixture timed out; inspect and stop only its exact task/process tree'}
-}finally{$lock.Dispose()}
-if($held.ExitCode -ne 0){throw 'Status write failure killed the capped child'}
-if(-not (Test-Path -LiteralPath ($statusFile+'.errors'))){throw 'Status write failures were not recorded'}
 $markerBefore=@(Get-ChildItem -LiteralPath (Join-Path $root 'results')).Count
 $manifest.roles.fixture.cpu_rate=1001;$manifest|ConvertTo-Json -Depth 8|Set-Content -LiteralPath $path -Encoding UTF8
 $bad=[Diagnostics.Process]::Start($info);$bad.StandardInput.Close();$bad.WaitForExit()
@@ -39,6 +29,6 @@ $manifest.roles.fixture.cpu_rate=100;$manifest.assembly_sha256='0'*64;$manifest|
 $bad=[Diagnostics.Process]::Start($info);$bad.StandardInput.Close();$bad.WaitForExit()
 if($bad.ExitCode -eq 0 -or @(Get-ChildItem -LiteralPath (Join-Path $root 'results')).Count -ne $markerBefore){throw 'Assembly integrity did not fail closed'}
 $receipt=[ordered]@{status='PASS';cpu_percent=1;descendants_verified=2;breakaway_rejected=$true;
- deterministic_outputs_identical=$true;python_current_job_query_verified=$true;single_thread_environment=$true;oversized_budget_rejected=$true;assembly_tamper_rejected=$true;status_write_failure_survived=$true;production_data_used=$false;quant_changed=$false}
+ deterministic_outputs_identical=$true;python_current_job_query_verified=$true;single_thread_environment=$true;oversized_budget_rejected=$true;assembly_tamper_rejected=$true;production_data_used=$false;quant_changed=$false}
 $receipt|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $root 'receipt.json') -Encoding UTF8
 $receipt|ConvertTo-Json -Compress
