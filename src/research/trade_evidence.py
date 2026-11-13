@@ -52,25 +52,53 @@ class TradeEvidenceLedger:
         self.recovery_mode = 'LEGACY_FULL_PARSE'
         self.certified_prefix_records = 0
         self.recovery_error_type = None
+        # Tail checkpoint (see docs/EVIDENCE_TAIL_CHECKPOINT.md): a running
+        # SHA-256 over every byte after the verified base, so a restart
+        # re-hashes bytes instead of JSON-decoding the whole history.
+        self.checkpoint_path = Path(str(self.path) + '.tail.json')
+        self.checkpoint_interval_s = 30.0
+        self.checkpoint_used = False
+        self.checkpoint_rejected_type = None
+        self.checkpoint_failures = 0
+        self._seg_base = None
+        self._seg_hash = None
+        self._extent = None
+        self._checkpoint_at = 0.0
         started = time.perf_counter()
         self._recover_tail()
         self.recovery_seconds = time.perf_counter()-started
+        if self.last_hash and self._seg_hash is not None:
+            self._write_checkpoint(force=True)
 
     def _recover_tail(self) -> None:
         if not self.path.exists() and self.recovery_certificate is None:
+            self._seg_base, self._seg_hash, self._extent = 0, hashlib.sha256(), 0
             return
         try:
             if self.recovery_certificate is not None:
                 self.recovery_mode = 'CERTIFIED_RECOVERY_PENDING'
                 self._recover_certified()
                 return
-            with self.path.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    if not line.strip():
-                        continue
-                    row = json.loads(line)
-                    self.sequence = int(row["sequence"])
-                    self.last_hash = str(row["hash"])
+            with self.path.open("rb") as handle:
+                end = os.fstat(handle.fileno()).st_size
+                resumed = self._resume_checkpoint(handle, 0, end)
+                if resumed is not None:
+                    count, previous, segment = resumed
+                    self.sequence, self.last_hash = self._verify_rows(
+                        handle, end, count, previous, segment)
+                    self.recovery_mode = 'TAIL_CHECKPOINT_AND_VERIFIED_TAIL'
+                else:
+                    handle.seek(0)
+                    segment = hashlib.sha256()
+                    for line in handle:
+                        segment.update(line)
+                        if not line.strip():
+                            continue
+                        row = json.loads(line)
+                        self.sequence = int(row["sequence"])
+                        self.last_hash = str(row["hash"])
+                    end = handle.tell()
+                self._seg_base, self._seg_hash, self._extent = 0, segment, end
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
             # Do not append to a chain whose tail cannot be trusted.
             self.write_failures += 1
@@ -78,6 +106,101 @@ class TradeEvidenceLedger:
             self.recovery_error_type = type(exc).__name__
             if self.recovery_certificate is not None:
                 self.recovery_mode = 'CERTIFIED_RECOVERY_FAILED'
+
+    @staticmethod
+    def _verify_rows(handle, end, count, previous, segment):
+        """Chain-verify complete rows from the handle position to `end`."""
+        while handle.tell() < end:
+            line = handle.readline(end-handle.tell())
+            if not line or not line.endswith(b'\n'):
+                raise ValueError('incomplete canonical tail')
+            segment.update(line)
+            if line.strip():
+                _, previous = _verified_row(line, previous, count+1)
+                count += 1
+        return count, previous
+
+    def _resume_checkpoint(self, handle, base, end):
+        """Return (sequence, last_hash, running segment hash) at the
+        checkpoint, with the handle positioned there, or None.
+
+        Accepted only when the checkpoint starts at the same verified base,
+        the SHA-256 of every byte from base to its extent matches, the extent
+        is a row boundary, and that boundary row re-hashes to the recorded
+        sequence and hash. Bytes past the base are protected only by the
+        service-written hash chain either way; streaming SHA-256 over them
+        detects the same accidental damage that per-row JSON verification
+        does, at disk speed instead of decode speed. Rows after the extent
+        are still chain-verified by the caller. Any doubt returns None and
+        the caller runs the full path; it never trusts an unchecked tail.
+        """
+        try:
+            if not self.checkpoint_path.exists():
+                return None
+            if self.checkpoint_path.stat().st_size > 64*1024:
+                raise ValueError('tail checkpoint exceeds metadata envelope')
+            mark = json.loads(self.checkpoint_path.read_text(encoding='utf-8'))
+            if mark.get('schema') != 'trade_evidence_tail/2':
+                raise ValueError('tail checkpoint schema')
+            extent, count = int(mark['extent']), int(mark['sequence'])
+            previous, digest = str(mark['last_hash']), str(mark['segment_sha256'])
+            if int(mark['base_extent']) != base:
+                raise ValueError('tail checkpoint base differs')
+            if not base < extent <= end or count <= 0:
+                raise ValueError('tail checkpoint extent')
+            handle.seek(base)
+            segment, remaining = hashlib.sha256(), extent-base
+            while remaining:
+                chunk = handle.read(min(remaining, 4*1024*1024))
+                if not chunk:
+                    raise ValueError('ledger truncated under checkpoint')
+                segment.update(chunk)
+                remaining -= len(chunk)
+            if segment.hexdigest() != digest:
+                raise ValueError('tail checkpoint segment hash differs')
+            handle.seek(extent-1)
+            if handle.read(1) != b'\n':
+                raise ValueError('tail checkpoint is not a row boundary')
+            last = self._prefix_last_row(handle, extent)
+            if last is None:
+                raise ValueError('tail checkpoint row missing')
+            _, actual = _verified_row(last, json.loads(last)['previous_hash'], count)
+            if actual != previous:
+                raise ValueError('tail checkpoint row differs')
+            handle.seek(extent)
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            self.checkpoint_rejected_type = type(exc).__name__
+            return None
+        self.checkpoint_used = True
+        return count, previous, segment
+
+    def _write_checkpoint(self, *, force: bool = False) -> None:
+        """Atomically persist the running tail state. Telemetry-grade: a
+        failure is counted and never blocks or fails an append."""
+        now = time.monotonic()
+        if not force and now-self._checkpoint_at < self.checkpoint_interval_s:
+            return
+        if self._seg_hash is None or not self.last_hash or self.sequence <= 0:
+            return
+        self._checkpoint_at = now
+        mark = {'schema': 'trade_evidence_tail/2', 'base_extent': self._seg_base,
+                'extent': self._extent, 'sequence': self.sequence,
+                'last_hash': self.last_hash,
+                'segment_sha256': self._seg_hash.copy().hexdigest(),
+                'written_at': time.time()}
+        temporary = Path(str(self.checkpoint_path)+'.tmp')
+        try:
+            with temporary.open('w', encoding='utf-8') as handle:
+                handle.write(json.dumps(mark, sort_keys=True))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.checkpoint_path)
+        except OSError:
+            self.checkpoint_failures += 1
+
+    def flush_checkpoint(self) -> None:
+        with self._append_lock:
+            self._write_checkpoint(force=True)
 
     @staticmethod
     def _prefix_last_row(handle, extent):
@@ -130,13 +253,13 @@ class TradeEvidenceLedger:
             elif last is not None or previous != GENESIS:
                 raise ValueError('empty certificate has nonempty tail metadata')
             handle.seek(extent)
-            while handle.tell() < before.st_size:
-                line = handle.readline(before.st_size-handle.tell())
-                if not line or not line.endswith(b'\n'):
-                    raise ValueError('incomplete canonical tail')
-                if line.strip():
-                    _, previous = _verified_row(line, previous, count+1)
-                    count += 1
+            resumed = self._resume_checkpoint(handle, extent, before.st_size)
+            if resumed is not None:
+                count, previous, segment = resumed
+            else:
+                handle.seek(extent)
+                segment = hashlib.sha256()
+            count, previous = self._verify_rows(handle, before.st_size, count, previous, segment)
             after = os.fstat(handle.fileno())
             named = self.path.stat()
             if ((before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns)
@@ -145,7 +268,10 @@ class TradeEvidenceLedger:
                 raise ValueError('canonical file changed during recovery')
         self.sequence, self.last_hash = count, previous
         self.certified_prefix_records = certificate['canonical_records']
-        self.recovery_mode = 'CERTIFIED_PREFIX_SHA256_AND_VERIFIED_TAIL'
+        self.recovery_mode = ('CERTIFIED_PREFIX_SHA256_TAIL_CHECKPOINT_AND_VERIFIED_TAIL'
+                              if self.checkpoint_used else
+                              'CERTIFIED_PREFIX_SHA256_AND_VERIFIED_TAIL')
+        self._seg_base, self._seg_hash, self._extent = extent, segment, before.st_size
 
     def record(self, event_type: str, payload: Dict[str, Any], *,
                timestamp: Optional[float] = None) -> Optional[Dict[str, Any]]:
@@ -175,13 +301,26 @@ class TradeEvidenceLedger:
         row = {**body, "hash": digest}
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(row, separators=(",", ":"), default=str) + "\n")
+            # Binary append with the platform line ending: identical bytes to
+            # the former text-mode write, and known exactly for the running
+            # segment hash.
+            data = (json.dumps(row, separators=(",", ":"), default=str) + os.linesep).encode("utf-8")
+            with self.path.open("ab") as handle:
+                start = handle.seek(0, os.SEEK_END)
+                handle.write(data)
         except OSError:
             self.write_failures += 1
+            self._seg_hash = None  # bytes on disk are now unknown; stop checkpointing
             return None
         self.sequence += 1
         self.last_hash = digest
+        if self._seg_hash is not None:
+            if start != self._extent:
+                self._seg_hash = None
+            else:
+                self._seg_hash.update(data)
+                self._extent = start + len(data)
+                self._write_checkpoint()
         return row
 
     @staticmethod
@@ -231,7 +370,10 @@ class TradeEvidenceLedger:
                 "recovery_mode": self.recovery_mode,
                 "certified_prefix_records": self.certified_prefix_records,
                 "recovery_seconds": self.recovery_seconds,
-                "recovery_error_type": self.recovery_error_type}
+                "recovery_error_type": self.recovery_error_type,
+                "checkpoint_used": self.checkpoint_used,
+                "checkpoint_rejected_type": self.checkpoint_rejected_type,
+                "checkpoint_failures": self.checkpoint_failures}
 
 
 def evidence_packet(*, mint: str, timestamp: float,
