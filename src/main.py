@@ -3689,6 +3689,18 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
                 token, creator=str(event.get("creator", "") or ""),
                 at=float(event.get("timestamp", time.time())),
                 regime=str(self.current_regime or "unknown"))
+            # Event-driven discovery: is this launch named after something
+            # the world started talking about in the last few hours, and how
+            # soon after? Recorded on the event as a fact; no authority.
+            try:
+                from src.research.world_event_heat import WORLD_EVENT_HEAT
+                matches = WORLD_EVENT_HEAT.match(
+                    token, str(event.get("name", "") or ""), str(event.get("symbol", "") or ""),
+                    float(event.get("timestamp", time.time())))
+                if matches:
+                    event["world_event_match"] = matches[:3]
+            except Exception as exc:
+                logger.debug("world event match skipped: %s", exc)
             self.wallet_intel.record_token_lifecycle(token, launch_at=event.get("timestamp", time.time()))
             self._assess_identity(token, event)
             # The pre-launch model's only feed. Every one of its seven public
