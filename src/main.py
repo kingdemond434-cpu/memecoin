@@ -1364,6 +1364,18 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
             "ratchet_stages": [],
         }
         self.elogw_engine.update_position(token, position)
+        if result.simulated and getattr(self, "trade_evidence", None) is not None:
+            # The paper fill proof's only input: one hash-chained row per
+            # simulated fill, so the books can be re-derived and checked
+            # by a reader that does not trust this process.
+            self.trade_evidence.record("paper_fill", {
+                "token": token, "side": "buy", "cost_usd": acquisition_cost,
+                "tokens": int(result.output_amount),
+                "sol": float(trade_info["position_size_sol"]),
+                "decision_id": decision_id,
+                "elogw": trade_info.get("elogw"),
+                "equity_usd": float(self.wallet_equity_usd or 0.0),
+                "sleeve": trade_info.get("sleeve", "t0_sniper")})
         staged = self._stage_exits(token, position)
         if staged is not None:
             position["staged_exits"] = staged.detail
@@ -2810,6 +2822,14 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
         position.setdefault("scale_ins", []).append(
             {"fraction": fraction, "cost_usd": added_cost, "multiple": multiple, "elogw_gain": gain}
         )
+        if result.simulated and getattr(self, "trade_evidence", None) is not None:
+            self.trade_evidence.record("paper_fill", {
+                "token": token, "side": "buy", "cost_usd": added_cost,
+                "tokens": int(result.output_amount), "scale_in": True,
+                "at_multiple": multiple, "elogw": gain,
+                "decision_id": position.get("decision_id"),
+                "equity_usd": float(self.wallet_equity_usd or 0.0),
+                "sleeve": position.get("sleeve", "t0_sniper")})
         logger.info("%s SCALE-IN %s +$%.2f at %.2fx marginal_elogw=%.6f",
                     "PAPER" if self.dry_run else "LIVE", token, added_cost, multiple, gain)
 
@@ -3323,6 +3343,16 @@ class MemecoinQuantDesk(CapitalRuntime, ResearchRuntime, ReportingSurface, Regim
         # capital that had not been returned, and leaving `_closed_pnl` empty
         # so the eventual real close counted the same PnL a second time.
         remaining = int(position["size_tokens"])
+        if result.simulated and getattr(self, "trade_evidence", None) is not None:
+            self.trade_evidence.record("paper_fill", {
+                "token": token, "side": "sell", "tokens": actual_sold,
+                "fraction": actual_sold / max(current_tokens, 1),
+                "proceeds_usd": proceeds, "native_delta_usd": native_delta_usd,
+                "allocated_cost_usd": allocated_cost, "realized_pnl_usd": pnl,
+                "reason": reason, "closed": remaining <= 0,
+                "decision_id": position.get("decision_id"),
+                "equity_usd": float(self.wallet_equity_usd or 0.0),
+                "sleeve": position.get("sleeve", "t0_sniper")})
         # The position is a different size now, so every rung is priced for a
         # size that no longer exists. Restaged on a partial, released on a
         # close -- a ladder held for a position that is gone is a ladder that
